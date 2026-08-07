@@ -122,6 +122,12 @@ pub enum Role {
     CommandLine,
     Clock,
     DialogPrimary,
+    DialogError,
+    DialogInput,
+    ButtonNormal,
+    ButtonFocused,
+    DialogGaugeFilled,
+    DialogGaugeEmpty,
     SplashFrame,
     SplashTitle,
     SplashVersion,
@@ -145,6 +151,12 @@ pub const ALL_ROLES: &[Role] = &[
     Role::CommandLine,
     Role::Clock,
     Role::DialogPrimary,
+    Role::DialogError,
+    Role::DialogInput,
+    Role::ButtonNormal,
+    Role::ButtonFocused,
+    Role::DialogGaugeFilled,
+    Role::DialogGaugeEmpty,
     Role::SplashFrame,
     Role::SplashTitle,
     Role::SplashVersion,
@@ -172,6 +184,12 @@ impl Role {
             Role::CommandLine => "commandline",
             Role::Clock => "clock",
             Role::DialogPrimary => "dialog.primary",
+            Role::DialogError => "dialog.error",
+            Role::DialogInput => "dialog.input",
+            Role::ButtonNormal => "button.normal",
+            Role::ButtonFocused => "button.focused",
+            Role::DialogGaugeFilled => "dialog.gauge.filled",
+            Role::DialogGaugeEmpty => "dialog.gauge.empty",
             Role::SplashFrame => "splash.frame",
             Role::SplashTitle => "splash.title",
             Role::SplashVersion => "splash.version",
@@ -281,6 +299,12 @@ impl Theme {
         set(Role::CommandLine, A(White), A(Black));
         set(Role::Clock, A(Black), A(Cyan));
         set(Role::DialogPrimary, A(Black), A(Cyan));
+        set(Role::DialogError, A(BrightWhite), A(Red));
+        set(Role::DialogInput, A(Black), A(Cyan));
+        set(Role::ButtonNormal, A(Black), A(White));
+        set(Role::ButtonFocused, A(Black), A(BrightYellow));
+        set(Role::DialogGaugeFilled, A(Blue), A(Cyan));
+        set(Role::DialogGaugeEmpty, A(Black), A(Cyan));
         set(Role::SplashFrame, A(Cyan), A(Blue));
         set(Role::SplashTitle, A(BrightWhite), A(Blue));
         set(Role::SplashVersion, A(White), A(Blue));
@@ -311,6 +335,12 @@ impl Theme {
         set(Role::CommandLine, A(White), A(Black));
         set(Role::Clock, A(Black), A(White));
         set(Role::DialogPrimary, A(Black), A(White));
+        set(Role::DialogError, A(BrightWhite), A(Black));
+        set(Role::DialogInput, A(Black), A(White));
+        set(Role::ButtonNormal, A(Black), A(White));
+        set(Role::ButtonFocused, A(White), A(Black));
+        set(Role::DialogGaugeFilled, A(BrightWhite), A(White));
+        set(Role::DialogGaugeEmpty, A(Black), A(White));
         set(Role::SplashFrame, A(White), A(Black));
         set(Role::SplashTitle, A(BrightWhite), A(Black));
         set(Role::SplashVersion, A(White), A(Black));

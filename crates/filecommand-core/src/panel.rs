@@ -3,9 +3,11 @@
 //! values produced by the `listing` module.
 
 use std::cmp::Ordering;
+use std::collections::HashSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::listing::{Entry, EntryKind};
+use crate::listing::{format_count, Entry, EntryKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SortDirection {
@@ -55,6 +57,10 @@ pub struct PanelState {
     /// yanking it back to row 0.
     pub cursor_user_moved: bool,
     pub last_error: Option<String>,
+    /// Selected entries, keyed by original on-disk name — never by row
+    /// index, so selection survives cursor movement, re-sort, and scroll.
+    /// The parent-directory pseudo-entry can never appear here.
+    pub selected: HashSet<OsString>,
 }
 
 impl PanelState {
@@ -67,6 +73,7 @@ impl PanelState {
             progress: ListingProgress::Streaming { count: 0 },
             cursor_user_moved: false,
             last_error: None,
+            selected: HashSet::new(),
         }
     }
 
@@ -115,7 +122,95 @@ impl PanelState {
         self.cursor_user_moved = false;
         self.progress = ListingProgress::Streaming { count: 0 };
         self.last_error = None;
+        self.selected.clear();
     }
+
+    /// Drop any selected names that no longer appear in `entries` — used
+    /// after a fresh listing (e.g. following a file-op job) so selection
+    /// never references a vanished entry.
+    pub fn reconcile_selection(&mut self) {
+        let present: HashSet<&OsString> = self.entries.iter().map(|e| &e.name).collect();
+        self.selected.retain(|name| present.contains(name));
+    }
+
+    /// Toggle selection on the entry under the cursor, then advance the
+    /// cursor by one row (never wrapping past the last entry). The parent
+    /// `..` pseudo-entry is never selectable and toggling it is a no-op.
+    pub fn toggle_selection_and_advance(&mut self) {
+        if let Some(entry) = self.entries.get(self.cursor) {
+            if entry.kind != EntryKind::ParentDir {
+                let name = entry.name.clone();
+                if !self.selected.remove(&name) {
+                    self.selected.insert(name);
+                }
+            }
+        }
+        self.move_cursor(CursorMove::Down(1));
+    }
+
+    /// Additively select every selectable entry whose name matches `pattern`
+    /// (`*`/`?` DOS-style wildcards, case-insensitive).
+    pub fn select_matching(&mut self, pattern: &str) {
+        for entry in &self.entries {
+            if entry.kind != EntryKind::ParentDir && wildcard_match(pattern, &entry.name.to_string_lossy()) {
+                self.selected.insert(entry.name.clone());
+            }
+        }
+    }
+
+    /// Subtractively deselect every entry whose name matches `pattern`.
+    pub fn deselect_matching(&mut self, pattern: &str) {
+        for entry in &self.entries {
+            if entry.kind != EntryKind::ParentDir && wildcard_match(pattern, &entry.name.to_string_lossy()) {
+                self.selected.remove(&entry.name);
+            }
+        }
+    }
+
+    /// Invert selection over every selectable entry; `..` is always left
+    /// unselected.
+    pub fn invert_selection(&mut self) {
+        for entry in &self.entries {
+            if entry.kind == EntryKind::ParentDir {
+                continue;
+            }
+            if !self.selected.remove(&entry.name) {
+                self.selected.insert(entry.name.clone());
+            }
+        }
+    }
+
+    /// Total bytes across selected entries; directories (and `..`) always
+    /// contribute 0.
+    pub fn selected_bytes(&self) -> u64 {
+        self.entries.iter().filter(|e| self.selected.contains(&e.name)).map(|e| if e.is_dir_like() { 0 } else { e.size }).sum()
+    }
+
+    /// `"N files selected, X bytes"`, or `None` when nothing is selected (in
+    /// which case the panel falls back to the per-entry status line).
+    pub fn selection_status(&self) -> Option<String> {
+        if self.selected.is_empty() {
+            return None;
+        }
+        Some(format!("{} files selected, {} bytes", format_count(self.selected.len()), format_count(self.selected_bytes() as usize)))
+    }
+}
+
+/// DOS-style wildcard match (`*` = any run of characters, `?` = any single
+/// character), case-insensitive.
+pub fn wildcard_match(pattern: &str, name: &str) -> bool {
+    fn match_bytes(pat: &[u8], s: &[u8]) -> bool {
+        match (pat.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => match_bytes(&pat[1..], s) || (!s.is_empty() && match_bytes(pat, &s[1..])),
+            (Some(b'?'), Some(_)) => match_bytes(&pat[1..], &s[1..]),
+            (Some(pc), Some(sc)) if pc == sc => match_bytes(&pat[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    let pattern = pattern.to_lowercase();
+    let name = name.to_lowercase();
+    match_bytes(pattern.as_bytes(), name.as_bytes())
 }
 
 /// Compare two entries for sort order. `..` always sorts first regardless of
@@ -255,6 +350,139 @@ mod tests {
         assert_eq!(p.cursor, 0);
         assert!(!p.cursor_user_moved);
         assert_eq!(p.progress, ListingProgress::Streaming { count: 0 });
+    }
+
+    #[test]
+    fn begin_new_listing_clears_selection() {
+        let mut p = PanelState::new(PathBuf::from("/a"));
+        p.entries = vec![file("x")];
+        p.selected.insert(OsString::from("x"));
+        p.begin_new_listing(PathBuf::from("/b"));
+        assert!(p.selected.is_empty());
+    }
+
+    #[test]
+    fn ins_toggles_and_advances_without_wrap() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![file("a"), file("b"), file("c")];
+        p.toggle_selection_and_advance();
+        assert!(p.selected.contains(&OsString::from("a")));
+        assert_eq!(p.cursor, 1);
+        p.toggle_selection_and_advance();
+        assert!(p.selected.contains(&OsString::from("b")));
+        assert_eq!(p.cursor, 2);
+        // Toggle "c" while already at the last row: no wrap past the end.
+        p.toggle_selection_and_advance();
+        assert!(p.selected.contains(&OsString::from("c")));
+        assert_eq!(p.cursor, 2);
+        // Toggling again deselects.
+        p.cursor = 0;
+        p.toggle_selection_and_advance();
+        assert!(!p.selected.contains(&OsString::from("a")));
+    }
+
+    #[test]
+    fn parent_dir_is_never_selectable() {
+        let mut p = PanelState::new(PathBuf::from("/a/b"));
+        p.entries = vec![Entry::parent_dir(), file("x")];
+        p.cursor = 0;
+        p.toggle_selection_and_advance();
+        assert!(p.selected.is_empty());
+        assert_eq!(p.cursor, 1);
+    }
+
+    #[test]
+    fn wildcard_select_and_deselect_are_additive_and_subtractive() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![Entry::parent_dir(), file("a.txt"), file("b.txt"), dir("c")];
+        p.select_matching("*.txt");
+        assert_eq!(p.selected.len(), 2);
+        assert!(!p.selected.contains(&OsString::from(".."))); // parent excluded even if pattern is "*"
+        p.deselect_matching("a.txt");
+        assert_eq!(p.selected, HashSet::from([OsString::from("b.txt")]));
+    }
+
+    #[test]
+    fn invert_selection_flips_all_selectable_leaves_parent_unselected() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![Entry::parent_dir(), file("a"), file("b"), dir("c")];
+        p.selected.insert(OsString::from("a"));
+        p.invert_selection();
+        assert_eq!(p.selected, HashSet::from([OsString::from("b"), OsString::from("c")]));
+        p.invert_selection();
+        assert_eq!(p.selected, HashSet::from([OsString::from("a")]));
+    }
+
+    #[test]
+    fn selection_status_counts_files_and_zeros_directories() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![
+            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None },
+            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None },
+        ];
+        assert_eq!(p.selection_status(), None);
+        p.select_matching("*");
+        assert_eq!(p.selection_status(), Some("2 files selected, 100 bytes".to_string()));
+    }
+
+    #[test]
+    fn selection_persists_across_cursor_move_and_resort_clears_only_on_dir_change() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![file("a"), file("b")];
+        p.selected.insert(OsString::from("a"));
+        p.move_cursor(CursorMove::Down(1));
+        assert!(p.selected.contains(&OsString::from("a")));
+        insert_sorted(&mut p.entries, file("aa"), SortDirection::Asc);
+        assert!(p.selected.contains(&OsString::from("a")), "re-sort/insert must not disturb selection");
+    }
+
+    #[test]
+    fn reconcile_selection_drops_vanished_entries() {
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![file("a"), file("b")];
+        p.selected.insert(OsString::from("a"));
+        p.selected.insert(OsString::from("b"));
+        p.entries = vec![file("b")];
+        p.reconcile_selection();
+        assert_eq!(p.selected, HashSet::from([OsString::from("b")]));
+    }
+
+    #[test]
+    fn wildcard_match_supports_star_and_question_case_insensitive() {
+        assert!(wildcard_match("*.TXT", "readme.txt"));
+        assert!(wildcard_match("a?c", "abc"));
+        assert!(!wildcard_match("a?c", "abbc"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(!wildcard_match("*.txt", "readme.md"));
+    }
+
+    mod selection_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_name() -> impl Strategy<Value = String> {
+            "[a-z]{1,6}\\.[a-z]{1,3}"
+        }
+
+        proptest! {
+            #[test]
+            fn invert_twice_is_identity(names in prop::collection::hash_set(arb_name(), 1..8)) {
+                let mut p = PanelState::new(PathBuf::from("/"));
+                p.entries = names.iter().map(|n| file(n)).collect();
+                let before = p.selected.clone();
+                p.invert_selection();
+                p.invert_selection();
+                prop_assert_eq!(p.selected, before);
+            }
+
+            #[test]
+            fn selected_bytes_never_counts_directories(names in prop::collection::vec(arb_name(), 1..8)) {
+                let mut p = PanelState::new(PathBuf::from("/"));
+                p.entries = names.iter().map(|n| dir(n)).collect();
+                p.select_matching("*");
+                prop_assert_eq!(p.selected_bytes(), 0);
+            }
+        }
     }
 
     #[test]

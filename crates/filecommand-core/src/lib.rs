@@ -7,6 +7,7 @@
 
 pub mod clock;
 pub mod config;
+pub mod fs_ops;
 pub mod identity;
 pub mod listing;
 pub mod panel;

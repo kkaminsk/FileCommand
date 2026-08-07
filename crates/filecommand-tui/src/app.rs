@@ -40,7 +40,10 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     let (tx, rx) = mpsc::channel::<Command>();
-    if run_effects(effects, &tx) {
+    // The active job's cancel flag + dialog-reply channel — TUI-only
+    // plumbing, deliberately not part of `core::State`.
+    let mut active_job: Option<worker::JobHandle> = None;
+    if run_effects(effects, &tx, &mut active_job) {
         return Ok(());
     }
 
@@ -53,7 +56,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             let (new_state, effects) = update(state, cmd);
             state = new_state;
             dirty = true;
-            if run_effects(effects, &tx) {
+            if run_effects(effects, &tx, &mut active_job) {
                 return Ok(());
             }
         }
@@ -66,7 +69,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                         let (new_state, effects) = update(state, cmd);
                         state = new_state;
                         dirty = true;
-                        if run_effects(effects, &tx) {
+                        if run_effects(effects, &tx, &mut active_job) {
                             return Ok(());
                         }
                     }
@@ -75,7 +78,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                     let (new_state, effects) = update(state, Command::Resize(w, h));
                     state = new_state;
                     dirty = true;
-                    if run_effects(effects, &tx) {
+                    if run_effects(effects, &tx, &mut active_job) {
                         return Ok(());
                     }
                 }
@@ -85,7 +88,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             let (new_state, effects) = update(state, Command::Tick(clock.now_ms()));
             state = new_state;
             dirty = true;
-            if run_effects(effects, &tx) {
+            if run_effects(effects, &tx, &mut active_job) {
                 return Ok(());
             }
         }
@@ -98,12 +101,28 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 
 /// Execute effects returned by `update`. Returns `true` if the caller should
 /// exit the event loop (a `Quit` effect was requested).
-fn run_effects(effects: Vec<Effect>, tx: &Sender<Command>) -> bool {
+fn run_effects(effects: Vec<Effect>, tx: &Sender<Command>, active_job: &mut Option<worker::JobHandle>) -> bool {
     let mut quit = false;
     for effect in effects {
         match effect {
             Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, tx.clone()),
             Effect::Quit => quit = true,
+            Effect::RunJob(job) => *active_job = Some(worker::spawn_job(job, tx.clone())),
+            Effect::CancelJob => {
+                if let Some(handle) = active_job {
+                    handle.cancel.cancel();
+                }
+            }
+            Effect::SendConflictReply(choice) => {
+                if let Some(handle) = active_job {
+                    let _ = handle.reply_tx.send(worker::JobReply::Conflict(choice));
+                }
+            }
+            Effect::SendErrorReply(choice) => {
+                if let Some(handle) = active_job {
+                    let _ = handle.reply_tx.send(worker::JobReply::Error(choice));
+                }
+            }
         }
     }
     quit
