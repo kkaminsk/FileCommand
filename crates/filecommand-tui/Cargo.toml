@@ -1,0 +1,21 @@
+[package]
+name = "filecommand-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "FileCommand terminal UI binary: event loop, rendering, terminal ownership"
+default-run = "filecommand"
+
+[[bin]]
+name = "filecommand"
+path = "src/main.rs"
+
+[dependencies]
+filecommand-core = { path = "../filecommand-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }

@@ -1,0 +1,20 @@
+---
+source: crates/filecommand-tui/tests/snapshots.rs
+expression: "render(&state, (80, 24))"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                ╔══════════════════════════════════════════════╗                
+                ║                                              ║                
+                ║                 FileCommand                  ║                
+                ║                Version 0.1.0                 ║                
+                ║                                              ║                
+                ║  Copyright (C) 2026 The FileCommand Authors  ║                
+                ║ Inspired by the Norton Commander, 1986-1998  ║                
+                ║                                              ║                
+                ╚══════════════════════════════════════════════╝

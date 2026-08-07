@@ -1,0 +1,10 @@
+---
+source: crates/filecommand-tui/tests/snapshots.rs
+expression: "render(&state, (40, 10))"
+---
+                                        
+                                        
+                                        
+                                        
+                                        
+Terminal too small — resize to at least
