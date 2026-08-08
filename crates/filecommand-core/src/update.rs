@@ -267,6 +267,20 @@ pub enum Command {
     // Sort modes (Ctrl+F3..Ctrl+F7).
     SetSortMode { side: PanelSide, mode: SortMode },
 
+    // Ctrl+P inline quick filter (§4.7), scoped to the active panel.
+    QuickFilterStart,
+    QuickFilterChar(char),
+    QuickFilterBackspace,
+    QuickFilterEnd,
+
+    // Panel tabs (§4.1/§4.7), scoped to the active panel.
+    /// Ctrl+T.
+    OpenTab,
+    /// Ctrl+W.
+    CloseTab,
+    /// Alt+1..9 (one-based).
+    SwitchTab(usize),
+
     // F9 menu overlay.
     MenuOpen,
     MenuClose,
@@ -562,17 +576,28 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::QuickSearchBackspace => {
                 if let Some(mut pattern) = state.quick_search.take() {
                     pattern.pop();
-                    if pattern.is_empty() {
-                        state.quick_search = None;
-                    } else {
+                    // An empty pattern stays active rather than exiting
+                    // type-ahead, and the cursor holds its position rather
+                    // than re-jumping (type-ahead-jump "Backspace on a
+                    // single-character pattern").
+                    if !pattern.is_empty() {
                         jump_to_prefix(&mut state, &pattern);
-                        state.quick_search = Some(pattern);
                     }
+                    state.quick_search = Some(pattern);
                 }
             }
             Command::QuickSearchEnd => state.quick_search = None,
 
             Command::SetSortMode { side, mode } => state.panel_mut(side).set_sort_mode(mode),
+
+            Command::QuickFilterStart => state.panel_mut(state.active).activate_quick_filter(),
+            Command::QuickFilterChar(c) => state.panel_mut(state.active).quick_filter_push(c),
+            Command::QuickFilterBackspace => state.panel_mut(state.active).quick_filter_backspace(),
+            Command::QuickFilterEnd => state.panel_mut(state.active).clear_quick_filter(),
+
+            Command::OpenTab => state.panel_mut(state.active).open_tab(),
+            Command::CloseTab => state.panel_mut(state.active).close_tab(),
+            Command::SwitchTab(n) => state.panel_mut(state.active).switch_tab(n),
 
             Command::MenuOpen => state.menu = Some(MenuState::opened()),
             Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
@@ -728,17 +753,13 @@ pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
     Some(cwd.join(target))
 }
 
-/// Move the cursor to the first entry whose name starts with `pattern`
-/// (case-insensitively). A pattern that matches nothing leaves the cursor
-/// where it is.
+/// Move the cursor to the first entry matching the type-ahead `pattern`
+/// (`quicksearch::type_ahead_match`). A pattern that matches nothing leaves
+/// the cursor where it is (type-ahead-jump "Alt+letter with no matching
+/// entry", "Extended pattern no longer matches").
 fn jump_to_prefix(state: &mut State, pattern: &str) {
     let side = state.active;
-    let needle = pattern.to_lowercase();
-    let found = state
-        .panel(side)
-        .entries
-        .iter()
-        .position(|e| e.name.to_string_lossy().to_lowercase().starts_with(&needle));
+    let found = crate::quicksearch::type_ahead_match(&state.panel(side).entries, pattern);
     if let Some(index) = found {
         let panel = state.panel_mut(side);
         panel.cursor = index;

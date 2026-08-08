@@ -93,6 +93,21 @@ pub struct PanelState {
     /// index, so selection survives cursor movement, re-sort, and scroll.
     /// The parent-directory pseudo-entry can never appear here.
     pub selected: HashSet<OsString>,
+    /// The Ctrl+P inline quick-filter pattern, or `None` when no filter is
+    /// active. While `Some`, the panel body is narrowed to entries whose
+    /// displayed name contains the pattern as a substring (plus `..`), and
+    /// cursor movement is restricted to the narrowed set (quick-filter all
+    /// requirements).
+    pub quick_filter: Option<String>,
+    /// Other tabs belonging to this panel, in list order, with the
+    /// currently active tab's slot omitted — its state lives inline in the
+    /// fields above rather than duplicated here. See [`TabData`] and
+    /// [`PanelState::open_tab`]/[`close_tab`]/[`switch_tab`] (panel-tabs "Per-panel
+    /// tab list with independent state").
+    pub tabs: Vec<TabData>,
+    /// This panel's active tab's zero-based position within the full
+    /// (`tabs` + the inline active tab) ordered list.
+    pub active_tab_index: usize,
 }
 
 impl PanelState {
@@ -110,6 +125,9 @@ impl PanelState {
             cursor_user_moved: false,
             last_error: None,
             selected: HashSet::new(),
+            quick_filter: None,
+            tabs: Vec::new(),
+            active_tab_index: 0,
         }
     }
 
@@ -130,6 +148,10 @@ impl PanelState {
             self.cursor = 0;
             return;
         }
+        if self.quick_filter.is_some() {
+            self.move_cursor_filtered(m);
+            return;
+        }
         let last = self.entries.len() - 1;
         self.cursor = match m {
             CursorMove::Up(n) => self.cursor.saturating_sub(n),
@@ -137,6 +159,23 @@ impl PanelState {
             CursorMove::Home => 0,
             CursorMove::End => last,
         };
+        self.cursor_user_moved = true;
+    }
+
+    /// `move_cursor`, but restricted to entries the active quick filter
+    /// leaves visible — a no-op when nothing is visible (quick-filter
+    /// "Navigation is restricted to matching entries").
+    fn move_cursor_filtered(&mut self, m: CursorMove) {
+        let visible = self.visible_indices();
+        let Some(last) = visible.len().checked_sub(1) else { return };
+        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        let new_pos = match m {
+            CursorMove::Up(n) => pos.saturating_sub(n),
+            CursorMove::Down(n) => (pos + n).min(last),
+            CursorMove::Home => 0,
+            CursorMove::End => last,
+        };
+        self.cursor = visible[new_pos];
         self.cursor_user_moved = true;
     }
 
@@ -188,6 +227,12 @@ impl PanelState {
         // the panel is still in Info mode.
         self.info = InfoValues::default();
         self.info_request = None;
+        // A quick filter narrowed *this* listing; a fresh directory has an
+        // entirely different entry set, so a stale pattern would either
+        // hide everything or match nothing meaningful. Esc is the
+        // documented way to clear it deliberately, but a directory change
+        // clears it implicitly too.
+        self.quick_filter = None;
     }
 
     /// Drop any selected names that no longer appear in `entries` — used
@@ -259,6 +304,195 @@ impl PanelState {
         }
         Some(format!("{} files selected, {} bytes", format_count(self.selected.len()), format_count(self.selected_bytes() as usize)))
     }
+
+    // -------------------------------------------------------------------
+    // Quick filter (Ctrl+P)
+    // -------------------------------------------------------------------
+
+    /// Whether `entry` is shown under the current `quick_filter` pattern.
+    /// The `..` parent entry always matches so upward navigation is never
+    /// blocked (quick-filter "Substring narrowing as the pattern is
+    /// typed").
+    fn matches_quick_filter(entry: &Entry, pattern: &str) -> bool {
+        entry.kind == EntryKind::ParentDir || entry.name.to_string_lossy().to_lowercase().contains(&pattern.to_lowercase())
+    }
+
+    /// Indices into `entries` visible under the active `quick_filter`, or
+    /// every index when no filter is active.
+    pub fn visible_indices(&self) -> Vec<usize> {
+        match &self.quick_filter {
+            None => (0..self.entries.len()).collect(),
+            Some(pattern) => self.entries.iter().enumerate().filter(|(_, e)| Self::matches_quick_filter(e, pattern)).map(|(i, _)| i).collect(),
+        }
+    }
+
+    /// Ctrl+P: enter quick-filter mode with an empty pattern (quick-filter
+    /// "Activating the quick filter").
+    pub fn activate_quick_filter(&mut self) {
+        self.quick_filter = Some(String::new());
+    }
+
+    /// Append `c` to the quick-filter pattern and re-narrow (quick-filter
+    /// "Substring narrowing as the pattern is typed").
+    pub fn quick_filter_push(&mut self, c: char) {
+        if let Some(pattern) = &mut self.quick_filter {
+            pattern.push(c);
+        }
+        self.snap_cursor_to_visible();
+    }
+
+    /// Backspace: shorten the quick-filter pattern by one character and
+    /// re-narrow. An already-empty pattern is left empty and quick-filter
+    /// mode stays active (quick-filter "Editing the pattern re-narrows
+    /// live").
+    pub fn quick_filter_backspace(&mut self) {
+        if let Some(pattern) = &mut self.quick_filter {
+            pattern.pop();
+        }
+        self.snap_cursor_to_visible();
+    }
+
+    /// Esc: clear the quick filter and restore the full listing. Selection
+    /// and sort mode are untouched, since the filter only narrows what is
+    /// shown (quick-filter "Clearing the quick filter").
+    pub fn clear_quick_filter(&mut self) {
+        self.quick_filter = None;
+    }
+
+    /// After a pattern change, move the cursor onto the nearest still-
+    /// visible entry if the one it was on got filtered out (quick-filter
+    /// "Cursor and mini-status behavior under an active filter").
+    fn snap_cursor_to_visible(&mut self) {
+        let visible = self.visible_indices();
+        if visible.is_empty() || visible.contains(&self.cursor) {
+            return;
+        }
+        if let Some(&nearest) = visible.iter().min_by_key(|&&i| i.abs_diff(self.cursor)) {
+            self.cursor = nearest;
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // Panel tabs (Ctrl+T / Ctrl+W / Alt+1..9)
+    // -------------------------------------------------------------------
+
+    /// How many tabs this panel currently has (always >= 1).
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len() + 1
+    }
+
+    /// Snapshot everything a tab independently owns from the fields
+    /// currently inline (i.e. the active tab's state).
+    fn to_tab_data(&self) -> TabData {
+        TabData {
+            cwd: self.cwd.clone(),
+            entries: self.entries.clone(),
+            cursor: self.cursor,
+            sort_mode: self.sort_mode,
+            sort_direction: self.sort_direction,
+            display_mode: self.display_mode,
+            info: self.info.clone(),
+            info_request: self.info_request,
+            progress: self.progress,
+            cursor_user_moved: self.cursor_user_moved,
+            last_error: self.last_error.clone(),
+            selected: self.selected.clone(),
+            quick_filter: self.quick_filter.clone(),
+        }
+    }
+
+    /// Replace the inline (active-tab) fields with `data`'s.
+    fn adopt_tab_data(&mut self, data: TabData) {
+        self.cwd = data.cwd;
+        self.entries = data.entries;
+        self.cursor = data.cursor;
+        self.sort_mode = data.sort_mode;
+        self.sort_direction = data.sort_direction;
+        self.display_mode = data.display_mode;
+        self.info = data.info;
+        self.info_request = data.info_request;
+        self.progress = data.progress;
+        self.cursor_user_moved = data.cursor_user_moved;
+        self.last_error = data.last_error;
+        self.selected = data.selected;
+        self.quick_filter = data.quick_filter;
+    }
+
+    /// The full ordered tab list, with the active tab's live state
+    /// (currently inline) reinserted at its position.
+    fn full_tab_list(&self) -> Vec<TabData> {
+        let mut list = self.tabs.clone();
+        list.insert(self.active_tab_index.min(list.len()), self.to_tab_data());
+        list
+    }
+
+    /// Replace the whole tab list with `list`, activating `active`
+    /// (`list[active]` becomes the new inline state).
+    fn apply_tab_list(&mut self, mut list: Vec<TabData>, active: usize) {
+        let data = list.remove(active);
+        self.tabs = list;
+        self.active_tab_index = active;
+        self.adopt_tab_data(data);
+    }
+
+    /// Ctrl+T: open a new tab inheriting the active tab's directory and
+    /// state, inserted right after it and becoming active (panel-tabs "New
+    /// tab (Ctrl+T)").
+    pub fn open_tab(&mut self) {
+        let mut list = self.full_tab_list();
+        let inherited = list[self.active_tab_index].clone();
+        list.insert(self.active_tab_index + 1, inherited);
+        self.apply_tab_list(list, self.active_tab_index + 1);
+    }
+
+    /// Ctrl+W: close the active tab and activate an adjacent tab. A no-op
+    /// when only one tab remains (panel-tabs "Close tab (Ctrl+W)").
+    pub fn close_tab(&mut self) {
+        let mut list = self.full_tab_list();
+        if list.len() <= 1 {
+            return;
+        }
+        list.remove(self.active_tab_index);
+        let new_active = self.active_tab_index.min(list.len() - 1);
+        self.apply_tab_list(list, new_active);
+    }
+
+    /// Alt+`n`: activate the tab at one-based position `n`. Out of range
+    /// (including `n == 0`) is a no-op (panel-tabs "Switch tab
+    /// (Alt+1..9)").
+    pub fn switch_tab(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let target = n - 1;
+        if target == self.active_tab_index || target >= self.tab_count() {
+            return;
+        }
+        let list = self.full_tab_list();
+        self.apply_tab_list(list, target);
+    }
+}
+
+/// One inactive tab's full, independent state — directory, entries,
+/// cursor, sort mode, display mode, and filter — snapshotted when it stops
+/// being the active tab (design D4; panel-tabs "Per-panel tab list with
+/// independent state"). The active tab's equivalent state lives inline on
+/// [`PanelState`] rather than duplicated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabData {
+    pub cwd: PathBuf,
+    pub entries: Vec<Entry>,
+    pub cursor: usize,
+    pub sort_mode: SortMode,
+    pub sort_direction: SortDirection,
+    pub display_mode: DisplayMode,
+    pub info: InfoValues,
+    pub info_request: Option<u64>,
+    pub progress: ListingProgress,
+    pub cursor_user_moved: bool,
+    pub last_error: Option<String>,
+    pub selected: HashSet<OsString>,
+    pub quick_filter: Option<String>,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single
@@ -845,6 +1079,223 @@ mod tests {
                 prop_assert_eq!(right.entries, right_before);
                 prop_assert_eq!(left.sort_mode, SortMode::Size);
             }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Quick filter (task 15.2)
+    // -----------------------------------------------------------------
+
+    mod quick_filter_tests {
+        use super::*;
+
+        fn panel_with(names: &[&str]) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.entries = std::iter::once(Entry::parent_dir()).chain(names.iter().map(|n| file(n))).collect();
+            p
+        }
+
+        #[test]
+        fn typing_narrows_to_substring_matches_keeping_parent_visible() {
+            let mut p = panel_with(&["report.txt", "readme.md", "notes.txt"]);
+            p.activate_quick_filter();
+            p.quick_filter_push('r');
+            p.quick_filter_push('e');
+            p.quick_filter_push('p');
+            let visible: Vec<String> = p.visible_indices().into_iter().map(|i| p.entries[i].name.to_string_lossy().into_owned()).collect();
+            assert_eq!(visible, vec!["..", "report.txt"]);
+        }
+
+        #[test]
+        fn no_matches_yields_an_empty_body_other_than_parent() {
+            let mut p = panel_with(&["a.txt", "b.txt"]);
+            p.activate_quick_filter();
+            for c in "zzz".chars() {
+                p.quick_filter_push(c);
+            }
+            let visible: Vec<String> = p.visible_indices().into_iter().map(|i| p.entries[i].name.to_string_lossy().into_owned()).collect();
+            assert_eq!(visible, vec![".."]);
+            assert!(p.quick_filter.is_some(), "quick-filter mode must stay active with no matches");
+        }
+
+        #[test]
+        fn backspace_re_narrows_live() {
+            let mut p = panel_with(&["report.txt", "readme.md"]);
+            p.activate_quick_filter();
+            p.quick_filter_push('r');
+            p.quick_filter_push('e');
+            p.quick_filter_push('p');
+            p.quick_filter_backspace();
+            p.quick_filter_backspace();
+            assert_eq!(p.quick_filter.as_deref(), Some("r"));
+            let visible: Vec<String> = p.visible_indices().into_iter().map(|i| p.entries[i].name.to_string_lossy().into_owned()).collect();
+            assert_eq!(visible, vec!["..", "report.txt", "readme.md"]);
+        }
+
+        #[test]
+        fn cursor_snaps_to_a_visible_entry_when_filtered_out() {
+            let mut p = panel_with(&["apple", "banana", "cherry"]);
+            p.cursor = 2; // "banana" (index 2 after the parent-dir slot at 0)
+            p.activate_quick_filter();
+            p.quick_filter_push('c'); // only "cherry" (+ "..") remain
+            let cursor_name = p.entries[p.cursor].name.to_string_lossy().into_owned();
+            assert_eq!(cursor_name, "cherry", "cursor must land on a still-visible entry, not a hidden one");
+        }
+
+        #[test]
+        fn navigation_is_restricted_to_matching_entries() {
+            let mut p = panel_with(&["apple", "avocado", "banana", "apricot"]);
+            p.activate_quick_filter();
+            p.quick_filter_push('a');
+            p.quick_filter_push('p'); // pattern "ap": apple and apricot match; avocado and banana do not
+            p.cursor = 1; // "apple"
+            p.move_cursor(CursorMove::Down(1));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("apricot"), "avocado and banana must be skipped as they don't match");
+            p.move_cursor(CursorMove::Down(1));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("apricot"), "movement must not run past the last visible match");
+        }
+
+        #[test]
+        fn esc_clears_the_filter_and_restores_the_full_listing() {
+            let mut p = panel_with(&["report.txt", "readme.md"]);
+            p.activate_quick_filter();
+            p.quick_filter_push('x');
+            p.clear_quick_filter();
+            assert_eq!(p.quick_filter, None);
+            assert_eq!(p.visible_indices().len(), p.entries.len());
+        }
+
+        #[test]
+        fn selection_and_sort_mode_survive_activation_and_clearing() {
+            let mut p = panel_with(&["a.txt", "b.txt"]);
+            p.selected.insert(OsString::from("a.txt"));
+            p.sort_mode = SortMode::Size;
+            p.activate_quick_filter();
+            p.quick_filter_push('b');
+            p.clear_quick_filter();
+            assert!(p.selected.contains(&OsString::from("a.txt")));
+            assert_eq!(p.sort_mode, SortMode::Size);
+        }
+
+        #[test]
+        fn backspace_on_an_empty_pattern_stays_active_and_empty() {
+            let mut p = panel_with(&["a.txt"]);
+            p.activate_quick_filter();
+            p.quick_filter_backspace();
+            assert_eq!(p.quick_filter.as_deref(), Some(""));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Panel tabs (task 15.5)
+    // -----------------------------------------------------------------
+
+    mod tab_tests {
+        use super::*;
+
+        #[test]
+        fn starts_with_exactly_one_tab() {
+            let p = PanelState::new(PathBuf::from("/a"));
+            assert_eq!(p.tab_count(), 1);
+        }
+
+        #[test]
+        fn each_tab_retains_its_own_directory_and_state() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\A"));
+            p.sort_mode = SortMode::Size;
+            p.selected.insert(OsString::from("x"));
+            p.cursor = 2;
+
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\B"));
+            p.sort_mode = SortMode::Name;
+            assert_eq!(p.tab_count(), 2);
+
+            // Switch back to tab 1.
+            p.switch_tab(1);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\A"));
+            assert_eq!(p.sort_mode, SortMode::Size);
+            assert_eq!(p.cursor, 2);
+            assert!(p.selected.contains(&OsString::from("x")));
+
+            // Switch to tab 2 and confirm it kept its own state.
+            p.switch_tab(2);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\B"));
+            assert_eq!(p.sort_mode, SortMode::Name);
+        }
+
+        #[test]
+        fn ctrl_t_opens_and_activates_a_new_tab_inheriting_state() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\Work"));
+            p.cursor = 1;
+            p.entries = vec![file("a"), file("b")];
+            p.selected.insert(OsString::from("a"));
+
+            p.open_tab();
+
+            assert_eq!(p.tab_count(), 2);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\Work"), "the new tab inherits the originating tab's directory");
+            assert_eq!(p.cursor, 1);
+            assert!(p.selected.contains(&OsString::from("a")));
+
+            // The original tab is untouched by a change made in the new one.
+            p.begin_new_listing(PathBuf::from(r"C:\Work\sub"));
+            p.switch_tab(1);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\Work"));
+            assert!(p.selected.contains(&OsString::from("a")), "original tab's selection must be untouched");
+        }
+
+        #[test]
+        fn ctrl_w_closes_the_active_tab_and_activates_a_neighbor() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\1"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\2"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\3"));
+            assert_eq!(p.tab_count(), 3);
+            p.switch_tab(2);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\2"));
+
+            p.close_tab();
+
+            assert_eq!(p.tab_count(), 2);
+            assert_ne!(p.cwd, PathBuf::from(r"C:\2"), "the closed tab's directory must no longer be active");
+        }
+
+        #[test]
+        fn ctrl_w_is_a_no_op_with_a_single_tab() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\only"));
+            p.close_tab();
+            assert_eq!(p.tab_count(), 1);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\only"));
+        }
+
+        #[test]
+        fn alt_n_activates_the_nth_tab() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\1"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\2"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\3"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\4"));
+            assert_eq!(p.tab_count(), 4);
+
+            p.switch_tab(3);
+            assert_eq!(p.cwd, PathBuf::from(r"C:\3"));
+        }
+
+        #[test]
+        fn alt_n_out_of_range_is_a_no_op() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\1"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\2"));
+            assert_eq!(p.tab_count(), 2);
+            let before = p.cwd.clone();
+            p.switch_tab(5);
+            assert_eq!(p.cwd, before, "out-of-range switch must leave the active tab unchanged");
+            p.switch_tab(0);
+            assert_eq!(p.cwd, before, "n == 0 must also be a no-op");
         }
     }
 }

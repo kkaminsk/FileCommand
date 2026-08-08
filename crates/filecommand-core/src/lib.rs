@@ -17,6 +17,7 @@ pub mod info;
 pub mod listing;
 pub mod menu;
 pub mod panel;
+pub mod quicksearch;
 pub mod shell;
 pub mod theme;
 pub mod update;

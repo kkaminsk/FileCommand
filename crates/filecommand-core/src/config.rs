@@ -18,8 +18,9 @@
 //! per user-menu "Create and recover the usermenu.toml file".
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use crate::quicksearch::FrecencyEntry;
 use crate::theme::DEFAULT_THEME_NAME;
 
 /// The default Windows shell. `cmd.exe` is chosen over PowerShell because
@@ -230,10 +231,10 @@ pub fn load(path: &Path) -> Config {
 // history.json
 // ---------------------------------------------------------------------
 
-/// Render history entries as a JSON array of strings. Hand-rolled rather
-/// than pulled from `serde` — this is the only JSON in the workspace and the
-/// shape is one string array.
-pub fn render_history(entries: &[String]) -> String {
+/// Render a JSON array of strings, without a trailing newline (shared by
+/// [`render_history`] and the `"commands"` array inside
+/// [`render_history_file`]).
+fn render_string_array(entries: &[String]) -> String {
     let mut out = String::from("[");
     for (i, entry) in entries.iter().enumerate() {
         if i > 0 {
@@ -246,7 +247,16 @@ pub fn render_history(entries: &[String]) -> String {
     if !entries.is_empty() {
         out.push('\n');
     }
-    out.push_str("]\n");
+    out.push(']');
+    out
+}
+
+/// Render history entries as a JSON array of strings. Hand-rolled rather
+/// than pulled from `serde` — this is the only JSON in the workspace and the
+/// shape is one string array.
+pub fn render_history(entries: &[String]) -> String {
+    let mut out = render_string_array(entries);
+    out.push('\n');
     out
 }
 
@@ -356,6 +366,231 @@ pub fn push_history(history: &mut Vec<String>, command: &str) {
         let excess = history.len() - MAX_HISTORY;
         history.drain(0..excess);
     }
+}
+
+// ---------------------------------------------------------------------
+// history.json (combined form): command history + directory frecency
+// ---------------------------------------------------------------------
+//
+// `fuzzy-jump`'s visited-directory frecency index shares `history.json`
+// with the plain command-history array above (design D6; fuzzy-jump
+// "Directory history persistence"). The two live under top-level
+// `"commands"` and `"directories"` keys in one JSON object rather than as a
+// bare array. [`HistoryFile`] and the functions below are additive: wiring
+// the live app to read/write this combined shape (in place of the plain
+// array `render_history`/`load_history` above) is a `filecommand-tui`
+// concern for a later step.
+
+/// One on-disk `history.json` document: command-line history plus the
+/// `fuzzy-jump` directory-frecency index, sharing one file and one atomic
+/// write (fuzzy-jump "Directory history persistence").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryFile {
+    pub commands: Vec<String>,
+    pub directories: Vec<FrecencyEntry>,
+}
+
+/// Render a [`HistoryFile`] to its on-disk JSON object form.
+pub fn render_history_file(file: &HistoryFile) -> String {
+    let mut out = String::from("{\n  \"commands\": ");
+    out.push_str(&render_string_array(&file.commands));
+    out.push_str(",\n  \"directories\": [");
+    for (i, d) in file.directories.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str("\n    {\"path\": ");
+        out.push_str(&json_escape(&d.path.to_string_lossy()));
+        out.push_str(&format!(", \"visit_count\": {}, \"last_visited_ms\": {}}}", d.visit_count, d.last_visited_ms));
+    }
+    if !file.directories.is_empty() {
+        out.push_str("\n  ");
+    }
+    out.push_str("]\n}\n");
+    out
+}
+
+/// Parse a `history.json` document in its combined object form. Tolerant:
+/// a missing or unparsable `"commands"`/`"directories"` key yields an empty
+/// list for that key rather than failing the whole parse, so a partially
+/// malformed or hand-edited file degrades gracefully (fuzzy-jump "Missing
+/// or malformed history file").
+pub fn parse_history_file(input: &str) -> HistoryFile {
+    let commands = extract_value_span(input, "commands").map(parse_history).unwrap_or_default();
+    let directories = extract_value_span(input, "directories").map(|span| parse_directories(span)).unwrap_or_default();
+    HistoryFile { commands, directories }
+}
+
+/// Read a combined `history.json`. A missing or unreadable file, or one
+/// that fails to parse at all, is empty history — never an error (fuzzy-jump
+/// "Missing or malformed history file").
+pub fn load_history_file(path: &Path) -> HistoryFile {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => parse_history_file(&contents),
+        Err(_) => HistoryFile::default(),
+    }
+}
+
+/// Write a combined `history.json` atomically: temp file + rename, mirroring
+/// [`save_history_atomic`].
+pub fn save_history_file_atomic(path: &Path, file: &HistoryFile) -> io::Result<()> {
+    let tmp = temp_sibling(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&tmp, render_history_file(file))?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+/// Find `"key": <value>` in `input` and return the raw text of the balanced
+/// `[...]` or `{...}` that follows, honoring string-literal quoting (so a
+/// bracket inside a quoted path never confuses the balance count). `None`
+/// when the key is absent or its value isn't a bracketed span.
+fn extract_value_span<'a>(input: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("\"{key}\"");
+    let key_pos = input.find(&needle)?;
+    let after_key = &input[key_pos + needle.len()..];
+    let colon_pos = after_key.find(':')?;
+    let value = after_key[colon_pos + 1..].trim_start();
+    let open = value.chars().next()?;
+    let close = match open {
+        '[' => ']',
+        '{' => '}',
+        _ => return None,
+    };
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut end = None;
+    for (i, c) in value.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth -= 1;
+                if depth == 0 {
+                    end = Some(i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(&value[..=end?])
+}
+
+/// Split a `[...]`-spanned array body into its top-level `{...}` object
+/// substrings, honoring string-literal quoting.
+fn split_top_level_objects(array_span: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut start = None;
+    for (i, c) in array_span.char_indices() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if c == '\\' {
+                escape = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_string = true,
+            '{' => {
+                if depth == 0 {
+                    start = Some(i);
+                }
+                depth += 1;
+            }
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    if let Some(s) = start.take() {
+                        out.push(&array_span[s..=i]);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Extract a quoted string field `"key": "value"` from within one object
+/// substring, honoring the same backslash escapes as [`parse_history`].
+fn extract_string_field(obj: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = obj.find(&needle)?;
+    let after = &obj[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let after_colon = after[colon + 1..].trim_start();
+    let mut chars = after_colon.strip_prefix('"')?.chars();
+    let mut s = String::new();
+    loop {
+        match chars.next()? {
+            '"' => return Some(s),
+            '\\' => match chars.next()? {
+                'n' => s.push('\n'),
+                'r' => s.push('\r'),
+                't' => s.push('\t'),
+                'u' => {
+                    let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                    s.push(u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)?);
+                }
+                other => s.push(other),
+            },
+            c => s.push(c),
+        }
+    }
+}
+
+/// Extract an unsigned integer field `"key": 123` from within one object
+/// substring.
+fn extract_number_field(obj: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let pos = obj.find(&needle)?;
+    let after = &obj[pos + needle.len()..];
+    let colon = after.find(':')?;
+    let after_colon = after[colon + 1..].trim_start();
+    let digits: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+/// Parse the `"directories"` array body into [`FrecencyEntry`] values. An
+/// object missing its required `"path"` string is skipped rather than
+/// aborting the whole parse.
+fn parse_directories(array_span: &str) -> Vec<FrecencyEntry> {
+    split_top_level_objects(array_span)
+        .into_iter()
+        .filter_map(|obj| {
+            let path = PathBuf::from(extract_string_field(obj, "path")?);
+            let visit_count = extract_number_field(obj, "visit_count").unwrap_or(1) as u32;
+            let last_visited_ms = extract_number_field(obj, "last_visited_ms").unwrap_or(0);
+            Some(FrecencyEntry { path, visit_count, last_visited_ms })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -715,6 +950,92 @@ mod tests {
     #[test]
     fn load_history_missing_file_is_empty() {
         assert!(load_history(Path::new("no/such/history.json")).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // history.json (combined form): commands + directory frecency
+    // (task 15.4)
+    // -------------------------------------------------------------------
+
+    fn sample_history_file() -> HistoryFile {
+        HistoryFile {
+            commands: vec!["dir".to_string(), r#"echo "hi""#.to_string()],
+            directories: vec![
+                FrecencyEntry { path: PathBuf::from(r"C:\Users\Me\Documents"), visit_count: 3, last_visited_ms: 12_345 },
+                FrecencyEntry { path: PathBuf::from(r"C:\Users\Me\Downloads"), visit_count: 1, last_visited_ms: 999 },
+            ],
+        }
+    }
+
+    #[test]
+    fn history_file_round_trips_commands_and_directories() {
+        let file = sample_history_file();
+        let rendered = render_history_file(&file);
+        assert_eq!(parse_history_file(&rendered), file);
+    }
+
+    #[test]
+    fn empty_history_file_round_trips() {
+        let file = HistoryFile::default();
+        let rendered = render_history_file(&file);
+        assert_eq!(parse_history_file(&rendered), file);
+    }
+
+    #[test]
+    fn history_file_paths_with_backslashes_round_trip() {
+        // Windows paths are the norm here; the escaped backslashes must
+        // survive the JSON round trip intact.
+        let file = HistoryFile { commands: vec![], directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\A\B\C"), visit_count: 5, last_visited_ms: 42 }] };
+        let rendered = render_history_file(&file);
+        assert_eq!(parse_history_file(&rendered), file);
+    }
+
+    #[test]
+    fn malformed_history_file_content_yields_empty_history() {
+        assert_eq!(parse_history_file("not json at all"), HistoryFile::default());
+        assert_eq!(parse_history_file(""), HistoryFile::default());
+    }
+
+    #[test]
+    fn partially_malformed_directories_key_falls_back_only_for_that_key() {
+        // The commands array parses fine even though "directories" isn't a
+        // bracketed value at all -- a partial failure degrades gracefully
+        // rather than discarding the whole document.
+        let input = "{\n  \"commands\": [\"dir\"],\n  \"directories\": null\n}\n";
+        let parsed = parse_history_file(input);
+        assert_eq!(parsed.commands, vec!["dir".to_string()]);
+        assert!(parsed.directories.is_empty());
+    }
+
+    #[test]
+    fn save_and_load_history_file_atomic_round_trips_and_overwrites() {
+        let dir = std::env::temp_dir().join(format!("filecommand-history-file-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(HISTORY_FILE);
+
+        let file = sample_history_file();
+        save_history_file_atomic(&path, &file).expect("write combined history");
+        assert_eq!(load_history_file(&path), file);
+        assert!(!path.with_file_name("history.json.tmp").exists());
+
+        let file2 = HistoryFile { commands: vec!["only".to_string()], directories: vec![] };
+        save_history_file_atomic(&path, &file2).expect("overwrite combined history");
+        assert_eq!(load_history_file(&path), file2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_history_file_missing_or_malformed_is_empty() {
+        assert_eq!(load_history_file(Path::new("no/such/history.json")), HistoryFile::default());
+
+        let dir = std::env::temp_dir().join(format!("filecommand-history-file-test-malformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(HISTORY_FILE);
+        std::fs::write(&path, "definitely not json").unwrap();
+        assert_eq!(load_history_file(&path), HistoryFile::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -------------------------------------------------------------------

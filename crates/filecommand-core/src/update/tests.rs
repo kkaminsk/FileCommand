@@ -554,16 +554,84 @@ fn leaving_quick_search_hands_printables_back_to_the_command_line() {
 }
 
 #[test]
-fn quick_search_backspace_shrinks_then_exits_the_mode() {
+fn quick_search_backspace_shrinks_and_stays_active_when_emptied() {
+    // type-ahead-jump "Backspace on a single-character pattern": the
+    // pattern becomes empty but type-ahead mode itself stays active (only
+    // Esc or a movement key exits it) and the cursor holds its position
+    // rather than re-jumping against an empty pattern.
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("alpha", 1)];
     let (state, _) = update(state, Command::QuickSearchStart('a'));
     let (state, _) = update(state, Command::QuickSearchChar('l'));
     assert_eq!(state.quick_search.as_deref(), Some("al"));
+    let cursor_before = state.left.cursor;
     let (state, _) = update(state, Command::QuickSearchBackspace);
     assert_eq!(state.quick_search.as_deref(), Some("a"));
     let (state, _) = update(state, Command::QuickSearchBackspace);
-    assert_eq!(state.quick_search, None);
+    assert_eq!(state.quick_search.as_deref(), Some(""), "type-ahead must remain active with an empty pattern");
+    assert_eq!(state.left.cursor, cursor_before, "the cursor must hold position rather than jump on an empty pattern");
+    let (state, _) = update(state, Command::QuickSearchEnd);
+    assert_eq!(state.quick_search, None, "Esc is still the way to actually exit type-ahead");
+}
+
+// ---------------------------------------------------------------------
+// Quick filter (Ctrl+P), reducer-level (task 15.2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn quick_filter_start_char_and_end_are_scoped_to_the_active_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+    state.right.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+
+    let (state, _) = update(state, Command::QuickFilterStart);
+    assert_eq!(state.left.quick_filter.as_deref(), Some(""));
+    assert_eq!(state.right.quick_filter, None, "the opposite panel must be unaffected");
+
+    let (state, _) = update(state, Command::QuickFilterChar('r'));
+    let (state, _) = update(state, Command::QuickFilterChar('e'));
+    let (state, _) = update(state, Command::QuickFilterChar('p'));
+    assert_eq!(state.left.quick_filter.as_deref(), Some("rep"));
+    let visible: Vec<String> = state.left.visible_indices().into_iter().map(|i| state.left.entries[i].name.to_string_lossy().into_owned()).collect();
+    assert_eq!(visible, vec!["report.txt"]);
+
+    let (state, _) = update(state, Command::QuickFilterBackspace);
+    assert_eq!(state.left.quick_filter.as_deref(), Some("re"));
+
+    let (state, _) = update(state, Command::QuickFilterEnd);
+    assert_eq!(state.left.quick_filter, None);
+}
+
+// ---------------------------------------------------------------------
+// Panel tabs (Ctrl+T / Ctrl+W / Alt+1..9), reducer-level (task 15.5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn tab_commands_are_scoped_to_the_active_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+
+    let (state, _) = update(state, Command::OpenTab);
+    assert_eq!(state.left.tab_count(), 2);
+    assert_eq!(state.right.tab_count(), 1, "the opposite panel's tabs must be untouched");
+
+    let (mut state, _) = update(state, Command::CloseTab);
+    assert_eq!(state.left.tab_count(), 1);
+
+    state.left.open_tab();
+    state.left.begin_new_listing(PathBuf::from("/left/other"));
+    let (state, _) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+}
+
+#[test]
+fn switch_tab_out_of_range_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    let before = state.right.cwd.clone();
+    let (state, _) = update(state, Command::SwitchTab(9));
+    assert_eq!(state.right.cwd, before);
+    assert_eq!(state.right.tab_count(), 1);
 }
 
 #[test]
