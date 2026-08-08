@@ -250,6 +250,7 @@ fn paste_bindings_are_config_overridable() {
     let keys = Keys {
         paste_name: filecommand_core::config::KeyBinding::new(false, true, false, "n"),
         paste_path: filecommand_core::config::KeyBinding::new(false, true, false, "p"),
+        ..Keys::default()
     };
     let state = panels();
     assert_eq!(map_key(key(KeyCode::Char('n'), KeyModifiers::ALT), &state, 5, &keys), Some(Command::PasteCursorName));

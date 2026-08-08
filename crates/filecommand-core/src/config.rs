@@ -2,13 +2,20 @@
 //!
 //! Recognized keys: `splash` (bool), `theme` (string), `shell` (string),
 //! `editor` (string, the F4 external-editor command), and the overridable
-//! bindings `key.paste_name` / `key.paste_path`. Missing files and
-//! unrecognized or malformed lines are tolerated; unrecognized keys are
-//! ignored.
+//! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
+//! `key.fuzzy_jump`. Missing files and unrecognized or malformed lines are
+//! tolerated; unrecognized keys are ignored.
 //!
 //! Command history persists to `history.json` next to the config, written
 //! atomically (temp file + rename) so a crash mid-write can never leave a
 //! truncated history behind.
+//!
+//! The F2 user menu is loaded from `usermenu.toml`, a real (if minimal)
+//! TOML array-of-tables document — unlike `config.toml`/`history.json`
+//! above, which are deliberately *not* real TOML/JSON parsers. Unlike those
+//! two, malformed `usermenu.toml` content is treated as an error condition
+//! (falling back to defaults and warning) rather than silently tolerated,
+//! per user-menu "Create and recover the usermenu.toml file".
 
 use std::io;
 use std::path::Path;
@@ -45,8 +52,9 @@ impl KeyBinding {
     }
 }
 
-/// Config-overridable bindings. Only the M3 paste bindings are overridable
-/// so far; the rest of the key map is still compiled in.
+/// Config-overridable bindings. Only the M3 paste bindings, plus M5's quick
+/// filter and fuzzy jump, are overridable so far; the rest of the key map is
+/// still compiled in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys {
     /// Pastes the cursor entry's file name. Default Ctrl+Enter — reliable on
@@ -55,11 +63,24 @@ pub struct Keys {
     /// Pastes the cursor entry's full path. Default Ctrl+] (ASCII 0x1D),
     /// which every terminal delivers.
     pub paste_path: KeyBinding,
+    /// Activates the Ctrl+P inline quick filter. Overridable because Ctrl+P
+    /// deviates from classic Norton Commander, unlike the rest of the key
+    /// map (quick-filter "Overridable binding"; design D6).
+    pub quick_filter: KeyBinding,
+    /// Opens the Ctrl+J fuzzy directory-jump dialog. Overridable for the
+    /// same reason as `quick_filter` (fuzzy-jump "Overridden binding still
+    /// opens the dialog"; design D6).
+    pub fuzzy_jump: KeyBinding,
 }
 
 impl Default for Keys {
     fn default() -> Self {
-        Keys { paste_name: KeyBinding::new(true, false, false, "enter"), paste_path: KeyBinding::new(true, false, false, "]") }
+        Keys {
+            paste_name: KeyBinding::new(true, false, false, "enter"),
+            paste_path: KeyBinding::new(true, false, false, "]"),
+            quick_filter: KeyBinding::new(true, false, false, "p"),
+            fuzzy_jump: KeyBinding::new(true, false, false, "j"),
+        }
     }
 }
 
@@ -154,6 +175,16 @@ pub fn parse(input: &str) -> Config {
             "key.paste_path" => {
                 if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
                     config.keys.paste_path = b;
+                }
+            }
+            "key.quick_filter" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.quick_filter = b;
+                }
+            }
+            "key.fuzzy_jump" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.fuzzy_jump = b;
                 }
             }
             _ => {}
@@ -327,6 +358,224 @@ pub fn push_history(history: &mut Vec<String>, command: &str) {
     }
 }
 
+// ---------------------------------------------------------------------
+// usermenu.toml
+// ---------------------------------------------------------------------
+
+/// The name of the F2 user-menu config file, next to `config.toml` in the
+/// platform config directory.
+pub const USERMENU_FILE: &str = "usermenu.toml";
+
+/// One F2 user-menu entry: a display `label` and the shell `command` it
+/// runs, unmodified, when activated (user-menu "Parse label and command
+/// entries from usermenu.toml").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMenuEntry {
+    pub label: String,
+    pub command: String,
+}
+
+/// The entries written to a fresh `usermenu.toml` on first run, and used
+/// in-memory (without touching the file) when it is malformed (user-menu
+/// "Create and recover the usermenu.toml file").
+pub fn default_user_menu_entries() -> Vec<UserMenuEntry> {
+    vec![
+        UserMenuEntry { label: "Open command prompt here".to_string(), command: "cmd.exe".to_string() },
+        UserMenuEntry { label: "Directory listing".to_string(), command: "dir".to_string() },
+    ]
+}
+
+/// The result of parsing `usermenu.toml` content: entries in file order,
+/// plus non-fatal warnings (an unknown key on an otherwise-recognized
+/// entry, or a key found outside any `[[entry]]` block). `malformed` is set
+/// when the content contains a line that is neither blank, a comment, an
+/// `[[entry]]` header, nor a `key = "value"` pair — real invalid TOML,
+/// distinct from a merely-unrecognized key (user-menu "Unknown keys warn
+/// rather than fail" vs "Malformed file warns and falls back").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedUserMenu {
+    pub entries: Vec<UserMenuEntry>,
+    pub warnings: Vec<String>,
+    pub malformed: bool,
+}
+
+/// Parse `usermenu.toml` content: a sequence of `[[entry]]` blocks, each
+/// with `label = "..."` and `command = "..."` string keys (basic
+/// double-quoted or literal single-quoted TOML strings). Pure and
+/// terminal-free, so parsing is unit-testable without touching a file
+/// (user-menu "Parsing SHALL be performed by the `config` module ... MUST
+/// be unit-testable without a terminal").
+pub fn parse_usermenu(input: &str) -> ParsedUserMenu {
+    let mut entries = Vec::new();
+    let mut warnings = Vec::new();
+    let mut malformed = false;
+    let mut current: Option<(Option<String>, Option<String>)> = None;
+    let mut in_entry = false;
+
+    for raw_line in input.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line == "[[entry]]" {
+            flush_usermenu_entry(&mut current, &mut entries, &mut warnings);
+            current = Some((None, None));
+            in_entry = true;
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            malformed = true;
+            continue;
+        };
+        let key = key.trim();
+        let Some(value) = parse_toml_string_strict(value.trim()) else {
+            malformed = true;
+            continue;
+        };
+        if !in_entry {
+            warnings.push(format!("`{key}` outside of an [[entry]] block is ignored"));
+            continue;
+        }
+        let Some((label, command)) = current.as_mut() else { continue };
+        match key {
+            "label" => *label = Some(value),
+            "command" => *command = Some(value),
+            other => warnings.push(format!("unknown key `{other}` in a usermenu.toml entry")),
+        }
+    }
+    flush_usermenu_entry(&mut current, &mut entries, &mut warnings);
+
+    ParsedUserMenu { entries, warnings, malformed }
+}
+
+/// Close out the entry block being accumulated (if any), pushing it as a
+/// completed [`UserMenuEntry`] when both `label` and `command` were set, or
+/// warning and dropping it when either is missing.
+fn flush_usermenu_entry(current: &mut Option<(Option<String>, Option<String>)>, entries: &mut Vec<UserMenuEntry>, warnings: &mut Vec<String>) {
+    let Some((label, command)) = current.take() else { return };
+    match (label, command) {
+        (Some(label), Some(command)) => entries.push(UserMenuEntry { label, command }),
+        (label, _) => {
+            let missing = if label.is_none() { "label" } else { "command" };
+            warnings.push(format!("entry missing `{missing}`, skipped"));
+        }
+    }
+}
+
+/// Parse a strict basic (`"..."`, backslash escapes) or literal (`'...'`,
+/// no escapes) TOML string. Unlike [`parse_string`], a bare/unquoted value
+/// is rejected (`None`) rather than accepted — `usermenu.toml` is real
+/// TOML, so an unquoted value is malformed content, not a readability
+/// shorthand.
+fn parse_toml_string_strict(value: &str) -> Option<String> {
+    if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
+        unescape_toml_basic(&value[1..value.len() - 1])
+    } else if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        Some(value[1..value.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+fn unescape_toml_basic(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            other => out.push(other),
+        }
+    }
+    Some(out)
+}
+
+/// Render entries back to `usermenu.toml` form (used to write the
+/// first-run default file).
+pub fn render_usermenu(entries: &[UserMenuEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        out.push_str("[[entry]]\n");
+        out.push_str(&format!("label = {}\n", toml_quote(&entry.label)));
+        out.push_str(&format!("command = {}\n", toml_quote(&entry.command)));
+        out.push('\n');
+    }
+    out
+}
+
+fn toml_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The outcome of loading `usermenu.toml` at startup (user-menu "Create and
+/// recover the usermenu.toml file").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMenuLoadResult {
+    pub entries: Vec<UserMenuEntry>,
+    /// Non-fatal parse warnings (empty unless `Loaded`-equivalent content
+    /// had unknown keys).
+    pub warnings: Vec<String>,
+    /// The file did not exist (or could not be read) and default entries
+    /// were written to `path`.
+    pub created_default: bool,
+    /// The file existed but its content was malformed; defaults are in
+    /// effect in memory and the on-disk file was left untouched — a
+    /// startup warning should be shown to the user.
+    pub malformed: bool,
+}
+
+/// Load the F2 user menu from `path`. Three outcomes (user-menu "Missing
+/// file is created with defaults", "Malformed file warns and falls back
+/// without overwriting", well-formed load):
+///
+/// - Missing/unreadable file: default entries are written to `path` and
+///   returned (`created_default: true`).
+/// - Malformed content: default entries are returned without touching the
+///   file (`malformed: true`).
+/// - Well-formed content: the parsed entries (possibly with warnings) are
+///   returned, including the zero-entries case (a deliberately empty menu
+///   is not malformed).
+pub fn load_user_menu(path: &Path) -> UserMenuLoadResult {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => {
+            let entries = default_user_menu_entries();
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            let _ = std::fs::write(path, render_usermenu(&entries));
+            return UserMenuLoadResult { entries, warnings: Vec::new(), created_default: true, malformed: false };
+        }
+    };
+    let parsed = parse_usermenu(&contents);
+    if parsed.malformed {
+        return UserMenuLoadResult { entries: default_user_menu_entries(), warnings: Vec::new(), created_default: false, malformed: true };
+    }
+    UserMenuLoadResult { entries: parsed.entries, warnings: parsed.warnings, created_default: false, malformed: false }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,10 +639,19 @@ mod tests {
     }
 
     #[test]
+    fn parses_overridable_quick_filter_and_fuzzy_jump_bindings() {
+        let config = parse("key.quick_filter = \"alt+p\"\nkey.fuzzy_jump = \"ctrl+shift+j\"\n");
+        assert_eq!(config.keys.quick_filter, KeyBinding::new(false, true, false, "p"));
+        assert_eq!(config.keys.fuzzy_jump, KeyBinding::new(true, false, true, "j"));
+    }
+
+    #[test]
     fn default_bindings_are_ctrl_enter_and_ctrl_bracket() {
         let keys = Keys::default();
         assert_eq!(keys.paste_name, KeyBinding::new(true, false, false, "enter"));
         assert_eq!(keys.paste_path, KeyBinding::new(true, false, false, "]"));
+        assert_eq!(keys.quick_filter, KeyBinding::new(true, false, false, "p"));
+        assert_eq!(keys.fuzzy_jump, KeyBinding::new(true, false, false, "j"));
     }
 
     #[test]
@@ -457,5 +715,143 @@ mod tests {
     #[test]
     fn load_history_missing_file_is_empty() {
         assert!(load_history(Path::new("no/such/history.json")).is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // usermenu.toml
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn well_formed_entries_are_loaded_in_file_order() {
+        let input = "[[entry]]\nlabel = \"A\"\ncommand = \"cmd-a\"\n\n[[entry]]\nlabel = \"B\"\ncommand = \"cmd-b\"\n";
+        let parsed = parse_usermenu(input);
+        assert!(!parsed.malformed);
+        assert!(parsed.warnings.is_empty());
+        assert_eq!(
+            parsed.entries,
+            vec![
+                UserMenuEntry { label: "A".to_string(), command: "cmd-a".to_string() },
+                UserMenuEntry { label: "B".to_string(), command: "cmd-b".to_string() },
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_key_on_an_entry_warns_but_still_loads_it() {
+        let input = "[[entry]]\nlabel = \"Backup\"\ncommand = \"robocopy . D:\\\\backup /E\"\nicon = \"disk\"\n";
+        let parsed = parse_usermenu(input);
+        assert!(!parsed.malformed, "an unknown key is a warning, not a hard failure");
+        assert_eq!(parsed.entries, vec![UserMenuEntry { label: "Backup".to_string(), command: "robocopy . D:\\backup /E".to_string() }]);
+        assert!(parsed.warnings.iter().any(|w| w.contains("icon")), "expected a warning mentioning the unknown key: {:?}", parsed.warnings);
+    }
+
+    #[test]
+    fn zero_entries_is_a_valid_empty_menu_not_malformed() {
+        let parsed = parse_usermenu("");
+        assert!(!parsed.malformed);
+        assert!(parsed.entries.is_empty());
+    }
+
+    #[test]
+    fn garbage_content_is_malformed() {
+        let parsed = parse_usermenu("this is not valid toml at all\n[[entry]]\nlabel = \"A\"\ncommand = \"a\"\n");
+        assert!(parsed.malformed);
+    }
+
+    #[test]
+    fn an_unquoted_value_is_malformed() {
+        // usermenu.toml is real TOML, unlike config.toml's lenient bare
+        // values — an unquoted value is a parse error here.
+        let parsed = parse_usermenu("[[entry]]\nlabel = A\ncommand = \"a\"\n");
+        assert!(parsed.malformed);
+    }
+
+    #[test]
+    fn an_entry_missing_a_required_field_is_dropped_with_a_warning() {
+        let parsed = parse_usermenu("[[entry]]\nlabel = \"No command\"\n\n[[entry]]\nlabel = \"Complete\"\ncommand = \"ok\"\n");
+        assert!(!parsed.malformed);
+        assert_eq!(parsed.entries, vec![UserMenuEntry { label: "Complete".to_string(), command: "ok".to_string() }]);
+        assert!(!parsed.warnings.is_empty());
+    }
+
+    #[test]
+    fn usermenu_render_and_parse_round_trip_including_backslashes_and_quotes() {
+        let entries = vec![
+            UserMenuEntry { label: "Backup".to_string(), command: r"robocopy . D:\backup /E".to_string() },
+            UserMenuEntry { label: "Say \"hi\"".to_string(), command: "echo \"hi\"".to_string() },
+        ];
+        let rendered = render_usermenu(&entries);
+        let parsed = parse_usermenu(&rendered);
+        assert!(!parsed.malformed);
+        assert_eq!(parsed.entries, entries);
+    }
+
+    #[test]
+    fn load_user_menu_creates_default_file_when_missing() {
+        let dir = std::env::temp_dir().join(format!("filecommand-usermenu-test-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join(USERMENU_FILE);
+        let result = load_user_menu(&path);
+        assert!(result.created_default);
+        assert!(!result.malformed);
+        assert_eq!(result.entries, default_user_menu_entries());
+        // The file now exists on disk and reloading it yields the same
+        // entries without creating it again.
+        let reloaded = load_user_menu(&path);
+        assert!(!reloaded.created_default);
+        assert_eq!(reloaded.entries, default_user_menu_entries());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_user_menu_falls_back_without_overwriting_a_malformed_file() {
+        let dir = std::env::temp_dir().join(format!("filecommand-usermenu-test-malformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(USERMENU_FILE);
+        let garbage = "not valid toml at all";
+        std::fs::write(&path, garbage).unwrap();
+
+        let result = load_user_menu(&path);
+        assert!(result.malformed);
+        assert!(!result.created_default);
+        assert_eq!(result.entries, default_user_menu_entries());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage, "a malformed file must be left untouched on disk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_user_menu_returns_well_formed_entries_unchanged() {
+        let dir = std::env::temp_dir().join(format!("filecommand-usermenu-test-wellformed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(USERMENU_FILE);
+        std::fs::write(&path, "[[entry]]\nlabel = \"Only\"\ncommand = \"only-cmd\"\n").unwrap();
+
+        let result = load_user_menu(&path);
+        assert!(!result.malformed);
+        assert!(!result.created_default);
+        assert_eq!(result.entries, vec![UserMenuEntry { label: "Only".to_string(), command: "only-cmd".to_string() }]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------
+    // Shared identity strings (help-and-about "Identity header matches the
+    // shared source of truth"; user-menu is unrelated but this lives in the
+    // same `config`-adjacent test surface per task 15.7).
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn identity_lines_are_the_single_source_of_truth_across_callers() {
+        // `identity::identity_lines` is what app.rs (splash) and
+        // info_panel.rs (the Info-mode banner) both consume verbatim — this
+        // assertion pins that the four lines are stable in shape and order,
+        // so a caller-side literal copy (as info_panel's tests use for
+        // convenience) cannot silently drift from the real source.
+        let lines = crate::identity::identity_lines(2026);
+        assert_eq!(lines[0], crate::identity::PRODUCT_NAME);
+        assert_eq!(lines[1], crate::identity::version_line());
+        assert_eq!(lines[2], crate::identity::copyright_line(2026));
+        assert_eq!(lines[3], crate::identity::TRIBUTE_LINE);
     }
 }

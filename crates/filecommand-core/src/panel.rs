@@ -16,13 +16,21 @@ pub enum SortDirection {
     Desc,
 }
 
-/// How a panel renders its body. M3 adds `Info`; Brief/Tree/Quick View
-/// arrive in M5.
+/// How a panel renders its body. M3 added `Info`; M5 adds `Brief` (three
+/// name-only columns), `Tree` (lazily-expanded directory tree driving the
+/// opposite panel), and `QuickView` (viewer-style preview of the opposite
+/// panel's cursor file) — design D7. Their rendering and reducer wiring
+/// land with the `additional-panel-modes` capability; this variant surface
+/// exists up front so other M5 groups compile against a stable enum
+/// (task 1.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DisplayMode {
     #[default]
     Full,
     Info,
+    Brief,
+    Tree,
+    QuickView,
 }
 
 /// Whether a listing is still streaming in from the worker thread, or done.

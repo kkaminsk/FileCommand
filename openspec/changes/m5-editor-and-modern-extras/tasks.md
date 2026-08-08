@@ -1,27 +1,27 @@
 # Tasks — M5 — Built-in editor & modern extras
 
 ## 1. Workspace, dependencies, and shared setup
-- [ ] 1.1 Add `git2` (libgit2) to `filecommand-core` dependencies for `git_info`, and document the C build requirement / `gitoxide`/`git status --porcelain` fallbacks in the crate README per design D3.
-- [ ] 1.2 Add a fuzzy-match helper dependency (or a hand-rolled subsequence scorer module) to `filecommand-core` for `fuzzy-jump`/`find-file`, keeping the scorer terminal-free (design D6, open question).
-- [ ] 1.3 Confirm `unicode-width` is available to `filecommand-core`/`filecommand-tui` for Brief-mode column alignment (design D7).
-- [ ] 1.4 Extend `filecommand-tui` dev-dependencies with `insta` + ratatui `TestBackend` wiring (if not already present) and ensure the pinned `Clock`, terminal-size, and locale fixtures from §8 are reusable for the new snapshots.
-- [ ] 1.5 Add new `Command`/`Msg` reducer variants and `PanelDisplayMode` variants (Brief, Tree, QuickView) to the core state enums so later groups compile against a stable surface (design D4/D7).
+- [x] 1.1 Add `git2` (libgit2) to `filecommand-core` dependencies for `git_info`, and document the C build requirement / `gitoxide`/`git status --porcelain` fallbacks in the crate README per design D3.
+- [x] 1.2 Add a fuzzy-match helper dependency (or a hand-rolled subsequence scorer module) to `filecommand-core` for `fuzzy-jump`/`find-file`, keeping the scorer terminal-free (design D6, open question).
+- [x] 1.3 Confirm `unicode-width` is available to `filecommand-core`/`filecommand-tui` for Brief-mode column alignment (design D7).
+- [x] 1.4 Extend `filecommand-tui` dev-dependencies with `insta` + ratatui `TestBackend` wiring (if not already present) and ensure the pinned `Clock`, terminal-size, and locale fixtures from §8 are reusable for the new snapshots.
+- [x] 1.5 Add new `Command`/`Msg` reducer variants and `PanelDisplayMode` variants (Brief, Tree, QuickView) to the core state enums so later groups compile against a stable surface (design D4/D7).
 
 ## 2. Core — shared identity strings & config loaders
-- [ ] 2.1 Introduce a single compiled-in identity source of truth (product name + version, copyright, tribute) in `config`, shared verbatim by the splash, Info-panel banner, Help header, and About dialog (design D8; help-and-about "Identity header matches the shared source of truth").
-- [ ] 2.2 Implement the `usermenu.toml` loader in `config`: parse `label`+`command` entries in file order, warn (not fail) on unknown keys (user-menu "Parse label and command entries", "Unknown keys warn rather than fail").
-- [ ] 2.3 Implement `usermenu.toml` first-run creation with default entries when absent, and malformed-file handling that warns, falls back to defaults, and does NOT overwrite the file on disk (user-menu "Create and recover the usermenu.toml file").
-- [ ] 2.4 Route the quick-filter (Ctrl+P) and fuzzy-jump (Ctrl+J) bindings through the existing keymap-override mechanism so both are remappable via `config.toml` (quick-filter "Overridable binding"; fuzzy-jump "Overridden binding still opens the dialog"; design D6).
+- [x] 2.1 Introduce a single compiled-in identity source of truth (product name + version, copyright, tribute) in `config`, shared verbatim by the splash, Info-panel banner, Help header, and About dialog (design D8; help-and-about "Identity header matches the shared source of truth").
+- [x] 2.2 Implement the `usermenu.toml` loader in `config`: parse `label`+`command` entries in file order, warn (not fail) on unknown keys (user-menu "Parse label and command entries", "Unknown keys warn rather than fail").
+- [x] 2.3 Implement `usermenu.toml` first-run creation with default entries when absent, and malformed-file handling that warns, falls back to defaults, and does NOT overwrite the file on disk (user-menu "Create and recover the usermenu.toml file").
+- [x] 2.4 Route the quick-filter (Ctrl+P) and fuzzy-jump (Ctrl+J) bindings through the existing keymap-override mechanism so both are remappable via `config.toml` (quick-filter "Overridable binding"; fuzzy-jump "Overridden binding still opens the dialog"; design D6).
 
 ## 3. Core — built-in editor buffer (`filecommand-core`)
-- [ ] 3.1 Add the editor model: in-memory `Vec<Line>` buffer with caret (line/col), loaded UTF-8 lossy, plus the pre-load 10 MB size check that redirects ≥10 MB files to the F3 viewer (builtin-editor "Editor invocation and size cap"; design D1).
-- [ ] 3.2 Detect and record the dominant line ending (CRLF vs LF) on load for per-file preservation (builtin-editor "Save in place …"; design D2).
-- [ ] 3.3 Implement insert vs overwrite text-entry modes with a toggle and derived header indicator state (builtin-editor "Insert and overwrite text entry").
-- [ ] 3.4 Implement line-based selection as an `[anchor_line, cursor_line]` range anchored by Mark, plus whole-line cut, copy, and paste against a line clipboard (builtin-editor "Line-based selection with cut, copy, and paste"; design D1).
-- [ ] 3.5 Implement literal (non-regex) search and search-and-replace over the buffer, matching metacharacters literally and marking the buffer modified on replace (builtin-editor "Search and search-and-replace without regex").
-- [ ] 3.6 Implement single-level undo as exactly one prior-state snapshot swap, capturing before each edit and never restoring more than one level (builtin-editor "Single-level undo"; design D1).
-- [ ] 3.7 Implement F2 save-in-place: write UTF-8 using the recorded line ending, clear modified state, all fs access via the narrow fs trait / `\\?\` long-path seam (builtin-editor "Save in place …"; design D2/D9).
-- [ ] 3.8 Derive the modified flag from `buffer != saved_snapshot` and expose save-on-exit intent so F10 with unsaved changes signals a confirm rather than exiting (builtin-editor "Modified indicator and save-on-exit prompt"; design D2).
+- [x] 3.1 Add the editor model: in-memory `Vec<Line>` buffer with caret (line/col), loaded UTF-8 lossy, plus the pre-load 10 MB size check that redirects ≥10 MB files to the F3 viewer (builtin-editor "Editor invocation and size cap"; design D1).
+- [x] 3.2 Detect and record the dominant line ending (CRLF vs LF) on load for per-file preservation (builtin-editor "Save in place …"; design D2).
+- [x] 3.3 Implement insert vs overwrite text-entry modes with a toggle and derived header indicator state (builtin-editor "Insert and overwrite text entry").
+- [x] 3.4 Implement line-based selection as an `[anchor_line, cursor_line]` range anchored by Mark, plus whole-line cut, copy, and paste against a line clipboard (builtin-editor "Line-based selection with cut, copy, and paste"; design D1).
+- [x] 3.5 Implement literal (non-regex) search and search-and-replace over the buffer, matching metacharacters literally and marking the buffer modified on replace (builtin-editor "Search and search-and-replace without regex").
+- [x] 3.6 Implement single-level undo as exactly one prior-state snapshot swap, capturing before each edit and never restoring more than one level (builtin-editor "Single-level undo"; design D1).
+- [x] 3.7 Implement F2 save-in-place: write UTF-8 using the recorded line ending, clear modified state, all fs access via the narrow fs trait / `\\?\` long-path seam (builtin-editor "Save in place …"; design D2/D9).
+- [x] 3.8 Derive the modified flag from `buffer != saved_snapshot` and expose save-on-exit intent so F10 with unsaved changes signals a confirm rather than exiting (builtin-editor "Modified indicator and save-on-exit prompt"; design D2).
 
 ## 4. Core — panel tabs, display modes, and quick-filter state
 - [ ] 4.1 Add a per-panel tab list + active-tab index where each tab holds fully independent panel state (dir, cursor, selection, sort, filter, display mode); one tab per panel on startup (panel-tabs "Per-panel tab list with independent state").
@@ -91,13 +91,13 @@
 - [ ] 14.3 Wire directory-navigation recording (any panel navigation) into the frecency history so both fuzzy jump and persistence stay current (fuzzy-jump "Navigation records history").
 
 ## 15. Testing (§8 strategy)
-- [ ] 15.1 Core unit tests — editor buffer: insert/overwrite, line cut/copy/paste, literal search/replace (metacharacter literality), single-level undo bounds, CRLF vs LF round-trip preservation, 10 MB cap redirect, and non-Unicode `OsString` filename save (builtin-editor all requirements).
+- [x] 15.1 Core unit tests — editor buffer: insert/overwrite, line cut/copy/paste, literal search/replace (metacharacter literality), single-level undo bounds, CRLF vs LF round-trip preservation, 10 MB cap redirect, and non-Unicode `OsString` filename save (builtin-editor all requirements).
 - [ ] 15.2 Core unit tests — quick-filter substring narrowing, `..` always visible, cursor snap-to-visible, selection/sort preserved across clear (quick-filter all requirements).
 - [ ] 15.3 Core unit tests — type-ahead pattern extend/shorten/first-match/no-match/empty and exit-routing transitions (type-ahead-jump all requirements).
 - [ ] 15.4 Core unit tests — fuzzy subsequence matching, empty-pattern-shows-all, and frecency ranking (frequency and recency tie-breaks) under a pinned clock; plus `history.json` round-trip and absent/malformed fallback (fuzzy-jump matching/ranking/persistence requirements).
 - [ ] 15.5 Core unit tests — per-panel tab independence, new/close/switch scoping and edge cases (last-tab no-op, out-of-range no-op) (panel-tabs state/new/close/switch requirements).
 - [ ] 15.6 Core unit tests — `git_info` against fixture repos: branch resolution, modified/untracked/staged markers, pathspec scoping, untracked-directory non-expansion, outside-repo "no info", and stale-result/timeout discarding via the generation key (git-info all requirements).
-- [ ] 15.7 Core unit tests — `config` `usermenu.toml` parsing (order, unknown-key warning), first-run default creation, malformed-warn-without-overwrite; and the shared identity-string single-source assertion (user-menu parsing/recovery; help-and-about identity).
+- [x] 15.7 Core unit tests — `config` `usermenu.toml` parsing (order, unknown-key warning), first-run default creation, malformed-warn-without-overwrite; and the shared identity-string single-source assertion (user-menu parsing/recovery; help-and-about identity).
 - [ ] 15.8 Core unit tests — `listing` lazy Tree child reads (no up-front full-drive scan) and the find-file subtree walk matching original `OsString` names with subtree-relative results (additional-panel-modes Tree lazy expansion; find-file recursive search).
 - [ ] 15.9 Proptest — reuse/extend property tests for path joining incl. `\\?\` prefixing on the new editor/find-file/Tree fs paths, and for the deterministic tab-strip shrink/scroll layout over arbitrary tab sets, active indices, and widths (§8 proptest; panel-tabs overflow; design D4/D9).
 - [ ] 15.10 TUI snapshot tests (`insta` + `TestBackend`, pinned Clock/size/locale) — editor chrome (header incl. `Line 12/440   Col 8`, `Ovr`, ` *`, F-key bar), tab strip (full/truncated/number-only/scrolled with `◄`/`►`), Brief columns, Tree mode, Quick View text + `▶SUB-DIR◀`, git branch suffix + marker column, quick-filter and type-ahead mini-status, fuzzy-jump dialog, find-file dialog, user menu, Help window + topic list, and About dialog (§8; help-and-about, panel-tabs, additional-panel-modes, git-info, builtin-editor rendering requirements).
