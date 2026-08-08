@@ -839,6 +839,46 @@ fn snapshot_quick_filter_mini_status_replaces_normal_content() {
 }
 
 #[test]
+fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
+    // `fixed_entries()` is `..`, `docs`, `Cargo.toml`, `readme.txt`; "read"
+    // matches only `readme.txt`, so the narrowed body must show `..` and
+    // `readme.txt` and hide `docs`/`Cargo.toml`, contradicting the pre-fix
+    // behavior where every entry stayed visible and only the cursor moved
+    // (quick-filter "the panel body is narrowed to entries whose displayed
+    // name contains the pattern").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(left_half.contains(".."), "`..` must always stay visible: {left_half}");
+    assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
+    assert!(!left_half.contains("docs"), "a non-matching entry must be hidden: {left_half}");
+    assert!(!left_half.contains("Cargo.toml"), "a non-matching entry must be hidden: {left_half}");
+}
+
+#[test]
+fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let right_half: String = text.lines().map(|l| l.chars().skip(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(right_half.contains("docs"), "the opposite panel's body must stay unfiltered: {right_half}");
+    assert!(right_half.contains("Cargo.toml"), "the opposite panel's body must stay unfiltered: {right_half}");
+}
+
+#[test]
+fn quick_filter_narrows_the_brief_mode_body_to_matching_entries() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.display_mode = filecommand_core::panel::DisplayMode::Brief;
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
+    assert!(!left_half.contains("docs"), "a non-matching entry must be hidden in Brief mode too: {left_half}");
+    assert!(!left_half.contains("Cargo.toml"), "a non-matching entry must be hidden in Brief mode too: {left_half}");
+}
+
+#[test]
 fn snapshot_type_ahead_mini_status_replaces_normal_content() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.quick_search = Some("re".to_string());
@@ -972,4 +1012,30 @@ fn snapshot_about_dialog_over_help_window() {
     assert!(text.contains("License: MIT OR Apache-2.0"));
     assert!(text.contains("OK"));
     insta::assert_snapshot!("about_dialog_over_help_window", text);
+}
+
+#[test]
+fn snapshot_startup_warning_dialog_overlays_the_panels() {
+    // Regression: a malformed usermenu.toml must raise a dismissable modal
+    // warning dialog (not a panel mini-status) at startup (user-menu
+    // "Malformed file warns and falls back without overwriting").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Warning"));
+    assert!(text.contains("usermenu.toml is malformed"));
+    assert!(text.contains("Press any key to continue"));
+    insta::assert_snapshot!("startup_warning_dialog", text);
+}
+
+#[test]
+fn snapshot_startup_warning_dialog_overlays_the_splash_screen_too() {
+    // The warning is raised before the event loop starts, so it can coexist
+    // with the splash screen — it must still be visible on top of it rather
+    // than getting lost underneath.
+    let mut state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Warning"));
+    assert!(text.contains("usermenu.toml is malformed"));
 }

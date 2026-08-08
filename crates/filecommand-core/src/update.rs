@@ -132,6 +132,16 @@ pub struct State {
     /// The F1 Help window (and, nested within it, the About dialog), or
     /// `None` when closed.
     pub help: Option<HelpState>,
+    /// A dismissable startup-warning modal, or `None` when there is nothing
+    /// to warn about. Currently raised only for a malformed `usermenu.toml`
+    /// (user-menu falls back to default entries without overwriting the
+    /// file, per §6) — modeled the same "one-shot `Option<T>` overlay,
+    /// dismissed by a dedicated `Command`" way as `drive_select`/
+    /// `fuzzy_jump`/`find_file`/`user_menu`/`help`, rather than a panel
+    /// mini-status, since it must be visible regardless of which panel (if
+    /// either) it concerns (user-menu "Malformed file warns and falls back
+    /// without overwriting").
+    pub startup_warning: Option<String>,
 }
 
 impl State {
@@ -186,6 +196,7 @@ impl State {
             find_file: None,
             user_menu: None,
             help: None,
+            startup_warning: None,
         }
     }
 
@@ -560,6 +571,11 @@ pub enum Command {
     // bookkeeping (an Info query, a Tree session) this generic command
     // deliberately does not.
     SetDisplayMode { side: PanelSide, mode: DisplayMode },
+
+    /// Dismiss the startup-warning modal (any key, per the one-shot dialogs'
+    /// existing Esc/Enter-dismiss convention) (user-menu "Malformed file
+    /// warns and falls back without overwriting").
+    DismissStartupWarning,
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -784,6 +800,10 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         effects.extend(handle_help(&mut state, cmd));
         return (state, effects);
     }
+    if state.startup_warning.is_some() && matches!(cmd, Command::DismissStartupWarning) {
+        state.startup_warning = None;
+        return (state, effects);
+    }
 
     match &state.phase {
         UiPhase::Splash { started_at_ms } => match cmd {
@@ -905,6 +925,12 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 p.tree = None;
                 p.info_request = None;
                 p.display_mode = mode;
+                // A quick filter narrowed the panel's prior display mode; a
+                // stale pattern must not linger invisibly into Brief/Tree/
+                // Info mode, whose renderers don't surface it the same way
+                // Full mode does (quick-filter "Substring narrowing as the
+                // pattern is typed").
+                p.clear_quick_filter();
             }
 
             Command::FuzzyJumpOpen => state.fuzzy_jump = Some(FuzzyJumpState::new()),
@@ -1094,10 +1120,22 @@ pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
 /// Move the cursor to the first entry matching the type-ahead `pattern`
 /// (`quicksearch::type_ahead_match`). A pattern that matches nothing leaves
 /// the cursor where it is (type-ahead-jump "Alt+letter with no matching
-/// entry", "Extended pattern no longer matches").
+/// entry", "Extended pattern no longer matches"). Input routing normally
+/// keeps type-ahead and the Ctrl+P quick filter mutually exclusive, but if
+/// both are ever active at once the jump must still only land within
+/// `visible_indices()` — otherwise the cursor could land on an entry the
+/// active filter hides (quick-filter "Navigation is restricted to matching
+/// entries").
 fn jump_to_prefix(state: &mut State, pattern: &str) {
     let side = state.active;
-    let found = crate::quicksearch::type_ahead_match(&state.panel(side).entries, pattern);
+    let panel = state.panel(side);
+    let found = if panel.quick_filter.is_some() {
+        let visible = panel.visible_indices();
+        let visible_entries: Vec<Entry> = visible.iter().map(|&i| panel.entries[i].clone()).collect();
+        crate::quicksearch::type_ahead_match(&visible_entries, pattern).map(|pos| visible[pos])
+    } else {
+        crate::quicksearch::type_ahead_match(&panel.entries, pattern)
+    };
     if let Some(index) = found {
         let panel = state.panel_mut(side);
         panel.cursor = index;
@@ -1118,6 +1156,11 @@ fn toggle_info_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
         // Every value starts pending; the worker fills them in place.
         panel.info = InfoValues::default();
         panel.info_request = Some(request);
+        // Same reasoning as `SetDisplayMode`/`EnterTreeMode`: Ctrl+L is a
+        // second path into Info mode, and a quick filter narrowing the
+        // prior Full-mode list must not linger invisibly here either
+        // (quick-filter "Substring narrowing as the pattern is typed").
+        panel.clear_quick_filter();
         vec![Effect::QueryInfo { panel: side, path: panel.cwd.clone(), request }]
     } else {
         let panel = state.panel_mut(side);
@@ -1843,6 +1886,11 @@ fn enter_tree_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
     let p = state.panel_mut(side);
     p.display_mode = DisplayMode::Tree;
     p.tree = Some(TreeState::new(root.clone(), prior_mode));
+    // Same reasoning as `SetDisplayMode`: a quick filter narrowing the
+    // prior list mode has no meaning in Tree mode and must not linger
+    // invisibly (quick-filter "Substring narrowing as the pattern is
+    // typed").
+    p.clear_quick_filter();
     vec![Effect::ExpandTreeNode { panel: side, path: root }]
 }
 

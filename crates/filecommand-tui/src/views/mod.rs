@@ -18,6 +18,7 @@ pub mod progress_dialog;
 pub mod quit_dialog;
 pub mod skipped_summary;
 pub mod splash;
+pub mod startup_warning;
 pub mod tab_strip;
 pub mod user_menu;
 pub mod viewer;
@@ -46,6 +47,28 @@ use crate::layout;
 /// since a stale position from a previous frame's phase would otherwise
 /// linger.
 pub fn render(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &State,
+    depth: ColorDepth,
+    identity_lines: &[String; 4],
+    clock_text: &str,
+    viewer_source: Option<&ByteSource>,
+) -> Option<(u16, u16)> {
+    let cursor = render_phase(buf, area, state, depth, identity_lines, clock_text, viewer_source);
+    // The startup-warning modal is drawn last, over whatever the current
+    // phase already painted — it can only ever be raised at the very start
+    // of a session (currently: a malformed `usermenu.toml`), so it must stay
+    // visible regardless of which phase (even the splash screen) happens to
+    // be on screen underneath it (user-menu "Malformed file warns and falls
+    // back without overwriting").
+    if let Some(message) = &state.startup_warning {
+        startup_warning::render_startup_warning(buf, area, &state.theme, depth, message);
+    }
+    cursor
+}
+
+fn render_phase(
     buf: &mut Buffer,
     area: Rect,
     state: &State,

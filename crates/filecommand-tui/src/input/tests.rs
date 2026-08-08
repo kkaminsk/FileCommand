@@ -669,6 +669,24 @@ fn quick_filter_is_scoped_to_the_active_panel_only() {
 }
 
 #[test]
+fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
+    // Regression: Alt+letter must not be able to start type-ahead
+    // (`QuickSearchStart`) while `panel.quick_filter` is already active on
+    // the active panel — the two input modes are mutually exclusive, and
+    // Esc (`QuickFilterEnd`) is the documented way out of the filter first.
+    let mut state = panels();
+    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(
+        map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state),
+        None,
+        "Alt+letter must be a no-op while the quick filter owns this panel's input"
+    );
+    // Once the filter is cleared, Alt+letter starts type-ahead normally.
+    state.left.quick_filter = None;
+    assert_eq!(map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state), Some(Command::QuickSearchStart('r')));
+}
+
+#[test]
 fn ctrl_t_ctrl_w_and_alt_digit_map_to_tab_commands() {
     let state = panels();
     assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab));
@@ -760,4 +778,29 @@ fn m5_dialogs_outrank_the_command_line_and_quick_search() {
     state.quick_search = Some("z".to_string());
     state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
     assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::FuzzyJumpChar('a')));
+}
+
+// ---------------------------------------------------------------------
+// M5 review fix: startup-warning modal (malformed usermenu.toml)
+// ---------------------------------------------------------------------
+
+#[test]
+fn startup_warning_is_dismissed_by_any_key() {
+    let mut state = panels();
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::DismissStartupWarning));
+}
+
+#[test]
+fn startup_warning_outranks_every_other_modal_and_typing_sink() {
+    // The dialog can only ever be up at session start, before anything else
+    // has had a chance to open, but it must still win the precedence check
+    // deterministically rather than relying on that invariant alone.
+    let mut state = typing("dir");
+    state.startup_warning = Some("usermenu.toml is malformed".to_string());
+    state.quick_search = Some("z".to_string());
+    state.menu = Some(MenuState::opened());
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::DismissStartupWarning));
 }

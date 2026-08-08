@@ -68,14 +68,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     state.history = history_file.commands;
     state.dir_history = history_file.directories;
     let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
-    state.user_menu_entries = user_menu.entries;
-    if user_menu.malformed {
-        // There is no general-purpose startup-warning dialog (yet); the
-        // panel's own inline-error mini-status is the established §7
-        // surface for "something's wrong but the app still runs" (user-menu
-        // "Malformed file warns and falls back without overwriting").
-        state.left.last_error = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
-    }
+    apply_user_menu(&mut state, user_menu);
 
     let (tx, rx) = mpsc::channel::<Command>();
     let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), viewer_source: None };
@@ -161,6 +154,21 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 fn apply_config(state: &mut State, config: &config::Config) {
     state.shell = ShellConfig::from_env(config.shell.clone());
     state.editor = config.editor.clone();
+}
+
+/// Snapshot the F2 user menu into `State` at startup, factored out of `run`
+/// for the same reason as `apply_config` — testable without a real
+/// terminal. On a malformed `usermenu.toml`, `config::load_user_menu` has
+/// already fallen back to default entries in memory without touching the
+/// file; this raises the spec-required dismissable startup-warning dialog
+/// (`state.startup_warning`) rather than a panel mini-status, since the
+/// warning concerns the whole session, not either panel specifically
+/// (user-menu "Malformed file warns and falls back without overwriting").
+fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
+    state.user_menu_entries = user_menu.entries;
+    if user_menu.malformed {
+        state.startup_warning = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+    }
 }
 
 /// Resolve a viewer key's meaning into a core `Command`. Simple toggles pass
@@ -547,6 +555,43 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
+    }
+
+    /// Regression test for the M5 review finding: a malformed
+    /// `usermenu.toml` used to only set the left panel's inline
+    /// `last_error` (with a comment noting there was no startup-warning
+    /// dialog); the spec requires a dismissable modal instead. Verifies
+    /// `apply_user_menu` raises `state.startup_warning`, falls back to
+    /// default entries, and never touches either panel's `last_error`.
+    #[test]
+    fn apply_user_menu_raises_the_startup_warning_dialog_on_malformed_content() {
+        let mut state = State::empty(Theme::classic());
+        let default_entries = config::default_user_menu_entries();
+        let malformed = config::UserMenuLoadResult {
+            entries: default_entries.clone(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+        };
+        apply_user_menu(&mut state, malformed);
+        assert_eq!(state.user_menu_entries, default_entries, "falls back to default entries");
+        assert!(
+            state.startup_warning.as_deref().is_some_and(|m| m.contains(config::USERMENU_FILE)),
+            "expected a startup warning naming the malformed file: {:?}",
+            state.startup_warning
+        );
+        assert_eq!(state.left.last_error, None, "the warning is a dedicated modal, not a panel mini-status");
+        assert_eq!(state.right.last_error, None);
+    }
+
+    #[test]
+    fn apply_user_menu_does_not_warn_on_well_formed_content() {
+        let mut state = State::empty(Theme::classic());
+        let entries = config::default_user_menu_entries();
+        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false };
+        apply_user_menu(&mut state, ok);
+        assert_eq!(state.user_menu_entries, entries);
+        assert_eq!(state.startup_warning, None);
     }
 
     #[test]

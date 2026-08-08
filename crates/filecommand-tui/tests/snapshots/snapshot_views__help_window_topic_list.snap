@@ -1,12 +1,12 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 947
+assertion_line: 990
 expression: text
 ---
 ╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
 ║Name↓        │ Size    Date    Time   ║║Name↓        │ Size    Date    Time   ║
 ║..     ╔════════════════════════════ Help ════════════════════════════╗       ║
-║docs   ║                         FileCommand                          ║03:0   ║
+║docs   ║                  FileCommand Version 0.1.0                   ║03:0   ║
 ║Cargo.t║          Copyright (C) 2026 The FileCommand Authors          ║03:0   ║
 ║readme.║         Inspired by the Norton Commander, 1986-1998          ║03:0   ║
 ║       ╠──────────────────────────────────────────────────────────────╣       ║

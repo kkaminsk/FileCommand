@@ -38,16 +38,20 @@ pub fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(title))) / 2) as u16;
     buf.set_string(title_x, y, title, body);
 
-    // Three centered identity lines, byte-for-byte the same strings the
-    // splash and Info-panel banner use (help-and-about "Identity header
-    // matches the shared source of truth").
-    let header_lines = [&identity_lines[0], &identity_lines[2], &identity_lines[3]];
+    // Three centered identity lines — name+version combined on the first
+    // line, then copyright, then tribute — byte-for-byte the same strings
+    // the splash and Info-panel banner use, per the spec's "header block of
+    // three centered lines carrying the identity lines (name + version,
+    // copyright, tribute)" (help-and-about "Identity header matches the
+    // shared source of truth").
+    let name_and_version = format!("{} {}", identity_lines[0], identity_lines[1]);
+    let header_lines = [name_and_version.as_str(), identity_lines[2].as_str(), identity_lines[3].as_str()];
     for (i, line) in header_lines.iter().enumerate() {
         let ry = y + 1 + i as u16;
         buf.set_string(x, ry, "\u{2551}", body);
         let lx = x + 1 + (inner_w.saturating_sub(display_width(line)) / 2) as u16;
         buf.set_string(x + 1, ry, " ".repeat(inner_w), body);
-        buf.set_string(lx, ry, line.as_str(), body);
+        buf.set_string(lx, ry, *line, body);
         buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
     }
 
@@ -221,6 +225,14 @@ mod tests {
         assert!(rows.contains("Help"));
         assert!(rows.contains("FileCommand"));
         assert!(rows.contains("Norton Commander"));
+    }
+
+    #[test]
+    fn identity_header_includes_the_version_line() {
+        let rows = render(&HelpState::new()).join("\n");
+        let version_line = &ids()[1];
+        assert!(version_line.starts_with("Version "));
+        assert!(rows.contains(version_line.as_str()), "expected the Help window header to include the version line: {rows}");
     }
 
     #[test]

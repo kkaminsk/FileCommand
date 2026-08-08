@@ -202,15 +202,20 @@ pub fn render_panel(
     buf.set_string(x0 + 1, body_y0, pad_to_width(&header, w.saturating_sub(2)), header_style);
     buf.set_string(right_x, body_y0, "\u{2551}", frame_style);
 
-    // Entry rows.
+    // Entry rows. When a quick filter is active the body is narrowed to
+    // `visible_indices()` (`..` plus name-matching entries) rather than the
+    // full `entries` list, matching `move_cursor`'s cursor-restriction and
+    // the spec's "the panel body is narrowed to entries whose displayed
+    // name contains the pattern" requirement (quick-filter "Substring
+    // narrowing as the pattern is typed").
+    let visible = panel.visible_indices();
     let rows_start = body_y0 + 1;
     let rows_h = body_h.saturating_sub(1); // header row
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
         buf.set_string(right_x, y, "\u{2551}", frame_style);
-        if let Some(entry) = panel.entries.get(row as usize) {
-            let is_selected = active && row as usize == panel.cursor;
+        if let Some((entry, is_selected)) = visible.get(row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
             let style = if is_selected {
                 cursor_style
             } else if entry.is_dir_like() {
@@ -284,13 +289,17 @@ fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: 
     let col_w = inner_w / 3;
     let col_widths = [col_w, col_w, inner_w.saturating_sub(col_w * 2)];
     let rows_h = body_h as usize;
+    // Narrow to the active quick filter's `visible_indices()` (`..` plus
+    // name-matching entries), exactly like Full mode above (quick-filter
+    // "Substring narrowing as the pattern is typed").
+    let visible = panel.visible_indices();
 
     for row in 0..rows_h {
         let y = body_y0 + row as u16;
         let mut x = x0 + 1;
         for (c, &cw) in col_widths.iter().enumerate() {
-            let idx = c * rows_h + row;
-            if let Some(entry) = panel.entries.get(idx) {
+            let pos = c * rows_h + row;
+            if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
                 let style = if is_cursor {
                     cursor_style

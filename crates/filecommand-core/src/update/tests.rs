@@ -613,6 +613,26 @@ fn quick_filter_start_char_and_end_are_scoped_to_the_active_panel() {
     assert_eq!(state.left.quick_filter, None);
 }
 
+#[test]
+fn jump_to_prefix_only_lands_within_the_active_quick_filter() {
+    // Input routing normally keeps type-ahead and the quick filter mutually
+    // exclusive, but `jump_to_prefix` (backing `QuickSearchStart`/`Char`)
+    // must still be safe if both are ever active together: it must not
+    // land the cursor on an entry the filter hides. Both "beta" and
+    // "berry" start with "b", so an unfiltered type-ahead jump would land
+    // on "beta" (it comes first); the active filter "rr" hides "beta" but
+    // not "berry", so the filtered jump must land on "berry" instead.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("beta", 1), file_entry("berry", 2)];
+    state.left.quick_filter = Some("rr".to_string());
+    let (state, _) = update(state, Command::QuickSearchStart('b'));
+    assert_eq!(
+        state.left.entries[state.left.cursor].name.to_string_lossy(),
+        "berry",
+        "the jump must only search entries the active filter leaves visible"
+    );
+}
+
 // ---------------------------------------------------------------------
 // Panel tabs (Ctrl+T / Ctrl+W / Alt+1..9), reducer-level (task 15.5)
 // ---------------------------------------------------------------------
@@ -2268,6 +2288,52 @@ fn set_display_mode_switches_the_named_panel_and_clears_tree_state() {
 }
 
 // ---------------------------------------------------------------------
+// M5 review fix: a quick filter must not linger invisibly across a
+// display-mode switch, since Brief/Tree/Info's renderers don't surface it
+// the same way Full mode does (quick-filter "Substring narrowing as the
+// pattern is typed").
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_display_mode_clears_an_active_quick_filter_on_the_named_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
+    assert_eq!(state.left.display_mode, DisplayMode::Brief);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Brief mode");
+}
+
+#[test]
+fn set_display_mode_does_not_clear_the_opposite_panels_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.entries = vec![file_entry("report.txt", 1)];
+    state.right.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
+    assert_eq!(state.right.quick_filter.as_deref(), Some("rep"), "the opposite panel's filter must be untouched");
+}
+
+#[test]
+fn entering_tree_mode_clears_an_active_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Tree);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Tree mode");
+}
+
+#[test]
+fn toggling_into_info_mode_clears_an_active_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::ToggleInfoMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Info);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Info mode");
+}
+
+// ---------------------------------------------------------------------
 // M5: Ctrl+J fuzzy jump
 // ---------------------------------------------------------------------
 
@@ -2579,4 +2645,26 @@ fn tree_cursor_preview_of_the_opposite_panel_does_not_record_frecency() {
     );
     let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
     assert!(state.dir_history.is_empty(), "browsing the tree previews the opposite panel; it does not count as a visit");
+}
+
+// ---------------------------------------------------------------------
+// M5 review fix: startup-warning modal (malformed usermenu.toml)
+// ---------------------------------------------------------------------
+
+#[test]
+fn dismiss_startup_warning_clears_it() {
+    let mut state = test_state(UiPhase::Panels);
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let (state, effects) = update(state, Command::DismissStartupWarning);
+    assert_eq!(state.startup_warning, None);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn dismiss_startup_warning_is_a_no_op_when_nothing_is_warned() {
+    let state = test_state(UiPhase::Panels);
+    assert_eq!(state.startup_warning, None);
+    let (state, effects) = update(state, Command::DismissStartupWarning);
+    assert_eq!(state.startup_warning, None);
+    assert!(effects.is_empty());
 }

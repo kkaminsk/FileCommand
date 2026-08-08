@@ -22,7 +22,14 @@ use filecommand_core::{Command, PanelSide, State, UiPhase};
 
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
     // Modal overlays come first: while one is up it owns every key it
-    // understands, regardless of the phase underneath.
+    // understands, regardless of the phase underneath. The startup-warning
+    // modal is checked first of all since it can only ever be up at the
+    // very start of a session, before anything else has had a chance to
+    // open (user-menu "Malformed file warns and falls back without
+    // overwriting").
+    if state.startup_warning.is_some() {
+        return map_startup_warning_key(key);
+    }
     if state.drive_select.is_some() {
         return map_drive_select_key(key);
     }
@@ -316,8 +323,13 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Insert => Some(Command::ToggleSelectAtCursor),
 
         // Alt+letter starts the type-ahead jump, which then owns plain
-        // printables until it is dismissed.
-        KeyCode::Char(c) if alt && !ctrl && c.is_alphanumeric() => Some(Command::QuickSearchStart(c)),
+        // printables until it is dismissed. Mutually exclusive with the
+        // Ctrl+P quick filter: if a filter is already active on this panel,
+        // Alt+letter is ignored rather than starting a second, competing
+        // input mode — Esc must exit the quick filter first (quick-filter
+        // "Navigation is restricted to matching entries"; type-ahead-jump
+        // "Mini-status display of the active pattern").
+        KeyCode::Char(c) if alt && !ctrl && c.is_alphanumeric() && state.active_panel().quick_filter.is_none() => Some(Command::QuickSearchStart(c)),
 
         // The grey +/-/* selection keys and typed +/-/* are the same key
         // event on Windows (crossterm cannot distinguish the numeric
@@ -419,6 +431,15 @@ fn map_help_key(key: KeyEvent, dialog: &HelpState) -> Option<Command> {
         KeyCode::Down => Some(Command::HelpMove(1)),
         _ => None,
     }
+}
+
+/// The startup-warning modal (currently raised only for a malformed
+/// `usermenu.toml`): any key dismisses it, matching the "Press any key to
+/// continue" convention `app.rs::wait_for_key` already uses for suspend/
+/// resume prompts elsewhere in this codebase (user-menu "Malformed file
+/// warns and falls back without overwriting").
+fn map_startup_warning_key(_key: KeyEvent) -> Option<Command> {
+    Some(Command::DismissStartupWarning)
 }
 
 fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
