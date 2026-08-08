@@ -4,7 +4,7 @@
 
 FileCommand is a keyboard-driven, dual-panel file manager for the terminal, written in Rust (ratatui + crossterm). It recreates the Norton Commander 5.5 look and workflow with a small set of modern extras. Windows-first; cross-platform builds are best-effort.
 
-The full application specification lives at `docs/superpowers/specs/2026-08-06-filecommand-design.md`. The project is pre-implementation — no Rust code exists yet.
+The full application specification lives at `docs/superpowers/specs/2026-08-06-filecommand-design.md`. Milestones M1–M5 are implemented in `crates/filecommand-core` (state/reducer, no UI deps) and `crates/filecommand-tui` (rendering); the OpenSpec specs under `openspec/specs/` are the source of truth for current behavior.
 
 ## Git workflow (strict)
 
