@@ -8,15 +8,20 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::config;
+use crate::config::{self, UserMenuEntry};
+use crate::dialogs::{HelpState, UserMenuState};
 use crate::drives::{self, DriveSelect};
+use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
+use crate::find_file::FindFileState;
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
+use crate::git_info::GitInfo;
 use crate::info::InfoValues;
-use crate::listing::{Entry, EntryKind, SortMode};
+use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
-use crate::panel::{CursorMove, DisplayMode, PanelState};
+use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
+use crate::quicksearch::{self, FrecencyEntry, FuzzyJumpState};
 use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
 use crate::viewer::ViewerState;
@@ -63,6 +68,10 @@ pub enum UiPhase {
     /// The F3 viewer, open full-screen in place of the panels (viewer:
     /// Frame-less full-screen chrome — "Viewer owns focus while open").
     Viewer(ViewerState),
+    /// The F4 built-in editor, open full-screen in place of the panels and
+    /// owning input focus the same way the viewer does (builtin-editor
+    /// "Full-screen editor chrome").
+    Editor(EditorState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,6 +111,37 @@ pub struct State {
     /// a superseded request is dropped instead of silently overwriting a
     /// fresher answer. See [`State::next_request_id`].
     pub request_seq: u64,
+    /// Directory frecency history backing the Ctrl+J fuzzy-jump dialog,
+    /// persisted alongside command history in `history.json` (fuzzy-jump
+    /// "Directory history persistence"; design D6).
+    pub dir_history: Vec<FrecencyEntry>,
+    /// The most recent clock reading `Command::Tick` delivered. Used to
+    /// timestamp frecency updates so `update` never reads a clock directly
+    /// — the TUI's injected `Clock` is still the only source of "now".
+    pub clock_ms: u64,
+    /// The F2 user menu's entries, snapshotted from `usermenu.toml` at
+    /// startup (user-menu "Parse label and command entries from
+    /// usermenu.toml").
+    pub user_menu_entries: Vec<UserMenuEntry>,
+    /// The Ctrl+J fuzzy-jump dialog, or `None` when closed.
+    pub fuzzy_jump: Option<FuzzyJumpState>,
+    /// The Alt+F7 find-file dialog, or `None` when closed.
+    pub find_file: Option<FindFileState>,
+    /// The F2 user-menu overlay, or `None` when closed.
+    pub user_menu: Option<UserMenuState>,
+    /// The F1 Help window (and, nested within it, the About dialog), or
+    /// `None` when closed.
+    pub help: Option<HelpState>,
+    /// A dismissable startup-warning modal, or `None` when there is nothing
+    /// to warn about. Currently raised only for a malformed `usermenu.toml`
+    /// (user-menu falls back to default entries without overwriting the
+    /// file, per §6) — modeled the same "one-shot `Option<T>` overlay,
+    /// dismissed by a dedicated `Command`" way as `drive_select`/
+    /// `fuzzy_jump`/`find_file`/`user_menu`/`help`, rather than a panel
+    /// mini-status, since it must be visible regardless of which panel (if
+    /// either) it concerns (user-menu "Malformed file warns and falls back
+    /// without overwriting").
+    pub startup_warning: Option<String>,
 }
 
 impl State {
@@ -149,6 +189,14 @@ impl State {
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
             request_seq: 0,
+            dir_history: Vec::new(),
+            clock_ms: 0,
+            user_menu_entries: Vec::new(),
+            fuzzy_jump: None,
+            find_file: None,
+            user_menu: None,
+            help: None,
+            startup_warning: None,
         }
     }
 
@@ -184,17 +232,23 @@ impl State {
         } else {
             UiPhase::Panels
         };
-        let state = State {
+        let mut state = State {
             left: PanelState::new(left_cwd.clone()),
             right: PanelState::new(right_cwd.clone()),
             phase,
             term_size,
+            clock_ms: now_ms,
             ..State::empty(theme)
         };
-        let effects = vec![
-            Effect::StartListing { panel: PanelSide::Left, path: left_cwd },
-            Effect::StartListing { panel: PanelSide::Right, path: right_cwd },
+        let mut effects = vec![
+            Effect::StartListing { panel: PanelSide::Left, path: left_cwd.clone() },
+            Effect::StartListing { panel: PanelSide::Right, path: right_cwd.clone() },
         ];
+        // Both panels start their git-info query alongside their first
+        // listing, exactly as a later navigation does (git-info "Background
+        // repository detection").
+        effects.push(git_info_query_effect(&mut state, PanelSide::Left, left_cwd));
+        effects.push(git_info_query_effect(&mut state, PanelSide::Right, right_cwd));
         (state, effects)
     }
 }
@@ -267,6 +321,35 @@ pub enum Command {
     // Sort modes (Ctrl+F3..Ctrl+F7).
     SetSortMode { side: PanelSide, mode: SortMode },
 
+    // Ctrl+P inline quick filter (§4.7), scoped to the active panel.
+    QuickFilterStart,
+    QuickFilterChar(char),
+    QuickFilterBackspace,
+    QuickFilterEnd,
+
+    // Panel tabs (§4.1/§4.7), scoped to the active panel.
+    /// Ctrl+T.
+    OpenTab,
+    /// Ctrl+W.
+    CloseTab,
+    /// Alt+1..9 (one-based).
+    SwitchTab(usize),
+
+    // Tree display mode (§4.2), scoped to a panel side.
+    /// Enter Tree mode on `side`, recording its current display mode so
+    /// Enter can restore it, and kicking off the drive root's immediate-
+    /// children read (additional-panel-modes "No up-front full-drive
+    /// scan"; design D7).
+    EnterTreeMode(PanelSide),
+    /// Reply to `Effect::ExpandTreeNode`: `path`'s immediate child
+    /// directories (empty on a read failure — skipped rather than
+    /// aborting, matching `find_in_subtree`'s precedent). Applied only if
+    /// `path` still names a not-yet-expanded node in `panel`'s tree, so a
+    /// reply for a node the tree no longer has (a since-superseded Tree
+    /// session) is silently dropped (additional-panel-modes "Children read
+    /// on expand").
+    TreeNodeExpanded { panel: PanelSide, path: PathBuf, children: Vec<Entry> },
+
     // F9 menu overlay.
     MenuOpen,
     MenuClose,
@@ -320,6 +403,74 @@ pub enum Command {
     /// panel's cursor.
     RequestExternalEditor,
 
+    // F4 built-in editor (M5). `RequestEditor` is the actual F4 keybinding
+    // target from a panel: it resolves the external-editor/built-in/size-cap
+    // precedence (builtin-editor "Editor invocation and size cap", "External
+    // editor takes precedence") and, when it wins, dispatches to the same
+    // `handle_request_external_editor` path `RequestExternalEditor` already
+    // exercises.
+    RequestEditor,
+    /// Reply to `Effect::OpenEditor`: the file loaded under the 10 MB cap
+    /// (builtin-editor "Small file opens in the editor").
+    EditorOpened(Box<EditorState>),
+    /// Reply to `Effect::OpenEditor`: the file is `size` bytes, at or above
+    /// the cap — redirected to the F3 viewer with a notice (builtin-editor
+    /// "Large file redirects to the viewer").
+    EditorTooLarge { path: PathBuf, size: u64 },
+    /// Reply to `Effect::OpenEditor` when the file could not be opened.
+    EditorOpenFailed { message: String },
+
+    // Editor keymap, while `UiPhase::Editor` owns focus.
+    EditorChar(char),
+    EditorNewline,
+    EditorBackspace,
+    EditorMove(EditorMove),
+    /// Insert key: toggle insert/overwrite text-entry mode.
+    EditorToggleMode,
+    /// F3: anchor a line selection at the caret.
+    EditorMark,
+    EditorCut,
+    EditorCopy,
+    EditorPaste,
+    EditorUndo,
+    /// F7: open the literal-search prompt.
+    EditorSearchStart,
+    EditorSearchChar(char),
+    EditorSearchBackspace,
+    EditorSearchCancel,
+    /// Enter on the search prompt: run `EditorState::find_next` for the
+    /// typed pattern.
+    EditorSearchConfirm,
+    /// F4 (while the editor, not a panel, owns focus): open the
+    /// search-and-replace prompt's first (pattern) stage.
+    EditorReplaceStart,
+    EditorReplaceChar(char),
+    EditorReplaceBackspace,
+    EditorReplaceCancel,
+    /// Enter on the replace prompt: advances pattern -> replacement, or —
+    /// from the replacement stage — runs `EditorState::replace_first`.
+    EditorReplaceConfirm,
+    /// F2: save in place.
+    EditorSave,
+    /// Reply to `Effect::SaveEditor`: the write succeeded. `then_quit`
+    /// echoes back whether this save was requested by the save-on-exit
+    /// confirm's "Y", in which case the editor closes once applied.
+    EditorSaved { editor: Box<EditorState>, then_quit: bool },
+    /// Reply to `Effect::SaveEditor`: the write failed — aborts a save-on-
+    /// exit quit attempt and surfaces the message inline rather than losing
+    /// the buffer (builtin-editor "Modified indicator and save-on-exit
+    /// prompt").
+    EditorSaveFailed { message: String },
+    /// F10: quit if unmodified, else raise the save-on-exit confirm
+    /// (builtin-editor "Quitting with unsaved changes prompts").
+    EditorRequestQuit,
+    /// "Y" on the save-on-exit confirm: save, then close the editor.
+    EditorConfirmQuitSave,
+    /// "N" on the save-on-exit confirm: close the editor without saving.
+    EditorConfirmQuitDiscard,
+    /// Esc on the save-on-exit confirm: dismiss it and keep editing.
+    EditorCancelQuit,
+
     // Worker-produced events, re-entering through the same `update` path.
     ListingChunk { panel: PanelSide, entries: Vec<Entry> },
     ListingComplete { panel: PanelSide, total: usize },
@@ -330,6 +481,15 @@ pub enum Command {
     JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
     DriveLabelResolved { target: PanelSide, letter: char, label: Option<String>, generation: u64 },
     InfoResolved { panel: PanelSide, path: PathBuf, request: u64, values: InfoValues },
+    /// Reply to `Effect::QueryGitInfo`: either a resolved repository's
+    /// branch and per-entry statuses, or `GitInfo::none()` for "outside any
+    /// repository" and for a timed-out query (git-info "Background
+    /// repository detection", "Silent absence on timeout and stale-result
+    /// discarding"). `request` is matched against
+    /// `PanelState::git_request` the same way `InfoResolved`'s `request` is
+    /// matched against `info_request`, so a reply for a directory/generation
+    /// the panel has since moved past is dropped.
+    GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo },
     /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
     /// (viewer: Instant open).
     ViewerOpened { path: PathBuf, file_len: u64 },
@@ -347,6 +507,75 @@ pub enum Command {
     /// Reply to `Effect::RunExternalEditor` when the editor could not be
     /// spawned (external-editor: Editor spawn errors do not crash the app).
     ExternalEditorSpawnFailed { message: String },
+
+    // Ctrl+J fuzzy jump (M5).
+    /// Open the dialog (default binding, overridable via `config.toml`).
+    FuzzyJumpOpen,
+    FuzzyJumpChar(char),
+    FuzzyJumpBackspace,
+    FuzzyJumpMove(isize),
+    /// Enter: navigate the active panel to the highlighted directory and
+    /// close the dialog (fuzzy-jump "Enter navigates the active panel").
+    FuzzyJumpConfirm,
+    /// Esc: close without navigating.
+    FuzzyJumpCancel,
+
+    // Alt+F7 find file (M5).
+    /// Open the dialog, rooted at the active panel's current directory
+    /// (find-file "Find-file invocation").
+    FindFileOpen,
+    FindFileChar(char),
+    FindFileBackspace,
+    /// Enter on the pattern input: kick off `Effect::FindInSubtree`.
+    FindFileSubmit,
+    /// Reply to `Effect::FindInSubtree`: one matched entry, streamed as the
+    /// walk finds it. `request` is matched against `FindFileState::request`
+    /// so a reply from an abandoned/superseded search is dropped (find-file
+    /// "Non-blocking search with static progress").
+    FindFileMatch { request: u64, m: FindMatch },
+    /// Reply to `Effect::FindInSubtree`: the walk has finished.
+    FindFileSearchDone { request: u64 },
+    FindFileMove(isize),
+    /// Enter on a result: navigate the active panel's current tab in place
+    /// and close the dialog (find-file "Navigate to a chosen result").
+    FindFileConfirm,
+    /// Esc: close without navigating, abandoning any in-progress search
+    /// (find-file "Dismiss the find-file dialog").
+    FindFileCancel,
+
+    // F2 user menu (M5).
+    UserMenuOpen,
+    UserMenuMove(isize),
+    /// Enter: run the highlighted entry's command via the shell passthrough
+    /// in the active panel's directory, then close the menu (user-menu "Run
+    /// the selected entry's command via the shell in the active panel
+    /// directory").
+    UserMenuConfirm,
+    /// Esc: close without running anything.
+    UserMenuCancel,
+
+    // F1 Help window + About dialog (M5).
+    HelpOpen,
+    HelpMove(isize),
+    /// Enter / the `Help` button: opens the highlighted topic's page, or
+    /// the About dialog for the special first entry.
+    HelpActivate,
+    /// Esc / the `Cancel` button: dismisses the About dialog back to the
+    /// list, or a topic page back to the list, or closes the window
+    /// entirely from the list.
+    HelpCancel,
+
+    // Panel display-mode switches reachable from the Left/Right menu (M5;
+    // design D7). `Info` and `Tree` keep their own dedicated commands
+    // (`ToggleInfoMode`, `EnterTreeMode`) since each carries extra
+    // bookkeeping (an Info query, a Tree session) this generic command
+    // deliberately does not.
+    SetDisplayMode { side: PanelSide, mode: DisplayMode },
+
+    /// Dismiss the startup-warning modal (any key, per the one-shot dialogs'
+    /// existing Esc/Enter-dismiss convention) (user-menu "Malformed file
+    /// warns and falls back without overwriting").
+    DismissStartupWarning,
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -370,8 +599,10 @@ pub enum Effect {
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
-    /// Rewrite `history.json` atomically with these entries.
-    PersistHistory(Vec<String>),
+    /// Rewrite `history.json` atomically with the command history and
+    /// directory frecency together (fuzzy-jump "Directory history
+    /// persistence"; design D6).
+    PersistHistory(config::HistoryFile),
     /// Read the logical-drive bitmask (cheap, synchronous) and feed the
     /// letters back as `DriveListReady` before the next paint.
     EnumerateDrives(PanelSide),
@@ -383,6 +614,20 @@ pub enum Effect {
     /// travels with the result so a reply from a since-superseded query can
     /// be told apart from the current one.
     QueryInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Run `git_info::query` for `path` on a dedicated worker thread —
+    /// never the shared Info worker, since a slow status call on one panel
+    /// must not head-of-line-block the other (design D3) — and report the
+    /// result back via `Command::GitInfoResolved`. `request` travels with
+    /// the result so a stale or timed-out reply can be told apart from the
+    /// query that's still current (git-info "Background repository
+    /// detection", "Pathspec-scoped status queries").
+    QueryGitInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Read `path`'s immediate child directories for Tree-mode expansion
+    /// (`listing::list_child_dirs`) on a worker thread, reporting them back
+    /// via `Command::TreeNodeExpanded` — one directory's worth of I/O per
+    /// call, never a recursive scan (additional-panel-modes "Children read
+    /// on expand"; design D7).
+    ExpandTreeNode { panel: PanelSide, path: PathBuf },
     /// Open `path` for the F3 viewer: map/open it and report back its
     /// length via `Command::ViewerOpened`, or the failure via
     /// `Command::ViewerOpenFailed`. Cheap enough to run synchronously
@@ -402,6 +647,28 @@ pub enum Effect {
     /// `RunShellCommand` uses (design D7; external-editor: TUI suspend and
     /// restore, Synchronous wait and panel re-read).
     RunExternalEditor(EditorInvocation, PanelSide),
+    /// Open `path` for the F4 built-in editor: stat it and, under the 10 MB
+    /// cap, read and decode it in full, reporting back via
+    /// `Command::EditorOpened`/`EditorTooLarge`/`EditorOpenFailed`. Run
+    /// synchronously before the next repaint rather than on a worker
+    /// thread — the same "cheap enough for the input path" precedent
+    /// `Effect::OpenViewer` sets, extended here to the whole-file read the
+    /// 10 MB cap explicitly bounds (design D1).
+    OpenEditor { path: PathBuf },
+    /// Write `editor`'s buffer to disk via `EditorState::save`, reporting
+    /// the post-save state back via `Command::EditorSaved` (or the failure
+    /// via `Command::EditorSaveFailed`). `then_quit` travels through
+    /// unchanged so the reply knows whether to close the editor once the
+    /// write lands (builtin-editor "Save in place …", design D9).
+    SaveEditor { editor: Box<EditorState>, then_quit: bool },
+    /// Walk `root`'s subtree for entries whose name contains `pattern` on a
+    /// worker thread, streaming each match back via `Command::FindFileMatch`
+    /// as it's found and finishing with `Command::FindFileSearchDone` —
+    /// never blocking the UI event loop (find-file "Non-blocking search
+    /// with static progress"). `request` travels with every reply so a
+    /// stale/abandoned search's results are dropped once the dialog has
+    /// moved on.
+    FindInSubtree { root: PathBuf, pattern: String, request: u64 },
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -420,6 +687,13 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             (other, false) => other.clone(),
         };
         return (state, effects);
+    }
+
+    // Every `Tick` updates the clock reading `begin_listing` timestamps
+    // frecency visits with, regardless of phase — mirrored generically here
+    // rather than duplicated in every phase arm that might navigate.
+    if let Command::Tick(now) = cmd {
+        state.clock_ms = now;
     }
 
     // Listing events fold in identically regardless of phase — a background
@@ -447,6 +721,19 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             return (state, effects);
         }
+        Command::GitInfoResolved { panel, path, request, info } => {
+            let p = state.panel_mut(panel);
+            if p.cwd == path && p.git_request == Some(request) {
+                p.git_info = info;
+            }
+            return (state, effects);
+        }
+        Command::TreeNodeExpanded { panel, path, children } => {
+            if let Some(tree) = state.panel_mut(panel).tree.as_mut() {
+                tree.insert_children(&path, children);
+            }
+            return (state, effects);
+        }
         _ => {}
     }
 
@@ -468,6 +755,14 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         return (state, effects);
     }
 
+    // The F4 built-in editor, likewise, replaces the panels full-screen and
+    // owns input focus while open (builtin-editor "Full-screen editor
+    // chrome").
+    if matches!(state.phase, UiPhase::Editor(_)) {
+        effects.extend(handle_editor(&mut state, cmd));
+        return (state, effects);
+    }
+
     // The drive-select dialog and the F9 menu are modal over the panels:
     // while one is open it claims the keys it understands.
     if state.drive_select.is_some() && is_drive_select_command(&cmd) {
@@ -483,6 +778,30 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             let (state, more) = update(state, next);
             return (state, more);
         }
+        return (state, effects);
+    }
+    // The M5 dialogs (fuzzy jump, find file, user menu, Help/About) are
+    // likewise modal overlays beside the phase, each claiming only the
+    // commands it understands while open — the same shape as the two blocks
+    // above.
+    if state.fuzzy_jump.is_some() && is_fuzzy_jump_command(&cmd) {
+        effects.extend(handle_fuzzy_jump(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.find_file.is_some() && is_find_file_command(&cmd) {
+        effects.extend(handle_find_file(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.user_menu.is_some() && is_user_menu_command(&cmd) {
+        effects.extend(handle_user_menu(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.help.is_some() && is_help_command(&cmd) {
+        effects.extend(handle_help(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.startup_warning.is_some() && matches!(cmd, Command::DismissStartupWarning) {
+        state.startup_warning = None;
         return (state, effects);
     }
 
@@ -507,7 +826,22 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             _ => {}
         },
         UiPhase::Panels => match cmd {
-            Command::MoveCursor(m) => state.panel_mut(state.active).move_cursor(m),
+            Command::MoveCursor(m) => {
+                // A movement key exits type-ahead (if active) *and* is
+                // still applied to the panel cursor as a normal movement,
+                // in the same keystroke — the `input/` mapper emits exactly
+                // this one command for a movement key while type-ahead owns
+                // the keyboard, relying on this side effect to also end the
+                // mode (type-ahead-jump "A movement key exits type-ahead
+                // and is applied to the panel"; design D5).
+                state.quick_search = None;
+                let side = state.active;
+                if state.panel(side).display_mode == DisplayMode::Tree {
+                    effects.extend(handle_tree_cursor_move(&mut state, side, m));
+                } else {
+                    state.panel_mut(side).move_cursor(m);
+                }
+            }
             Command::ToggleActivePanel => state.active = state.active.toggle(),
             Command::Enter => effects.extend(handle_enter(&mut state)),
             Command::ParentDir => {
@@ -562,17 +896,50 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::QuickSearchBackspace => {
                 if let Some(mut pattern) = state.quick_search.take() {
                     pattern.pop();
-                    if pattern.is_empty() {
-                        state.quick_search = None;
-                    } else {
+                    // An empty pattern stays active rather than exiting
+                    // type-ahead, and the cursor holds its position rather
+                    // than re-jumping (type-ahead-jump "Backspace on a
+                    // single-character pattern").
+                    if !pattern.is_empty() {
                         jump_to_prefix(&mut state, &pattern);
-                        state.quick_search = Some(pattern);
                     }
+                    state.quick_search = Some(pattern);
                 }
             }
             Command::QuickSearchEnd => state.quick_search = None,
 
             Command::SetSortMode { side, mode } => state.panel_mut(side).set_sort_mode(mode),
+
+            Command::QuickFilterStart => state.panel_mut(state.active).activate_quick_filter(),
+            Command::QuickFilterChar(c) => state.panel_mut(state.active).quick_filter_push(c),
+            Command::QuickFilterBackspace => state.panel_mut(state.active).quick_filter_backspace(),
+            Command::QuickFilterEnd => state.panel_mut(state.active).clear_quick_filter(),
+
+            Command::OpenTab => state.panel_mut(state.active).open_tab(),
+            Command::CloseTab => state.panel_mut(state.active).close_tab(),
+            Command::SwitchTab(n) => state.panel_mut(state.active).switch_tab(n),
+
+            Command::EnterTreeMode(side) => effects.extend(enter_tree_mode(&mut state, side)),
+            Command::SetDisplayMode { side, mode } => {
+                let p = state.panel_mut(side);
+                p.tree = None;
+                p.info_request = None;
+                p.display_mode = mode;
+                // A quick filter narrowed the panel's prior display mode; a
+                // stale pattern must not linger invisibly into Brief/Tree/
+                // Info mode, whose renderers don't surface it the same way
+                // Full mode does (quick-filter "Substring narrowing as the
+                // pattern is typed").
+                p.clear_quick_filter();
+            }
+
+            Command::FuzzyJumpOpen => state.fuzzy_jump = Some(FuzzyJumpState::new()),
+            Command::FindFileOpen => {
+                let root = state.active_panel().cwd.clone();
+                state.find_file = Some(FindFileState::new(root));
+            }
+            Command::UserMenuOpen => state.user_menu = Some(UserMenuState::new()),
+            Command::HelpOpen => state.help = Some(HelpState::new()),
 
             Command::MenuOpen => state.menu = Some(MenuState::opened()),
             Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
@@ -602,11 +969,32 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::RequestExternalEditor => effects.extend(handle_request_external_editor(&mut state)),
             Command::ExternalEditorSpawnFailed { message } => state.panel_mut(state.active).last_error = Some(message),
 
+            Command::RequestEditor => effects.extend(handle_request_editor(&mut state)),
+            Command::EditorOpened(editor) => {
+                // Mirrors the `Command::ViewerOpened` clear: a prior failed
+                // F3/F4 attempt may have left `last_error` set (§7 error
+                // policy).
+                state.panel_mut(state.active).last_error = None;
+                state.phase = UiPhase::Editor(*editor);
+            }
+            Command::EditorTooLarge { path, size: _ } => {
+                // builtin-editor "Large file redirects to the viewer": the
+                // notice lands on the panel's mini-status (the same surface
+                // `Command::ViewerOpenFailed` uses) since the viewer chrome
+                // itself has no room reserved for a banner; it's visible the
+                // moment the user returns from the viewer to the panels.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                state.panel_mut(state.active).last_error =
+                    Some(format!("{name} is too large for the editor (10 MB limit) — opened in the viewer"));
+                effects.push(Effect::OpenViewer { path });
+            }
+            Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+
             Command::Tick(_) => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
             _ => {}
         },
-        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) => {
+        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) | UiPhase::Editor(_) => {
             unreachable!("handled above")
         }
     }
@@ -677,7 +1065,8 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     if let Some(target) = parse_cd(&text) {
         config::push_history(&mut state.history, &text);
         let side = state.active;
-        let mut effects = vec![Effect::PersistHistory(state.history.clone())];
+        let mut effects =
+            vec![Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() })];
         if let Some(path) = resolve_cd_target(&state.panel(side).cwd, &target) {
             effects.extend(begin_listing(state, side, path));
         }
@@ -689,7 +1078,7 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     let cwd = state.active_panel().cwd.clone();
     vec![
         Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side),
-        Effect::PersistHistory(state.history.clone()),
+        Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }),
     ]
 }
 
@@ -728,17 +1117,25 @@ pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
     Some(cwd.join(target))
 }
 
-/// Move the cursor to the first entry whose name starts with `pattern`
-/// (case-insensitively). A pattern that matches nothing leaves the cursor
-/// where it is.
+/// Move the cursor to the first entry matching the type-ahead `pattern`
+/// (`quicksearch::type_ahead_match`). A pattern that matches nothing leaves
+/// the cursor where it is (type-ahead-jump "Alt+letter with no matching
+/// entry", "Extended pattern no longer matches"). Input routing normally
+/// keeps type-ahead and the Ctrl+P quick filter mutually exclusive, but if
+/// both are ever active at once the jump must still only land within
+/// `visible_indices()` — otherwise the cursor could land on an entry the
+/// active filter hides (quick-filter "Navigation is restricted to matching
+/// entries").
 fn jump_to_prefix(state: &mut State, pattern: &str) {
     let side = state.active;
-    let needle = pattern.to_lowercase();
-    let found = state
-        .panel(side)
-        .entries
-        .iter()
-        .position(|e| e.name.to_string_lossy().to_lowercase().starts_with(&needle));
+    let panel = state.panel(side);
+    let found = if panel.quick_filter.is_some() {
+        let visible = panel.visible_indices();
+        let visible_entries: Vec<Entry> = visible.iter().map(|&i| panel.entries[i].clone()).collect();
+        crate::quicksearch::type_ahead_match(&visible_entries, pattern).map(|pos| visible[pos])
+    } else {
+        crate::quicksearch::type_ahead_match(&panel.entries, pattern)
+    };
     if let Some(index) = found {
         let panel = state.panel_mut(side);
         panel.cursor = index;
@@ -759,6 +1156,11 @@ fn toggle_info_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
         // Every value starts pending; the worker fills them in place.
         panel.info = InfoValues::default();
         panel.info_request = Some(request);
+        // Same reasoning as `SetDisplayMode`/`EnterTreeMode`: Ctrl+L is a
+        // second path into Info mode, and a quick filter narrowing the
+        // prior Full-mode list must not linger invisibly here either
+        // (quick-filter "Substring narrowing as the pattern is typed").
+        panel.clear_quick_filter();
         vec![Effect::QueryInfo { panel: side, path: panel.cwd.clone(), request }]
     } else {
         let panel = state.panel_mut(side);
@@ -892,6 +1294,174 @@ fn handle_request_external_editor(state: &mut State) -> Vec<Effect> {
 }
 
 // ---------------------------------------------------------------------
+// F4 built-in editor (M5)
+// ---------------------------------------------------------------------
+
+/// F4 from a panel: the external editor takes precedence when configured
+/// (builtin-editor "External editor takes precedence") — reusing
+/// `handle_request_external_editor`'s own entry/directory resolution rather
+/// than duplicating it. Otherwise, on a file (not `..`, not a directory),
+/// kick off the size-gated open; the size cap itself is enforced by
+/// `EditorState::open` on the TUI side once `Effect::OpenEditor` runs
+/// (builtin-editor "Editor invocation and size cap").
+fn handle_request_editor(state: &mut State) -> Vec<Effect> {
+    if state.editor.is_some() {
+        return handle_request_external_editor(state);
+    }
+    let side = state.active;
+    let panel = state.panel(side);
+    let Some(entry) = panel.selected() else { return vec![] };
+    if entry.is_dir_like() {
+        return vec![];
+    }
+    let path = panel.cwd.join(&entry.name);
+    state.panel_mut(side).last_error = None;
+    vec![Effect::OpenEditor { path }]
+}
+
+/// The editor body's visible row count for a given terminal height: the
+/// header and F-key bar each reserve one row, exactly like the viewer's
+/// `body_rows` (kept as a one-line duplicate here rather than a cross-crate
+/// dependency, since `core::update` needs it for `ensure_caret_visible` and
+/// cannot depend on `filecommand-tui`).
+fn editor_viewport(term_size: (u16, u16)) -> (usize, usize) {
+    (term_size.1.saturating_sub(2).max(1) as usize, term_size.0.max(1) as usize)
+}
+
+/// Drive every command while the editor is open (gated in [`update`] by
+/// `UiPhase::Editor`). Saving is the one operation here that needs I/O
+/// (`EditorState::save` writes to disk), so it is dispatched as
+/// `Effect::SaveEditor` and applied only once `Command::EditorSaved`/
+/// `EditorSaveFailed` reply — mirroring how `handle_viewer` defers the
+/// viewer's own I/O to effects and re-enters through their replies (design
+/// D1/D2).
+fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let UiPhase::Editor(mut editor) = std::mem::replace(&mut state.phase, UiPhase::Panels) else {
+        unreachable!("handle_editor only called when phase is Editor");
+    };
+    let (rows, cols) = editor_viewport(state.term_size);
+    match cmd {
+        Command::EditorChar(c) => editor.type_char(c),
+        Command::EditorNewline => editor.insert_newline(),
+        Command::EditorBackspace => editor.backspace(),
+        Command::EditorMove(m) => match m {
+            EditorMove::Left => editor.move_left(),
+            EditorMove::Right => editor.move_right(),
+            EditorMove::Up => editor.move_up(),
+            EditorMove::Down => editor.move_down(),
+            EditorMove::Home => editor.move_home(),
+            EditorMove::End => editor.move_end(),
+            EditorMove::PageUp(rows) => editor.move_page_up(rows),
+            EditorMove::PageDown(rows) => editor.move_page_down(rows),
+        },
+        Command::EditorToggleMode => editor.toggle_mode(),
+        Command::EditorMark => editor.start_mark(),
+        Command::EditorCut => editor.cut_selection(),
+        Command::EditorCopy => editor.copy_selection(),
+        Command::EditorPaste => editor.paste(),
+        Command::EditorUndo => editor.undo(),
+
+        Command::EditorSearchStart => editor.search_prompt = Some(String::new()),
+        Command::EditorSearchChar(c) => {
+            if let Some(p) = &mut editor.search_prompt {
+                p.push(c);
+            }
+        }
+        Command::EditorSearchBackspace => {
+            if let Some(p) = &mut editor.search_prompt {
+                p.pop();
+            }
+        }
+        Command::EditorSearchCancel => editor.search_prompt = None,
+        Command::EditorSearchConfirm => {
+            if let Some(pattern) = editor.search_prompt.take() {
+                if !pattern.is_empty() {
+                    editor.find_next(&pattern);
+                }
+            }
+        }
+
+        Command::EditorReplaceStart => editor.replace_prompt = Some(ReplacePrompt::Pattern(String::new())),
+        Command::EditorReplaceChar(c) => {
+            if let Some(prompt) = &mut editor.replace_prompt {
+                match prompt {
+                    ReplacePrompt::Pattern(p) => p.push(c),
+                    ReplacePrompt::Replacement { replacement, .. } => replacement.push(c),
+                }
+            }
+        }
+        Command::EditorReplaceBackspace => {
+            if let Some(prompt) = &mut editor.replace_prompt {
+                match prompt {
+                    ReplacePrompt::Pattern(p) => {
+                        p.pop();
+                    }
+                    ReplacePrompt::Replacement { replacement, .. } => {
+                        replacement.pop();
+                    }
+                }
+            }
+        }
+        Command::EditorReplaceCancel => editor.replace_prompt = None,
+        // Enter: the pattern stage advances to the replacement stage (an
+        // empty pattern instead cancels the prompt outright — nothing to
+        // search for); the replacement stage performs the replacement
+        // (builtin-editor "Replace substitutes a match").
+        Command::EditorReplaceConfirm => {
+            if let Some(prompt) = editor.replace_prompt.take() {
+                match prompt {
+                    ReplacePrompt::Pattern(pattern) if !pattern.is_empty() => {
+                        editor.replace_prompt = Some(ReplacePrompt::Replacement { pattern, replacement: String::new() });
+                    }
+                    ReplacePrompt::Pattern(_) => {}
+                    ReplacePrompt::Replacement { pattern, replacement } => {
+                        editor.replace_first(&pattern, &replacement);
+                    }
+                }
+            }
+        }
+
+        Command::EditorSave => {
+            effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: false });
+        }
+        Command::EditorSaved { editor: saved, then_quit } => {
+            if then_quit {
+                // Phase was already reset to `Panels` by the `mem::replace`
+                // above; leaving it as-is is the exit.
+                return effects;
+            }
+            editor = *saved;
+            editor.quit_confirm = false;
+        }
+        Command::EditorSaveFailed { message } => {
+            editor.save_error = Some(message);
+            editor.quit_confirm = false;
+        }
+
+        Command::EditorRequestQuit => {
+            if editor.is_modified() {
+                editor.quit_confirm = true;
+            } else {
+                // Unmodified: exits directly (builtin-editor "Quitting an
+                // unmodified buffer exits directly") — phase stays `Panels`.
+                return effects;
+            }
+        }
+        Command::EditorConfirmQuitSave => {
+            effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: true });
+        }
+        Command::EditorConfirmQuitDiscard => return effects,
+        Command::EditorCancelQuit => editor.quit_confirm = false,
+
+        _ => {}
+    }
+    editor.ensure_caret_visible(rows, cols);
+    state.phase = UiPhase::Editor(editor);
+    effects
+}
+
+// ---------------------------------------------------------------------
 // Drive select
 // ---------------------------------------------------------------------
 
@@ -994,6 +1564,8 @@ fn handle_menu(state: &mut State, cmd: Command) -> Option<Command> {
 pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Command> {
     match action {
         MenuAction::ToggleInfoMode => Some(Command::ToggleInfoMode(side)),
+        MenuAction::SetDisplayMode(mode) => Some(Command::SetDisplayMode { side, mode }),
+        MenuAction::EnterTree => Some(Command::EnterTreeMode(side)),
         MenuAction::SortBy(mode) => Some(Command::SetSortMode { side, mode }),
         MenuAction::Reread => Some(Command::RereadPanel(side)),
         MenuAction::DriveSelect => Some(Command::OpenDriveSelect(side)),
@@ -1005,6 +1577,8 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::DeselectGroup => Some(Command::GroupDeselectAll),
         MenuAction::InvertSelection => Some(Command::InvertSelection),
         MenuAction::PanelsOnOff => Some(Command::ShowScrollback),
+        MenuAction::FindFile => Some(Command::FindFileOpen),
+        MenuAction::FuzzyJump => Some(Command::FuzzyJumpOpen),
         MenuAction::Quit => Some(Command::RequestQuit),
         MenuAction::Unimplemented => None,
     }
@@ -1265,6 +1839,9 @@ fn handle_enter(state: &mut State) -> Vec<Effect> {
         return run_command_line(state);
     }
     let side = state.active;
+    if state.panel(side).display_mode == DisplayMode::Tree {
+        return handle_tree_enter(state, side);
+    }
     let Some(entry) = state.panel(side).selected() else { return vec![] };
     match entry.kind {
         EntryKind::File => {
@@ -1292,7 +1869,253 @@ fn handle_parent(state: &mut State, side: PanelSide) -> Vec<Effect> {
     }
 }
 
+// ---------------------------------------------------------------------
+// Tree display mode (M5, design D7)
+// ---------------------------------------------------------------------
+
+/// Enter Tree mode on `side`: record the panel's current display mode so
+/// Enter can restore it, root the tree at the panel's drive, and kick off
+/// the drive root's immediate-children read — the only I/O Tree mode
+/// performs up front (additional-panel-modes "No up-front full-drive
+/// scan").
+fn enter_tree_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let panel = state.panel(side);
+    let prior_mode = panel.display_mode;
+    let letter = drives::drive_letter_of(&panel.cwd).unwrap_or('C');
+    let root = drives::drive_root(letter);
+    let p = state.panel_mut(side);
+    p.display_mode = DisplayMode::Tree;
+    p.tree = Some(TreeState::new(root.clone(), prior_mode));
+    // Same reasoning as `SetDisplayMode`: a quick filter narrowing the
+    // prior list mode has no meaning in Tree mode and must not linger
+    // invisibly (quick-filter "Substring narrowing as the pattern is
+    // typed").
+    p.clear_quick_filter();
+    vec![Effect::ExpandTreeNode { panel: side, path: root }]
+}
+
+/// Move `side`'s tree cursor, then re-list the opposite panel at whatever
+/// directory is now highlighted (additional-panel-modes "Tree mode drives
+/// the opposite panel"), expanding the newly highlighted node if it hasn't
+/// been already (additional-panel-modes "Children read on expand").
+fn handle_tree_cursor_move(state: &mut State, side: PanelSide, m: CursorMove) -> Vec<Effect> {
+    let (target, needs_expand) = {
+        let Some(tree) = state.panel_mut(side).tree.as_mut() else { return vec![] };
+        tree.move_cursor(m);
+        let Some(node) = tree.selected() else { return vec![] };
+        (node.path.clone(), !node.expanded)
+    };
+    let mut effects = begin_listing_inner(state, side.toggle(), target.clone());
+    if needs_expand {
+        effects.push(Effect::ExpandTreeNode { panel: side, path: target });
+    }
+    effects
+}
+
+/// Enter on a tree node: leave Tree mode, restoring the panel's prior
+/// display mode, and navigate this panel (not the opposite one) to the
+/// highlighted directory (additional-panel-modes "Enter returns to prior
+/// list mode at chosen directory").
+fn handle_tree_enter(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let Some(tree) = &state.panel(side).tree else { return vec![] };
+    let Some(node) = tree.selected() else { return vec![] };
+    let target = node.path.clone();
+    let prior_mode = tree.prior_mode;
+    let p = state.panel_mut(side);
+    p.tree = None;
+    p.display_mode = prior_mode;
+    begin_listing(state, side, target)
+}
+
+// ---------------------------------------------------------------------
+// Ctrl+J fuzzy jump (M5)
+// ---------------------------------------------------------------------
+
+fn is_fuzzy_jump_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::FuzzyJumpChar(_) | Command::FuzzyJumpBackspace | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel
+    )
+}
+
+/// Drive the fuzzy-jump dialog (gated in [`update`] by `state.fuzzy_jump`).
+/// The ranked/filtered list itself is never stored on the dialog — it is
+/// recomputed from `state.dir_history` each time via
+/// [`quicksearch::rank_directories`], which is why every arm re-derives it
+/// rather than caching (fuzzy-jump "Fuzzy matching of visited directories",
+/// "Frecency ranking").
+fn handle_fuzzy_jump(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.fuzzy_jump.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::FuzzyJumpChar(c) => state.fuzzy_jump.as_mut().unwrap().push(c),
+        Command::FuzzyJumpBackspace => state.fuzzy_jump.as_mut().unwrap().backspace(),
+        Command::FuzzyJumpMove(delta) => {
+            let pattern = state.fuzzy_jump.as_ref().unwrap().pattern.clone();
+            let len = quicksearch::rank_directories(&state.dir_history, &pattern, state.clock_ms).len();
+            state.fuzzy_jump.as_mut().unwrap().move_cursor(delta, len);
+        }
+        Command::FuzzyJumpCancel => state.fuzzy_jump = None,
+        Command::FuzzyJumpConfirm => {
+            let fj = state.fuzzy_jump.take().unwrap();
+            let ranked = quicksearch::rank_directories(&state.dir_history, &fj.pattern, state.clock_ms);
+            if let Some(path) = ranked.get(fj.cursor).map(|e| e.path.clone()) {
+                let side = state.active;
+                return begin_listing(state, side, path);
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// Alt+F7 find file (M5)
+// ---------------------------------------------------------------------
+
+fn is_find_file_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::FindFileChar(_)
+            | Command::FindFileBackspace
+            | Command::FindFileSubmit
+            | Command::FindFileMatch { .. }
+            | Command::FindFileSearchDone { .. }
+            | Command::FindFileMove(_)
+            | Command::FindFileConfirm
+            | Command::FindFileCancel
+    )
+}
+
+/// Drive the find-file dialog (gated in [`update`] by `state.find_file`).
+fn handle_find_file(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.find_file.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::FindFileChar(c) => state.find_file.as_mut().unwrap().push(c),
+        Command::FindFileBackspace => state.find_file.as_mut().unwrap().backspace(),
+        Command::FindFileSubmit => {
+            let request = state.next_request_id();
+            let ff = state.find_file.as_mut().unwrap();
+            ff.submit(request);
+            let root = ff.root.clone();
+            let pattern = ff.pattern.clone();
+            return vec![Effect::FindInSubtree { root, pattern, request }];
+        }
+        Command::FindFileMatch { request, m } => state.find_file.as_mut().unwrap().push_match(request, m),
+        Command::FindFileSearchDone { request } => state.find_file.as_mut().unwrap().mark_done(request),
+        Command::FindFileMove(delta) => state.find_file.as_mut().unwrap().move_cursor(delta),
+        // Dismissing abandons any in-progress search: the walk itself has
+        // no cancel signal (like `git_info::query`, it simply finishes and
+        // its late `FindFileMatch`/`FindFileSearchDone` replies find
+        // `state.find_file` already `None` and are silently dropped by the
+        // `state.find_file.is_some()` gate in `update`) (find-file "Esc
+        // cancels").
+        Command::FindFileCancel => state.find_file = None,
+        Command::FindFileConfirm => {
+            let ff = state.find_file.take().unwrap();
+            let Some(m) = ff.selected().cloned() else { return vec![] };
+            let target_dir = match m.relative_path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => ff.root.join(parent),
+                _ => ff.root.clone(),
+            };
+            let side = state.active;
+            let effects = begin_listing(state, side, target_dir);
+            state.panel_mut(side).pending_cursor_target = Some(m.entry.name);
+            return effects;
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// F2 user menu (M5)
+// ---------------------------------------------------------------------
+
+fn is_user_menu_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::UserMenuMove(_) | Command::UserMenuConfirm | Command::UserMenuCancel)
+}
+
+/// Drive the F2 user menu (gated in [`update`] by `state.user_menu`).
+/// Entries themselves live in `state.user_menu_entries`, loaded once at
+/// startup — the menu overlay only tracks the cursor (user-menu "Open the
+/// F2 user menu", "Navigate and dismiss the user menu").
+fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.user_menu.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::UserMenuMove(delta) => {
+            let len = state.user_menu_entries.len();
+            state.user_menu.as_mut().unwrap().move_cursor(delta, len);
+        }
+        Command::UserMenuCancel => state.user_menu = None,
+        Command::UserMenuConfirm => {
+            let menu = state.user_menu.take().unwrap();
+            if let Some(entry) = state.user_menu_entries.get(menu.cursor).cloned() {
+                let side = state.active;
+                let cwd = state.panel(side).cwd.clone();
+                return vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &entry.command, &cwd), side)];
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// F1 Help window + About dialog (M5)
+// ---------------------------------------------------------------------
+
+fn is_help_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::HelpMove(_) | Command::HelpActivate | Command::HelpCancel)
+}
+
+/// Drive the F1 Help window (gated in [`update`] by `state.help`).
+fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.help.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::HelpMove(delta) => {
+            let visible = crate::dialogs::help_topic_visible_rows(crate::dialogs::help_window_height(state.term_size.1));
+            state.help.as_mut().unwrap().move_cursor(delta, visible);
+        }
+        Command::HelpActivate => state.help.as_mut().unwrap().activate(),
+        Command::HelpCancel => {
+            let mut h = state.help.take().unwrap();
+            // `back` returns `true` when it stepped down one level (About
+            // -> list, or page -> list) rather than closing the window
+            // outright; only then is the window kept open.
+            if h.back() {
+                state.help = Some(h);
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+/// The choke point every deliberate navigation of `side`'s directory flows
+/// through — Enter into a directory, `..`, a typed `cd`, drive select,
+/// Tree's own Enter-to-return, and the M5 fuzzy-jump/find-file dialogs — so
+/// it is also where the Ctrl+J frecency history is recorded and persisted
+/// (fuzzy-jump "Navigation records history"; design D6). Tree's cursor-move
+/// preview of the *opposite* panel deliberately bypasses this (via
+/// [`begin_listing_inner`] directly) since that is the tree being browsed,
+/// not "the user navigating the active panel into a directory" the
+/// fuzzy-jump requirement describes.
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
+    quicksearch::record_visit(&mut state.dir_history, &path, state.clock_ms);
+    let mut effects = begin_listing_inner(state, side, path);
+    effects.push(Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }));
+    effects
+}
+
+fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     state.panel_mut(side).begin_new_listing(path.clone());
     let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
     // A panel sitting in Info mode needs its drive/directory figures
@@ -1303,9 +2126,23 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
     if state.panel(side).display_mode == DisplayMode::Info {
         let request = state.next_request_id();
         state.panel_mut(side).info_request = Some(request);
-        effects.push(Effect::QueryInfo { panel: side, path, request });
+        effects.push(Effect::QueryInfo { panel: side, path: path.clone(), request });
     }
+    // Every navigation (and re-read) re-issues the git-info query for
+    // wherever the panel just landed, regardless of display mode — the
+    // branch suffix and marker column are independent of Info mode (git-info
+    // "Query re-issued on navigation").
+    effects.push(git_info_query_effect(state, side, path));
     effects
+}
+
+/// Mint a fresh generation id, record it as `side`'s outstanding git-info
+/// request, and build the effect that runs the query on a worker thread
+/// (git-info "Background repository detection"; design D3).
+fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> Effect {
+    let request = state.next_request_id();
+    state.panel_mut(side).git_request = Some(request);
+    Effect::QueryGitInfo { panel: side, path, request }
 }
 
 fn apply_listing_event(state: &mut State, cmd: Command) {
@@ -1324,6 +2161,17 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             p.progress = crate::panel::ListingProgress::Complete { count: total };
             p.clamp_cursor();
             p.reconcile_selection();
+            // A find-file navigation seeds this with the matched entry's
+            // name (`update::handle_find_file`'s `FindFileConfirm`); once
+            // this directory's listing has actually landed, settle the
+            // cursor on it (find-file "Navigate to a chosen result" —
+            // "cursor positioned on the matched entry").
+            if let Some(name) = p.pending_cursor_target.take() {
+                if let Some(idx) = p.entries.iter().position(|e| e.name == name) {
+                    p.cursor = idx;
+                    p.cursor_user_moved = true;
+                }
+            }
         }
         Command::ListingFailed { panel, message } => {
             let p = state.panel_mut(panel);

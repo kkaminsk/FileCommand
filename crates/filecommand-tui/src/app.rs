@@ -12,6 +12,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
+use filecommand_core::editor::{EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
@@ -63,7 +64,11 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
-    state.history = config::load_history(Path::new(config::HISTORY_FILE));
+    let history_file = config::load_history_file(Path::new(config::HISTORY_FILE));
+    state.history = history_file.commands;
+    state.dir_history = history_file.directories;
+    let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
+    apply_user_menu(&mut state, user_menu);
 
     let (tx, rx) = mpsc::channel::<Command>();
     let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), viewer_source: None };
@@ -87,6 +92,10 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                             let source = rt.viewer_source.as_ref().map(|(_, s)| s);
                             input::map_viewer_key(key, viewer, rows_visible)
                                 .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
+                        }
+                        UiPhase::Editor(editor) => {
+                            let rows_visible = views::editor::body_rows(state.term_size.1);
+                            input::map_editor_key(key, editor, rows_visible)
                         }
                         _ => {
                             let page_size = layout::compute(state.term_size).entries_visible;
@@ -145,6 +154,21 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 fn apply_config(state: &mut State, config: &config::Config) {
     state.shell = ShellConfig::from_env(config.shell.clone());
     state.editor = config.editor.clone();
+}
+
+/// Snapshot the F2 user menu into `State` at startup, factored out of `run`
+/// for the same reason as `apply_config` — testable without a real
+/// terminal. On a malformed `usermenu.toml`, `config::load_user_menu` has
+/// already fallen back to default entries in memory without touching the
+/// file; this raises the spec-required dismissable startup-warning dialog
+/// (`state.startup_warning`) rather than a panel mini-status, since the
+/// warning concerns the whole session, not either panel specifically
+/// (user-menu "Malformed file warns and falls back without overwriting").
+fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
+    state.user_menu_entries = user_menu.entries;
+    if user_menu.malformed {
+        state.startup_warning = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+    }
 }
 
 /// Resolve a viewer key's meaning into a core `Command`. Simple toggles pass
@@ -292,10 +316,10 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 let _ = rt.tx.send(Command::RereadPanel(side));
             }
             Effect::ShowScrollback => show_scrollback(guard)?,
-            Effect::PersistHistory(entries) => {
+            Effect::PersistHistory(file) => {
                 // A history write failing (read-only directory, full disk)
                 // must never take the session down with it.
-                let _ = config::save_history_atomic(&rt.history_path, &entries);
+                let _ = config::save_history_file_atomic(&rt.history_path, &file);
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -305,6 +329,8 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
+            Effect::QueryGitInfo { panel, path, request } => worker::spawn_git_info_query(panel, path, request, rt.tx.clone()),
+            Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone()),
             Effect::OpenViewer { path } => match ByteSource::open(&path) {
                 Ok(source) => {
                     // O(1): opening/mapping touches only the handle and its
@@ -334,6 +360,35 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
                 }
             },
+            Effect::OpenEditor { path } => match EditorState::open(&path) {
+                // Synchronous, like `Effect::OpenViewer`: the whole read is
+                // bounded by the 10 MB cap, so this is cheap enough for the
+                // input path rather than warranting a worker thread (design
+                // D1).
+                Ok(EditorLoadResult::Loaded(editor)) => {
+                    let _ = rt.tx.send(Command::EditorOpened(Box::new(editor)));
+                }
+                Ok(EditorLoadResult::TooLarge { size }) => {
+                    let _ = rt.tx.send(Command::EditorTooLarge { path, size });
+                }
+                Err(e) => {
+                    let _ = rt.tx.send(Command::EditorOpenFailed { message: e.to_string() });
+                }
+            },
+            Effect::FindInSubtree { root, pattern, request } => {
+                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone());
+            }
+            Effect::SaveEditor { editor, then_quit } => {
+                let mut editor = *editor;
+                match editor.save() {
+                    Ok(()) => {
+                        let _ = rt.tx.send(Command::EditorSaved { editor: Box::new(editor), then_quit });
+                    }
+                    Err(e) => {
+                        let _ = rt.tx.send(Command::EditorSaveFailed { message: e.to_string() });
+                    }
+                }
+            }
         }
     }
     Ok(quit)
@@ -445,7 +500,16 @@ fn draw(
     guard.terminal.draw(|frame| {
         let area = frame.area();
         let depth = ColorDepth::Ansi16;
-        views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
+        // `views::render` takes `frame.buffer_mut()`, a mutable borrow that
+        // ends when the call returns — only then can `frame.set_cursor_position`
+        // borrow `frame` again, which is why the cursor position travels
+        // back as a return value instead of being set from inside `render`
+        // itself (builtin-editor "Full-screen editor chrome" — caret as the
+        // terminal cursor).
+        let cursor = views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
+        if let Some((x, y)) = cursor {
+            frame.set_cursor_position((x, y));
+        }
     })?;
     Ok(())
 }
@@ -491,6 +555,43 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
+    }
+
+    /// Regression test for the M5 review finding: a malformed
+    /// `usermenu.toml` used to only set the left panel's inline
+    /// `last_error` (with a comment noting there was no startup-warning
+    /// dialog); the spec requires a dismissable modal instead. Verifies
+    /// `apply_user_menu` raises `state.startup_warning`, falls back to
+    /// default entries, and never touches either panel's `last_error`.
+    #[test]
+    fn apply_user_menu_raises_the_startup_warning_dialog_on_malformed_content() {
+        let mut state = State::empty(Theme::classic());
+        let default_entries = config::default_user_menu_entries();
+        let malformed = config::UserMenuLoadResult {
+            entries: default_entries.clone(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+        };
+        apply_user_menu(&mut state, malformed);
+        assert_eq!(state.user_menu_entries, default_entries, "falls back to default entries");
+        assert!(
+            state.startup_warning.as_deref().is_some_and(|m| m.contains(config::USERMENU_FILE)),
+            "expected a startup warning naming the malformed file: {:?}",
+            state.startup_warning
+        );
+        assert_eq!(state.left.last_error, None, "the warning is a dedicated modal, not a panel mini-status");
+        assert_eq!(state.right.last_error, None);
+    }
+
+    #[test]
+    fn apply_user_menu_does_not_warn_on_well_formed_content() {
+        let mut state = State::empty(Theme::classic());
+        let entries = config::default_user_menu_entries();
+        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false };
+        apply_user_menu(&mut state, ok);
+        assert_eq!(state.user_menu_entries, entries);
+        assert_eq!(state.startup_warning, None);
     }
 
     #[test]

@@ -11,10 +11,12 @@ use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
 use filecommand_core::drives::DriveSelect;
+use filecommand_core::editor::EditorState;
+use filecommand_core::git_info::{FileStatus, GitInfo};
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
 use filecommand_core::menu::{MenuId, MenuState};
-use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection};
+use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
 use filecommand_core::{PanelSide, State, UiPhase};
@@ -472,4 +474,568 @@ fn viewer_replaces_the_panels_full_screen() {
     let text = render_viewer_to_text(80, 24, &state, Some(&source));
     assert!(!text.contains('\u{2554}'), "no panel border while the viewer is open:\n{text}");
     assert!(text.contains("sample.txt"), "the header shows the open file:\n{text}");
+}
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+fn editor_state(editor: EditorState) -> State {
+    State { phase: UiPhase::Editor(editor), ..State::empty(Theme::classic()) }
+}
+
+#[test]
+fn snapshot_editor_chrome_unmodified() {
+    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    insta::assert_snapshot!("editor_chrome_unmodified", text);
+}
+
+#[test]
+fn snapshot_editor_header_position_and_modified_indicator() {
+    // 440 lines ("line one".."line 440") plus a trailing empty line from the
+    // final newline (matching how `logical_lines`/`from_bytes` model every
+    // other file in this codebase), caret on line 12 column 8 (both
+    // 1-based, matching the spec's header example), buffer modified.
+    let content: String = (1..=440).map(|i| format!("line {i}\n")).collect();
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes());
+    editor.caret.line = 11;
+    editor.caret.col = 7;
+    editor.type_char('!');
+    editor.caret.line = 11;
+    editor.caret.col = 7;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("Edit: C:\\big.txt *"), "`{header}`");
+    assert!(header.contains("Line 12/441   Col 8"), "`{header}`");
+    insta::assert_snapshot!("editor_header_position_and_modified", header);
+}
+
+#[test]
+fn snapshot_editor_overwrite_indicator() {
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    editor.toggle_mode();
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let header = text.lines().next().unwrap();
+    assert!(header.trim_end().ends_with("Ovr"), "`{header}`");
+    insta::assert_snapshot!("editor_overwrite_indicator", header);
+}
+
+#[test]
+fn snapshot_editor_keybar() {
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let last = text.lines().last().unwrap();
+    assert!(last.trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "`{last}`");
+    insta::assert_snapshot!("editor_keybar", last);
+}
+
+#[test]
+fn snapshot_editor_marked_selection() {
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n");
+    editor.start_mark();
+    editor.move_down();
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    insta::assert_snapshot!("editor_marked_selection", text);
+}
+
+#[test]
+fn snapshot_editor_save_on_exit_confirm() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n");
+    editor.type_char('!');
+    editor.quit_confirm = true;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Save changes to notes.txt?"), "{text}");
+    insta::assert_snapshot!("editor_save_on_exit_confirm", text);
+}
+
+#[test]
+fn editor_replaces_the_panels_full_screen() {
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!text.contains('\u{2554}'), "no panel border while the editor is open:\n{text}");
+    assert!(text.contains("f.txt"), "the header shows the open file:\n{text}");
+}
+
+// ---------------------------------------------------------------------
+// M5: panel tabs — tab strip
+// ---------------------------------------------------------------------
+
+fn panel_with_tabs(cwds: &[&str]) -> PanelState {
+    let mut panel = complete_panel(cwds[0], 0);
+    for cwd in &cwds[1..] {
+        panel.open_tab();
+        panel.begin_new_listing(PathBuf::from(cwd));
+        panel.entries = fixed_entries();
+        panel.progress = ListingProgress::Complete { count: panel.entries.len() };
+    }
+    panel.switch_tab(1);
+    panel
+}
+
+#[test]
+fn snapshot_tab_strip_hidden_with_a_single_tab() {
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    // The left panel's top border stays at row 0 — no strip row inserted.
+    assert!(text.lines().next().unwrap().starts_with('\u{2554}'), "{}", text.lines().next().unwrap());
+}
+
+#[test]
+fn snapshot_tab_strip_full_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\alpha", r"C:\beta"]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let strip_row = text.lines().nth(1).unwrap();
+    assert!(strip_row.contains("1:ALPHA"), "`{strip_row}`");
+    assert!(strip_row.contains("2:BETA"), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_full_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_body_shrinks_by_one_row() {
+    let one_tab = base_state(UiPhase::Panels, Theme::classic());
+    let one_tab_text = render_to_text(80, 24, &one_tab, ColorDepth::Ansi16);
+    let mut two_tabs = base_state(UiPhase::Panels, Theme::classic());
+    two_tabs.left = panel_with_tabs(&[r"C:\alpha", r"C:\beta"]);
+    let two_tabs_text = render_to_text(80, 24, &two_tabs, ColorDepth::Ansi16);
+    // Both variants fill the same 24 rows; the strip trades one entry row
+    // for itself rather than growing the panel (panel-tabs "Strip appears
+    // and reclaims a row with two tabs").
+    assert_eq!(one_tab_text.lines().count(), two_tabs_text.lines().count());
+}
+
+/// The first `width` *characters* (not bytes — a tab-strip row can contain
+/// multi-byte box-drawing glyphs) of a rendered row, isolating the left
+/// panel's half of a two-panel row.
+fn left_half(row: &str, width: usize) -> String {
+    row.chars().take(width).collect()
+}
+
+#[test]
+fn snapshot_tab_strip_truncated_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\b"]);
+    let l = filecommand_tui::layout::compute((26, 24));
+    let text = render_to_text(26, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(strip_row.contains('\u{2026}'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_truncated_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_number_only_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\other"]);
+    let l = filecommand_tui::layout::compute((14, 24));
+    let text = render_to_text(14, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(!strip_row.contains(':'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_number_only_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_scrolled_with_overflow_markers() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let cwds: Vec<String> = (1..=12).map(|i| format!(r"C:\dir{i}")).collect();
+    let cwd_refs: Vec<&str> = cwds.iter().map(String::as_str).collect();
+    state.left = panel_with_tabs(&cwd_refs);
+    state.left.switch_tab(6); // land somewhere in the middle
+    let l = filecommand_tui::layout::compute((30, 24));
+    let text = render_to_text(30, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(strip_row.contains('\u{25C4}') || strip_row.contains('\u{25BA}'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_scrolled_with_markers", strip_row);
+}
+
+// ---------------------------------------------------------------------
+// M5: Brief, Tree, Quick View panel modes; git branch suffix + marker
+// column (additional-panel-modes; git-info)
+// ---------------------------------------------------------------------
+
+#[test]
+fn snapshot_brief_mode_three_name_columns() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut panel = complete_panel(r"C:\Users\demo\left", 0);
+    panel.display_mode = DisplayMode::Brief;
+    panel.entries = std::iter::once(Entry::parent_dir())
+        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None }))
+        .collect();
+    state.left = panel;
+    // A short panel (6 body rows, after the command line and F-key bar
+    // reserve their own rows) so the 9 entries visibly wrap into a second
+    // column rather than all fitting in one (additional-panel-modes "Brief
+    // mode renders three name-only columns").
+    let l = filecommand_tui::layout::compute((80, 10));
+    let text = render_to_text(80, 10, &state, ColorDepth::Ansi16);
+    let first_body_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(!first_body_row.contains("Size"), "Brief mode has no Size/Date/Time header: `{first_body_row}`");
+    assert!(first_body_row.contains("\u{25B6}UP--DIR\u{25C4}"), "`{first_body_row}`");
+    assert!(first_body_row.contains("f5.txt"), "the 7th entry wraps into the second column, on the same row: `{first_body_row}`");
+    insta::assert_snapshot!("brief_mode_three_columns", text);
+}
+
+fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
+    let mut panel = complete_panel(r"C:\Users\demo\left", 0);
+    let mut tree = TreeState::new(PathBuf::from(r"C:\"), prior_mode);
+    tree.insert_children(
+        &PathBuf::from(r"C:\"),
+        vec![
+            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None },
+            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None },
+        ],
+    );
+    tree.cursor = cursor;
+    panel.display_mode = DisplayMode::Tree;
+    panel.tree = Some(tree);
+    panel
+}
+
+#[test]
+fn snapshot_tree_mode_header_root_and_branch_glyphs() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = tree_panel(DisplayMode::Full, 2); // highlight "Beta"
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let l = filecommand_tui::layout::compute((80, 24));
+
+    let header_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(header_row.contains("Tree"), "`{header_row}`");
+
+    let root_row = left_half(text.lines().nth(2).unwrap(), l.left.width as usize);
+    assert!(root_row.contains(r"C:\"), "`{root_row}`");
+
+    assert!(text.contains("ALPHA"), "{text}");
+    assert!(text.contains("BETA"), "{text}");
+    assert!(text.contains('\u{251C}') || text.contains('\u{2514}'), "branch glyphs present:\n{text}");
+
+    let bottom_row = text.lines().nth(l.left.height as usize - 1).unwrap();
+    assert!(bottom_row.contains(r"C:\Beta"), "mini-status shows the highlighted directory's full path: `{bottom_row}`");
+    insta::assert_snapshot!("tree_mode_branches", text);
+}
+
+fn temp_quick_view_file(name: &str, contents: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("filecommand-tui-quickview-snapshot-{}-{}", std::process::id(), name));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("preview.txt");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+fn quick_view_previews_the_opposite_cursor_file() {
+    // Not an `insta` snapshot: the real on-disk temp directory the preview
+    // file lives in (needed so `ByteSource::open` resolves) bakes the
+    // machine-specific temp path into the right panel's title, which would
+    // make a full-screen snapshot non-deterministic across machines/users.
+    // The behavior itself — wrap-on text-head preview, mini-status name +
+    // size — is still fully exercised via direct assertions.
+    let file_path = temp_quick_view_file("text", b"Hello from quick view\nsecond line\n");
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 0);
+    left.display_mode = DisplayMode::QuickView;
+    state.left = left;
+
+    let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
+    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None }];
+    right.progress = ListingProgress::Complete { count: 1 };
+    right.cursor = 0;
+    state.right = right;
+
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    assert!(top.contains("Quick view"), "`{top}`");
+    assert!(text.contains("Hello from quick view"), "the previewed file's head is rendered like the viewer's text mode:\n{text}");
+    assert!(text.contains("second line"), "{text}");
+    let bottom_row = text.lines().nth(21).unwrap();
+    assert!(bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'), "mini-status shows the previewed file's name and size: `{bottom_row}`");
+}
+
+#[test]
+fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 0);
+    left.display_mode = DisplayMode::QuickView;
+    state.left = left;
+
+    let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
+    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None }];
+    right.progress = ListingProgress::Complete { count: 1 };
+    right.cursor = 0;
+    state.right = right;
+
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("\u{25B6}SUB-DIR\u{25C4}"), "{text}");
+    insta::assert_snapshot!("quick_view_sub_dir_indicator", text);
+}
+
+#[test]
+fn snapshot_git_branch_suffix_and_marker_column() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 1);
+    left.git_info = GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([
+            (std::ffi::OsString::from("Cargo.toml"), FileStatus::Modified),
+            (std::ffi::OsString::from("readme.txt"), FileStatus::Untracked),
+        ]),
+    };
+    state.left = left;
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+
+    let top = text.lines().next().unwrap();
+    assert!(top.contains("(main)"), "branch suffix on the active panel's top border: `{top}`");
+
+    // Rows: 0 = top border, 1 = header, 2 = "..", 3 = "docs", 4 =
+    // "Cargo.toml", 5 = "readme.txt" — the marker cell is the column
+    // immediately after the left frame vertical.
+    let marker_col: Vec<char> = text.lines().skip(2).take(4).map(|line| line.chars().nth(1).unwrap()).collect();
+    assert_eq!(marker_col, vec![' ', ' ', 'M', '?'], "blank/blank/modified/untracked markers: {marker_col:?}");
+    insta::assert_snapshot!("git_branch_suffix_and_marker_column", text);
+}
+
+#[test]
+fn snapshot_git_info_absent_reserves_no_marker_column() {
+    // Outside a repository (the default `GitInfo::none()`), the layout must
+    // be pixel-identical to the pre-git-info M1-M4 rendering — no reserved
+    // blank column (git-info "Single-reflow appearance with nothing
+    // reserved while pending").
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let with_no_git = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let plain = render_to_text(80, 24, &base_state(UiPhase::Panels, Theme::classic()), ColorDepth::Ansi16);
+    assert_eq!(with_no_git, plain);
+    assert!(!with_no_git.lines().next().unwrap().contains('('), "no branch suffix outside a repo");
+}
+
+// ---------------------------------------------------------------------
+// M5: quick-filter/type-ahead mini-status, and the fuzzy-jump, find-file,
+// user-menu, and Help/About dialogs (§8; quick-filter, type-ahead-jump,
+// fuzzy-jump, find-file, user-menu, help-and-about)
+// ---------------------------------------------------------------------
+
+/// The active panel's mini-status row — its own bottom border, which for
+/// the standard 80x24 layout is screen row 21 (0-indexed): panels occupy
+/// rows 0..22 of the 24-row screen (`layout::compute` reserves the last 2
+/// for the command line + F-key bar).
+fn mini_status_row(text: &str) -> &str {
+    text.lines().nth(21).unwrap()
+}
+
+#[test]
+fn snapshot_quick_filter_mini_status_replaces_normal_content() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("rep".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("rep"), "`{row}`");
+    insta::assert_snapshot!("quick_filter_mini_status", row);
+}
+
+#[test]
+fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
+    // `fixed_entries()` is `..`, `docs`, `Cargo.toml`, `readme.txt`; "read"
+    // matches only `readme.txt`, so the narrowed body must show `..` and
+    // `readme.txt` and hide `docs`/`Cargo.toml`, contradicting the pre-fix
+    // behavior where every entry stayed visible and only the cursor moved
+    // (quick-filter "the panel body is narrowed to entries whose displayed
+    // name contains the pattern").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(left_half.contains(".."), "`..` must always stay visible: {left_half}");
+    assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
+    assert!(!left_half.contains("docs"), "a non-matching entry must be hidden: {left_half}");
+    assert!(!left_half.contains("Cargo.toml"), "a non-matching entry must be hidden: {left_half}");
+}
+
+#[test]
+fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let right_half: String = text.lines().map(|l| l.chars().skip(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(right_half.contains("docs"), "the opposite panel's body must stay unfiltered: {right_half}");
+    assert!(right_half.contains("Cargo.toml"), "the opposite panel's body must stay unfiltered: {right_half}");
+}
+
+#[test]
+fn quick_filter_narrows_the_brief_mode_body_to_matching_entries() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.display_mode = filecommand_core::panel::DisplayMode::Brief;
+    state.left.quick_filter = Some("read".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
+    assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
+    assert!(!left_half.contains("docs"), "a non-matching entry must be hidden in Brief mode too: {left_half}");
+    assert!(!left_half.contains("Cargo.toml"), "a non-matching entry must be hidden in Brief mode too: {left_half}");
+}
+
+#[test]
+fn snapshot_type_ahead_mini_status_replaces_normal_content() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.quick_search = Some("re".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("re"), "`{row}`");
+    insta::assert_snapshot!("type_ahead_mini_status", row);
+}
+
+#[test]
+fn type_ahead_mini_status_only_affects_the_active_panel() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.active = PanelSide::Left;
+    state.quick_search = Some("zz".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    // Row 21's left half is the active (left) panel's mini-status; its
+    // right half belongs to the inactive right panel, which must show its
+    // ordinary status instead of the pattern.
+    let row = mini_status_row(&text);
+    let chars: Vec<char> = row.chars().collect();
+    let mid = chars.len() / 2;
+    let left_half: String = chars[..mid].iter().collect();
+    let right_half: String = chars[mid..].iter().collect();
+    assert!(left_half.contains("zz"));
+    assert!(!right_half.contains("zz"));
+}
+
+#[test]
+fn snapshot_fuzzy_jump_dialog() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.dir_history = vec![
+        filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Documents"), visit_count: 5, last_visited_ms: 1_000 },
+        filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Downloads"), visit_count: 1, last_visited_ms: 500 },
+    ];
+    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Fuzzy jump"));
+    assert!(text.contains("Documents") && text.contains("Downloads"));
+    insta::assert_snapshot!("fuzzy_jump_dialog", text);
+}
+
+#[test]
+fn snapshot_find_file_dialog_with_streamed_results() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
+    dialog.push('r');
+    dialog.push('e');
+    dialog.submit(1);
+    dialog.push_match(
+        1,
+        filecommand_core::listing::FindMatch {
+            relative_path: PathBuf::from(r"docs\readme.txt"),
+            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+        },
+    );
+    dialog.mark_done(1);
+    state.find_file = Some(dialog);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Find file"));
+    assert!(text.contains(r"docs\readme.txt"));
+    insta::assert_snapshot!("find_file_dialog_with_results", text);
+}
+
+#[test]
+fn snapshot_find_file_dialog_no_matches() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
+    dialog.push('z');
+    dialog.submit(1);
+    dialog.mark_done(1);
+    state.find_file = Some(dialog);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("No matches"));
+    insta::assert_snapshot!("find_file_dialog_no_matches", text);
+}
+
+#[test]
+fn snapshot_user_menu_dialog_with_entries() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.user_menu_entries = vec![
+        filecommand_core::config::UserMenuEntry { label: "Compress".to_string(), command: "7z a x.7z".to_string() },
+        filecommand_core::config::UserMenuEntry { label: "Backup".to_string(), command: r"robocopy . D:\backup /E".to_string() },
+        filecommand_core::config::UserMenuEntry { label: "Checksum".to_string(), command: "certutil -hashfile x SHA256".to_string() },
+    ];
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Compress") && text.contains("Backup") && text.contains("Checksum"));
+    assert!(!text.contains("robocopy"), "the command string is never shown, only the label");
+    insta::assert_snapshot!("user_menu_dialog_with_entries", text);
+}
+
+#[test]
+fn snapshot_user_menu_dialog_empty_state() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("no entries"));
+    insta::assert_snapshot!("user_menu_dialog_empty", text);
+}
+
+#[test]
+fn snapshot_help_window_topic_list() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Help"));
+    assert!(text.contains("About FileCommand"));
+    assert!(text.contains("FileCommand") && text.contains("Norton Commander"), "shared identity header");
+    insta::assert_snapshot!("help_window_topic_list", text);
+}
+
+#[test]
+fn snapshot_help_window_topic_page() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut help = filecommand_core::dialogs::HelpState::new();
+    help.page = Some(1); // Keyboard reference
+    state.help = Some(help);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("modifier variants"));
+    assert!(!text.contains("About FileCommand"), "the list is replaced by the page");
+    insta::assert_snapshot!("help_window_topic_page", text);
+}
+
+#[test]
+fn snapshot_about_dialog_over_help_window() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut help = filecommand_core::dialogs::HelpState::new();
+    help.about_open = true;
+    state.help = Some(help);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("License: MIT OR Apache-2.0"));
+    assert!(text.contains("OK"));
+    insta::assert_snapshot!("about_dialog_over_help_window", text);
+}
+
+#[test]
+fn snapshot_startup_warning_dialog_overlays_the_panels() {
+    // Regression: a malformed usermenu.toml must raise a dismissable modal
+    // warning dialog (not a panel mini-status) at startup (user-menu
+    // "Malformed file warns and falls back without overwriting").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Warning"));
+    assert!(text.contains("usermenu.toml is malformed"));
+    assert!(text.contains("Press any key to continue"));
+    insta::assert_snapshot!("startup_warning_dialog", text);
+}
+
+#[test]
+fn snapshot_startup_warning_dialog_overlays_the_splash_screen_too() {
+    // The warning is raised before the event loop starts, so it can coexist
+    // with the splash screen — it must still be visible on top of it rather
+    // than getting lost underneath.
+    let mut state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Warning"));
+    assert!(text.contains("usermenu.toml is malformed"));
 }

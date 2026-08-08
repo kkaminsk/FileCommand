@@ -11,6 +11,21 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The SPDX license expression, taken from the workspace `Cargo.toml` at
+/// compile time — the single source of truth the About dialog's `License:`
+/// line quotes verbatim (help-and-about "About dialog shows identity,
+/// license, and repository"; §10 license).
+pub fn license() -> &'static str {
+    env!("CARGO_PKG_LICENSE")
+}
+
+/// The project's repository URL, likewise taken from `Cargo.toml` at
+/// compile time (help-and-about "About dialog shows identity, license, and
+/// repository").
+pub fn repository_url() -> &'static str {
+    env!("CARGO_PKG_REPOSITORY")
+}
+
 /// "Version X.Y.Z"
 pub fn version_line() -> String {
     format!("Version {}", version())
@@ -44,6 +59,12 @@ mod tests {
     #[test]
     fn copyright_line_includes_year_and_authors() {
         assert_eq!(copyright_line(2026), "Copyright (C) 2026 The FileCommand Authors");
+    }
+
+    #[test]
+    fn license_and_repository_are_sourced_from_cargo_toml() {
+        assert_eq!(license(), env!("CARGO_PKG_LICENSE"));
+        assert!(!repository_url().is_empty());
     }
 
     #[test]

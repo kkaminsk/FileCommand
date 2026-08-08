@@ -303,8 +303,12 @@ fn read_text_window(source: &ByteSource, top_offset: u64, chunk_size: usize) -> 
     (window, read_start + start as u64)
 }
 
+/// `pub(crate)` rather than private: Quick View mode (additional-panel-
+/// modes "Quick View preview of the opposite panel cursor file"; design D7)
+/// reuses this exact renderer against a synthetic wrap-on `ViewerState`
+/// rather than duplicating the text-layout logic.
 #[allow(clippy::too_many_arguments)]
-fn render_text_body(
+pub(crate) fn render_text_body(
     buf: &mut Buffer,
     x: u16,
     body_y: u16,

@@ -1,0 +1,28 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+expression: text
+---
+ Edit: C:\notes.txt             Line 1/3   Col 1                             45 
+The quick brown fox                                                             
+jumps over the lazy dog.                                                        
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit

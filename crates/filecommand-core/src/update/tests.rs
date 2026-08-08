@@ -21,6 +21,17 @@ fn dir_entry(name: &str) -> Entry {
     Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
 }
 
+/// Every navigation/re-read now also issues `Effect::QueryGitInfo`
+/// alongside `Effect::StartListing` (git-info "Query re-issued on
+/// navigation"), and `Effect::PersistHistory` (fuzzy-jump "Navigation
+/// records history"; design D6). Tests that predate M5 and only care about
+/// the listing-related effects filter both out with this helper rather than
+/// asserting on request ids/frecency bookkeeping that are incidental to
+/// what they're testing.
+fn without_git_info_effects(effects: Vec<Effect>) -> Vec<Effect> {
+    effects.into_iter().filter(|e| !matches!(e, Effect::QueryGitInfo { .. } | Effect::PersistHistory(_))).collect()
+}
+
 // ---------------------------------------------------------------------
 // M1/M2 regression coverage
 // ---------------------------------------------------------------------
@@ -40,7 +51,7 @@ fn directory_read_returns_intent_effect_without_io() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
     // The panel's own entries were reset locally — no filesystem was touched.
     assert!(state.left.entries.is_empty());
     assert!(matches!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }));
@@ -75,7 +86,7 @@ fn enter_on_parent_dir_navigates_up_and_resets_cursor() {
     state.left.entries = vec![Entry::parent_dir()];
     state.left.cursor = 0;
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
     assert_eq!(state.left.cursor, 0);
 }
 
@@ -150,7 +161,7 @@ fn initial_builds_start_listing_effects_for_both_panels() {
     let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
     assert_eq!(
-        effects,
+        without_git_info_effects(effects),
         vec![
             Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/l") },
             Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/r") },
@@ -386,7 +397,7 @@ fn job_done_with_no_skips_rereads_matching_panels_and_returns_to_panels() {
     );
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(
-        effects,
+        without_git_info_effects(effects),
         vec![
             Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
             Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
@@ -409,7 +420,7 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
         Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
     );
     assert_eq!(state.phase, UiPhase::FileOpSummary(skipped));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
 
     let (state, _) = update(state, Command::FileOpConfirm);
     assert_eq!(state.phase, UiPhase::Panels);
@@ -432,7 +443,7 @@ fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
             dest_dir: PathBuf::from("/somewhere/else"),
         },
     );
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
 }
 
 #[test]
@@ -465,7 +476,7 @@ fn reread_reissues_start_listing_and_clears_the_error() {
     state.left.last_error = Some("boom".to_string());
     state.left.cwd = PathBuf::from("/left");
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
     assert!(state.left.last_error.is_none());
 }
 
@@ -554,16 +565,104 @@ fn leaving_quick_search_hands_printables_back_to_the_command_line() {
 }
 
 #[test]
-fn quick_search_backspace_shrinks_then_exits_the_mode() {
+fn quick_search_backspace_shrinks_and_stays_active_when_emptied() {
+    // type-ahead-jump "Backspace on a single-character pattern": the
+    // pattern becomes empty but type-ahead mode itself stays active (only
+    // Esc or a movement key exits it) and the cursor holds its position
+    // rather than re-jumping against an empty pattern.
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("alpha", 1)];
     let (state, _) = update(state, Command::QuickSearchStart('a'));
     let (state, _) = update(state, Command::QuickSearchChar('l'));
     assert_eq!(state.quick_search.as_deref(), Some("al"));
+    let cursor_before = state.left.cursor;
     let (state, _) = update(state, Command::QuickSearchBackspace);
     assert_eq!(state.quick_search.as_deref(), Some("a"));
     let (state, _) = update(state, Command::QuickSearchBackspace);
-    assert_eq!(state.quick_search, None);
+    assert_eq!(state.quick_search.as_deref(), Some(""), "type-ahead must remain active with an empty pattern");
+    assert_eq!(state.left.cursor, cursor_before, "the cursor must hold position rather than jump on an empty pattern");
+    let (state, _) = update(state, Command::QuickSearchEnd);
+    assert_eq!(state.quick_search, None, "Esc is still the way to actually exit type-ahead");
+}
+
+// ---------------------------------------------------------------------
+// Quick filter (Ctrl+P), reducer-level (task 15.2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn quick_filter_start_char_and_end_are_scoped_to_the_active_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+    state.right.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+
+    let (state, _) = update(state, Command::QuickFilterStart);
+    assert_eq!(state.left.quick_filter.as_deref(), Some(""));
+    assert_eq!(state.right.quick_filter, None, "the opposite panel must be unaffected");
+
+    let (state, _) = update(state, Command::QuickFilterChar('r'));
+    let (state, _) = update(state, Command::QuickFilterChar('e'));
+    let (state, _) = update(state, Command::QuickFilterChar('p'));
+    assert_eq!(state.left.quick_filter.as_deref(), Some("rep"));
+    let visible: Vec<String> = state.left.visible_indices().into_iter().map(|i| state.left.entries[i].name.to_string_lossy().into_owned()).collect();
+    assert_eq!(visible, vec!["report.txt"]);
+
+    let (state, _) = update(state, Command::QuickFilterBackspace);
+    assert_eq!(state.left.quick_filter.as_deref(), Some("re"));
+
+    let (state, _) = update(state, Command::QuickFilterEnd);
+    assert_eq!(state.left.quick_filter, None);
+}
+
+#[test]
+fn jump_to_prefix_only_lands_within_the_active_quick_filter() {
+    // Input routing normally keeps type-ahead and the quick filter mutually
+    // exclusive, but `jump_to_prefix` (backing `QuickSearchStart`/`Char`)
+    // must still be safe if both are ever active together: it must not
+    // land the cursor on an entry the filter hides. Both "beta" and
+    // "berry" start with "b", so an unfiltered type-ahead jump would land
+    // on "beta" (it comes first); the active filter "rr" hides "beta" but
+    // not "berry", so the filtered jump must land on "berry" instead.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("beta", 1), file_entry("berry", 2)];
+    state.left.quick_filter = Some("rr".to_string());
+    let (state, _) = update(state, Command::QuickSearchStart('b'));
+    assert_eq!(
+        state.left.entries[state.left.cursor].name.to_string_lossy(),
+        "berry",
+        "the jump must only search entries the active filter leaves visible"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Panel tabs (Ctrl+T / Ctrl+W / Alt+1..9), reducer-level (task 15.5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn tab_commands_are_scoped_to_the_active_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+
+    let (state, _) = update(state, Command::OpenTab);
+    assert_eq!(state.left.tab_count(), 2);
+    assert_eq!(state.right.tab_count(), 1, "the opposite panel's tabs must be untouched");
+
+    let (mut state, _) = update(state, Command::CloseTab);
+    assert_eq!(state.left.tab_count(), 1);
+
+    state.left.open_tab();
+    state.left.begin_new_listing(PathBuf::from("/left/other"));
+    let (state, _) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+}
+
+#[test]
+fn switch_tab_out_of_range_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    let before = state.right.cwd.clone();
+    let (state, _) = update(state, Command::SwitchTab(9));
+    assert_eq!(state.right.cwd, before);
+    assert_eq!(state.right.tab_count(), 1);
 }
 
 #[test]
@@ -621,11 +720,11 @@ fn running_a_command_records_history_clears_the_buffer_and_persists() {
     assert_eq!(state.prompt(), format!("{}>", PathBuf::from(r"C:\NORTON").display()));
 
     match effects.as_slice() {
-        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(entries)] => {
+        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(file)] => {
             assert_eq!(inv.cwd, PathBuf::from(r"C:\NORTON"));
             assert_eq!(inv.args.last().unwrap(), "dir");
             assert_eq!(*side, PanelSide::Left, "the command ran in the active panel, so that panel is re-read");
-            assert_eq!(entries, &vec!["dir".to_string()]);
+            assert_eq!(file.commands, vec!["dir".to_string()]);
         }
         other => panic!("expected a shell command plus a history write, got {other:?}"),
     }
@@ -651,7 +750,7 @@ fn enter_with_an_empty_buffer_still_navigates() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (_, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
 }
 
 #[test]
@@ -797,7 +896,7 @@ fn reread_preserves_the_sort_mode() {
     state.left.sort_mode = SortMode::Size;
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
     assert_eq!(state.left.sort_mode, SortMode::Size);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
     assert!(state.left.entries.is_empty(), "a re-read discards the current entries and streams fresh ones");
     assert!(state.left.progress.is_streaming());
 }
@@ -886,9 +985,9 @@ fn left_menu_sorts_the_left_panel_even_when_the_right_one_is_focused() {
     state.left.entries = vec![file_entry("b", 1), file_entry("a", 2)];
 
     let (state, _) = update(state, Command::MenuOpen); // Left menu
-    // Opens on Info; Down walks Name, Extension, Modif. time, Size
-    // (the separator is skipped, not counted).
-    let state = (0..4).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
+    // Opens on Brief; Down walks Full, Tree, Quick view, Info, then (the
+    // separator skipped, not counted) Name, Extension, Modif. time, Size.
+    let state = (0..8).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
     assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Size"));
     let (state, _) = update(state, Command::MenuActivate);
 
@@ -898,9 +997,11 @@ fn left_menu_sorts_the_left_panel_even_when_the_right_one_is_focused() {
 
 #[test]
 fn right_menu_targets_the_right_panel() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('r'));
+    // Opens on Brief; Down four times walks Full, Tree, Quick view, Info.
+    let state = (0..4).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
     let (state, effects) = update(state, Command::MenuActivate); // Info
     assert_eq!(state.right.display_mode, DisplayMode::Info);
     assert_eq!(state.left.display_mode, DisplayMode::Full);
@@ -1087,7 +1188,7 @@ fn selecting_a_drive_switches_the_target_panel_to_its_root() {
     let (state, effects) = update(state, Command::DriveSelectConfirm);
     assert!(state.drive_select.is_none(), "confirming closes the dialog");
     assert_eq!(state.right.cwd, PathBuf::from(r"D:\"));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"D:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"D:\") }]);
 }
 
 #[test]
@@ -1097,7 +1198,7 @@ fn selecting_an_unavailable_drive_surfaces_the_panel_error_state() {
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['A'] },
     );
     let (state, effects) = update(state, Command::DriveSelectConfirm);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"A:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"A:\") }]);
     // The worker's read fails and comes back as a normal listing failure —
     // no dedicated hang-prone path.
     let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "device not ready".into() });
@@ -1600,4 +1701,970 @@ fn a_subsequently_successful_f4_launch_clears_a_stale_last_error_from_an_earlier
         "successfully dispatching the F4 editor spawn must clear a stale error from an earlier failed attempt"
     );
     assert!(matches!(effects.as_slice(), [Effect::RunExternalEditor(_, PanelSide::Left)]));
+}
+
+// ---------------------------------------------------------------------
+// M5: git_info — generation-key staleness guard (design D3; git-info
+// "Query re-issued on navigation", "Silent absence on timeout and
+// stale-result discarding")
+// ---------------------------------------------------------------------
+
+#[test]
+fn initial_state_issues_a_git_info_query_for_each_panel() {
+    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
+    let left_request = state.left.git_request.expect("left panel mints a git-info request on startup");
+    let right_request = state.right.git_request.expect("right panel mints a git-info request on startup");
+    assert_ne!(left_request, right_request);
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/l"), request: left_request }));
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Right, path: PathBuf::from("/r"), request: right_request }));
+}
+
+#[test]
+fn navigating_reissues_the_git_info_query_and_clears_the_previous_directorys_info() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    state.left.git_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "the previous directory's git info is cleared, not carried over");
+    let request = state.left.git_request.expect("navigating mints a fresh git-info request");
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/left/sub"), request }));
+}
+
+#[test]
+fn a_reread_mints_a_fresh_git_info_request_even_for_the_same_path() {
+    let state = test_state(UiPhase::Panels);
+    let first_request = state.left.git_request;
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second_request = state.left.git_request.expect("re-reading mints a request id");
+    assert_ne!(Some(second_request), first_request);
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/left"), request: second_request }));
+}
+
+#[test]
+fn a_resolved_git_info_result_is_applied_in_place() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let request = state.left.git_request.unwrap();
+    let info = crate::git_info::GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([(OsString::from("a.txt"), crate::git_info::FileStatus::Modified)]),
+    };
+    let (state, effects) =
+        update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, info: info.clone() });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.git_info, info);
+}
+
+#[test]
+fn a_git_info_result_for_a_directory_the_panel_left_is_discarded() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let request = state.left.git_request.unwrap();
+    let info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, _) = update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), request, info });
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "a result for another directory is dropped");
+}
+
+#[test]
+fn a_stale_git_info_result_from_an_out_of_order_reread_is_discarded_but_the_fresher_one_applies() {
+    // Mirrors `a_stale_info_result_from_an_out_of_order_reread_is_discarded_but_the_fresher_one_applies`:
+    // two RereadPanel commands for the same path mint two different
+    // request ids, so `path` equality alone can't tell the stale reply
+    // apart from the current one — this is also how a timed-out query's
+    // late reply is safely dropped (git-info "Silent absence on timeout
+    // and stale-result discarding").
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let first_request = state.left.git_request.unwrap();
+
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second_request = state.left.git_request.unwrap();
+    assert_ne!(first_request, second_request, "re-reading mints a fresh request id even for the same path");
+
+    let stale_info = crate::git_info::GitInfo { branch: Some("stale-branch".to_string()), ..Default::default() };
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: first_request, info: stale_info },
+    );
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "the stale (first-request) answer is dropped");
+
+    let fresh_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved {
+            panel: PanelSide::Left,
+            path: PathBuf::from("/left"),
+            request: second_request,
+            info: fresh_info.clone(),
+        },
+    );
+    assert_eq!(state.left.git_info, fresh_info, "the current request's answer applies");
+}
+
+#[test]
+fn a_timed_out_query_answered_late_with_no_info_is_silently_dropped_once_superseded() {
+    // A worker-thread timeout is, from the reducer's point of view, just
+    // another reply — it degrades to `GitInfo::none()` — so it goes
+    // through the exact same generation-key guard as any other late
+    // reply: once a fresher request is outstanding, the timed-out query's
+    // eventual answer (of any content) must not clobber it.
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let timed_out_request = state.left.git_request.unwrap();
+
+    let (mut state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let current_request = state.left.git_request.unwrap();
+    state.left.git_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: timed_out_request, info: GitInfo::none() },
+    );
+    assert_eq!(
+        state.left.git_info.branch.as_deref(),
+        Some("main"),
+        "the timed-out query's late reply must not overwrite the current request's already-applied result"
+    );
+    let _ = current_request;
+}
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+use crate::editor::{EditorMove, EditorState, EntryMode, ReplacePrompt};
+
+fn editor_with(lines: &[&str]) -> EditorState {
+    let text = lines.join("\n");
+    let mut bytes = text.into_bytes();
+    if !lines.is_empty() {
+        bytes.push(b'\n');
+    }
+    EditorState::from_bytes(PathBuf::from("/left/edit.txt"), &bytes)
+}
+
+/// A real on-disk file to back tests that exercise an actual
+/// `EditorState::save` round trip (the `Effect::SaveEditor` reply tests),
+/// rather than a bare in-memory `from_bytes` buffer whose path doesn't
+/// exist.
+fn editor_with_temp_file(name: &str, lines: &[&str]) -> EditorState {
+    let dir = std::env::temp_dir().join(format!("filecommand-update-test-editor-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("file.txt");
+    let mut text = lines.join("\n");
+    if !lines.is_empty() {
+        text.push('\n');
+    }
+    std::fs::write(&path, &text).unwrap();
+    match EditorState::open(&path).unwrap() {
+        crate::editor::LoadResult::Loaded(e) => e,
+        crate::editor::LoadResult::TooLarge { .. } => panic!("test fixture unexpectedly exceeds the editor size cap"),
+    }
+}
+
+fn editor_state(editor: EditorState) -> State {
+    State { phase: UiPhase::Editor(editor), ..test_state(UiPhase::Panels) }
+}
+
+#[test]
+fn f4_with_no_editor_configured_opens_the_built_in_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (state, effects) = update(state, Command::RequestEditor);
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/report.txt") }]);
+    assert_eq!(state.phase, UiPhase::Panels, "phase flips only once EditorOpened comes back — opening is I/O");
+}
+
+#[test]
+fn f4_with_an_external_editor_configured_takes_precedence_over_the_built_in_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(
+        matches!(effects.as_slice(), [Effect::RunExternalEditor(_, PanelSide::Left)]),
+        "external editor takes precedence: no OpenEditor effect, got {effects:?}"
+    );
+}
+
+#[test]
+fn f4_on_a_directory_or_empty_panel_does_not_open_the_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(effects.is_empty());
+
+    let state = test_state(UiPhase::Panels);
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn editor_opened_enters_the_editor_phase_with_the_loaded_buffer() {
+    let state = test_state(UiPhase::Panels);
+    let editor = editor_with(&["line one", "line two"]);
+    let (state, effects) = update(state, Command::EditorOpened(Box::new(editor)));
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::Editor(e) => assert_eq!(e.lines, vec!["line one".to_string(), "line two".to_string(), String::new()]),
+        other => panic!("expected UiPhase::Editor, got {other:?}"),
+    }
+}
+
+#[test]
+fn editor_too_large_opens_the_viewer_instead_with_an_inline_notice() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::EditorTooLarge { path: PathBuf::from("/left/huge.log"), size: 20_000_000 });
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/huge.log") }]);
+    assert_eq!(state.phase, UiPhase::Panels);
+    let message = state.left.last_error.expect("a notice explaining the redirect");
+    assert!(message.contains("huge.log"), "{message}");
+    assert!(message.contains("10 MB"), "{message}");
+}
+
+#[test]
+fn editor_open_failed_surfaces_an_inline_error() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::EditorOpenFailed { message: "access denied".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
+}
+
+#[test]
+fn typing_in_the_editor_inserts_and_marks_the_buffer_modified() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorChar('X'));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines[0], "Xabc");
+    assert!(e.is_modified());
+}
+
+#[test]
+fn editor_move_commands_move_the_caret() {
+    let state = editor_state(editor_with(&["hello"]));
+    let (state, _) = update(state, Command::EditorMove(EditorMove::Right));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.caret.col, 1);
+    let (state, _) = update(state, Command::EditorMove(EditorMove::End));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.caret.col, 5);
+}
+
+#[test]
+fn insert_toggles_overwrite_mode() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorToggleMode);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.mode, EntryMode::Overwrite);
+}
+
+#[test]
+fn mark_cut_copy_paste_flow_through_the_reducer() {
+    let state = editor_state(editor_with(&["a", "b", "c"]));
+    let (state, _) = update(state, Command::EditorMark);
+    let (state, _) = update(state, Command::EditorMove(EditorMove::Down));
+    let (state, _) = update(state, Command::EditorCut);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines, vec!["c".to_string(), String::new()]);
+    assert_eq!(e.clipboard, vec!["a".to_string(), "b".to_string()]);
+
+    let (state, _) = update(state, Command::EditorPaste);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines, vec!["a".to_string(), "b".to_string(), "c".to_string(), String::new()]);
+}
+
+#[test]
+fn undo_flows_through_the_reducer() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorMove(EditorMove::End));
+    let (state, _) = update(state, Command::EditorChar('d'));
+    let (state, _) = update(state, Command::EditorUndo);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines[0], "abc");
+}
+
+#[test]
+fn search_prompt_confirm_moves_the_caret_to_the_next_match() {
+    let state = editor_state(editor_with(&["needle here", "another needle"]));
+    let (state, _) = update(state, Command::EditorSearchStart);
+    let (state, _) = update(state, Command::EditorSearchChar('n'));
+    let (state, _) = update(state, Command::EditorSearchChar('e'));
+    let (state, _) = update(state, Command::EditorSearchConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.search_prompt.is_none(), "the prompt closes on confirm");
+    assert_eq!(e.caret, crate::editor::Caret { line: 1, col: 8 });
+}
+
+#[test]
+fn search_prompt_backspace_and_cancel_edit_and_close_the_prompt() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorSearchStart);
+    let (state, _) = update(state, Command::EditorSearchChar('x'));
+    let (state, _) = update(state, Command::EditorSearchBackspace);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.search_prompt.as_deref(), Some(""));
+    let (state, _) = update(state, Command::EditorSearchCancel);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.search_prompt, None);
+}
+
+#[test]
+fn replace_prompt_advances_from_pattern_to_replacement_then_replaces() {
+    let state = editor_state(editor_with(&["hello world"]));
+    let (state, _) = update(state, Command::EditorReplaceStart);
+    let (state, _) = update(state, Command::EditorReplaceChar('w'));
+    let (state, _) = update(state, Command::EditorReplaceChar('o'));
+    let (state, _) = update(state, Command::EditorReplaceChar('r'));
+    let (state, _) = update(state, Command::EditorReplaceChar('l'));
+    let (state, _) = update(state, Command::EditorReplaceChar('d'));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, Some(ReplacePrompt::Pattern("world".to_string())));
+
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, Some(ReplacePrompt::Replacement { pattern: "world".to_string(), replacement: String::new() }));
+
+    let (state, _) = update(state, Command::EditorReplaceChar('X'));
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, None, "the prompt closes once the replacement runs");
+    assert_eq!(e.lines[0], "hello X");
+    assert!(e.is_modified());
+}
+
+#[test]
+fn replace_confirm_with_an_empty_pattern_cancels_rather_than_advancing() {
+    let state = editor_state(editor_with(&["hello"]));
+    let (state, _) = update(state, Command::EditorReplaceStart);
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, None);
+}
+
+#[test]
+fn editor_save_dispatches_the_save_effect_and_the_reply_updates_the_saved_snapshot() {
+    let mut editor = editor_with_temp_file("save-effect", &["abc"]);
+    editor.type_char('X');
+    assert!(editor.is_modified());
+    let state = editor_state(editor.clone());
+    let (state, effects) = update(state, Command::EditorSave);
+    match effects.as_slice() {
+        [Effect::SaveEditor { editor: e, then_quit: false }] => assert_eq!(e.lines, editor.lines),
+        other => panic!("expected a single SaveEditor effect, got {other:?}"),
+    }
+    // The buffer is unchanged until the reply arrives — save is I/O.
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.is_modified());
+
+    // Mirrors what the TUI's effect executor actually does: clone the
+    // editor into the effect, call the real (I/O-performing) `save()` on
+    // it, then reply with the post-save state.
+    let mut saved = editor;
+    saved.save().unwrap();
+    assert!(!saved.is_modified(), "sanity: a real save clears the modified flag on the saved copy");
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: false });
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.is_modified(), "the post-save snapshot from the reply clears the modified flag");
+}
+
+#[test]
+fn editor_save_failed_surfaces_an_inline_message_without_losing_the_buffer() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, effects) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.save_error.as_deref(), Some("disk full"));
+    assert!(e.is_modified(), "a failed save must not silently discard the unsaved edit");
+}
+
+#[test]
+fn f10_on_an_unmodified_buffer_exits_directly() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, effects) = update(state, Command::EditorRequestQuit);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn f10_on_a_modified_buffer_raises_the_save_on_exit_confirm() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, effects) = update(state, Command::EditorRequestQuit);
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.quit_confirm);
+}
+
+#[test]
+fn cancelling_the_save_on_exit_confirm_returns_to_editing() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorCancelQuit);
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.quit_confirm);
+}
+
+#[test]
+fn discarding_at_the_save_on_exit_confirm_exits_without_saving() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitDiscard);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn confirming_save_at_the_save_on_exit_confirm_dispatches_a_save_that_quits() {
+    let mut editor = editor_with_temp_file("quit-save", &["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor.clone());
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitSave);
+    match effects.as_slice() {
+        [Effect::SaveEditor { then_quit: true, .. }] => {}
+        other => panic!("expected a SaveEditor effect with then_quit: true, got {other:?}"),
+    }
+    // Still in the editor until the save actually lands.
+    assert!(matches!(state.phase, UiPhase::Editor(_)));
+
+    let mut saved = editor;
+    saved.save().unwrap();
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: true });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels, "a successful save-then-quit closes the editor");
+}
+
+#[test]
+fn a_failed_save_during_quit_aborts_the_quit_and_keeps_editing() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitSave);
+    assert!(matches!(effects.as_slice(), [Effect::SaveEditor { then_quit: true, .. }]));
+
+    let (state, _) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected the failed save to abort the quit and stay in the editor") };
+    assert_eq!(e.save_error.as_deref(), Some("disk full"));
+    assert!(!e.quit_confirm, "the confirm dialog itself closes so the user can see and act on the error");
+}
+
+// ---------------------------------------------------------------------
+// M5: Tree display mode (design D7; additional-panel-modes)
+// ---------------------------------------------------------------------
+
+fn dir_child(name: &str) -> Entry {
+    dir_entry(name)
+}
+
+#[test]
+fn entering_tree_mode_roots_at_the_drive_and_requests_the_root_children() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\Users\demo");
+    state.left.display_mode = DisplayMode::Info;
+    let (state, effects) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Tree);
+    let tree = state.left.tree.as_ref().expect("Tree mode populates tree state");
+    assert_eq!(tree.nodes.len(), 1);
+    assert_eq!(tree.nodes[0].path, PathBuf::from(r"C:\"));
+    assert_eq!(tree.prior_mode, DisplayMode::Info, "the pre-Tree display mode is recorded for Enter to restore");
+    assert!(effects.contains(&Effect::ExpandTreeNode { panel: PanelSide::Left, path: PathBuf::from(r"C:\") }));
+}
+
+#[test]
+fn tree_node_expanded_splices_children_into_the_matching_panels_tree() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let tree = state.left.tree.as_ref().unwrap();
+    assert_eq!(tree.nodes.len(), 3);
+    assert_eq!(tree.nodes[1].path, PathBuf::from(r"C:\alpha"));
+}
+
+#[test]
+fn a_tree_node_expanded_reply_for_the_other_panel_is_dropped() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    // The right panel never entered Tree mode, so it has no tree at all —
+    // a reply naming it must not panic or fabricate one.
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Right, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    assert!(state.right.tree.is_none());
+    assert_eq!(state.left.tree.as_ref().unwrap().nodes.len(), 1, "the left panel's tree is untouched by a reply addressed elsewhere");
+}
+
+#[test]
+fn moving_the_tree_cursor_relists_the_opposite_panel_at_the_highlighted_directory() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let (state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert_eq!(state.left.tree.as_ref().unwrap().cursor, 1);
+    assert!(
+        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\alpha") }),
+        "the opposite (right) panel must be re-listed at the newly highlighted directory"
+    );
+    // Landing on "alpha" (not yet expanded) also requests its children.
+    assert!(!state.left.tree.as_ref().unwrap().nodes[1].expanded);
+}
+
+#[test]
+fn moving_onto_an_unexpanded_node_requests_its_children_but_not_an_already_expanded_one() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    let (state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(effects.contains(&Effect::ExpandTreeNode { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }));
+
+    // Expand it, then move away and back — no second expand request for an
+    // already-expanded node.
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha"), children: vec![] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Up(1)));
+    let (_state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::ExpandTreeNode { path, .. } if path == std::path::Path::new(r"C:\alpha"))),
+        "an already-expanded node must not be re-requested: {effects:?}"
+    );
+}
+
+#[test]
+fn enter_on_a_tree_node_restores_the_prior_mode_and_navigates_this_panel_there() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.display_mode = DisplayMode::Brief;
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1))); // highlight "alpha"
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.display_mode, DisplayMode::Brief, "Enter restores the pre-Tree display mode");
+    assert!(state.left.tree.is_none(), "leaving Tree mode clears the tree state");
+    assert!(
+        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }),
+        "Enter navigates *this* panel to the highlighted directory, not the opposite one"
+    );
+}
+
+// ---------------------------------------------------------------------
+// M5: Brief/Full/Quick view display-mode switch (design D7)
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_display_mode_switches_the_named_panel_and_clears_tree_state() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.tree = Some(crate::panel::TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full));
+    state.right.display_mode = DisplayMode::Tree;
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Right, mode: DisplayMode::Brief });
+    assert_eq!(state.right.display_mode, DisplayMode::Brief);
+    assert!(state.right.tree.is_none());
+    assert_eq!(state.left.display_mode, DisplayMode::Full, "the other panel is untouched");
+}
+
+// ---------------------------------------------------------------------
+// M5 review fix: a quick filter must not linger invisibly across a
+// display-mode switch, since Brief/Tree/Info's renderers don't surface it
+// the same way Full mode does (quick-filter "Substring narrowing as the
+// pattern is typed").
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_display_mode_clears_an_active_quick_filter_on_the_named_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
+    assert_eq!(state.left.display_mode, DisplayMode::Brief);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Brief mode");
+}
+
+#[test]
+fn set_display_mode_does_not_clear_the_opposite_panels_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.entries = vec![file_entry("report.txt", 1)];
+    state.right.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
+    assert_eq!(state.right.quick_filter.as_deref(), Some("rep"), "the opposite panel's filter must be untouched");
+}
+
+#[test]
+fn entering_tree_mode_clears_an_active_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Tree);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Tree mode");
+}
+
+#[test]
+fn toggling_into_info_mode_clears_an_active_quick_filter() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 1)];
+    state.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(state, Command::ToggleInfoMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Info);
+    assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Info mode");
+}
+
+// ---------------------------------------------------------------------
+// M5: Ctrl+J fuzzy jump
+// ---------------------------------------------------------------------
+
+fn history_entry(path: &str, count: u32, ms: u64) -> crate::quicksearch::FrecencyEntry {
+    crate::quicksearch::FrecencyEntry { path: PathBuf::from(path), visit_count: count, last_visited_ms: ms }
+}
+
+#[test]
+fn fuzzy_jump_open_and_esc_close_without_navigating() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    assert!(state.fuzzy_jump.is_some());
+    let (state, effects) = update(state, Command::FuzzyJumpCancel);
+    assert!(state.fuzzy_jump.is_none());
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel is unchanged");
+}
+
+#[test]
+fn fuzzy_jump_typing_and_backspace_edit_the_pattern() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let (state, _) = update(state, Command::FuzzyJumpChar('d'));
+    let (state, _) = update(state, Command::FuzzyJumpChar('o'));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "do");
+    let (state, _) = update(state, Command::FuzzyJumpBackspace);
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "d");
+}
+
+#[test]
+fn fuzzy_jump_confirm_navigates_the_active_panel_to_the_highlighted_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.dir_history = vec![history_entry(r"C:\Low", 1, 0), history_entry(r"C:\High", 10, 0)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    // No pattern typed: the full frecency-ranked list shows, most frecent
+    // first, so the default (cursor 0) highlight is `C:\High`.
+    let (state, effects) = update(state, Command::FuzzyJumpConfirm);
+    assert!(state.fuzzy_jump.is_none(), "the dialog closes");
+    assert_eq!(state.right.cwd, PathBuf::from(r"C:\High"));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the opposite panel is unaffected");
+    assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Right, .. })));
+}
+
+#[test]
+fn fuzzy_jump_move_clamps_within_the_currently_filtered_list() {
+    let mut state = test_state(UiPhase::Panels);
+    state.dir_history = vec![history_entry(r"C:\A", 1, 0), history_entry(r"C:\B", 1, 0)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let (state, _) = update(state, Command::FuzzyJumpMove(-5));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 0);
+    let (state, _) = update(state, Command::FuzzyJumpMove(5));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
+}
+
+// ---------------------------------------------------------------------
+// M5: Alt+F7 find file
+// ---------------------------------------------------------------------
+
+fn find_match(rel: &str, name: &str) -> FindMatch {
+    FindMatch { relative_path: PathBuf::from(rel), entry: dir_entry_named(name) }
+}
+
+fn dir_entry_named(name: &str) -> Entry {
+    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None }
+}
+
+#[test]
+fn find_file_open_roots_at_the_active_panels_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    assert_eq!(state.find_file.as_ref().unwrap().root, PathBuf::from(r"C:\proj"));
+}
+
+#[test]
+fn find_file_submit_mints_a_request_and_dispatches_the_walk_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileChar('r'));
+    let (state, effects) = update(state, Command::FindFileSubmit);
+    match effects.as_slice() {
+        [Effect::FindInSubtree { root, pattern, request }] => {
+            assert_eq!(root, &PathBuf::from(r"C:\proj"));
+            assert_eq!(pattern, "r");
+            assert_eq!(state.find_file.as_ref().unwrap().request, Some(*request));
+        }
+        other => panic!("expected exactly one FindInSubtree effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_file_matches_from_a_superseded_request_are_dropped() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit); // request 1
+    let (state, _) = update(state, Command::FindFileMatch { request: 999, m: find_match("a.txt", "a.txt") });
+    assert!(state.find_file.as_ref().unwrap().results.is_empty(), "a stale-request match must be dropped");
+}
+
+#[test]
+fn find_file_confirm_navigates_in_place_and_seeds_the_cursor_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let (state, _) = update(state, Command::FindFileMatch { request, m: find_match(r"sub\report.txt", "report.txt") });
+    let (state, effects) = update(state, Command::FindFileConfirm);
+    assert!(state.find_file.is_none(), "the dialog closes");
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj\sub"), "navigates to the match's containing directory");
+    assert_eq!(state.left.pending_cursor_target, Some(OsString::from("report.txt")));
+    assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })));
+}
+
+#[test]
+fn find_file_confirm_with_a_root_level_match_navigates_to_the_root() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let (state, _) = update(state, Command::FindFileMatch { request, m: find_match("readme.txt", "readme.txt") });
+    let (state, _) = update(state, Command::FindFileConfirm);
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj"));
+}
+
+#[test]
+fn find_file_cancel_abandons_the_search_without_navigating() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let (state, effects) = update(state, Command::FindFileCancel);
+    assert!(state.find_file.is_none());
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+}
+
+#[test]
+fn listing_complete_settles_the_cursor_on_a_pending_find_file_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.pending_cursor_target = Some(OsString::from("b.txt"));
+    let (state, _) = update(
+        state,
+        Command::ListingChunk {
+            panel: PanelSide::Left,
+            entries: vec![dir_entry_named("a.txt"), dir_entry_named("b.txt"), dir_entry_named("c.txt")],
+        },
+    );
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 3 });
+    assert_eq!(state.left.cursor, 1);
+    assert!(state.left.pending_cursor_target.is_none(), "consumed once applied");
+}
+
+// ---------------------------------------------------------------------
+// M5: F2 user menu
+// ---------------------------------------------------------------------
+
+#[test]
+fn user_menu_confirm_dispatches_the_highlighted_commands_shell_passthrough() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\Projects\app");
+    state.user_menu_entries = vec![
+        crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() },
+        crate::config::UserMenuEntry { label: "Build".to_string(), command: "cargo build".to_string() },
+    ];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(1));
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none(), "the menu closes");
+    match effects.as_slice() {
+        [Effect::RunShellCommand(inv, side)] => {
+            assert_eq!(inv.cwd, PathBuf::from(r"C:\Projects\app"));
+            assert!(inv.args.iter().any(|a| a.contains("cargo build")), "{:?}", inv.args);
+            assert_eq!(*side, PanelSide::Right);
+        }
+        other => panic!("expected exactly one RunShellCommand effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn user_menu_esc_closes_without_running_anything() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, effects) = update(state, Command::UserMenuCancel);
+    assert!(state.user_menu.is_none());
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn user_menu_move_clamps_and_confirm_on_an_empty_menu_is_a_harmless_close() {
+    let state = test_state(UiPhase::Panels); // user_menu_entries is empty
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(5));
+    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 0);
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none());
+    assert!(effects.is_empty(), "nothing to run on an empty menu");
+}
+
+// ---------------------------------------------------------------------
+// M5: F1 Help window + About dialog
+// ---------------------------------------------------------------------
+
+#[test]
+fn help_opens_with_about_filecommand_highlighted_first() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let help = state.help.unwrap();
+    assert_eq!(help.cursor, 0);
+    assert_eq!(crate::dialogs::HELP_TOPICS[help.cursor], "About FileCommand");
+    assert!(help.page.is_none());
+    assert!(!help.about_open);
+}
+
+#[test]
+fn help_activate_on_about_opens_the_about_dialog_not_a_page() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpActivate);
+    assert!(state.help.as_ref().unwrap().about_open);
+    assert!(state.help.as_ref().unwrap().page.is_none());
+}
+
+#[test]
+fn help_activate_on_a_topic_opens_its_page() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(1)); // "Keyboard reference"
+    let (state, _) = update(state, Command::HelpActivate);
+    assert_eq!(state.help.as_ref().unwrap().page, Some(1));
+}
+
+#[test]
+fn help_cancel_returns_a_page_to_the_list_then_closes_the_window() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(1));
+    let (state, _) = update(state, Command::HelpActivate);
+    assert!(state.help.as_ref().unwrap().page.is_some());
+
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_some(), "Esc from a page returns to the list, not closing the window");
+    assert!(state.help.as_ref().unwrap().page.is_none());
+    assert_eq!(state.help.as_ref().unwrap().cursor, 1, "the highlight is preserved");
+
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_none(), "Esc from the list closes the window");
+}
+
+#[test]
+fn help_cancel_dismisses_about_back_to_the_list_with_about_still_highlighted() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpActivate); // opens About
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_some());
+    assert!(!state.help.as_ref().unwrap().about_open);
+    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+}
+
+#[test]
+fn help_move_does_not_walk_past_the_ends_of_the_topic_list() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(-5));
+    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+    let last = crate::dialogs::HELP_TOPICS.len() - 1;
+    let state = (0..20).fold(state, |s, _| update(s, Command::HelpMove(1)).0);
+    assert_eq!(state.help.as_ref().unwrap().cursor, last);
+}
+
+// ---------------------------------------------------------------------
+// M5: directory frecency recording + persistence (fuzzy-jump "Navigation
+// records history")
+// ---------------------------------------------------------------------
+
+#[test]
+fn navigating_into_a_directory_records_and_persists_frecency() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    state.clock_ms = 5_000;
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.dir_history, vec![history_entry("/left/sub", 1, 5_000)]);
+    assert!(effects.iter().any(|e| matches!(e, Effect::PersistHistory(file) if file.directories == state.dir_history)));
+}
+
+#[test]
+fn revisiting_a_directory_increments_its_frecency_entry_rather_than_duplicating() {
+    let mut state = test_state(UiPhase::Panels);
+    state.dir_history = vec![history_entry(r"C:\a", 1, 0)];
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left)); // /left, a fresh entry
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left)); // /left again
+    let count = state.dir_history.iter().find(|e| e.path.as_path() == Path::new("/left")).unwrap().visit_count;
+    assert_eq!(count, 2, "re-reading the same directory increments the same entry rather than adding a duplicate");
+}
+
+#[test]
+fn tree_cursor_preview_of_the_opposite_panel_does_not_record_frecency() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(state.dir_history.is_empty(), "browsing the tree previews the opposite panel; it does not count as a visit");
+}
+
+// ---------------------------------------------------------------------
+// M5 review fix: startup-warning modal (malformed usermenu.toml)
+// ---------------------------------------------------------------------
+
+#[test]
+fn dismiss_startup_warning_clears_it() {
+    let mut state = test_state(UiPhase::Panels);
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    let (state, effects) = update(state, Command::DismissStartupWarning);
+    assert_eq!(state.startup_warning, None);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn dismiss_startup_warning_is_a_no_op_when_nothing_is_warned() {
+    let state = test_state(UiPhase::Panels);
+    assert_eq!(state.startup_warning, None);
+    let (state, effects) = update(state, Command::DismissStartupWarning);
+    assert_eq!(state.startup_warning, None);
+    assert!(effects.is_empty());
 }

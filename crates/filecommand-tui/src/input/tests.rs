@@ -250,6 +250,7 @@ fn paste_bindings_are_config_overridable() {
     let keys = Keys {
         paste_name: filecommand_core::config::KeyBinding::new(false, true, false, "n"),
         paste_path: filecommand_core::config::KeyBinding::new(false, true, false, "p"),
+        ..Keys::default()
     };
     let state = panels();
     assert_eq!(map_key(key(KeyCode::Char('n'), KeyModifiers::ALT), &state, 5, &keys), Some(Command::PasteCursorName));
@@ -424,9 +425,26 @@ fn exactly_one_typing_sink_claims_any_given_key() {
 fn a_non_printable_key_dismisses_quick_search() {
     let mut state = panels();
     state.quick_search = Some("r".to_string());
-    for code in [KeyCode::Up, KeyCode::Enter, KeyCode::Tab, KeyCode::F(5)] {
+    for code in [KeyCode::Enter, KeyCode::Tab, KeyCode::F(5)] {
         assert_eq!(map(plain(code), &state), Some(Command::QuickSearchEnd), "{code:?}");
     }
+}
+
+#[test]
+fn a_movement_key_exits_quick_search_and_is_still_applied_to_the_panel() {
+    // Unlike Esc/Enter/Tab (plain dismissal), a movement key both ends
+    // type-ahead and moves the cursor in the same keystroke — the mapper
+    // emits the `MoveCursor` command directly, and `core::update` clears
+    // `quick_search` as a side effect of applying it (type-ahead-jump "A
+    // movement key exits type-ahead and is applied to the panel"; design
+    // D5).
+    let mut state = panels();
+    state.quick_search = Some("r".to_string());
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MoveCursor(CursorMove::Down(1))));
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::MoveCursor(CursorMove::Up(1))));
+    assert_eq!(map(plain(KeyCode::PageDown), &state), Some(Command::MoveCursor(CursorMove::Down(5))));
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::MoveCursor(CursorMove::Home)));
+    assert_eq!(map(plain(KeyCode::End), &state), Some(Command::MoveCursor(CursorMove::End)));
 }
 
 #[test]
@@ -451,13 +469,17 @@ fn entries_are_irrelevant_to_key_mapping() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn f3_opens_the_viewer_and_plain_f4_opens_the_external_editor() {
+fn f3_opens_the_viewer_and_plain_f4_requests_the_editor() {
     assert_eq!(map(plain(KeyCode::F(3)), &panels()), Some(Command::RequestViewer));
-    assert_eq!(map(plain(KeyCode::F(4)), &panels()), Some(Command::RequestExternalEditor));
+    // `RequestEditor` (not the M4 `RequestExternalEditor` directly) is the
+    // F4 keybinding target from M5 on — it resolves the external-editor
+    // precedence itself (builtin-editor "External editor takes
+    // precedence").
+    assert_eq!(map(plain(KeyCode::F(4)), &panels()), Some(Command::RequestEditor));
 }
 
 #[test]
-fn ctrl_f4_still_means_sort_by_extension_not_the_external_editor() {
+fn ctrl_f4_still_means_sort_by_extension_not_the_editor() {
     assert_eq!(map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()), Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension }));
 }
 
@@ -518,4 +540,267 @@ fn viewer_search_prompt_owns_the_keyboard_while_open() {
     assert_eq!(map_viewer_key(plain(KeyCode::Backspace), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchBackspace)));
     assert_eq!(map_viewer_key(plain(KeyCode::Enter), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchConfirm)));
     assert_eq!(map_viewer_key(plain(KeyCode::Esc), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchCancel)));
+}
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+fn open_editor(text: &str) -> filecommand_core::editor::EditorState {
+    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes())
+}
+
+#[test]
+fn editor_phase_is_not_routed_through_map_key() {
+    let state = state_with(UiPhase::Editor(open_editor("abc\n")));
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), None, "the event loop must call map_editor_key directly instead");
+}
+
+#[test]
+fn editor_fkeys_map_to_save_mark_replace_search_and_quit() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), Some(Command::EditorSave));
+    assert_eq!(map_editor_key(plain(KeyCode::F(3)), &e, 20), Some(Command::EditorMark));
+    assert_eq!(map_editor_key(plain(KeyCode::F(4)), &e, 20), Some(Command::EditorReplaceStart));
+    assert_eq!(map_editor_key(plain(KeyCode::F(7)), &e, 20), Some(Command::EditorSearchStart));
+    assert_eq!(map_editor_key(plain(KeyCode::F(10)), &e, 20), Some(Command::EditorRequestQuit));
+}
+
+#[test]
+fn editor_printable_keys_type_and_insert_toggles_overwrite() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('x')), &e, 20), Some(Command::EditorChar('x')));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorNewline));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Insert), &e, 20), Some(Command::EditorToggleMode));
+}
+
+#[test]
+fn editor_movement_keys_carry_the_visible_row_count_for_paging() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::Left), &e, 20), Some(Command::EditorMove(EditorMove::Left)));
+    assert_eq!(map_editor_key(plain(KeyCode::Right), &e, 20), Some(Command::EditorMove(EditorMove::Right)));
+    assert_eq!(map_editor_key(plain(KeyCode::Up), &e, 20), Some(Command::EditorMove(EditorMove::Up)));
+    assert_eq!(map_editor_key(plain(KeyCode::Down), &e, 20), Some(Command::EditorMove(EditorMove::Down)));
+    assert_eq!(map_editor_key(plain(KeyCode::Home), &e, 20), Some(Command::EditorMove(EditorMove::Home)));
+    assert_eq!(map_editor_key(plain(KeyCode::End), &e, 20), Some(Command::EditorMove(EditorMove::End)));
+    assert_eq!(map_editor_key(plain(KeyCode::PageUp), &e, 20), Some(Command::EditorMove(EditorMove::PageUp(20))));
+    assert_eq!(map_editor_key(plain(KeyCode::PageDown), &e, 20), Some(Command::EditorMove(EditorMove::PageDown(20))));
+}
+
+#[test]
+fn editor_cut_copy_paste_undo_use_ctrl_bindings() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCut));
+    assert_eq!(map_editor_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCopy));
+    assert_eq!(map_editor_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorPaste));
+    assert_eq!(map_editor_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorUndo));
+}
+
+#[test]
+fn editor_search_prompt_owns_the_keyboard_while_open() {
+    let mut e = open_editor("abc\n");
+    e.search_prompt = Some("ab".to_string());
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), None, "F-keys are swallowed by the prompt");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('c')), &e, 20), Some(Command::EditorSearchChar('c')));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorSearchBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorSearchConfirm));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorSearchCancel));
+}
+
+#[test]
+fn editor_replace_prompt_owns_the_keyboard_while_open() {
+    let mut e = open_editor("abc\n");
+    e.replace_prompt = Some(filecommand_core::editor::ReplacePrompt::Pattern("x".to_string()));
+    assert_eq!(map_editor_key(plain(KeyCode::F(7)), &e, 20), None, "F-keys are swallowed by the prompt");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('y')), &e, 20), Some(Command::EditorReplaceChar('y')));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorReplaceBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorReplaceConfirm));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorReplaceCancel));
+}
+
+#[test]
+fn editor_quit_confirm_owns_y_n_and_esc_over_everything_else() {
+    let mut e = open_editor("abc\n");
+    e.quit_confirm = true;
+    assert_eq!(map_editor_key(plain(KeyCode::Char('y')), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Char('Y')), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Char('n')), &e, 20), Some(Command::EditorConfirmQuitDiscard));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorCancelQuit));
+    // F2 (save) must not leak through the confirm.
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), None);
+}
+
+// ---------------------------------------------------------------------
+// M5: quick filter, tabs, and dialog key bindings
+// ---------------------------------------------------------------------
+
+#[test]
+fn ctrl_p_and_ctrl_j_open_quick_filter_and_fuzzy_jump_by_default() {
+    let state = panels();
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
+    assert_eq!(map(key(KeyCode::Char('j'), KeyModifiers::CONTROL), &state), Some(Command::FuzzyJumpOpen));
+}
+
+#[test]
+fn quick_filter_owns_printables_and_backspace_and_esc_but_not_movement() {
+    let mut state = panels();
+    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(map(plain(KeyCode::Char('p')), &state), Some(Command::QuickFilterChar('p')));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::QuickFilterBackspace));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::QuickFilterEnd));
+    // Movement/Enter fall through to the ordinary panel mapping — the
+    // filter narrows what they can land on, but doesn't intercept them
+    // (quick-filter "Navigation is restricted to matching entries").
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MoveCursor(CursorMove::Down(1))));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::Enter));
+}
+
+#[test]
+fn quick_filter_is_scoped_to_the_active_panel_only() {
+    let mut state = panels();
+    state.right.quick_filter = Some("x".to_string()); // right is inactive here
+    assert_eq!(
+        map(plain(KeyCode::Char('a')), &state),
+        Some(Command::CommandLineChar('a')),
+        "the inactive panel's filter must not steal printables from the command line"
+    );
+}
+
+#[test]
+fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
+    // Regression: Alt+letter must not be able to start type-ahead
+    // (`QuickSearchStart`) while `panel.quick_filter` is already active on
+    // the active panel — the two input modes are mutually exclusive, and
+    // Esc (`QuickFilterEnd`) is the documented way out of the filter first.
+    let mut state = panels();
+    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(
+        map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state),
+        None,
+        "Alt+letter must be a no-op while the quick filter owns this panel's input"
+    );
+    // Once the filter is cleared, Alt+letter starts type-ahead normally.
+    state.left.quick_filter = None;
+    assert_eq!(map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state), Some(Command::QuickSearchStart('r')));
+}
+
+#[test]
+fn ctrl_t_ctrl_w_and_alt_digit_map_to_tab_commands() {
+    let state = panels();
+    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab));
+    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab));
+    assert_eq!(map(key(KeyCode::Char('3'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(3)));
+    assert_eq!(map(key(KeyCode::Char('9'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(9)));
+}
+
+#[test]
+fn f1_f2_and_alt_f7_open_help_user_menu_and_find_file() {
+    let state = panels();
+    assert_eq!(map(plain(KeyCode::F(1)), &state), Some(Command::HelpOpen));
+    assert_eq!(map(plain(KeyCode::F(2)), &state), Some(Command::UserMenuOpen));
+    assert_eq!(map(key(KeyCode::F(7), KeyModifiers::ALT), &state), Some(Command::FindFileOpen));
+    // Alt+F1/F2 still mean drive select, not Help/user menu.
+    assert_eq!(map(key(KeyCode::F(1), KeyModifiers::ALT), &state), Some(Command::OpenDriveSelect(PanelSide::Left)));
+    assert_eq!(map(key(KeyCode::F(2), KeyModifiers::ALT), &state), Some(Command::OpenDriveSelect(PanelSide::Right)));
+}
+
+#[test]
+fn fuzzy_jump_dialog_owns_typing_movement_and_dismissal() {
+    let mut state = panels();
+    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::FuzzyJumpChar('d')));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::FuzzyJumpBackspace));
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FuzzyJumpMove(-1)));
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::FuzzyJumpMove(1)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FuzzyJumpConfirm));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FuzzyJumpCancel));
+}
+
+#[test]
+fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation() {
+    let mut state = panels();
+    state.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::FindFileChar('r')));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::FindFileBackspace));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FindFileSubmit));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FindFileCancel));
+
+    let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
+    submitted.submit(1);
+    state.find_file = Some(submitted);
+    assert_eq!(map(plain(KeyCode::Char('r')), &state), None, "the pattern is fixed once a search is in flight");
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FindFileMove(-1)));
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::FindFileMove(1)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FindFileConfirm));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FindFileCancel));
+}
+
+#[test]
+fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
+    let mut state = panels();
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::UserMenuMove(-1)));
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::UserMenuMove(1)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::UserMenuConfirm));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::UserMenuCancel));
+    // Printables are not routed to the command line while the menu is open.
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), None);
+}
+
+#[test]
+fn help_dialog_precedence_list_then_page_then_about() {
+    let mut state = panels();
+    let mut help = filecommand_core::dialogs::HelpState::new();
+    state.help = Some(help);
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HelpMove(1)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpActivate));
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
+
+    help.page = Some(1);
+    state.help = Some(help);
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
+    assert_eq!(map(plain(KeyCode::Down), &state), None, "a topic page does not scroll a list that isn't shown");
+
+    help.page = None;
+    help.about_open = true;
+    state.help = Some(help);
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpCancel));
+    assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::HelpCancel));
+}
+
+#[test]
+fn m5_dialogs_outrank_the_command_line_and_quick_search() {
+    let mut state = typing("dir");
+    state.quick_search = Some("z".to_string());
+    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::FuzzyJumpChar('a')));
+}
+
+// ---------------------------------------------------------------------
+// M5 review fix: startup-warning modal (malformed usermenu.toml)
+// ---------------------------------------------------------------------
+
+#[test]
+fn startup_warning_is_dismissed_by_any_key() {
+    let mut state = panels();
+    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::DismissStartupWarning));
+}
+
+#[test]
+fn startup_warning_outranks_every_other_modal_and_typing_sink() {
+    // The dialog can only ever be up at session start, before anything else
+    // has had a chance to open, but it must still win the precedence check
+    // deterministically rather than relying on that invariant alone.
+    let mut state = typing("dir");
+    state.startup_warning = Some("usermenu.toml is malformed".to_string());
+    state.quick_search = Some("z".to_string());
+    state.menu = Some(MenuState::opened());
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::DismissStartupWarning));
 }

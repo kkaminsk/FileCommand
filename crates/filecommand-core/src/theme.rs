@@ -117,6 +117,13 @@ pub enum Role {
     PanelCursor,
     PanelSelected,
     PanelMinistatus,
+    /// The M5 git-info status-marker column's `M` (modified) glyph
+    /// (git-info "Per-file status marker column").
+    PanelGitModified,
+    /// The status-marker column's `?` (untracked) glyph.
+    PanelGitUntracked,
+    /// The status-marker column's `+` (staged) glyph.
+    PanelGitStaged,
     KeybarNumber,
     KeybarLabel,
     CommandLine,
@@ -132,6 +139,10 @@ pub enum Role {
     DialogPrimary,
     DialogError,
     DialogInput,
+    /// The M5 secondary/grey dialog style (black on white, single-line
+    /// frame) — the About dialog is the only v1 user of it (help-and-about
+    /// "About FileCommand dialog"; §10 license).
+    DialogSecondary,
     ButtonNormal,
     ButtonFocused,
     DialogGaugeFilled,
@@ -149,6 +160,12 @@ pub enum Role {
     /// A search hit's highlighted cells (viewer: F7 streaming search —
     /// "Match becomes the top anchor and is highlighted").
     ViewerMatch,
+    /// The panel-tabs strip's active-tab label (panel-tabs "Tab label
+    /// rendering and active styling").
+    TabActive,
+    /// The panel-tabs strip's inactive-tab labels and `◄`/`►` overflow
+    /// markers.
+    TabInactive,
 }
 
 pub const ALL_ROLES: &[Role] = &[
@@ -163,6 +180,9 @@ pub const ALL_ROLES: &[Role] = &[
     Role::PanelCursor,
     Role::PanelSelected,
     Role::PanelMinistatus,
+    Role::PanelGitModified,
+    Role::PanelGitUntracked,
+    Role::PanelGitStaged,
     Role::KeybarNumber,
     Role::KeybarLabel,
     Role::CommandLine,
@@ -178,6 +198,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::DialogPrimary,
     Role::DialogError,
     Role::DialogInput,
+    Role::DialogSecondary,
     Role::ButtonNormal,
     Role::ButtonFocused,
     Role::DialogGaugeFilled,
@@ -189,6 +210,8 @@ pub const ALL_ROLES: &[Role] = &[
     Role::ViewerHeader,
     Role::ViewerText,
     Role::ViewerMatch,
+    Role::TabActive,
+    Role::TabInactive,
 ];
 
 impl Role {
@@ -207,6 +230,9 @@ impl Role {
             Role::PanelCursor => "panel.cursor",
             Role::PanelSelected => "panel.selected",
             Role::PanelMinistatus => "panel.ministatus",
+            Role::PanelGitModified => "panel.git.modified",
+            Role::PanelGitUntracked => "panel.git.untracked",
+            Role::PanelGitStaged => "panel.git.staged",
             Role::KeybarNumber => "keybar.number",
             Role::KeybarLabel => "keybar.label",
             Role::CommandLine => "commandline",
@@ -222,6 +248,7 @@ impl Role {
             Role::DialogPrimary => "dialog.primary",
             Role::DialogError => "dialog.error",
             Role::DialogInput => "dialog.input",
+            Role::DialogSecondary => "dialog.secondary",
             Role::ButtonNormal => "button.normal",
             Role::ButtonFocused => "button.focused",
             Role::DialogGaugeFilled => "dialog.gauge.filled",
@@ -233,6 +260,8 @@ impl Role {
             Role::ViewerHeader => "viewer.header",
             Role::ViewerText => "viewer.text",
             Role::ViewerMatch => "viewer.match",
+            Role::TabActive => "tab.active",
+            Role::TabInactive => "tab.inactive",
         }
     }
 }
@@ -333,6 +362,12 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(Cyan));
         set(Role::PanelSelected, A(BrightYellow), A(Blue));
         set(Role::PanelMinistatus, A(Cyan), A(Blue));
+        // Conventional git-status hues: red for a working-tree change,
+        // yellow for untracked, green for staged — distinct from every
+        // other panel role so the marker column reads at a glance.
+        set(Role::PanelGitModified, A(BrightRed), A(Blue));
+        set(Role::PanelGitUntracked, A(BrightYellow), A(Blue));
+        set(Role::PanelGitStaged, A(BrightGreen), A(Blue));
         set(Role::KeybarNumber, A(White), A(Black));
         set(Role::KeybarLabel, A(Black), A(Cyan));
         set(Role::CommandLine, A(White), A(Black));
@@ -348,6 +383,7 @@ impl Theme {
         set(Role::DialogPrimary, A(Black), A(Cyan));
         set(Role::DialogError, A(BrightWhite), A(Red));
         set(Role::DialogInput, A(Black), A(Cyan));
+        set(Role::DialogSecondary, A(Black), A(White));
         set(Role::ButtonNormal, A(Black), A(White));
         set(Role::ButtonFocused, A(Black), A(BrightYellow));
         set(Role::DialogGaugeFilled, A(Blue), A(Cyan));
@@ -359,6 +395,8 @@ impl Theme {
         set(Role::ViewerHeader, A(Black), A(Cyan));
         set(Role::ViewerText, A(White), A(Blue));
         set(Role::ViewerMatch, A(Black), A(Cyan));
+        set(Role::TabActive, A(Black), A(Cyan));
+        set(Role::TabInactive, A(Cyan), A(Blue));
         Theme::build("nc-classic", m).expect("nc-classic role table is complete")
     }
 
@@ -380,6 +418,12 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(White));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(White), A(Black));
+        // Mono carries no hue meaning (same precedent as `MenuHotkey`
+        // above): all three marker glyphs read as ordinary bright text
+        // rather than color-coded status.
+        set(Role::PanelGitModified, A(BrightWhite), A(Black));
+        set(Role::PanelGitUntracked, A(BrightWhite), A(Black));
+        set(Role::PanelGitStaged, A(BrightWhite), A(Black));
         set(Role::KeybarNumber, A(White), A(Black));
         set(Role::KeybarLabel, A(Black), A(White));
         set(Role::CommandLine, A(White), A(Black));
@@ -399,6 +443,10 @@ impl Theme {
         set(Role::DialogPrimary, A(Black), A(White));
         set(Role::DialogError, A(BrightWhite), A(Black));
         set(Role::DialogInput, A(Black), A(White));
+        // Mono has no distinct secondary hue to fall back to; it collapses
+        // onto the same black-on-white block as the primary dialog style,
+        // matching how `MenuHotkey` and other roles collapse in mono.
+        set(Role::DialogSecondary, A(Black), A(White));
         set(Role::ButtonNormal, A(Black), A(White));
         set(Role::ButtonFocused, A(White), A(Black));
         set(Role::DialogGaugeFilled, A(BrightWhite), A(White));
@@ -412,6 +460,11 @@ impl Theme {
         set(Role::ViewerHeader, A(Black), A(White));
         set(Role::ViewerText, A(White), A(Black));
         set(Role::ViewerMatch, A(Black), A(White));
+        // Mirrors `PanelTitleActive`/`PanelTitleInactive`'s mono inversion:
+        // the active tab inverts to black-on-white, the inactive tabs stay
+        // white-on-black.
+        set(Role::TabActive, A(Black), A(White));
+        set(Role::TabInactive, A(White), A(Black));
         Theme::build("nc-mono", m).expect("nc-mono role table is complete")
     }
 

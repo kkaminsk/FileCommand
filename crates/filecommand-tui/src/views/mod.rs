@@ -4,7 +4,11 @@ pub mod conflict_dialog;
 pub mod delete_confirm;
 pub mod destination_input;
 pub mod drive_select;
+pub mod editor;
 pub mod error_dialog;
+pub mod find_file;
+pub mod fuzzy_jump;
+pub mod help;
 pub mod info_panel;
 pub mod keybar;
 pub mod menubar;
@@ -14,6 +18,9 @@ pub mod progress_dialog;
 pub mod quit_dialog;
 pub mod skipped_summary;
 pub mod splash;
+pub mod startup_warning;
+pub mod tab_strip;
+pub mod user_menu;
 pub mod viewer;
 
 use filecommand_core::fs_ops::dialog::RunningDialog;
@@ -33,6 +40,12 @@ use crate::layout;
 /// window backing an active `UiPhase::Viewer` (design D1 — the TUI owns the
 /// `ByteSource`, `core::State` never does); it is ignored in every other
 /// phase.
+///
+/// Returns the real terminal cursor's `(x, y)` position when the current
+/// phase wants one shown (only `UiPhase::Editor`, for the caret) — `None`
+/// otherwise, which the caller must treat as "leave the cursor hidden"
+/// since a stale position from a previous frame's phase would otherwise
+/// linger.
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -41,25 +54,73 @@ pub fn render(
     identity_lines: &[String; 4],
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
-) {
+) -> Option<(u16, u16)> {
+    let cursor = render_phase(buf, area, state, depth, identity_lines, clock_text, viewer_source);
+    // The startup-warning modal is drawn last, over whatever the current
+    // phase already painted — it can only ever be raised at the very start
+    // of a session (currently: a malformed `usermenu.toml`), so it must stay
+    // visible regardless of which phase (even the splash screen) happens to
+    // be on screen underneath it (user-menu "Malformed file warns and falls
+    // back without overwriting").
+    if let Some(message) = &state.startup_warning {
+        startup_warning::render_startup_warning(buf, area, &state.theme, depth, message);
+    }
+    cursor
+}
+
+fn render_phase(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &State,
+    depth: ColorDepth,
+    identity_lines: &[String; 4],
+    clock_text: &str,
+    viewer_source: Option<&ByteSource>,
+) -> Option<(u16, u16)> {
     match &state.phase {
         UiPhase::Splash { .. } => {
             splash::render_splash(buf, area, &state.theme, depth, identity_lines);
+            None
         }
         UiPhase::Placeholder => {
             placeholder::render_placeholder(buf, area, &state.theme, depth);
+            None
         }
         UiPhase::Viewer(v) => {
             viewer::render_viewer(buf, area, v, &state.theme, depth, viewer_source);
+            None
         }
+        UiPhase::Editor(e) => editor::render_editor(buf, area, e, &state.theme, depth),
         UiPhase::Panels
         | UiPhase::QuitConfirm
         | UiPhase::FileOpSetup(_)
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height));
-            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left, identity_lines);
-            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right, identity_lines);
+            let left_type_ahead = (state.active == PanelSide::Left).then_some(state.quick_search.as_deref()).flatten();
+            let right_type_ahead = (state.active == PanelSide::Right).then_some(state.quick_search.as_deref()).flatten();
+            panel::render_panel(
+                buf,
+                l.left,
+                &state.left,
+                &state.theme,
+                depth,
+                state.active == PanelSide::Left,
+                identity_lines,
+                &state.right,
+                left_type_ahead,
+            );
+            panel::render_panel(
+                buf,
+                l.right,
+                &state.right,
+                &state.theme,
+                depth,
+                state.active == PanelSide::Right,
+                identity_lines,
+                &state.left,
+                right_type_ahead,
+            );
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
             // which is what "hides" it; closing the bar simply stops that
@@ -75,6 +136,18 @@ pub fn render(
             }
             if let Some(dialog) = &state.drive_select {
                 drive_select::render_drive_select(buf, area, &state.theme, depth, dialog);
+            }
+            if let Some(dialog) = &state.fuzzy_jump {
+                fuzzy_jump::render_fuzzy_jump(buf, area, &state.theme, depth, dialog, &state.dir_history, state.clock_ms);
+            }
+            if let Some(dialog) = &state.find_file {
+                find_file::render_find_file(buf, area, &state.theme, depth, dialog);
+            }
+            if let Some(dialog) = &state.user_menu {
+                user_menu::render_user_menu(buf, area, &state.theme, depth, dialog, &state.user_menu_entries);
+            }
+            if let Some(dialog) = &state.help {
+                help::render_help(buf, area, &state.theme, depth, dialog, identity_lines);
             }
 
             match &state.phase {
@@ -99,6 +172,7 @@ pub fn render(
                 }
                 _ => {}
             }
+            None
         }
     }
 }

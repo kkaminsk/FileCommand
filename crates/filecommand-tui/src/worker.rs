@@ -7,19 +7,29 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
+use std::time::Duration;
 
 use filecommand_core::drives;
 use filecommand_core::fs_ops::{
     CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
 };
+use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
-use filecommand_core::listing::{list_dir_chunked, Entry, FsReader, StdFsReader};
+use filecommand_core::listing::{find_in_subtree, list_dir_chunked, Entry, FsReader, StdFsReader};
 use filecommand_core::panel::parent_path;
 use filecommand_core::viewer::search::{find_forward, DEFAULT_CHUNK_SIZE};
 use filecommand_core::viewer::ByteSource;
 use filecommand_core::{Command, PanelSide};
 
 const CHUNK_SIZE: usize = 256;
+
+/// How long `spawn_git_info_query` waits for `git_info::query` before giving
+/// up and reporting "no info" (git-info "Silent absence on timeout and
+/// stale-result discarding"; design D3). Generous enough that a normal
+/// local-repo status call never hits it, short enough that a stalled
+/// network share doesn't leave the branch suffix/marker column in limbo
+/// indefinitely.
+const GIT_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Fetch one drive's volume label off the input path. Absent media and
 /// unreachable network shares block here, never in the render loop; the
@@ -42,6 +52,49 @@ pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sende
         let values = gather_info(&StdFsReader, &path);
         let _ = tx.send(Command::InfoResolved { panel, path, request, values });
     });
+}
+
+/// Run `git_info::query` for `path` on its own dedicated worker thread —
+/// never the shared Info worker, since a slow status call on one panel
+/// must not head-of-line-block the other (design D3; git-info "Background
+/// repository detection"). The result — resolved branch/statuses, or
+/// `GitInfo::none()` for "outside any repository" — is reported back;
+/// `core::update`'s generation-key guard (`PanelState::git_request`) is what
+/// decides whether a stale reply (one for a directory/generation the panel
+/// has since moved past) actually gets applied.
+///
+/// If `git_info::query` (blocking and, being libgit2, not cancellable
+/// mid-call) has not returned within `GIT_INFO_TIMEOUT`, this reports
+/// `GitInfo::none()` immediately instead of waiting further and silently
+/// discards whatever the query eventually returns — never forwarding a
+/// second, late reply for the same `request` (git-info "Silent absence on
+/// timeout and stale-result discarding": "leaving the uncancellable call to
+/// finish" is exactly what `race_with_timeout` does by simply not waiting
+/// on its inner thread any further, not by aborting it).
+pub fn spawn_git_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let inner_path = path.clone();
+        let info = race_with_timeout(GIT_INFO_TIMEOUT, move || git_info::query(&inner_path)).unwrap_or_else(GitInfo::none);
+        let _ = tx.send(Command::GitInfoResolved { panel, path, request, info });
+    });
+}
+
+/// Run `f` on a fresh thread and wait up to `timeout` for its result.
+/// `Some(value)` if `f` finished in time; `None` on timeout — `f`'s thread
+/// is simply left running to completion in the background (there is no way
+/// to cancel an arbitrary blocking call), and its eventual result is
+/// dropped rather than delivered late, since nothing is listening for it
+/// past the timeout.
+fn race_with_timeout<T, F>(timeout: Duration, f: F) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(timeout).ok()
 }
 
 /// The blocking half of an Info query, factored out so it can be driven
@@ -88,6 +141,37 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
             None => (None, None),
         };
         let _ = tx.send(Command::ViewerSearchResult { offset, match_range, request });
+    });
+}
+
+/// Read `path`'s immediate child directories for Tree-mode expansion
+/// (`listing::list_child_dirs`) on a worker thread, reporting them back via
+/// `Command::TreeNodeExpanded`. A read failure (permission denied, a
+/// since-vanished directory) reports an empty child list rather than
+/// aborting — `core::update`'s `TreeState::insert_children` still marks the
+/// node expanded, so a broken node simply shows no children instead of
+/// leaving the query outstanding forever (additional-panel-modes "Children
+/// read on expand"; design D7).
+pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let children = filecommand_core::listing::list_child_dirs(&StdFsReader, &path).unwrap_or_default();
+        let _ = tx.send(Command::TreeNodeExpanded { panel, path, children });
+    });
+}
+
+/// Run the Alt+F7 subtree name search on a worker thread, streaming each
+/// match back via `Command::FindFileMatch` as `listing::find_in_subtree`
+/// finds it and finishing with `Command::FindFileSearchDone` — the walk
+/// itself performs its own I/O per directory, so results reach the UI
+/// incrementally rather than only once the whole subtree has been walked
+/// (find-file "Non-blocking search with static progress", "UI stays
+/// responsive during a large walk").
+pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        find_in_subtree(&StdFsReader, &root, &pattern, |m| {
+            let _ = tx.send(Command::FindFileMatch { request, m });
+        });
+        let _ = tx.send(Command::FindFileSearchDone { request });
     });
 }
 
@@ -269,6 +353,55 @@ mod tests {
         let boxes = filecommand_core::info::info_boxes(&values, None);
         let rendered: Vec<&str> = boxes.iter().flat_map(|b| b.fields.iter()).map(|f| f.value.as_str()).collect();
         assert!(!rendered.iter().any(|v| *v == PENDING), "no field is left pending: {rendered:?}");
+    }
+
+    #[test]
+    fn race_with_timeout_returns_the_value_when_it_finishes_in_time() {
+        let result = race_with_timeout(std::time::Duration::from_secs(5), || 42);
+        assert_eq!(result, Some(42));
+    }
+
+    #[test]
+    fn race_with_timeout_gives_up_and_returns_none_on_a_slow_call() {
+        let result = race_with_timeout(std::time::Duration::from_millis(20), || {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            "too slow"
+        });
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn spawn_find_subtree_streams_matches_then_reports_done() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-worker-find-file-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("report.txt"), b"x").unwrap();
+        std::fs::write(dir.join("sub").join("report2.txt"), b"x").unwrap();
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        spawn_find_subtree(dir.clone(), "report".to_string(), 7, tx);
+
+        let mut matched_names = Vec::new();
+        let saw_done;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Command::FindFileMatch { request, m }) => {
+                    assert_eq!(request, 7);
+                    matched_names.push(m.entry.name.to_string_lossy().into_owned());
+                }
+                Ok(Command::FindFileSearchDone { request }) => {
+                    assert_eq!(request, 7);
+                    saw_done = true;
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        matched_names.sort();
+        assert_eq!(matched_names, vec!["report.txt".to_string(), "report2.txt".to_string()]);
+        assert!(saw_done);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
