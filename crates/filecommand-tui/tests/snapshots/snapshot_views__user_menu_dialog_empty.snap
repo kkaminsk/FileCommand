@@ -1,6 +1,6 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 936
+assertion_line: 979
 expression: text
 ---
 ╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
@@ -12,11 +12,11 @@ expression: text
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
-║                                      ║║                                      ║
 ║                     ╔═══════════ User menu ════════════╗                     ║
 ║                     ║(no entries — see usermenu.toml)  ║                     ║
+║                     ╠══════════════════════════════════╣                     ║
+║                     ║ Themes                           ║                     ║
 ║                     ╚══════════════════════════════════╝                     ║
-║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║

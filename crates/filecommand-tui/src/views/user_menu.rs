@@ -1,5 +1,6 @@
 //! The F2 user menu: a primary-style modal list of `usermenu.toml` labels
-//! in file order, with an empty-state placeholder when there are none
+//! in file order, with an empty-state placeholder when there are none, plus
+//! a separator and a compiled-in `Themes` row that is always present
 //! (user-menu "Open the F2 user menu").
 
 use filecommand_core::config::UserMenuEntry;
@@ -15,15 +16,26 @@ const TITLE: &str = " User menu ";
 const MIN_INNER_W: usize = 20;
 const MAX_INNER_W: usize = 50;
 const EMPTY_PLACEHOLDER: &str = "(no entries — see usermenu.toml)";
+/// The compiled-in built-in row's label — matches the Options pull-down's
+/// `Themes` item (design D2 of `user-menu-themes-entry`).
+const THEMES_LABEL: &str = "Themes";
 
+/// Renders the F2 user menu: the user's `usermenu.toml` entries (or the
+/// empty-state placeholder), then always a separator row and a compiled-in
+/// `Themes` row (user-menu "Open the F2 user menu"). `dialog.cursor ==
+/// entries.len()` highlights the built-in row; the separator row is never
+/// highlighted (design D2/D3).
 pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry]) {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let highlight = role_style(theme, Role::MenuHighlight, depth);
 
-    let widest_label = entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER));
+    let widest_label = entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER)).max(display_width(THEMES_LABEL));
     let inner_w = (widest_label + 2).clamp(MIN_INNER_W, MAX_INNER_W).min(area.width.saturating_sub(4) as usize).max(display_width(TITLE));
     let box_w = inner_w as u16 + 2;
-    let rows = entries.len().max(1); // the empty-state placeholder is one row
+    // User rows (or the one-row empty placeholder), plus a separator row and
+    // the built-in Themes row.
+    let user_rows = entries.len().max(1);
+    let rows = user_rows + 2;
     let box_h = rows as u16 + 2;
     if area.width < box_w || area.height < box_h {
         return;
@@ -48,6 +60,17 @@ pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Colo
             buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
         }
     }
+
+    // Separator row, then the built-in Themes row — always present, below
+    // the user entries (or the empty-state placeholder).
+    let sep_y = y + 1 + user_rows as u16;
+    buf.set_string(x, sep_y, format!("\u{2560}{}\u{2563}", "\u{2550}".repeat(inner_w)), body);
+
+    let themes_y = sep_y + 1;
+    let themes_style = if dialog.cursor == entries.len() { highlight } else { body };
+    buf.set_string(x, themes_y, "\u{2551}", body);
+    buf.set_string(x + 1, themes_y, pad_to_width(&format!(" {THEMES_LABEL}"), inner_w), themes_style);
+    buf.set_string(x + 1 + inner_w as u16, themes_y, "\u{2551}", body);
 
     buf.set_string(x, y + box_h - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body);
 }

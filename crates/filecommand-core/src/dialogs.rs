@@ -14,7 +14,10 @@ use std::ffi::OsString;
 /// The open F2 user menu: just a cursor over `State::user_menu_entries`,
 /// which is loaded once at startup from `usermenu.toml` and does not change
 /// while the menu is open (user-menu "Open the F2 user menu", "Navigate and
-/// dismiss the user menu").
+/// dismiss the user menu"). The reducer (`update.rs::handle_user_menu`)
+/// extends the cursor's usable domain by one past `entries.len()` for a
+/// compiled-in "Themes" slot — `UserMenuEntry`/`state.user_menu_entries`
+/// stay untouched (design D3 of `user-menu-themes-entry`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UserMenuState {
     pub cursor: usize,

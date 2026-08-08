@@ -967,6 +967,8 @@ fn snapshot_user_menu_dialog_with_entries() {
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Compress") && text.contains("Backup") && text.contains("Checksum"));
     assert!(!text.contains("robocopy"), "the command string is never shown, only the label");
+    assert!(text.contains("Themes"), "the built-in Themes row always renders below the user entries");
+    assert!(text.contains('\u{2560}') && text.contains('\u{2563}'), "a separator row sets the built-in entry off from the user entries");
     insta::assert_snapshot!("user_menu_dialog_with_entries", text);
 }
 
@@ -976,6 +978,8 @@ fn snapshot_user_menu_dialog_empty_state() {
     state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("no entries"));
+    assert!(text.contains("Themes"), "the built-in Themes row renders below the placeholder even with no user entries");
+    assert!(text.contains('\u{2560}') && text.contains('\u{2563}'), "a separator row sets the built-in entry off from the placeholder");
     insta::assert_snapshot!("user_menu_dialog_empty", text);
 }
 

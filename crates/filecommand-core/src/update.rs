@@ -555,10 +555,13 @@ pub enum Command {
     // F2 user menu (M5).
     UserMenuOpen,
     UserMenuMove(isize),
-    /// Enter: run the highlighted entry's command via the shell passthrough
-    /// in the active panel's directory, then close the menu (user-menu "Run
-    /// the selected entry's command via the shell in the active panel
-    /// directory").
+    /// Enter: on a user entry, run its command via the shell passthrough in
+    /// the active panel's directory (user-menu "Run the selected entry's
+    /// command via the shell in the active panel directory"); on the
+    /// compiled-in built-in Themes slot (cursor at `entries.len()`), open
+    /// the theme picker instead — no shell effect (user-menu "Built-in
+    /// Themes entry opens the theme selector"). Either way the user menu
+    /// closes first.
     UserMenuConfirm,
     /// Esc: close without running anything.
     UserMenuCancel,
@@ -2274,14 +2277,19 @@ fn is_user_menu_command(cmd: &Command) -> bool {
 /// Drive the F2 user menu (gated in [`update`] by `state.user_menu`).
 /// Entries themselves live in `state.user_menu_entries`, loaded once at
 /// startup — the menu overlay only tracks the cursor (user-menu "Open the
-/// F2 user menu", "Navigate and dismiss the user menu").
+/// F2 user menu", "Navigate and dismiss the user menu"). The cursor domain
+/// is `0..=state.user_menu_entries.len()`: the last index is the
+/// compiled-in "Themes" slot, not a config entry (design D3).
 fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
     if state.user_menu.is_none() {
         return vec![];
     }
     match cmd {
         Command::UserMenuMove(delta) => {
-            let len = state.user_menu_entries.len();
+            // Cursor domain is the user entries plus one compiled-in
+            // built-in slot at index `entries.len()` for "Themes" (design
+            // D3) — not an entry appended to `state.user_menu_entries`.
+            let len = state.user_menu_entries.len() + 1;
             state.user_menu.as_mut().unwrap().move_cursor(delta, len);
         }
         Command::UserMenuCancel => state.user_menu = None,
@@ -2292,6 +2300,12 @@ fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
                 let cwd = state.panel(side).cwd.clone();
                 return vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &entry.command, &cwd), side)];
             }
+            // Cursor is at the built-in Themes slot (`entries.len()`): the
+            // user menu is already closed above (design D4); open the
+            // theme picker via the exact same path as
+            // `MenuAction::OpenThemes`, pre-highlighting the active theme.
+            // No shell effect.
+            state.theme_picker = Some(ThemePickerState::open(&state.theme.name));
         }
         _ => {}
     }
