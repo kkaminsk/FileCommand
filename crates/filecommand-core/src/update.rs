@@ -289,7 +289,11 @@ pub enum Effect {
     SendErrorReply(ErrorChoice),
     /// Suspend the TUI, run this invocation on the real terminal, wait for a
     /// keypress, then restore and redraw.
-    RunShellCommand(shell::Invocation),
+    /// The invocation to run, plus the panel side to re-read once the TUI
+    /// resumes — the shell spawn is inherently a TUI-side effect, so the
+    /// re-read command has to travel with it rather than reaching `update`
+    /// on its own (§ "Run command" — "the active panel is re-read").
+    RunShellCommand(shell::Invocation, PanelSide),
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
@@ -558,9 +562,10 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     }
 
     config::push_history(&mut state.history, &text);
+    let side = state.active;
     let cwd = state.active_panel().cwd.clone();
     vec![
-        Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd)),
+        Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side),
         Effect::PersistHistory(state.history.clone()),
     ]
 }
@@ -1021,7 +1026,7 @@ fn handle_enter(state: &mut State) -> Vec<Effect> {
             let cwd = state.panel(side).cwd.clone();
             // Quoted so a name with spaces reaches the shell as one token.
             let text = format!("\"{name}\"");
-            vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd))]
+            vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side)]
         }
         EntryKind::ParentDir => handle_parent(state, side),
         EntryKind::Directory => {

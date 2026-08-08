@@ -621,9 +621,10 @@ fn running_a_command_records_history_clears_the_buffer_and_persists() {
     assert_eq!(state.prompt(), format!("{}>", PathBuf::from(r"C:\NORTON").display()));
 
     match effects.as_slice() {
-        [Effect::RunShellCommand(inv), Effect::PersistHistory(entries)] => {
+        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(entries)] => {
             assert_eq!(inv.cwd, PathBuf::from(r"C:\NORTON"));
             assert_eq!(inv.args.last().unwrap(), "dir");
+            assert_eq!(*side, PanelSide::Left, "the command ran in the active panel, so that panel is re-read");
             assert_eq!(entries, &vec!["dir".to_string()]);
         }
         other => panic!("expected a shell command plus a history write, got {other:?}"),
@@ -637,7 +638,7 @@ fn running_a_command_uses_the_configured_shell() {
     let state = type_line(state, "Get-ChildItem");
     let (_, effects) = update(state, Command::Enter);
     match effects.first() {
-        Some(Effect::RunShellCommand(inv)) => {
+        Some(Effect::RunShellCommand(inv, _)) => {
             assert_eq!(inv.program, "powershell");
             assert_eq!(inv.args, vec!["-NoLogo".to_string(), "-Command".to_string(), "Get-ChildItem".to_string()]);
         }
@@ -659,9 +660,10 @@ fn enter_on_an_executable_target_spawns_it_through_the_shell() {
     state.left.entries = vec![file_entry("setup.exe", 1)];
     let (_, effects) = update(state, Command::Enter);
     match effects.as_slice() {
-        [Effect::RunShellCommand(inv)] => {
+        [Effect::RunShellCommand(inv, side)] => {
             assert_eq!(inv.args.last().unwrap(), "\"setup.exe\"");
             assert_eq!(inv.cwd, PathBuf::from("/left"));
+            assert_eq!(*side, PanelSide::Left);
         }
         other => panic!("expected the executable to spawn through the shell, got {other:?}"),
     }
@@ -718,7 +720,7 @@ fn cd_navigates_the_panel_instead_of_spawning_a_shell() {
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
     assert!(
-        !effects.iter().any(|e| matches!(e, Effect::RunShellCommand(_))),
+        !effects.iter().any(|e| matches!(e, Effect::RunShellCommand(..))),
         "`cd` in a fresh child would be a no-op, so it must not reach the shell"
     );
     assert!(effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }));

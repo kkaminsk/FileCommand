@@ -59,27 +59,27 @@
 
 ## 8. TUI — command-line view, suspend/restore, Ctrl+O (`command-line`)
 
-- [ ] 8.1 Add a `views/command_line` renderer drawing the prompt path plus buffer on the command-line row (Requirement: prompt & routing — "Prompt shows active panel path").
-- [ ] 8.2 Implement the idempotent terminal suspend/restore primitive in the TUI binary: leave raw mode + alternate screen, and re-enter both, safe to call twice, integrated with the app-wide panic hook (Requirement: Run command — "Terminal restored after a failing child").
-- [ ] 8.3 Implement Enter-runs-command: suspend the TUI, spawn the core-built child inheriting stdio in the panel directory, wait, prompt "press any key", restore, then re-read the active panel (Requirement: Run command — "Enter runs the typed command", "Command buffer cleared after run"); route Enter on an executable target through the same path.
-- [ ] 8.4 Implement Ctrl+O: leave the alternate screen to reveal host scrollback, and re-enter + redraw on any key, keeping no internal output buffer (Requirement: Panels on/off — both scenarios).
+- [x] 8.1 Add a `views/command_line` renderer drawing the prompt path plus buffer on the command-line row (Requirement: prompt & routing — "Prompt shows active panel path").
+- [x] 8.2 Implement the idempotent terminal suspend/restore primitive in the TUI binary: leave raw mode + alternate screen, and re-enter both, safe to call twice, integrated with the app-wide panic hook (Requirement: Run command — "Terminal restored after a failing child").
+- [x] 8.3 Implement Enter-runs-command: suspend the TUI, spawn the core-built child inheriting stdio in the panel directory, wait, prompt "press any key", restore, then re-read the active panel (Requirement: Run command — "Enter runs the typed command", "Command buffer cleared after run"); route Enter on an executable target through the same path.
+- [x] 8.4 Implement Ctrl+O: leave the alternate screen to reveal host scrollback, and re-enter + redraw on any key, keeping no internal output buffer (Requirement: Panels on/off — both scenarios).
 
 ## 9. TUI — F9 menu bar & pull-downs (`pulldown-menus`)
 
-- [ ] 9.1 Add a `views/menubar` renderer overlaying the top row: full-width black-on-cyan bar with the five titles, hotkey letters in `menu.hotkey`, and the clock suppressed while open (Requirement: F9 menu-bar overlay — "F9 opens…", "Menu hotkey letters are highlighted"; restore top row + clock on close).
-- [ ] 9.2 Render the active menu title white-on-black (`menu.highlight`) (Requirement: Menu title activation — "First menu is active").
-- [ ] 9.3 Render the open pull-down as a single-line CP437-framed box below its title: selected item white-on-black, enabled items black-on-cyan, disabled grey (white-on-cyan `menu.disabled`), separators drawn with `─` (Requirement: Pull-down visuals — "Framed pull-down with a selected item", "Separator row rendering").
+- [x] 9.1 Add a `views/menubar` renderer overlaying the top row: full-width black-on-cyan bar with the five titles, hotkey letters in `menu.hotkey`, and the clock suppressed while open (Requirement: F9 menu-bar overlay — "F9 opens…", "Menu hotkey letters are highlighted"; restore top row + clock on close).
+- [x] 9.2 Render the active menu title white-on-black (`menu.highlight`) (Requirement: Menu title activation — "First menu is active").
+- [x] 9.3 Render the open pull-down as a single-line CP437-framed box below its title: selected item white-on-black, enabled items black-on-cyan, disabled grey (white-on-cyan `menu.disabled`), separators drawn with `─` (Requirement: Pull-down visuals — "Framed pull-down with a selected item", "Separator row rendering").
 
 ## 10. TUI — drive-select dialog & Info panel views
 
-- [ ] 10.1 Add a `views/drive_select` renderer painting all enumerated drive letters on the first frame with blank label columns, filling labels in place as they resolve, using CP437 glyphs and ANSI-16 colors only (Requirement: enumeration — "Drive letters appear before any label"; Requirement: lazy fetch — "Label fills in place").
-- [ ] 10.2 Add a `views/info_panel` renderer: vertically stacked single-line-framed boxes inside the panel's double border, `info.banner` bright-white banner, `info.label` cyan labels, `info.value` bright-yellow values, and `…` static placeholders with no spinner/animation (Requirement: Info display mode — "Boxes are single-line framed and stacked"; Requirement: field labels distinct; Requirement: Info mode rendering uses static text only — scenario "No animation for pending values").
+- [x] 10.1 Add a `views/drive_select` renderer painting all enumerated drive letters on the first frame with blank label columns, filling labels in place as they resolve, using CP437 glyphs and ANSI-16 colors only (Requirement: enumeration — "Drive letters appear before any label"; Requirement: lazy fetch — "Label fills in place").
+- [x] 10.2 Add a `views/info_panel` renderer: vertically stacked single-line-framed boxes inside the panel's double border, `info.banner` bright-white banner, `info.label` cyan labels, `info.value` bright-yellow values, and `…` static placeholders with no spinner/animation (Requirement: Info display mode — "Boxes are single-line framed and stacked"; Requirement: field labels distinct; Requirement: Info mode rendering uses static text only — scenario "No animation for pending values").
 
 ## 11. TUI — input routing & wiring
 
-- [ ] 11.1 Route printable keys, Up/Down (history vs cursor), Esc, Ctrl+Enter, Ctrl+] into the command-line update path with the quick-search mode-flag arbitration.
-- [ ] 11.2 Route F9 and menu-navigation keys (arrows, Enter, Esc, hotkey letters, Left/Right) into the menu state machine, and dispatch activated menu items to their M3/earlier actions.
-- [ ] 11.3 Route Ctrl+F3..F7, Ctrl+R, Alt+F1/F2, and Ctrl+L to their core update paths, and dispatch menu items that mirror these actions (display mode, sort mode, re-read, drive select, on/off, quit) through the same handlers.
+- [x] 11.1 Route printable keys, Up/Down (history vs cursor), Esc, Ctrl+Enter, Ctrl+] into the command-line update path with the quick-search mode-flag arbitration.
+- [x] 11.2 Route F9 and menu-navigation keys (arrows, Enter, Esc, hotkey letters, Left/Right) into the menu state machine, and dispatch activated menu items to their M3/earlier actions.
+- [x] 11.3 Route Ctrl+F3..F7, Ctrl+R, Alt+F1/F2, and Ctrl+L to their core update paths, and dispatch menu items that mirror these actions (display mode, sort mode, re-read, drive select, on/off, quit) through the same handlers.
 
 ## 12. Testing (§8)
 
@@ -90,8 +90,8 @@
 - [x] 12.5 Core unit tests: menu state machine — open/close, hotkey jump, vertical selection skipping disabled/separators, Enter-dispatch-and-close, Esc-keeps-bar, horizontal wrap, and menu contents/disabled sets (all `pulldown-menus` scenarios).
 - [x] 12.6 Core unit tests: drive enumeration parsing behind the fs seam, Alt+F1/F2 targeting, lazy-label fill-in-place, stale-result discard, available/unavailable selection outcomes, and UNC handling (all `drive-select` scenarios).
 - [x] 12.7 Core unit tests: Info toggle per-panel isolation, content set, async placeholder→value replacement, and stale-result discard on drive/directory change (all `info-panel` state scenarios).
-- [ ] 12.8 TUI snapshot tests (insta + `TestBackend`, pinned `Clock`/size/locale): command line with prompt and recalled history entry (Requirement: prompt & routing).
-- [ ] 12.9 TUI snapshot tests: F9 menu bar with an open pull-down showing a selected item, a disabled item, and a separator (`pulldown-menus` visuals).
-- [ ] 12.10 TUI snapshot tests: drive-select dialog before labels resolve (blank columns) and after labels resolve (`drive-select` scenarios).
-- [ ] 12.11 TUI snapshot tests: Info panel with `…` placeholders and with resolved values, and a panel header showing the sort arrow (`info-panel` and `sort-modes` header scenarios).
-- [ ] 12.12 TUI test: terminal restore is idempotent and the panic hook restores raw mode + alternate screen after a failing/panicking child (Requirement: Run command — "Terminal restored after a failing child").
+- [x] 12.8 TUI snapshot tests (insta + `TestBackend`, pinned `Clock`/size/locale): command line with prompt and recalled history entry (Requirement: prompt & routing).
+- [x] 12.9 TUI snapshot tests: F9 menu bar with an open pull-down showing a selected item, a disabled item, and a separator (`pulldown-menus` visuals).
+- [x] 12.10 TUI snapshot tests: drive-select dialog before labels resolve (blank columns) and after labels resolve (`drive-select` scenarios).
+- [x] 12.11 TUI snapshot tests: Info panel with `…` placeholders and with resolved values, and a panel header showing the sort arrow (`info-panel` and `sort-modes` header scenarios).
+- [x] 12.12 TUI test: terminal restore is idempotent and the panic hook restores raw mode + alternate screen after a failing/panicking child (Requirement: Run command — "Terminal restored after a failing child").

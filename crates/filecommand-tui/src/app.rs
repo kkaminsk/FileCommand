@@ -165,7 +165,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     let _ = handle.reply_tx.send(worker::JobReply::Error(choice));
                 }
             }
-            Effect::RunShellCommand(invocation) => run_shell_command(guard, &invocation)?,
+            Effect::RunShellCommand(invocation, side) => {
+                run_shell_command(guard, &invocation)?;
+                // Fed straight back, same as drive enumeration: the panel
+                // that owned the command must show whatever the command did
+                // to its directory the moment the TUI repaints.
+                let _ = rt.tx.send(Command::RereadPanel(side));
+            }
             Effect::ShowScrollback => show_scrollback(guard)?,
             Effect::PersistHistory(entries) => {
                 // A history write failing (read-only directory, full disk)
