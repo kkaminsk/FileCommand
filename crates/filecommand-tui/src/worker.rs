@@ -5,17 +5,68 @@
 //! additionally exposing a cancel flag and a reply channel so the main loop
 //! can answer conflict/error dialogs the worker thread blocks on.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Sender};
 
+use filecommand_core::drives;
 use filecommand_core::fs_ops::{
     CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
 };
-use filecommand_core::listing::{list_dir_chunked, Entry, StdFsReader};
+use filecommand_core::info::InfoValues;
+use filecommand_core::listing::{list_dir_chunked, Entry, FsReader, StdFsReader};
 use filecommand_core::panel::parent_path;
 use filecommand_core::{Command, PanelSide};
 
 const CHUNK_SIZE: usize = 256;
+
+/// Fetch one drive's volume label off the input path. Absent media and
+/// unreachable network shares block here, never in the render loop; the
+/// dialog shows the drive with a blank label meanwhile, and a result that
+/// arrives after the dialog closed is discarded by `core::update`.
+pub fn spawn_drive_label(target: PanelSide, letter: char, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let label = drives::volume_info(letter).map(|(label, _serial)| label);
+        let _ = tx.send(Command::DriveLabelResolved { target, letter, label });
+    });
+}
+
+/// Gather every async Info-panel value for `path` on a worker thread.
+///
+/// The whole set is sent as one result: these queries hit the same volume
+/// and complete together, and a single fill-in keeps the panel from
+/// repainting several times in a row.
+pub fn spawn_info_query(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let values = gather_info(&StdFsReader, &path);
+        let _ = tx.send(Command::InfoResolved { panel, path, values });
+    });
+}
+
+/// The blocking half of an Info query, factored out so it can be driven
+/// with an injected reader in tests.
+pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
+    let drive = drives::drive_letter_of(path);
+    let space = drive.and_then(drives::disk_space);
+    let volume = drive.and_then(drives::volume_info);
+    let (files, dirs) = match reader.read_dir(path) {
+        Ok(entries) => {
+            let dirs = entries.iter().filter(|e| e.is_dir).count();
+            (entries.len() - dirs, dirs)
+        }
+        // An unreadable directory still resolves — as zero counts rather
+        // than a permanent `…` the user cannot clear.
+        Err(_) => (0, 0),
+    };
+    InfoValues {
+        memory_bytes: Some(drives::available_memory().unwrap_or(0)),
+        drive_total: Some(space.map(|s| s.total).unwrap_or(0)),
+        drive_free: Some(space.map(|s| s.free).unwrap_or(0)),
+        volume_label: Some(volume.as_ref().map(|(l, _)| l.clone()).unwrap_or_default()),
+        serial: Some(volume.map(|(_, s)| s).unwrap_or_else(|| drives::format_serial(0))),
+        file_count: Some(files),
+        dir_count: Some(dirs),
+    }
+}
 
 pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
     std::thread::spawn(move || {
@@ -101,6 +152,52 @@ impl JobSink for ChannelSink {
 
     fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use filecommand_core::info::PENDING;
+    use filecommand_core::listing::RawDirEntry;
+    use std::io;
+
+    struct FakeReader(io::Result<Vec<RawDirEntry>>);
+
+    impl FsReader for FakeReader {
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<RawDirEntry>> {
+            match &self.0 {
+                Ok(entries) => Ok(entries.clone()),
+                Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
+            }
+        }
+    }
+
+    fn raw(name: &str, is_dir: bool) -> RawDirEntry {
+        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None }
+    }
+
+    #[test]
+    fn gather_info_counts_files_and_directories_separately() {
+        let reader = FakeReader(Ok(vec![raw("a.txt", false), raw("b.txt", false), raw("sub", true)]));
+        let values = gather_info(&reader, Path::new(r"C:\somewhere"));
+        assert_eq!(values.file_count, Some(2));
+        assert_eq!(values.dir_count, Some(1));
+    }
+
+    #[test]
+    fn gather_info_always_resolves_every_field() {
+        // Even on a path with no drive letter and an unreadable directory,
+        // nothing may be left showing `…` forever.
+        let reader = FakeReader(Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")));
+        let values = gather_info(&reader, Path::new(r"\\server\share"));
+        assert!(values.is_complete(), "an unreadable directory must still resolve, got {values:?}");
+        assert_eq!(values.file_count, Some(0));
+        assert_eq!(values.dir_count, Some(0));
+
+        let boxes = filecommand_core::info::info_boxes(&values, None);
+        let rendered: Vec<&str> = boxes.iter().flat_map(|b| b.fields.iter()).map(|f| f.value.as_str()).collect();
+        assert!(!rendered.iter().any(|v| *v == PENDING), "no field is left pending: {rendered:?}");
     }
 }
 

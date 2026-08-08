@@ -6,12 +6,17 @@
 //! callers supply the current time via [`Command::Tick`].
 
 use std::ffi::OsString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::config;
+use crate::drives::{self, DriveSelect};
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
-use crate::listing::{Entry, EntryKind};
-use crate::panel::{CursorMove, PanelState};
+use crate::info::InfoValues;
+use crate::listing::{Entry, EntryKind, SortMode};
+use crate::menu::{MenuAction, MenuId, MenuState};
+use crate::panel::{CursorMove, DisplayMode, PanelState};
+use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
 
 pub const MIN_COLS: u16 = 80;
@@ -34,6 +39,10 @@ impl PanelSide {
 }
 
 /// Top-level UI phase. Governs how commands are interpreted by `update`.
+///
+/// The F9 menu and the drive-select dialog deliberately live *beside* the
+/// phase (as `State::menu` / `State::drive_select`) rather than inside it:
+/// they overlay the panels without replacing whatever phase is underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiPhase {
     Splash { started_at_ms: u64 },
@@ -56,7 +65,25 @@ pub struct State {
     pub left: PanelState,
     pub right: PanelState,
     pub active: PanelSide,
+    /// The live command-line buffer. Printable keys land here whenever a
+    /// panel is focused and no dialog or quick-search owns them.
     pub command_line: String,
+    /// Executed commands, oldest first.
+    pub history: Vec<String>,
+    /// Where Up/Down recall currently sits in `history`; `None` means "not
+    /// recalling", which is the state every edit resets to.
+    pub history_cursor: Option<usize>,
+    /// The §4.7 type-ahead quick-search pattern. While this is `Some`, it —
+    /// not the command line — consumes plain printable keys. Exactly one
+    /// typing sink ever sees a given key.
+    pub quick_search: Option<String>,
+    /// The F9 menu overlay, or `None` when the bar is closed.
+    pub menu: Option<MenuState>,
+    /// The Alt+F1/F2 drive-select dialog, or `None` when closed.
+    pub drive_select: Option<DriveSelect>,
+    /// Shell program + PATHEXT, snapshotted from config/environment at
+    /// startup so `update` stays a pure function of `State`.
+    pub shell: ShellConfig,
     pub phase: UiPhase,
     pub theme: Theme,
     pub term_size: (u16, u16),
@@ -79,6 +106,33 @@ impl State {
 
     pub fn active_panel(&self) -> &PanelState {
         self.panel(self.active)
+    }
+
+    /// The command-line prompt for the active panel, e.g. `C:\NORTON>`. It
+    /// follows focus and directory changes because it is derived, never
+    /// stored.
+    pub fn prompt(&self) -> String {
+        format!("{}>", self.active_panel().cwd.display())
+    }
+
+    /// A bare state with empty panels — the base every test builds on, and
+    /// the shape `initial` fills in.
+    pub fn empty(theme: Theme) -> State {
+        State {
+            left: PanelState::new(PathBuf::from("/")),
+            right: PanelState::new(PathBuf::from("/")),
+            active: PanelSide::Left,
+            command_line: String::new(),
+            history: Vec::new(),
+            history_cursor: None,
+            quick_search: None,
+            menu: None,
+            drive_select: None,
+            shell: ShellConfig::default(),
+            phase: UiPhase::Panels,
+            theme,
+            term_size: (MIN_COLS, MIN_ROWS),
+        }
     }
 
     fn too_small(size: (u16, u16)) -> bool {
@@ -107,11 +161,9 @@ impl State {
         let state = State {
             left: PanelState::new(left_cwd.clone()),
             right: PanelState::new(right_cwd.clone()),
-            active: PanelSide::Left,
-            command_line: String::new(),
             phase,
-            theme,
             term_size,
+            ..State::empty(theme)
         };
         let effects = vec![
             Effect::StartListing { panel: PanelSide::Left, path: left_cwd },
@@ -135,9 +187,9 @@ pub enum Command {
     Resize(u16, u16),
     /// Current time in ms, supplied by the TUI's injected `Clock`.
     Tick(u64),
-    /// Re-read the active panel's directory — the recovery action offered
-    /// after a listing failure, but harmless (and available) at any time.
-    RetryListing,
+    /// Re-read a panel's directory (Ctrl+R). Also the recovery action
+    /// offered after a listing failure, but available at any time.
+    RereadPanel(PanelSide),
 
     // Selection (Ins/+/-/*).
     ToggleSelectAtCursor,
@@ -164,6 +216,54 @@ pub enum Command {
     FileOpErrorChoice(ErrorChoice),
     FileOpCancelJob,
 
+    // Command line.
+    CommandLineChar(char),
+    CommandLineBackspace,
+    /// Esc: clears the buffer, which is the explicit mechanism that hands
+    /// Up/Down back to the panel cursor.
+    CommandLineClear,
+    CommandLineHistoryPrev,
+    CommandLineHistoryNext,
+    /// Ctrl+Enter — paste the cursor entry's file name.
+    PasteCursorName,
+    /// Ctrl+] — paste the cursor entry's full path.
+    PasteCursorPath,
+    /// Ctrl+O — drop to the host terminal's scrollback.
+    ShowScrollback,
+
+    // Type-ahead quick search (§4.7), which competes with the command line
+    // for printable keys.
+    QuickSearchStart(char),
+    QuickSearchChar(char),
+    QuickSearchBackspace,
+    QuickSearchEnd,
+
+    // Sort modes (Ctrl+F3..Ctrl+F7).
+    SetSortMode { side: PanelSide, mode: SortMode },
+
+    // F9 menu overlay.
+    MenuOpen,
+    MenuClose,
+    /// Esc: closes the pull-down but leaves the bar open; a second Esc
+    /// closes the bar.
+    MenuCollapse,
+    MenuSelectPrev,
+    MenuSelectNext,
+    MenuPrevMenu,
+    MenuNextMenu,
+    MenuHotkey(char),
+    MenuActivate,
+
+    // Drive select (Alt+F1/F2).
+    OpenDriveSelect(PanelSide),
+    DriveListReady { target: PanelSide, drives: Vec<char> },
+    DriveSelectMove(isize),
+    DriveSelectConfirm,
+    DriveSelectCancel,
+
+    // Info display mode (Ctrl+L).
+    ToggleInfoMode(PanelSide),
+
     // Worker-produced events, re-entering through the same `update` path.
     ListingChunk { panel: PanelSide, entries: Vec<Entry> },
     ListingComplete { panel: PanelSide, total: usize },
@@ -172,11 +272,13 @@ pub enum Command {
     JobConflict(ConflictInfo),
     JobError(ErrorInfo),
     JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
+    DriveLabelResolved { target: PanelSide, letter: char, label: Option<String> },
+    InfoResolved { panel: PanelSide, path: PathBuf, values: InfoValues },
 }
 
 /// A side-effect request. `update` only ever returns these; it never
 /// performs them. The TUI event loop executes them (spawning worker
-/// threads, exiting the process, ...).
+/// threads, suspending the terminal, exiting the process, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     StartListing { panel: PanelSide, path: PathBuf },
@@ -185,6 +287,21 @@ pub enum Effect {
     CancelJob,
     SendConflictReply(ConflictChoice),
     SendErrorReply(ErrorChoice),
+    /// Suspend the TUI, run this invocation on the real terminal, wait for a
+    /// keypress, then restore and redraw.
+    RunShellCommand(shell::Invocation),
+    /// Leave the alternate screen to expose the host terminal's scrollback
+    /// until any key is pressed.
+    ShowScrollback,
+    /// Rewrite `history.json` atomically with these entries.
+    PersistHistory(Vec<String>),
+    /// Read the logical-drive bitmask (cheap, synchronous) and feed the
+    /// letters back as `DriveListReady` before the next paint.
+    EnumerateDrives(PanelSide),
+    /// Fetch one drive's volume label on a worker thread.
+    FetchDriveLabel { target: PanelSide, letter: char },
+    /// Gather the Info panel's async values on a worker thread.
+    QueryInfo { panel: PanelSide, path: PathBuf },
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -212,6 +329,27 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         return (state, effects);
     }
 
+    // Async drive/Info results are applied only when they still describe
+    // what is on screen; a stale answer is dropped, never rendered.
+    match cmd {
+        Command::DriveLabelResolved { target, letter, label } => {
+            if let Some(dialog) = &mut state.drive_select {
+                if dialog.target == target {
+                    dialog.apply_label(letter, label);
+                }
+            }
+            return (state, effects);
+        }
+        Command::InfoResolved { panel, path, values } => {
+            let p = state.panel_mut(panel);
+            if p.display_mode == DisplayMode::Info && p.cwd == path {
+                p.info = values;
+            }
+            return (state, effects);
+        }
+        _ => {}
+    }
+
     // File-op setup/running/summary phases (and the job events that drive
     // them) are handled uniformly here, independent of the
     // Splash/Placeholder/QuitConfirm/Panels phases below.
@@ -219,6 +357,24 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         || matches!(cmd, Command::JobProgress(_) | Command::JobConflict(_) | Command::JobError(_) | Command::JobDone { .. })
     {
         effects.extend(handle_file_op(&mut state, cmd));
+        return (state, effects);
+    }
+
+    // The drive-select dialog and the F9 menu are modal over the panels:
+    // while one is open it claims the keys it understands.
+    if state.drive_select.is_some() && is_drive_select_command(&cmd) {
+        effects.extend(handle_drive_select(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.menu.is_some() && is_menu_command(&cmd) {
+        let follow_up = handle_menu(&mut state, cmd);
+        if let Some(next) = follow_up {
+            // An activated item re-enters `update` as the command it stands
+            // for, so a menu action and its keyboard shortcut share one
+            // implementation.
+            let (state, more) = update(state, next);
+            return (state, more);
+        }
         return (state, effects);
     }
 
@@ -251,8 +407,7 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 effects.extend(handle_parent(&mut state, side));
             }
             Command::RequestQuit => state.phase = UiPhase::QuitConfirm,
-            Command::RetryListing => {
-                let side = state.active;
+            Command::RereadPanel(side) => {
                 let path = state.panel(side).cwd.clone();
                 effects.extend(begin_listing(&mut state, side, path));
             }
@@ -264,6 +419,64 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::RequestMove => enter_file_op_setup(&mut state, JobKind::Move),
             Command::RequestMkdir => enter_file_op_setup(&mut state, JobKind::Mkdir),
             Command::RequestDelete => enter_delete_confirm(&mut state),
+
+            Command::CommandLineChar(c) => {
+                state.command_line.push(c);
+                state.history_cursor = None;
+            }
+            Command::CommandLineBackspace => {
+                state.command_line.pop();
+                state.history_cursor = None;
+            }
+            Command::CommandLineClear => {
+                state.command_line.clear();
+                state.history_cursor = None;
+            }
+            Command::CommandLineHistoryPrev => recall_history(&mut state, -1),
+            Command::CommandLineHistoryNext => recall_history(&mut state, 1),
+            Command::PasteCursorName => paste_cursor_entry(&mut state, false),
+            Command::PasteCursorPath => paste_cursor_entry(&mut state, true),
+            Command::ShowScrollback => effects.push(Effect::ShowScrollback),
+
+            Command::QuickSearchStart(c) => {
+                let mut pattern = String::new();
+                pattern.push(c);
+                jump_to_prefix(&mut state, &pattern);
+                state.quick_search = Some(pattern);
+            }
+            Command::QuickSearchChar(c) => {
+                if let Some(mut pattern) = state.quick_search.take() {
+                    pattern.push(c);
+                    jump_to_prefix(&mut state, &pattern);
+                    state.quick_search = Some(pattern);
+                }
+            }
+            Command::QuickSearchBackspace => {
+                if let Some(mut pattern) = state.quick_search.take() {
+                    pattern.pop();
+                    if pattern.is_empty() {
+                        state.quick_search = None;
+                    } else {
+                        jump_to_prefix(&mut state, &pattern);
+                        state.quick_search = Some(pattern);
+                    }
+                }
+            }
+            Command::QuickSearchEnd => state.quick_search = None,
+
+            Command::SetSortMode { side, mode } => state.panel_mut(side).set_sort_mode(mode),
+
+            Command::MenuOpen => state.menu = Some(MenuState::opened()),
+            Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
+            Command::DriveListReady { target, drives } => {
+                let current = drives::drive_letter_of(&state.panel(target).cwd);
+                for letter in &drives {
+                    effects.push(Effect::FetchDriveLabel { target, letter: *letter });
+                }
+                state.drive_select = Some(DriveSelect::new(target, drives, current));
+            }
+            Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
+
             Command::Tick(_) => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
             _ => {}
@@ -273,6 +486,279 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
     (state, effects)
 }
+
+// ---------------------------------------------------------------------
+// Command line
+// ---------------------------------------------------------------------
+
+/// Walk `history` by `delta` (-1 = older, +1 = newer) into the buffer.
+///
+/// Stepping past the newest entry stops recalling but deliberately leaves
+/// the buffer as it is: Esc, not Down, is the documented way to release
+/// Up/Down back to the panel cursor.
+fn recall_history(state: &mut State, delta: isize) {
+    if state.history.is_empty() {
+        return;
+    }
+    let last = state.history.len() - 1;
+    let next = match (state.history_cursor, delta) {
+        (None, d) if d < 0 => Some(last),
+        (None, _) => None,
+        (Some(i), d) if d < 0 => Some(i.saturating_sub(1)),
+        (Some(i), _) if i < last => Some(i + 1),
+        (Some(_), _) => None,
+    };
+    match next {
+        Some(i) => {
+            state.command_line = state.history[i].clone();
+            state.history_cursor = Some(i);
+        }
+        None => state.history_cursor = None,
+    }
+}
+
+/// Ctrl+Enter / Ctrl+]: append the cursor entry's name or full path,
+/// space-separating it from whatever is already typed.
+fn paste_cursor_entry(state: &mut State, full_path: bool) {
+    let panel = state.active_panel();
+    let Some(entry) = panel.selected() else { return };
+    let text = if full_path {
+        panel.cwd.join(&entry.name).display().to_string()
+    } else {
+        entry.name.to_string_lossy().into_owned()
+    };
+    if !state.command_line.is_empty() && !state.command_line.ends_with(' ') {
+        state.command_line.push(' ');
+    }
+    state.command_line.push_str(&text);
+    state.history_cursor = None;
+}
+
+/// Run the typed line: record it in history, clear the buffer, and hand the
+/// TUI a fully-formed invocation to spawn with the terminal suspended.
+fn run_command_line(state: &mut State) -> Vec<Effect> {
+    let text = state.command_line.trim().to_string();
+    if text.is_empty() {
+        return vec![];
+    }
+    state.command_line.clear();
+    state.history_cursor = None;
+
+    // `cd` cannot work through the shell — each command runs in a fresh
+    // child, so its working directory dies with it. NC navigates the panel
+    // instead, which is also how a UNC path is entered by hand.
+    if let Some(target) = parse_cd(&text) {
+        config::push_history(&mut state.history, &text);
+        let side = state.active;
+        let mut effects = vec![Effect::PersistHistory(state.history.clone())];
+        if let Some(path) = resolve_cd_target(&state.panel(side).cwd, &target) {
+            effects.extend(begin_listing(state, side, path));
+        }
+        return effects;
+    }
+
+    config::push_history(&mut state.history, &text);
+    let cwd = state.active_panel().cwd.clone();
+    vec![
+        Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd)),
+        Effect::PersistHistory(state.history.clone()),
+    ]
+}
+
+/// The target of a `cd <path>` line, or `None` if this isn't a `cd`.
+pub fn parse_cd(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix("cd ").or_else(|| trimmed.strip_prefix("CD ")).or_else(|| trimmed.strip_prefix("Cd "))?;
+    let target = rest.trim().trim_matches('"');
+    if target.is_empty() {
+        None
+    } else {
+        Some(target.to_string())
+    }
+}
+
+/// Resolve a `cd` target against `cwd`. Absolute paths, UNC paths, and bare
+/// drive letters (`D:`) are taken as-is; anything else is relative.
+pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
+    if target == ".." {
+        return crate::panel::parent_path(cwd);
+    }
+    if target == "." {
+        return Some(cwd.to_path_buf());
+    }
+    let path = Path::new(target);
+    if drives::is_unc_path(path) || path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    // `D:` on its own means that drive's root, not a relative path.
+    let mut chars = target.chars();
+    if let (Some(letter), Some(':'), None) = (chars.next(), chars.next(), chars.next()) {
+        if letter.is_ascii_alphabetic() {
+            return Some(drives::drive_root(letter));
+        }
+    }
+    Some(cwd.join(target))
+}
+
+/// Move the cursor to the first entry whose name starts with `pattern`
+/// (case-insensitively). A pattern that matches nothing leaves the cursor
+/// where it is.
+fn jump_to_prefix(state: &mut State, pattern: &str) {
+    let side = state.active;
+    let needle = pattern.to_lowercase();
+    let found = state
+        .panel(side)
+        .entries
+        .iter()
+        .position(|e| e.name.to_string_lossy().to_lowercase().starts_with(&needle));
+    if let Some(index) = found {
+        let panel = state.panel_mut(side);
+        panel.cursor = index;
+        panel.cursor_user_moved = true;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Info mode
+// ---------------------------------------------------------------------
+
+fn toggle_info_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let panel = state.panel_mut(side);
+    panel.display_mode = match panel.display_mode {
+        DisplayMode::Full => DisplayMode::Info,
+        DisplayMode::Info => DisplayMode::Full,
+    };
+    if panel.display_mode == DisplayMode::Info {
+        // Every value starts pending; the worker fills them in place.
+        panel.info = InfoValues::default();
+        vec![Effect::QueryInfo { panel: side, path: panel.cwd.clone() }]
+    } else {
+        vec![]
+    }
+}
+
+// ---------------------------------------------------------------------
+// Drive select
+// ---------------------------------------------------------------------
+
+fn is_drive_select_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::DriveSelectMove(_) | Command::DriveSelectConfirm | Command::DriveSelectCancel)
+}
+
+fn handle_drive_select(state: &mut State, cmd: Command) -> Vec<Effect> {
+    match cmd {
+        Command::DriveSelectMove(delta) => {
+            if let Some(dialog) = &mut state.drive_select {
+                dialog.move_selection(delta);
+            }
+            vec![]
+        }
+        Command::DriveSelectCancel => {
+            // The target panel keeps its current directory.
+            state.drive_select = None;
+            vec![]
+        }
+        Command::DriveSelectConfirm => {
+            let Some(dialog) = state.drive_select.take() else { return vec![] };
+            let Some(letter) = dialog.selected_letter() else { return vec![] };
+            // An unavailable drive is not special-cased here: the listing
+            // read fails on the worker thread and surfaces through
+            // `ListingFailed` as the panel's inline error state.
+            let path = drives::drive_root(letter);
+            begin_listing(state, dialog.target, path)
+        }
+        _ => vec![],
+    }
+}
+
+// ---------------------------------------------------------------------
+// F9 menu
+// ---------------------------------------------------------------------
+
+fn is_menu_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::MenuOpen
+            | Command::MenuClose
+            | Command::MenuCollapse
+            | Command::MenuSelectPrev
+            | Command::MenuSelectNext
+            | Command::MenuPrevMenu
+            | Command::MenuNextMenu
+            | Command::MenuHotkey(_)
+            | Command::MenuActivate
+    )
+}
+
+/// Drive the menu state machine. Returns the command an activated item
+/// stands for, which the caller re-enters `update` with.
+fn handle_menu(state: &mut State, cmd: Command) -> Option<Command> {
+    let active_side = state.active;
+    let menu = state.menu.as_mut()?;
+    match cmd {
+        Command::MenuOpen | Command::MenuClose => state.menu = None,
+        Command::MenuCollapse => {
+            // Esc closes the pull-down first, leaving the bar open with its
+            // title still highlighted; a second Esc closes the bar.
+            if menu.pulldown_open {
+                menu.pulldown_open = false;
+            } else {
+                state.menu = None;
+            }
+        }
+        Command::MenuSelectPrev => menu.move_selection(-1),
+        Command::MenuSelectNext => menu.move_selection(1),
+        Command::MenuPrevMenu => {
+            let target = menu.active.prev();
+            menu.go_to(target);
+        }
+        Command::MenuNextMenu => {
+            let target = menu.active.next();
+            menu.go_to(target);
+        }
+        Command::MenuHotkey(c) => {
+            if let Some(id) = MenuId::from_hotkey(c) {
+                menu.go_to(id);
+            }
+        }
+        Command::MenuActivate => {
+            let item = menu.selected_item()?;
+            let side = menu.active.target_side(active_side);
+            let action = item.action;
+            // Activating an item closes the whole overlay, restoring the top
+            // row and the clock, before the action runs.
+            state.menu = None;
+            return menu_action_command(action, side);
+        }
+        _ => {}
+    }
+    None
+}
+
+/// The command a menu item stands for. Disabled items never reach here, so
+/// `Unimplemented` maps to nothing.
+pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Command> {
+    match action {
+        MenuAction::ToggleInfoMode => Some(Command::ToggleInfoMode(side)),
+        MenuAction::SortBy(mode) => Some(Command::SetSortMode { side, mode }),
+        MenuAction::Reread => Some(Command::RereadPanel(side)),
+        MenuAction::DriveSelect => Some(Command::OpenDriveSelect(side)),
+        MenuAction::Copy => Some(Command::RequestCopy),
+        MenuAction::Move => Some(Command::RequestMove),
+        MenuAction::Mkdir => Some(Command::RequestMkdir),
+        MenuAction::Delete => Some(Command::RequestDelete),
+        MenuAction::SelectGroup => Some(Command::GroupSelectAll),
+        MenuAction::DeselectGroup => Some(Command::GroupDeselectAll),
+        MenuAction::InvertSelection => Some(Command::InvertSelection),
+        MenuAction::PanelsOnOff => Some(Command::ShowScrollback),
+        MenuAction::Quit => Some(Command::RequestQuit),
+        MenuAction::Unimplemented => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// File operations (M2)
+// ---------------------------------------------------------------------
 
 /// Which selectable entry(ies) an F5/F6/F8 request applies to: the explicit
 /// selection if non-empty, else the single entry under the cursor.
@@ -516,11 +1002,27 @@ fn handle_file_op_running(
     }
 }
 
+/// Enter: run the typed command line if there is one, otherwise act on the
+/// entry under the cursor — descend into a directory, or spawn an
+/// executable target through the same suspended-shell path a typed command
+/// uses.
 fn handle_enter(state: &mut State) -> Vec<Effect> {
+    if !state.command_line.trim().is_empty() {
+        return run_command_line(state);
+    }
     let side = state.active;
     let Some(entry) = state.panel(side).selected() else { return vec![] };
     match entry.kind {
-        EntryKind::File => vec![],
+        EntryKind::File => {
+            let name = entry.name.to_string_lossy().into_owned();
+            if !shell::is_executable_name(&name, &state.shell.pathext) {
+                return vec![];
+            }
+            let cwd = state.panel(side).cwd.clone();
+            // Quoted so a name with spaces reaches the shell as one token.
+            let text = format!("\"{name}\"");
+            vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd))]
+        }
         EntryKind::ParentDir => handle_parent(state, side),
         EntryKind::Directory => {
             let new_dir = state.panel(side).cwd.join(&entry.name);
@@ -538,7 +1040,13 @@ fn handle_parent(state: &mut State, side: PanelSide) -> Vec<Effect> {
 
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     state.panel_mut(side).begin_new_listing(path.clone());
-    vec![Effect::StartListing { panel: side, path }]
+    let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
+    // A panel sitting in Info mode needs its drive/directory figures
+    // re-gathered for wherever it just landed.
+    if state.panel(side).display_mode == DisplayMode::Info {
+        effects.push(Effect::QueryInfo { panel: side, path });
+    }
+    effects
 }
 
 fn apply_listing_event(state: &mut State, cmd: Command) {
@@ -568,477 +1076,4 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::listing::{Entry, EntryKind};
-    use std::ffi::OsString;
-
-    fn test_state(phase: UiPhase) -> State {
-        State {
-            left: PanelState::new(PathBuf::from("/left")),
-            right: PanelState::new(PathBuf::from("/right")),
-            active: PanelSide::Left,
-            command_line: String::new(),
-            phase,
-            theme: Theme::classic(),
-            term_size: (80, 24),
-        }
-    }
-
-    #[test]
-    fn update_is_deterministic() {
-        let s1 = test_state(UiPhase::Panels);
-        let s2 = test_state(UiPhase::Panels);
-        let (r1, e1) = update(s1, Command::ToggleActivePanel);
-        let (r2, e2) = update(s2, Command::ToggleActivePanel);
-        assert_eq!(r1, r2);
-        assert_eq!(e1, e2);
-    }
-
-    #[test]
-    fn directory_read_returns_intent_effect_without_io() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![Entry { name: OsString::from("sub"), kind: EntryKind::Directory, size: 0, modified: None }];
-        let (state, effects) = update(state, Command::Enter);
-        assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
-        // The panel's own entries were reset locally — no filesystem was touched.
-        assert!(state.left.entries.is_empty());
-        assert!(matches!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }));
-    }
-
-    #[test]
-    fn worker_events_reenter_through_update() {
-        let state = test_state(UiPhase::Panels);
-        let entries = vec![Entry { name: OsString::from("a"), kind: EntryKind::File, size: 1, modified: None }];
-        let (state, effects) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone() });
-        assert!(effects.is_empty());
-        assert_eq!(state.left.entries, entries);
-        let (state, effects) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1 });
-        assert!(effects.is_empty());
-        assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 1 });
-    }
-
-    #[test]
-    fn toggle_active_panel_is_exclusive() {
-        let state = test_state(UiPhase::Panels);
-        assert_eq!(state.active, PanelSide::Left);
-        let (state, _) = update(state, Command::ToggleActivePanel);
-        assert_eq!(state.active, PanelSide::Right);
-        let (state, _) = update(state, Command::ToggleActivePanel);
-        assert_eq!(state.active, PanelSide::Left);
-    }
-
-    #[test]
-    fn enter_on_parent_dir_navigates_up_and_resets_cursor() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.cwd = PathBuf::from("/a/b");
-        state.left.entries = vec![Entry::parent_dir()];
-        state.left.cursor = 0;
-        let (state, effects) = update(state, Command::Enter);
-        assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
-        assert_eq!(state.left.cursor, 0);
-    }
-
-    #[test]
-    fn parent_nav_at_root_is_no_op() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.cwd = PathBuf::from("/");
-        let (state, effects) = update(state, Command::ParentDir);
-        assert!(effects.is_empty());
-        assert_eq!(state.left.cwd, PathBuf::from("/"));
-    }
-
-    #[test]
-    fn f10_raises_quit_confirm_and_confirm_quits() {
-        let state = test_state(UiPhase::Panels);
-        let (state, effects) = update(state, Command::RequestQuit);
-        assert_eq!(state.phase, UiPhase::QuitConfirm);
-        assert!(effects.is_empty());
-        let (state, effects) = update(state, Command::ConfirmQuit);
-        assert_eq!(effects, vec![Effect::Quit]);
-        let _ = state;
-    }
-
-    #[test]
-    fn quit_confirm_cancel_returns_to_panels() {
-        let state = test_state(UiPhase::QuitConfirm);
-        let (state, effects) = update(state, Command::CancelQuit);
-        assert_eq!(state.phase, UiPhase::Panels);
-        assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn splash_dismissed_immediately_by_key_before_min_hold() {
-        let state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
-        let (state, effects) = update(state, Command::ToggleActivePanel);
-        assert_eq!(state.phase, UiPhase::Panels);
-        // The dismissing key was consumed, not forwarded: active panel must
-        // still be Left (unaffected by the ToggleActivePanel command).
-        assert_eq!(state.active, PanelSide::Left);
-        assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn splash_auto_dismisses_after_min_hold_via_tick() {
-        let state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
-        let (state, _) = update(state, Command::Tick(1_799));
-        assert!(matches!(state.phase, UiPhase::Splash { .. }));
-        let (state, _) = update(state, Command::Tick(1_800));
-        assert_eq!(state.phase, UiPhase::Panels);
-    }
-
-    #[test]
-    fn placeholder_below_min_and_grows_back_to_panels_never_splash() {
-        let state = test_state(UiPhase::Splash { started_at_ms: 0 });
-        let (state, _) = update(state, Command::Resize(40, 10));
-        assert_eq!(state.phase, UiPhase::Placeholder);
-        let (state, _) = update(state, Command::Resize(80, 24));
-        assert_eq!(state.phase, UiPhase::Panels);
-    }
-
-    #[test]
-    fn listing_chunk_during_splash_still_updates_panel_state() {
-        let state = test_state(UiPhase::Splash { started_at_ms: 0 });
-        let entries = vec![Entry { name: OsString::from("a"), kind: EntryKind::File, size: 0, modified: None }];
-        let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone() });
-        assert_eq!(state.left.entries, entries);
-        assert!(matches!(state.phase, UiPhase::Splash { .. }));
-    }
-
-    #[test]
-    fn initial_builds_start_listing_effects_for_both_panels() {
-        let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
-        assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
-        assert_eq!(
-            effects,
-            vec![
-                Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/l") },
-                Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/r") },
-            ]
-        );
-    }
-
-    #[test]
-    fn initial_below_min_size_skips_straight_to_placeholder() {
-        let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
-        assert_eq!(state.phase, UiPhase::Placeholder);
-    }
-
-    #[test]
-    fn initial_without_splash_starts_at_panels() {
-        let (state, _) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
-        assert_eq!(state.phase, UiPhase::Panels);
-    }
-
-    fn file_entry(name: &str, size: u64) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None }
-    }
-
-    fn dir_entry(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
-    }
-
-    #[test]
-    fn request_copy_with_no_selection_and_no_cursor_entry_is_noop() {
-        let state = test_state(UiPhase::Panels);
-        let (state, effects) = update(state, Command::RequestCopy);
-        assert_eq!(state.phase, UiPhase::Panels);
-        assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn request_copy_uses_cursor_entry_when_nothing_explicitly_selected() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 10)];
-        let (state, _) = update(state, Command::RequestCopy);
-        match state.phase {
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, .. }) => {
-                assert_eq!(kind, JobKind::Copy);
-                assert_eq!(sources.len(), 1);
-                assert_eq!(sources[0].original_name, OsString::from("a.txt"));
-            }
-            other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_copy_prefills_destination_with_opposite_panel_cwd() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 10)];
-        let (state, _) = update(state, Command::RequestCopy);
-        match state.phase {
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
-                assert_eq!(input, PathBuf::from("/right").display().to_string());
-            }
-            other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_copy_uses_explicit_selection_over_cursor() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
-        state.left.selected.insert(OsString::from("b.txt"));
-        let (state, _) = update(state, Command::RequestCopy);
-        match state.phase {
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { sources, .. }) => {
-                assert_eq!(sources.len(), 1);
-                assert_eq!(sources[0].original_name, OsString::from("b.txt"));
-            }
-            other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn request_mkdir_is_always_available_even_with_empty_panel() {
-        let state = test_state(UiPhase::Panels);
-        let (state, _) = update(state, Command::RequestMkdir);
-        assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind: JobKind::Mkdir, .. })));
-    }
-
-    #[test]
-    fn destination_input_typing_and_confirm_starts_job() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1)];
-        let (state, _) = update(state, Command::RequestCopy);
-        let (state, _) = update(state, Command::FileOpInputBackspace); // backspace on prefilled input
-        let (state, _) = update(state, Command::FileOpInputChar('X'));
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        match &state.phase {
-            UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Progress { kind, .. } } => {
-                assert_eq!(*kind, JobKind::Copy);
-                assert_eq!(source_dir, &PathBuf::from("/left"));
-                assert!(dest_dir.to_string_lossy().ends_with('X'));
-            }
-            other => panic!("expected FileOpRunning Progress, got {other:?}"),
-        }
-        assert!(matches!(effects.as_slice(), [Effect::RunJob(_)]));
-    }
-
-    #[test]
-    fn destination_input_confirm_with_empty_input_is_noop() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1)];
-        let (state, _) = update(state, Command::RequestMkdir);
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        assert!(effects.is_empty());
-        assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { .. })));
-    }
-
-    #[test]
-    fn escape_cancels_destination_input_back_to_panels() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1)];
-        let (state, _) = update(state, Command::RequestCopy);
-        let (state, effects) = update(state, Command::FileOpCancel);
-        assert_eq!(state.phase, UiPhase::Panels);
-        assert!(effects.is_empty());
-    }
-
-    #[test]
-    fn delete_confirm_requires_second_confirmation_for_a_directory() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![dir_entry("sub")];
-        let (state, effects) = update(state, Command::RequestDelete);
-        assert!(effects.is_empty());
-        assert!(matches!(
-            state.phase,
-            UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { needs_second_confirm: true, confirmed_once: false, .. })
-        ));
-
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        assert!(effects.is_empty(), "first confirm just arms the second confirmation");
-        assert!(matches!(
-            state.phase,
-            UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { needs_second_confirm: true, confirmed_once: true, .. })
-        ));
-
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        assert!(matches!(effects.as_slice(), [Effect::RunJob(Job { kind: JobKind::Delete, .. })]));
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
-    }
-
-    #[test]
-    fn delete_confirm_single_file_needs_only_one_confirmation() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1)];
-        let (state, _) = update(state, Command::RequestDelete);
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        assert!(matches!(effects.as_slice(), [Effect::RunJob(_)]));
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
-    }
-
-    fn running_progress_state(kind: JobKind, source_dir: &str, dest_dir: &str) -> State {
-        let mut state = test_state(UiPhase::FileOpRunning {
-            source_dir: PathBuf::from(source_dir),
-            dest_dir: PathBuf::from(dest_dir),
-            dialog: RunningDialog::Progress { kind, progress: ProgressInfo::starting(3, 30) },
-        });
-        state.left.cwd = PathBuf::from(source_dir);
-        state.right.cwd = PathBuf::from(dest_dir);
-        state
-    }
-
-    #[test]
-    fn job_progress_event_updates_progress_dialog() {
-        let state = running_progress_state(JobKind::Copy, "/left", "/right");
-        let info = ProgressInfo { files_done: 1, files_total: 3, bytes_done: 10, bytes_total: 30, current_file: OsString::from("a.txt") };
-        let (state, effects) = update(state, Command::JobProgress(info.clone()));
-        assert!(effects.is_empty());
-        match state.phase {
-            UiPhase::FileOpRunning { dialog: RunningDialog::Progress { progress, .. }, .. } => assert_eq!(progress, info),
-            other => panic!("expected Progress dialog, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn job_conflict_event_switches_to_conflict_dialog_and_reply_returns_to_progress() {
-        let state = running_progress_state(JobKind::Copy, "/left", "/right");
-        let info = ConflictInfo {
-            source_name: OsString::from("a.txt"),
-            source_size: 1,
-            source_modified: None,
-            target_path: PathBuf::from("/right/a.txt"),
-            target_size: 2,
-            target_modified: None,
-        };
-        let (state, _) = update(state, Command::JobConflict(info.clone()));
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }));
-
-        let (state, effects) = update(state, Command::FileOpConflictChoice(ConflictChoice::Overwrite));
-        assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Overwrite)]);
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
-    }
-
-    #[test]
-    fn conflict_rename_flow_composes_a_name_then_replies() {
-        let state = running_progress_state(JobKind::Copy, "/left", "/right");
-        let info = ConflictInfo {
-            source_name: OsString::from("a.txt"),
-            source_size: 1,
-            source_modified: None,
-            target_path: PathBuf::from("/right/a.txt"),
-            target_size: 2,
-            target_modified: None,
-        };
-        let (state, _) = update(state, Command::JobConflict(info));
-        let (state, _) = update(state, Command::FileOpBeginRename);
-        let (state, _) = update(state, Command::FileOpInputChar('b'));
-        let (state, _) = update(state, Command::FileOpInputChar('.'));
-        let (state, _) = update(state, Command::FileOpInputChar('c'));
-        let (state, effects) = update(state, Command::FileOpConfirm);
-        assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Rename(OsString::from("b.c")))]);
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
-    }
-
-    #[test]
-    fn job_error_event_switches_to_error_dialog_and_reply_returns_to_progress() {
-        let state = running_progress_state(JobKind::Delete, "/left", "/left");
-        let info = ErrorInfo { path: PathBuf::from("/left/a.txt"), message: "permission denied".to_string() };
-        let (state, _) = update(state, Command::JobError(info));
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Error { .. }, .. }));
-        let (state, effects) = update(state, Command::FileOpErrorChoice(ErrorChoice::Skip));
-        assert_eq!(effects, vec![Effect::SendErrorReply(ErrorChoice::Skip)]);
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
-    }
-
-    #[test]
-    fn job_cancel_sends_cancel_effect_without_leaving_progress_dialog() {
-        let state = running_progress_state(JobKind::Copy, "/left", "/right");
-        let (state, effects) = update(state, Command::FileOpCancelJob);
-        assert_eq!(effects, vec![Effect::CancelJob]);
-        assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
-    }
-
-    #[test]
-    fn job_done_with_no_skips_rereads_matching_panels_and_returns_to_panels() {
-        let state = running_progress_state(JobKind::Copy, "/left", "/right");
-        let (state, effects) = update(
-            state,
-            Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
-        );
-        assert_eq!(state.phase, UiPhase::Panels);
-        assert_eq!(
-            effects,
-            vec![
-                Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
-                Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
-            ]
-        );
-    }
-
-    #[test]
-    fn job_done_with_skips_shows_summary_instead_of_panels() {
-        let mut state = test_state(UiPhase::FileOpRunning {
-            source_dir: PathBuf::from("/left"),
-            dest_dir: PathBuf::from("/left"),
-            dialog: RunningDialog::Progress { kind: JobKind::Delete, progress: ProgressInfo::starting(3, 30) },
-        });
-        state.left.cwd = PathBuf::from("/left");
-        state.right.cwd = PathBuf::from("/right"); // unaffected panel: must not be re-read
-        let skipped = vec![SkippedItem { path: PathBuf::from("/left/a.txt"), reason: "denied".to_string() }];
-        let (state, effects) = update(
-            state,
-            Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
-        );
-        assert_eq!(state.phase, UiPhase::FileOpSummary(skipped));
-        assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
-
-        let (state, _) = update(state, Command::FileOpConfirm);
-        assert_eq!(state.phase, UiPhase::Panels);
-    }
-
-    #[test]
-    fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
-        let mut state = test_state(UiPhase::FileOpRunning {
-            source_dir: PathBuf::from("/left"),
-            dest_dir: PathBuf::from("/somewhere/else"),
-            dialog: RunningDialog::Progress { kind: JobKind::Copy, progress: ProgressInfo::starting(1, 1) },
-        });
-        state.left.cwd = PathBuf::from("/left");
-        state.right.cwd = PathBuf::from("/right"); // does not match dest_dir
-        let (_, effects) = update(
-            state,
-            Command::JobDone {
-                outcome: JobOutcome::Completed { skipped: vec![] },
-                source_dir: PathBuf::from("/left"),
-                dest_dir: PathBuf::from("/somewhere/else"),
-            },
-        );
-        assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
-    }
-
-    #[test]
-    fn listing_complete_reconciles_selection_against_fresh_entries() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.selected.insert(OsString::from("gone.txt"));
-        state.left.selected.insert(OsString::from("stays.txt"));
-        state.left.entries = vec![file_entry("stays.txt", 1)];
-        let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1 });
-        assert_eq!(state.left.selected, std::collections::HashSet::from([OsString::from("stays.txt")]));
-    }
-
-    #[test]
-    fn selection_commands_operate_on_active_panel() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
-        let (state, _) = update(state, Command::ToggleSelectAtCursor);
-        assert!(state.left.selected.contains(&OsString::from("a.txt")));
-        let (state, _) = update(state, Command::InvertSelection);
-        assert_eq!(state.left.selected, std::collections::HashSet::from([OsString::from("b.txt")]));
-        let (state, _) = update(state, Command::GroupSelectAll);
-        assert_eq!(state.left.selected.len(), 2);
-        let (state, _) = update(state, Command::GroupDeselectAll);
-        assert!(state.left.selected.is_empty());
-    }
-
-    #[test]
-    fn retry_listing_reissues_start_listing_for_active_panel() {
-        let mut state = test_state(UiPhase::Panels);
-        state.left.last_error = Some("boom".to_string());
-        state.left.cwd = PathBuf::from("/left");
-        let (state, effects) = update(state, Command::RetryListing);
-        assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
-        assert!(state.left.last_error.is_none());
-    }
-}
+mod tests;

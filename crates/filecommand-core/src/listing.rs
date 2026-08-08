@@ -2,6 +2,7 @@
 //! model, and streaming enumeration designed to be driven from a worker
 //! thread (owned by `filecommand-tui`, never spawned here).
 
+use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -83,6 +84,159 @@ impl Entry {
 /// Lossy UTF-8 rendering of a possibly-non-Unicode file name.
 pub fn display_name_lossy(entry: &Entry) -> String {
     entry.name.to_string_lossy().into_owned()
+}
+
+// ---------------------------------------------------------------------
+// Sort modes and comparators
+// ---------------------------------------------------------------------
+
+/// Which key a panel is sorted by. Set per panel with Ctrl+F3..Ctrl+F7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortMode {
+    #[default]
+    Name,
+    Extension,
+    Time,
+    Size,
+    /// Directory-enumeration order: no reordering at all beyond floating
+    /// `..` to the top.
+    Unsorted,
+}
+
+/// The panel column a sort mode marks with its `↓`/`↑` arrow. `Unsorted`
+/// marks no column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortColumn {
+    Name,
+    Size,
+    Date,
+}
+
+impl SortMode {
+    /// The header column this mode's arrow indicator belongs on, or `None`
+    /// in `Unsorted` mode where no column carries an arrow.
+    pub fn column(self) -> Option<SortColumn> {
+        match self {
+            // Extension sorting is still a name-column ordering in NC — the
+            // arrow stays on Name.
+            SortMode::Name | SortMode::Extension => Some(SortColumn::Name),
+            SortMode::Size => Some(SortColumn::Size),
+            // One modification timestamp is displayed across the Date and
+            // Time columns; the arrow marks the first of the pair.
+            SortMode::Time => Some(SortColumn::Date),
+            SortMode::Unsorted => None,
+        }
+    }
+}
+
+/// The `↓`/`↑` indicator for a sort direction. Both are CP437-heritage
+/// glyphs.
+pub fn sort_arrow(descending: bool) -> &'static str {
+    if descending {
+        "\u{2191}"
+    } else {
+        "\u{2193}"
+    }
+}
+
+fn lower_name(entry: &Entry) -> String {
+    entry.name.to_string_lossy().to_lowercase()
+}
+
+/// The DOS-style extension of a name: everything after the last `.`, except
+/// that a leading dot is part of the name (`.gitignore` has no extension).
+pub fn extension_of(name: &str) -> &str {
+    match name.rfind('.') {
+        Some(0) | None => "",
+        Some(i) => &name[i + 1..],
+    }
+}
+
+/// Case-insensitive name order. Directories and files interleave, matching
+/// classic Norton Commander behavior.
+pub fn cmp_by_name(a: &Entry, b: &Entry) -> Ordering {
+    lower_name(a).cmp(&lower_name(b))
+}
+
+/// Extension order, falling back to name so entries sharing an extension
+/// stay in a predictable (total) order.
+pub fn cmp_by_extension(a: &Entry, b: &Entry) -> Ordering {
+    let (an, bn) = (lower_name(a), lower_name(b));
+    extension_of(&an).cmp(extension_of(&bn)).then_with(|| an.cmp(&bn))
+}
+
+/// Modification-time order, oldest first; entries with no timestamp sort
+/// before any timestamped entry. Ties break on name.
+pub fn cmp_by_time(a: &Entry, b: &Entry) -> Ordering {
+    a.modified.cmp(&b.modified).then_with(|| lower_name(a).cmp(&lower_name(b)))
+}
+
+/// Size order, smallest first, ties breaking on name. Directories carry
+/// size 0 and therefore group at the front.
+pub fn cmp_by_size(a: &Entry, b: &Entry) -> Ordering {
+    a.size.cmp(&b.size).then_with(|| lower_name(a).cmp(&lower_name(b)))
+}
+
+/// The comparator for `mode`, before `..`-first and direction handling.
+/// `Unsorted` compares every pair equal, so a *stable* sort leaves
+/// enumeration order untouched.
+pub fn cmp_by_mode(a: &Entry, b: &Entry, mode: SortMode) -> Ordering {
+    match mode {
+        SortMode::Name => cmp_by_name(a, b),
+        SortMode::Extension => cmp_by_extension(a, b),
+        SortMode::Time => cmp_by_time(a, b),
+        SortMode::Size => cmp_by_size(a, b),
+        SortMode::Unsorted => Ordering::Equal,
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+
+    fn f(name: &str, size: u64, modified: Option<DateTime>) -> Entry {
+        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified }
+    }
+
+    fn dt(day: u8) -> DateTime {
+        DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }
+    }
+
+    #[test]
+    fn extension_of_ignores_a_leading_dot() {
+        assert_eq!(extension_of("readme.txt"), "txt");
+        assert_eq!(extension_of("archive.tar.gz"), "gz");
+        assert_eq!(extension_of(".gitignore"), "");
+        assert_eq!(extension_of("noext"), "");
+    }
+
+    #[test]
+    fn each_comparator_orders_by_its_own_key() {
+        assert_eq!(cmp_by_name(&f("apple", 9, None), &f("Banana", 1, None)), Ordering::Less);
+        assert_eq!(cmp_by_extension(&f("z.aaa", 0, None), &f("a.zzz", 0, None)), Ordering::Less);
+        assert_eq!(cmp_by_size(&f("big", 100, None), &f("small", 1, None)), Ordering::Greater);
+        assert_eq!(cmp_by_time(&f("old", 0, Some(dt(1))), &f("new", 0, Some(dt(2)))), Ordering::Less);
+    }
+
+    #[test]
+    fn unsorted_compares_everything_equal() {
+        assert_eq!(cmp_by_mode(&f("z", 9, None), &f("a", 1, None), SortMode::Unsorted), Ordering::Equal);
+    }
+
+    #[test]
+    fn sort_column_maps_modes_and_unsorted_has_none() {
+        assert_eq!(SortMode::Name.column(), Some(SortColumn::Name));
+        assert_eq!(SortMode::Extension.column(), Some(SortColumn::Name));
+        assert_eq!(SortMode::Size.column(), Some(SortColumn::Size));
+        assert_eq!(SortMode::Time.column(), Some(SortColumn::Date));
+        assert_eq!(SortMode::Unsorted.column(), None);
+    }
+
+    #[test]
+    fn sort_arrow_points_down_for_ascending() {
+        assert_eq!(sort_arrow(false), "\u{2193}");
+        assert_eq!(sort_arrow(true), "\u{2191}");
+    }
 }
 
 /// Display (column) width of a string, accounting for wide/combining

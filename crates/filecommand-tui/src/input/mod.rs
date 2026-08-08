@@ -1,15 +1,32 @@
-//! Maps crossterm key events to core [`Command`]s. Aware of the current
-//! [`UiPhase`] since a dialog interprets keys differently than the normal
-//! panel view — the mapping itself still performs no state mutation.
+//! Maps crossterm key events to core [`Command`]s.
+//!
+//! The mapper reads the whole [`State`] rather than just the phase, because
+//! from M3 on the same physical key means different things depending on
+//! what owns it: Up is history recall with text typed and a cursor move
+//! without, Backspace edits the command line or goes to the parent
+//! directory, and printable keys go to the command line unless quick-search
+//! or a dialog has claimed them. The mapping itself still performs no state
+//! mutation and no I/O.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use filecommand_core::config::{KeyBinding, Keys};
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
+use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
-use filecommand_core::{Command, UiPhase};
+use filecommand_core::{Command, PanelSide, State, UiPhase};
 
-pub fn map_key(key: KeyEvent, phase: &UiPhase, page_size: usize) -> Option<Command> {
-    match phase {
+pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
+    // Modal overlays come first: while one is up it owns every key it
+    // understands, regardless of the phase underneath.
+    if state.drive_select.is_some() {
+        return map_drive_select_key(key);
+    }
+    if state.menu.is_some() {
+        return map_menu_key(key);
+    }
+
+    match &state.phase {
         UiPhase::QuitConfirm => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::ConfirmQuit),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::CancelQuit),
@@ -18,32 +35,166 @@ pub fn map_key(key: KeyEvent, phase: &UiPhase, page_size: usize) -> Option<Comma
         UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
         UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
         UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
-        _ => match key.code {
-            KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
-            KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
-            KeyCode::PageUp if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::ParentDir),
-            KeyCode::PageUp => Some(Command::MoveCursor(CursorMove::Up(page_size))),
-            KeyCode::PageDown => Some(Command::MoveCursor(CursorMove::Down(page_size))),
-            KeyCode::Home => Some(Command::MoveCursor(CursorMove::Home)),
-            KeyCode::End => Some(Command::MoveCursor(CursorMove::End)),
-            KeyCode::Tab => Some(Command::ToggleActivePanel),
-            KeyCode::Enter => Some(Command::Enter),
-            // The command line is display-only in M1 (always empty), so
-            // Backspace always means "go to parent directory".
-            KeyCode::Backspace => Some(Command::ParentDir),
-            KeyCode::Char('r') | KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::RetryListing),
-            KeyCode::Insert => Some(Command::ToggleSelectAtCursor),
-            KeyCode::Char('+') => Some(Command::GroupSelectAll),
-            KeyCode::Char('-') => Some(Command::GroupDeselectAll),
-            KeyCode::Char('*') => Some(Command::InvertSelection),
-            KeyCode::F(5) => Some(Command::RequestCopy),
-            KeyCode::F(6) => Some(Command::RequestMove),
-            KeyCode::F(7) => Some(Command::RequestMkdir),
-            KeyCode::F(8) => Some(Command::RequestDelete),
-            KeyCode::F(10) => Some(Command::RequestQuit),
-            _ => None,
-        },
+        _ => {
+            if state.quick_search.is_some() {
+                return map_quick_search_key(key);
+            }
+            map_panel_key(key, state, page_size, keys)
+        }
     }
+}
+
+fn is_plain(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
+    let active = state.active;
+    let typing = !state.command_line.is_empty();
+
+    // Config-overridable bindings win over the compiled-in map, so a user
+    // who rebinds Ctrl+] to something else still gets the default meaning
+    // of whatever key they moved it to.
+    if matches_binding(&key, &keys.paste_name) {
+        return Some(Command::PasteCursorName);
+    }
+    if matches_binding(&key, &keys.paste_path) {
+        return Some(Command::PasteCursorPath);
+    }
+
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        // Sort modes: Ctrl+F3..Ctrl+F6 pick a key, Ctrl+F7 restores
+        // enumeration order.
+        KeyCode::F(3) if ctrl => Some(Command::SetSortMode { side: active, mode: SortMode::Name }),
+        KeyCode::F(4) if ctrl => Some(Command::SetSortMode { side: active, mode: SortMode::Extension }),
+        KeyCode::F(5) if ctrl => Some(Command::SetSortMode { side: active, mode: SortMode::Time }),
+        KeyCode::F(6) if ctrl => Some(Command::SetSortMode { side: active, mode: SortMode::Size }),
+        KeyCode::F(7) if ctrl => Some(Command::SetSortMode { side: active, mode: SortMode::Unsorted }),
+
+        KeyCode::F(1) if alt => Some(Command::OpenDriveSelect(PanelSide::Left)),
+        KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
+
+        KeyCode::F(5) => Some(Command::RequestCopy),
+        KeyCode::F(6) => Some(Command::RequestMove),
+        KeyCode::F(7) => Some(Command::RequestMkdir),
+        KeyCode::F(8) => Some(Command::RequestDelete),
+        KeyCode::F(9) => Some(Command::MenuOpen),
+        KeyCode::F(10) => Some(Command::RequestQuit),
+
+        KeyCode::Char('r') | KeyCode::Char('R') if ctrl => Some(Command::RereadPanel(active)),
+        KeyCode::Char('l') | KeyCode::Char('L') if ctrl => Some(Command::ToggleInfoMode(active)),
+        KeyCode::Char('o') | KeyCode::Char('O') if ctrl => Some(Command::ShowScrollback),
+
+        // Up/Down walk command history while something is typed, and move
+        // the panel cursor when the buffer is empty. Esc is the documented
+        // way to hand them back to the panel.
+        KeyCode::Up if typing => Some(Command::CommandLineHistoryPrev),
+        KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
+        KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
+        KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
+        KeyCode::Esc if typing => Some(Command::CommandLineClear),
+        KeyCode::Backspace if typing => Some(Command::CommandLineBackspace),
+        KeyCode::Backspace => Some(Command::ParentDir),
+
+        KeyCode::PageUp if ctrl => Some(Command::ParentDir),
+        KeyCode::PageUp => Some(Command::MoveCursor(CursorMove::Up(page_size))),
+        KeyCode::PageDown => Some(Command::MoveCursor(CursorMove::Down(page_size))),
+        KeyCode::Home => Some(Command::MoveCursor(CursorMove::Home)),
+        KeyCode::End => Some(Command::MoveCursor(CursorMove::End)),
+        KeyCode::Tab => Some(Command::ToggleActivePanel),
+        KeyCode::Enter => Some(Command::Enter),
+        KeyCode::Insert => Some(Command::ToggleSelectAtCursor),
+
+        // Alt+letter starts the type-ahead jump, which then owns plain
+        // printables until it is dismissed.
+        KeyCode::Char(c) if alt && !ctrl && c.is_alphanumeric() => Some(Command::QuickSearchStart(c)),
+
+        // The grey +/-/* selection keys and typed +/-/* are the same key
+        // event on Windows (crossterm cannot distinguish the numeric
+        // keypad here), so an empty command line means "select" and a
+        // non-empty one means "type".
+        KeyCode::Char('+') if is_plain(&key) && !typing => Some(Command::GroupSelectAll),
+        KeyCode::Char('-') if is_plain(&key) && !typing => Some(Command::GroupDeselectAll),
+        KeyCode::Char('*') if is_plain(&key) && !typing => Some(Command::InvertSelection),
+
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::CommandLineChar(c)),
+        _ => None,
+    }
+}
+
+fn map_menu_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::MenuCollapse),
+        KeyCode::F(9) | KeyCode::F(10) => Some(Command::MenuClose),
+        KeyCode::Up => Some(Command::MenuSelectPrev),
+        KeyCode::Down => Some(Command::MenuSelectNext),
+        KeyCode::Left => Some(Command::MenuPrevMenu),
+        KeyCode::Right => Some(Command::MenuNextMenu),
+        KeyCode::Enter => Some(Command::MenuActivate),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::MenuHotkey(c)),
+        _ => None,
+    }
+}
+
+fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::DriveSelectCancel),
+        KeyCode::Up => Some(Command::DriveSelectMove(-1)),
+        KeyCode::Down => Some(Command::DriveSelectMove(1)),
+        KeyCode::Home | KeyCode::PageUp => Some(Command::DriveSelectMove(isize::MIN / 2)),
+        KeyCode::End | KeyCode::PageDown => Some(Command::DriveSelectMove(isize::MAX / 2)),
+        KeyCode::Enter => Some(Command::DriveSelectConfirm),
+        _ => None,
+    }
+}
+
+/// While the type-ahead jump owns the keyboard, plain printables extend the
+/// pattern and anything else dismisses it — so the command line never sees
+/// a key quick-search consumed, and vice versa.
+fn map_quick_search_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Backspace => Some(Command::QuickSearchBackspace),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::QuickSearchChar(c)),
+        _ => Some(Command::QuickSearchEnd),
+    }
+}
+
+/// The name `parse_binding` normalizes a key to, for matching a live event
+/// against a configured binding.
+fn key_name(code: KeyCode) -> Option<String> {
+    Some(match code {
+        KeyCode::Char(c) => c.to_lowercase().to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Esc => "esc".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "pageup".to_string(),
+        KeyCode::PageDown => "pagedown".to_string(),
+        KeyCode::Up => "up".to_string(),
+        KeyCode::Down => "down".to_string(),
+        KeyCode::Left => "left".to_string(),
+        KeyCode::Right => "right".to_string(),
+        KeyCode::F(n) => format!("f{n}"),
+        _ => return None,
+    })
+}
+
+/// Ctrl and Alt must match exactly. Shift is only checked when the binding
+/// asks for it, since for a printable key the shift is already baked into
+/// the character the terminal delivered.
+pub fn matches_binding(key: &KeyEvent, binding: &KeyBinding) -> bool {
+    let Some(name) = key_name(key.code) else { return false };
+    name == binding.key
+        && key.modifiers.contains(KeyModifiers::CONTROL) == binding.ctrl
+        && key.modifiers.contains(KeyModifiers::ALT) == binding.alt
+        && (!binding.shift || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
 fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> {
@@ -95,181 +246,4 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crossterm::event::KeyEventKind;
-
-    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
-        KeyEvent { code, modifiers, kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::NONE }
-    }
-
-    #[test]
-    fn f10_requests_quit_in_panels_phase() {
-        let cmd = map_key(key(KeyCode::F(10), KeyModifiers::NONE), &UiPhase::Panels, 5);
-        assert_eq!(cmd, Some(Command::RequestQuit));
-    }
-
-    #[test]
-    fn quit_dialog_maps_y_and_n() {
-        assert_eq!(map_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &UiPhase::QuitConfirm, 5), Some(Command::ConfirmQuit));
-        assert_eq!(map_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &UiPhase::QuitConfirm, 5), Some(Command::CancelQuit));
-        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE), &UiPhase::QuitConfirm, 5), Some(Command::CancelQuit));
-    }
-
-    #[test]
-    fn ctrl_pgup_is_parent_dir_plain_pgup_is_page_move() {
-        assert_eq!(map_key(key(KeyCode::PageUp, KeyModifiers::CONTROL), &UiPhase::Panels, 7), Some(Command::ParentDir));
-        assert_eq!(map_key(key(KeyCode::PageUp, KeyModifiers::NONE), &UiPhase::Panels, 7), Some(Command::MoveCursor(CursorMove::Up(7))));
-    }
-
-    #[test]
-    fn tab_and_enter_map_to_expected_commands() {
-        assert_eq!(map_key(key(KeyCode::Tab, KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::ToggleActivePanel));
-        assert_eq!(map_key(key(KeyCode::Enter, KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::Enter));
-    }
-
-    #[test]
-    fn backspace_is_parent_dir() {
-        assert_eq!(map_key(key(KeyCode::Backspace, KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::ParentDir));
-    }
-
-    #[test]
-    fn f5_through_f8_map_to_file_op_requests() {
-        assert_eq!(map_key(key(KeyCode::F(5), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::RequestCopy));
-        assert_eq!(map_key(key(KeyCode::F(6), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::RequestMove));
-        assert_eq!(map_key(key(KeyCode::F(7), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::RequestMkdir));
-        assert_eq!(map_key(key(KeyCode::F(8), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::RequestDelete));
-    }
-
-    #[test]
-    fn selection_keys_map_in_panels_phase() {
-        assert_eq!(map_key(key(KeyCode::Insert, KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::ToggleSelectAtCursor));
-        assert_eq!(map_key(key(KeyCode::Char('+'), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::GroupSelectAll));
-        assert_eq!(map_key(key(KeyCode::Char('-'), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::GroupDeselectAll));
-        assert_eq!(map_key(key(KeyCode::Char('*'), KeyModifiers::NONE), &UiPhase::Panels, 5), Some(Command::InvertSelection));
-    }
-
-    #[test]
-    fn ctrl_r_retries_listing() {
-        assert_eq!(map_key(key(KeyCode::Char('r'), KeyModifiers::CONTROL), &UiPhase::Panels, 5), Some(Command::RetryListing));
-    }
-
-    fn destination_input_phase() -> UiPhase {
-        UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
-            kind: filecommand_core::fs_ops::JobKind::Copy,
-            sources: vec![],
-            source_dir: std::path::PathBuf::from("/left"),
-            input: String::new(),
-        })
-    }
-
-    #[test]
-    fn destination_input_routes_typing_and_confirm_cancel() {
-        let phase = destination_input_phase();
-        assert_eq!(map_key(key(KeyCode::Char('x'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpInputChar('x')));
-        assert_eq!(map_key(key(KeyCode::Backspace, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpInputBackspace));
-        assert_eq!(map_key(key(KeyCode::Enter, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConfirm));
-        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpCancel));
-    }
-
-    fn delete_confirm_phase() -> UiPhase {
-        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
-            sources: vec![],
-            source_dir: std::path::PathBuf::from("/left"),
-            needs_second_confirm: false,
-            confirmed_once: false,
-        })
-    }
-
-    #[test]
-    fn delete_confirm_routes_y_n() {
-        let phase = delete_confirm_phase();
-        assert_eq!(map_key(key(KeyCode::Char('y'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConfirm));
-        assert_eq!(map_key(key(KeyCode::Char('n'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpCancel));
-    }
-
-    fn progress_phase() -> UiPhase {
-        UiPhase::FileOpRunning {
-            source_dir: std::path::PathBuf::from("/left"),
-            dest_dir: std::path::PathBuf::from("/right"),
-            dialog: RunningDialog::Progress {
-                kind: filecommand_core::fs_ops::JobKind::Copy,
-                progress: filecommand_core::fs_ops::ProgressInfo::starting(1, 1),
-            },
-        }
-    }
-
-    #[test]
-    fn progress_dialog_cancel_key_maps_to_cancel_job() {
-        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE), &progress_phase(), 5), Some(Command::FileOpCancelJob));
-    }
-
-    fn conflict_phase(rename_input: Option<String>) -> UiPhase {
-        UiPhase::FileOpRunning {
-            source_dir: std::path::PathBuf::from("/left"),
-            dest_dir: std::path::PathBuf::from("/right"),
-            dialog: RunningDialog::Conflict {
-                kind: filecommand_core::fs_ops::JobKind::Copy,
-                info: filecommand_core::fs_ops::ConflictInfo {
-                    source_name: std::ffi::OsString::from("a.txt"),
-                    source_size: 1,
-                    source_modified: None,
-                    target_path: std::path::PathBuf::from("/right/a.txt"),
-                    target_size: 2,
-                    target_modified: None,
-                },
-                progress: filecommand_core::fs_ops::ProgressInfo::starting(1, 1),
-                rename_input,
-            },
-        }
-    }
-
-    #[test]
-    fn conflict_dialog_routes_mnemonic_keys() {
-        let phase = conflict_phase(None);
-        assert_eq!(map_key(key(KeyCode::Char('o'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConflictChoice(ConflictChoice::Overwrite)));
-        assert_eq!(
-            map_key(key(KeyCode::Char('w'), KeyModifiers::NONE), &phase, 5),
-            Some(Command::FileOpConflictChoice(ConflictChoice::OverwriteAll))
-        );
-        assert_eq!(map_key(key(KeyCode::Char('s'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConflictChoice(ConflictChoice::Skip)));
-        assert_eq!(map_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConflictChoice(ConflictChoice::SkipAll)));
-        assert_eq!(map_key(key(KeyCode::Char('r'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpBeginRename));
-    }
-
-    #[test]
-    fn conflict_dialog_rename_mode_routes_typing_instead_of_mnemonics() {
-        let phase = conflict_phase(Some(String::new()));
-        assert_eq!(map_key(key(KeyCode::Char('o'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpInputChar('o')));
-        assert_eq!(map_key(key(KeyCode::Enter, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConfirm));
-        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpCancel));
-    }
-
-    fn error_phase() -> UiPhase {
-        UiPhase::FileOpRunning {
-            source_dir: std::path::PathBuf::from("/left"),
-            dest_dir: std::path::PathBuf::from("/left"),
-            dialog: RunningDialog::Error {
-                kind: filecommand_core::fs_ops::JobKind::Delete,
-                info: filecommand_core::fs_ops::ErrorInfo { path: std::path::PathBuf::from("/left/a.txt"), message: "denied".into() },
-                progress: filecommand_core::fs_ops::ProgressInfo::starting(1, 1),
-            },
-        }
-    }
-
-    #[test]
-    fn error_dialog_routes_mnemonic_keys() {
-        let phase = error_phase();
-        assert_eq!(map_key(key(KeyCode::Char('r'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpErrorChoice(ErrorChoice::Retry)));
-        assert_eq!(map_key(key(KeyCode::Char('s'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpErrorChoice(ErrorChoice::Skip)));
-        assert_eq!(map_key(key(KeyCode::Char('a'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpErrorChoice(ErrorChoice::SkipAll)));
-        assert_eq!(map_key(key(KeyCode::Char('b'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpErrorChoice(ErrorChoice::Abort)));
-        assert_eq!(map_key(key(KeyCode::Esc, KeyModifiers::NONE), &phase, 5), Some(Command::FileOpErrorChoice(ErrorChoice::Abort)));
-    }
-
-    #[test]
-    fn summary_phase_dismisses_on_any_key() {
-        let phase = UiPhase::FileOpSummary(vec![]);
-        assert_eq!(map_key(key(KeyCode::Char('z'), KeyModifiers::NONE), &phase, 5), Some(Command::FileOpConfirm));
-    }
-}
+mod tests;

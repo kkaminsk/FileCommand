@@ -121,6 +121,14 @@ pub enum Role {
     KeybarLabel,
     CommandLine,
     Clock,
+    MenuBar,
+    MenuBody,
+    MenuHighlight,
+    MenuHotkey,
+    MenuDisabled,
+    InfoLabel,
+    InfoValue,
+    InfoBanner,
     DialogPrimary,
     DialogError,
     DialogInput,
@@ -150,6 +158,14 @@ pub const ALL_ROLES: &[Role] = &[
     Role::KeybarLabel,
     Role::CommandLine,
     Role::Clock,
+    Role::MenuBar,
+    Role::MenuBody,
+    Role::MenuHighlight,
+    Role::MenuHotkey,
+    Role::MenuDisabled,
+    Role::InfoLabel,
+    Role::InfoValue,
+    Role::InfoBanner,
     Role::DialogPrimary,
     Role::DialogError,
     Role::DialogInput,
@@ -183,6 +199,14 @@ impl Role {
             Role::KeybarLabel => "keybar.label",
             Role::CommandLine => "commandline",
             Role::Clock => "clock",
+            Role::MenuBar => "menubar",
+            Role::MenuBody => "menu.body",
+            Role::MenuHighlight => "menu.highlight",
+            Role::MenuHotkey => "menu.hotkey",
+            Role::MenuDisabled => "menu.disabled",
+            Role::InfoLabel => "info.label",
+            Role::InfoValue => "info.value",
+            Role::InfoBanner => "info.banner",
             Role::DialogPrimary => "dialog.primary",
             Role::DialogError => "dialog.error",
             Role::DialogInput => "dialog.input",
@@ -298,6 +322,14 @@ impl Theme {
         set(Role::KeybarLabel, A(Black), A(Cyan));
         set(Role::CommandLine, A(White), A(Black));
         set(Role::Clock, A(Black), A(Cyan));
+        set(Role::MenuBar, A(Black), A(Cyan));
+        set(Role::MenuBody, A(Black), A(Cyan));
+        set(Role::MenuHighlight, A(White), A(Black));
+        set(Role::MenuHotkey, A(BrightYellow), A(Cyan));
+        set(Role::MenuDisabled, A(White), A(Cyan));
+        set(Role::InfoLabel, A(Cyan), A(Blue));
+        set(Role::InfoValue, A(BrightYellow), A(Blue));
+        set(Role::InfoBanner, A(BrightWhite), A(Blue));
         set(Role::DialogPrimary, A(Black), A(Cyan));
         set(Role::DialogError, A(BrightWhite), A(Red));
         set(Role::DialogInput, A(Black), A(Cyan));
@@ -334,6 +366,18 @@ impl Theme {
         set(Role::KeybarLabel, A(Black), A(White));
         set(Role::CommandLine, A(White), A(Black));
         set(Role::Clock, A(Black), A(White));
+        set(Role::MenuBar, A(Black), A(White));
+        set(Role::MenuBody, A(Black), A(White));
+        set(Role::MenuHighlight, A(White), A(Black));
+        // Grey-on-white is the only "unavailable" cue mono can carry, and it
+        // is a brightness difference rather than a hue one.
+        set(Role::MenuDisabled, A(BrightBlack), A(White));
+        // Mono carries no hue meaning; the hotkey letter reads as ordinary
+        // bar text and F1 Help documents the letters instead.
+        set(Role::MenuHotkey, A(Black), A(White));
+        set(Role::InfoLabel, A(White), A(Black));
+        set(Role::InfoValue, A(BrightWhite), A(Black));
+        set(Role::InfoBanner, A(BrightWhite), A(Black));
         set(Role::DialogPrimary, A(Black), A(White));
         set(Role::DialogError, A(BrightWhite), A(Black));
         set(Role::DialogInput, A(Black), A(White));
@@ -477,6 +521,35 @@ mod tests {
         // these three.
         let variants = [ResolvedColor::Ansi16(Ansi16::White), ResolvedColor::Inherit, ResolvedColor::Rgb(Rgb(0, 0, 0))];
         assert_eq!(variants.len(), 3);
+    }
+
+    #[test]
+    fn classic_menu_and_info_roles_match_spec() {
+        let theme = Theme::classic();
+        let cases: &[(Role, Ansi16, Ansi16)] = &[
+            (Role::MenuBar, Ansi16::Black, Ansi16::Cyan),
+            (Role::MenuBody, Ansi16::Black, Ansi16::Cyan),
+            (Role::MenuHighlight, Ansi16::White, Ansi16::Black),
+            (Role::MenuHotkey, Ansi16::BrightYellow, Ansi16::Cyan),
+            (Role::MenuDisabled, Ansi16::White, Ansi16::Cyan),
+            (Role::InfoLabel, Ansi16::Cyan, Ansi16::Blue),
+            (Role::InfoValue, Ansi16::BrightYellow, Ansi16::Blue),
+            (Role::InfoBanner, Ansi16::BrightWhite, Ansi16::Blue),
+        ];
+        for (role, fg, bg) in cases {
+            let spec = theme.get(*role);
+            assert_eq!(spec.fg, ColorValue::Ansi16(*fg), "fg mismatch for {role}");
+            assert_eq!(spec.bg, ColorValue::Ansi16(*bg), "bg mismatch for {role}");
+        }
+    }
+
+    #[test]
+    fn menu_roles_are_visually_distinct_in_both_themes() {
+        for theme in [Theme::classic(), Theme::mono()] {
+            let body = theme.get(Role::MenuBody);
+            assert_ne!(body, theme.get(Role::MenuHighlight), "{}: selected item must differ from body", theme.name);
+            assert_ne!(body, theme.get(Role::MenuDisabled), "{}: disabled item must differ from body", theme.name);
+        }
     }
 
     #[test]

@@ -1,9 +1,12 @@
-pub mod cmdline;
+pub mod command_line;
 pub mod conflict_dialog;
 pub mod delete_confirm;
 pub mod destination_input;
+pub mod drive_select;
 pub mod error_dialog;
+pub mod info_panel;
 pub mod keybar;
+pub mod menubar;
 pub mod panel;
 pub mod placeholder;
 pub mod progress_dialog;
@@ -35,10 +38,20 @@ pub fn render(buf: &mut Buffer, area: Rect, state: &State, depth: ColorDepth, id
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height));
-            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left);
-            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right);
-            cmdline::render_command_line(buf, l.cmdline, &state.theme, depth, &state.active_panel().cwd);
+            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left, identity_lines);
+            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right, identity_lines);
+            command_line::render_command_line(buf, l.cmdline, &state.theme, depth, &state.prompt(), &state.command_line);
             keybar::render_keybar(buf, l.keybar, &state.theme, depth);
+
+            // The F9 bar overlays the panels' top borders (and the clock)
+            // rather than reserving a row of its own.
+            if let Some(menu) = &state.menu {
+                menubar::render_menu_bar(buf, area, &state.theme, depth, menu);
+            }
+            if let Some(dialog) = &state.drive_select {
+                drive_select::render_drive_select(buf, area, &state.theme, depth, dialog);
+            }
+
             match &state.phase {
                 UiPhase::QuitConfirm => quit_dialog::render_quit_dialog(buf, area, &state.theme, depth),
                 UiPhase::FileOpSetup(setup) => {

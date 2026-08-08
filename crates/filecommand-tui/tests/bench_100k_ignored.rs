@@ -14,9 +14,10 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use filecommand_core::listing::{Entry, EntryKind};
+use filecommand_core::listing::SortMode;
 use filecommand_core::panel::{insert_sorted, ListingProgress, PanelState, SortDirection};
 use filecommand_core::theme::{ColorDepth, Theme};
-use filecommand_core::{PanelSide, State, UiPhase};
+use filecommand_core::State;
 
 use filecommand_tui::views;
 
@@ -35,7 +36,7 @@ fn bench_streamed_sorted_insert_100k() {
     let start = Instant::now();
     let mut sorted: Vec<Entry> = Vec::new();
     for e in entries {
-        insert_sorted(&mut sorted, e, SortDirection::Asc);
+        insert_sorted(&mut sorted, e, SortMode::Name, SortDirection::Asc);
     }
     let elapsed = start.elapsed();
     eprintln!("streamed insert_sorted x {N}: {elapsed:?} ({:.2} ms/entry avg)", elapsed.as_secs_f64() * 1000.0 / N as f64);
@@ -47,7 +48,7 @@ fn bench_streamed_sorted_insert_100k() {
 fn bench_bulk_sort_100k() {
     let mut entries = synthetic_entries(N);
     let start = Instant::now();
-    entries.sort_by(|a, b| filecommand_core::panel::cmp_entries(a, b, SortDirection::Asc));
+    entries.sort_by(|a, b| filecommand_core::panel::cmp_entries(a, b, SortMode::Name, SortDirection::Asc));
     let elapsed = start.elapsed();
     eprintln!("bulk sort_by x {N}: {elapsed:?}");
     assert_eq!(entries.len(), N);
@@ -58,20 +59,12 @@ fn bench_bulk_sort_100k() {
 fn bench_render_frame_with_100k_entries() {
     let mut panel = PanelState::new(PathBuf::from(r"C:\bench"));
     let mut entries = synthetic_entries(N);
-    entries.sort_by(|a, b| filecommand_core::panel::cmp_entries(a, b, SortDirection::Asc));
+    entries.sort_by(|a, b| filecommand_core::panel::cmp_entries(a, b, SortMode::Name, SortDirection::Asc));
     panel.entries = entries;
     panel.progress = ListingProgress::Complete { count: N };
     panel.cursor = N / 2;
 
-    let state = State {
-        left: panel.clone(),
-        right: panel,
-        active: PanelSide::Left,
-        command_line: String::new(),
-        phase: UiPhase::Panels,
-        theme: Theme::classic(),
-        term_size: (80, 24),
-    };
+    let state = State { left: panel.clone(), right: panel, ..State::empty(Theme::classic()) };
     let identity_lines = [String::new(), String::new(), String::new(), String::new()];
 
     let backend = TestBackend::new(80, 24);

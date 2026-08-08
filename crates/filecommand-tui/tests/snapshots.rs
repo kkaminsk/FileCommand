@@ -11,7 +11,7 @@ use ratatui::layout::Rect;
 use filecommand_core::listing::{DateTime, Entry, EntryKind};
 use filecommand_core::panel::{ListingProgress, PanelState};
 use filecommand_core::theme::{ColorDepth, Theme};
-use filecommand_core::{PanelSide, State, UiPhase};
+use filecommand_core::{State, UiPhase};
 
 use filecommand_tui::views;
 
@@ -62,15 +62,7 @@ fn sample_state(theme: Theme) -> State {
     let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\Documents"));
     right.progress = ListingProgress::Streaming { count: 12_345 };
 
-    State {
-        left,
-        right,
-        active: PanelSide::Left,
-        command_line: String::new(),
-        phase: UiPhase::Panels,
-        theme,
-        term_size: (80, 24),
-    }
+    State { left, right, ..State::empty(theme) }
 }
 
 fn render(state: &State, size: (u16, u16)) -> String {
@@ -95,43 +87,19 @@ fn streaming_ministatus_shows_reading_count() {
 
 #[test]
 fn splash_nc_classic() {
-    let state = State {
-        left: PanelState::new(PathBuf::from("/")),
-        right: PanelState::new(PathBuf::from("/")),
-        active: PanelSide::Left,
-        command_line: String::new(),
-        phase: UiPhase::Splash { started_at_ms: 0 },
-        theme: Theme::classic(),
-        term_size: (80, 24),
-    };
+    let state = State { phase: UiPhase::Splash { started_at_ms: 0 }, ..State::empty(Theme::classic()) };
     insta::assert_snapshot!("splash_nc_classic", render(&state, (80, 24)));
 }
 
 #[test]
 fn splash_nc_mono() {
-    let state = State {
-        left: PanelState::new(PathBuf::from("/")),
-        right: PanelState::new(PathBuf::from("/")),
-        active: PanelSide::Left,
-        command_line: String::new(),
-        phase: UiPhase::Splash { started_at_ms: 0 },
-        theme: Theme::mono(),
-        term_size: (80, 24),
-    };
+    let state = State { phase: UiPhase::Splash { started_at_ms: 0 }, ..State::empty(Theme::mono()) };
     insta::assert_snapshot!("splash_nc_mono", render(&state, (80, 24)));
 }
 
 #[test]
 fn terminal_too_small_placeholder() {
-    let state = State {
-        left: PanelState::new(PathBuf::from("/")),
-        right: PanelState::new(PathBuf::from("/")),
-        active: PanelSide::Left,
-        command_line: String::new(),
-        phase: UiPhase::Placeholder,
-        theme: Theme::classic(),
-        term_size: (40, 10),
-    };
+    let state = State { phase: UiPhase::Placeholder, term_size: (40, 10), ..State::empty(Theme::classic()) };
     insta::assert_snapshot!("terminal_too_small_placeholder", render(&state, (40, 10)));
 }
 

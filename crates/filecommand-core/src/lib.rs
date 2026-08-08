@@ -7,10 +7,14 @@
 
 pub mod clock;
 pub mod config;
+pub mod drives;
 pub mod fs_ops;
 pub mod identity;
+pub mod info;
 pub mod listing;
+pub mod menu;
 pub mod panel;
+pub mod shell;
 pub mod theme;
 pub mod update;
 
