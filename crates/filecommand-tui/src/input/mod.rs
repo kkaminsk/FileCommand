@@ -46,6 +46,9 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     if state.user_menu.is_some() {
         return map_user_menu_key(key);
     }
+    if state.theme_picker.is_some() {
+        return map_theme_picker_key(key);
+    }
     if let Some(dialog) = &state.help {
         return map_help_key(key, dialog);
     }
@@ -410,6 +413,18 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
         KeyCode::Enter => Some(Command::UserMenuConfirm),
         KeyCode::Up => Some(Command::UserMenuMove(-1)),
         KeyCode::Down => Some(Command::UserMenuMove(1)),
+        _ => None,
+    }
+}
+
+/// Options → Themes picker (theme-selection "Picker navigation, apply, and
+/// cancel").
+fn map_theme_picker_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::ThemePickerCancel),
+        KeyCode::Enter => Some(Command::ThemePickerConfirm),
+        KeyCode::Up => Some(Command::ThemePickerMove(-1)),
+        KeyCode::Down => Some(Command::ThemePickerMove(1)),
         _ => None,
     }
 }

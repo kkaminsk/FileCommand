@@ -93,6 +93,9 @@ pub enum MenuAction {
     FindFile,
     FuzzyJump,
     Quit,
+    /// Options → Themes: opens the theme-selection picker dialog
+    /// (theme-selection "Options menu opens the theme picker").
+    OpenThemes,
     /// Rendered as a real entry so the menu matches its final shape, but
     /// greyed out and unselectable until its milestone lands.
     Unimplemented,
@@ -187,7 +190,7 @@ const COMMANDS_MENU: &[MenuEntry] = &[
 
 const OPTIONS_MENU: &[MenuEntry] = &[
     item("Configuration", 0, "", MenuAction::Unimplemented),
-    item("Themes", 0, "", MenuAction::Unimplemented),
+    item("Themes", 0, "", MenuAction::OpenThemes),
     item("Editor selection", 0, "", MenuAction::Unimplemented),
     MenuEntry::Separator,
     item("Save setup", 0, "", MenuAction::Unimplemented),
@@ -366,9 +369,25 @@ mod tests {
     }
 
     #[test]
-    fn options_menu_is_entirely_disabled_for_now() {
-        assert_eq!(first_selectable(MenuId::Options), None);
-        assert!(MenuState::for_menu(MenuId::Options).selected_item().is_none());
+    fn options_menu_themes_is_enabled_the_rest_still_render_disabled() {
+        // Themes (theme-selection) is the first Options entry, and is the
+        // canonical "renders disabled" example's *former* stand-in — see
+        // `pulldown-menus` MODIFIED "Menu contents": the rest of the menu
+        // stays a placeholder (pulldown-menus "Not-yet-available feature
+        // renders disabled" now anchors on Attributes/Configuration/etc.
+        // instead).
+        let menu = MenuState::for_menu(MenuId::Options);
+        assert_eq!(menu.selected_item().map(|i| i.label), Some("Themes"));
+        for label in ["Configuration", "Editor selection", "Save setup"] {
+            let item = entries(MenuId::Options)
+                .iter()
+                .find_map(|e| match e {
+                    MenuEntry::Item(i) if i.label == label => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("`{label}` missing from the Options menu"));
+            assert!(!item.is_enabled(), "`{label}` should still render disabled");
+        }
     }
 
     #[test]

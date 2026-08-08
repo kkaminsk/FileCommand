@@ -1378,11 +1378,16 @@ fn right_menu_targets_the_right_panel() {
 }
 
 #[test]
-fn activating_a_menu_with_no_enabled_items_just_closes_it() {
+fn activating_options_themes_opens_the_theme_picker_and_closes_the_menu() {
+    // Options used to be entirely disabled (the old target of this test);
+    // Themes (visual-themes) is now its first enabled item, so activating
+    // Options and pressing Enter opens the picker instead of doing nothing
+    // (theme-selection "Options menu opens the theme picker").
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
-    let (state, _) = update(state, Command::MenuHotkey('o')); // Options: all disabled
+    let (state, _) = update(state, Command::MenuHotkey('o')); // Options: Themes is first-selectable
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_some(), "with nothing selectable, Enter does nothing");
+    assert!(state.menu.is_none(), "activating an item closes the whole menu overlay");
+    assert!(state.theme_picker.is_some(), "Options -> Themes opens the picker");
     assert!(effects.is_empty());
 }
 
@@ -2905,6 +2910,59 @@ fn user_menu_move_clamps_and_confirm_on_an_empty_menu_is_a_harmless_close() {
     let (state, effects) = update(state, Command::UserMenuConfirm);
     assert!(state.user_menu.is_none());
     assert!(effects.is_empty(), "nothing to run on an empty menu");
+}
+
+// ---------------------------------------------------------------------
+// visual-themes: Options -> Themes picker
+// ---------------------------------------------------------------------
+
+#[test]
+fn theme_picker_opens_from_the_options_menu_with_the_active_theme_highlighted() {
+    let mut state = test_state(UiPhase::Panels);
+    state.theme = Theme::terminal_green();
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('o'));
+    let (state, effects) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none(), "the menu overlay closes");
+    let picker = state.theme_picker.expect("Options -> Themes opens the picker");
+    let expected = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "terminal-green").unwrap();
+    assert_eq!(picker.highlight, expected, "the active theme's row is pre-highlighted");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn theme_picker_up_down_moves_the_highlight_over_the_theme_list() {
+    let state = test_state(UiPhase::Panels); // active theme is nc-classic (index 0)
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 0);
+    let (state, _) = update(state, Command::ThemePickerMove(1));
+    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 1);
+    let (state, _) = update(state, Command::ThemePickerMove(-1));
+    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 0, "Up from the first row holds, it does not wrap");
+}
+
+#[test]
+fn theme_picker_enter_applies_the_highlighted_theme_immediately_and_persists_it() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    // Move down to `yellow-storm` (index 4 of BUILTIN_THEME_NAMES).
+    let target = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "yellow-storm").unwrap();
+    let (state, _) = update(state, Command::ThemePickerMove(target as isize));
+    let (state, effects) = update(state, Command::ThemePickerConfirm);
+    assert!(state.theme_picker.is_none(), "the dialog closes");
+    assert_eq!(state.theme.name, "yellow-storm", "the active theme switches in this same reducer step");
+    assert_eq!(effects, vec![Effect::PersistTheme("yellow-storm".to_string())]);
+}
+
+#[test]
+fn theme_picker_esc_changes_nothing() {
+    let state = test_state(UiPhase::Panels); // active theme is nc-classic
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    let (state, _) = update(state, Command::ThemePickerMove(3)); // highlight some other theme
+    let (state, effects) = update(state, Command::ThemePickerCancel);
+    assert!(state.theme_picker.is_none(), "the dialog closes");
+    assert_eq!(state.theme.name, "nc-classic", "the active theme is untouched");
+    assert!(effects.is_empty(), "nothing is persisted on cancel");
 }
 
 // ---------------------------------------------------------------------
