@@ -149,6 +149,12 @@ pub enum Role {
     /// A search hit's highlighted cells (viewer: F7 streaming search —
     /// "Match becomes the top anchor and is highlighted").
     ViewerMatch,
+    /// The panel-tabs strip's active-tab label (panel-tabs "Tab label
+    /// rendering and active styling").
+    TabActive,
+    /// The panel-tabs strip's inactive-tab labels and `◄`/`►` overflow
+    /// markers.
+    TabInactive,
 }
 
 pub const ALL_ROLES: &[Role] = &[
@@ -189,6 +195,8 @@ pub const ALL_ROLES: &[Role] = &[
     Role::ViewerHeader,
     Role::ViewerText,
     Role::ViewerMatch,
+    Role::TabActive,
+    Role::TabInactive,
 ];
 
 impl Role {
@@ -233,6 +241,8 @@ impl Role {
             Role::ViewerHeader => "viewer.header",
             Role::ViewerText => "viewer.text",
             Role::ViewerMatch => "viewer.match",
+            Role::TabActive => "tab.active",
+            Role::TabInactive => "tab.inactive",
         }
     }
 }
@@ -359,6 +369,8 @@ impl Theme {
         set(Role::ViewerHeader, A(Black), A(Cyan));
         set(Role::ViewerText, A(White), A(Blue));
         set(Role::ViewerMatch, A(Black), A(Cyan));
+        set(Role::TabActive, A(Black), A(Cyan));
+        set(Role::TabInactive, A(Cyan), A(Blue));
         Theme::build("nc-classic", m).expect("nc-classic role table is complete")
     }
 
@@ -412,6 +424,11 @@ impl Theme {
         set(Role::ViewerHeader, A(Black), A(White));
         set(Role::ViewerText, A(White), A(Black));
         set(Role::ViewerMatch, A(Black), A(White));
+        // Mirrors `PanelTitleActive`/`PanelTitleInactive`'s mono inversion:
+        // the active tab inverts to black-on-white, the inactive tabs stay
+        // white-on-black.
+        set(Role::TabActive, A(Black), A(White));
+        set(Role::TabInactive, A(White), A(Black));
         Theme::build("nc-mono", m).expect("nc-mono role table is complete")
     }
 

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::drives::{self, DriveSelect};
+use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
@@ -64,6 +65,10 @@ pub enum UiPhase {
     /// The F3 viewer, open full-screen in place of the panels (viewer:
     /// Frame-less full-screen chrome — "Viewer owns focus while open").
     Viewer(ViewerState),
+    /// The F4 built-in editor, open full-screen in place of the panels and
+    /// owning input focus the same way the viewer does (builtin-editor
+    /// "Full-screen editor chrome").
+    Editor(EditorState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +345,74 @@ pub enum Command {
     /// panel's cursor.
     RequestExternalEditor,
 
+    // F4 built-in editor (M5). `RequestEditor` is the actual F4 keybinding
+    // target from a panel: it resolves the external-editor/built-in/size-cap
+    // precedence (builtin-editor "Editor invocation and size cap", "External
+    // editor takes precedence") and, when it wins, dispatches to the same
+    // `handle_request_external_editor` path `RequestExternalEditor` already
+    // exercises.
+    RequestEditor,
+    /// Reply to `Effect::OpenEditor`: the file loaded under the 10 MB cap
+    /// (builtin-editor "Small file opens in the editor").
+    EditorOpened(Box<EditorState>),
+    /// Reply to `Effect::OpenEditor`: the file is `size` bytes, at or above
+    /// the cap — redirected to the F3 viewer with a notice (builtin-editor
+    /// "Large file redirects to the viewer").
+    EditorTooLarge { path: PathBuf, size: u64 },
+    /// Reply to `Effect::OpenEditor` when the file could not be opened.
+    EditorOpenFailed { message: String },
+
+    // Editor keymap, while `UiPhase::Editor` owns focus.
+    EditorChar(char),
+    EditorNewline,
+    EditorBackspace,
+    EditorMove(EditorMove),
+    /// Insert key: toggle insert/overwrite text-entry mode.
+    EditorToggleMode,
+    /// F3: anchor a line selection at the caret.
+    EditorMark,
+    EditorCut,
+    EditorCopy,
+    EditorPaste,
+    EditorUndo,
+    /// F7: open the literal-search prompt.
+    EditorSearchStart,
+    EditorSearchChar(char),
+    EditorSearchBackspace,
+    EditorSearchCancel,
+    /// Enter on the search prompt: run `EditorState::find_next` for the
+    /// typed pattern.
+    EditorSearchConfirm,
+    /// F4 (while the editor, not a panel, owns focus): open the
+    /// search-and-replace prompt's first (pattern) stage.
+    EditorReplaceStart,
+    EditorReplaceChar(char),
+    EditorReplaceBackspace,
+    EditorReplaceCancel,
+    /// Enter on the replace prompt: advances pattern -> replacement, or —
+    /// from the replacement stage — runs `EditorState::replace_first`.
+    EditorReplaceConfirm,
+    /// F2: save in place.
+    EditorSave,
+    /// Reply to `Effect::SaveEditor`: the write succeeded. `then_quit`
+    /// echoes back whether this save was requested by the save-on-exit
+    /// confirm's "Y", in which case the editor closes once applied.
+    EditorSaved { editor: Box<EditorState>, then_quit: bool },
+    /// Reply to `Effect::SaveEditor`: the write failed — aborts a save-on-
+    /// exit quit attempt and surfaces the message inline rather than losing
+    /// the buffer (builtin-editor "Modified indicator and save-on-exit
+    /// prompt").
+    EditorSaveFailed { message: String },
+    /// F10: quit if unmodified, else raise the save-on-exit confirm
+    /// (builtin-editor "Quitting with unsaved changes prompts").
+    EditorRequestQuit,
+    /// "Y" on the save-on-exit confirm: save, then close the editor.
+    EditorConfirmQuitSave,
+    /// "N" on the save-on-exit confirm: close the editor without saving.
+    EditorConfirmQuitDiscard,
+    /// Esc on the save-on-exit confirm: dismiss it and keep editing.
+    EditorCancelQuit,
+
     // Worker-produced events, re-entering through the same `update` path.
     ListingChunk { panel: PanelSide, entries: Vec<Entry> },
     ListingComplete { panel: PanelSide, total: usize },
@@ -439,6 +512,20 @@ pub enum Effect {
     /// `RunShellCommand` uses (design D7; external-editor: TUI suspend and
     /// restore, Synchronous wait and panel re-read).
     RunExternalEditor(EditorInvocation, PanelSide),
+    /// Open `path` for the F4 built-in editor: stat it and, under the 10 MB
+    /// cap, read and decode it in full, reporting back via
+    /// `Command::EditorOpened`/`EditorTooLarge`/`EditorOpenFailed`. Run
+    /// synchronously before the next repaint rather than on a worker
+    /// thread — the same "cheap enough for the input path" precedent
+    /// `Effect::OpenViewer` sets, extended here to the whole-file read the
+    /// 10 MB cap explicitly bounds (design D1).
+    OpenEditor { path: PathBuf },
+    /// Write `editor`'s buffer to disk via `EditorState::save`, reporting
+    /// the post-save state back via `Command::EditorSaved` (or the failure
+    /// via `Command::EditorSaveFailed`). `then_quit` travels through
+    /// unchanged so the reply knows whether to close the editor once the
+    /// write lands (builtin-editor "Save in place …", design D9).
+    SaveEditor { editor: Box<EditorState>, then_quit: bool },
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -509,6 +596,14 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // focus while open"), so its commands are handled uniformly here.
     if matches!(state.phase, UiPhase::Viewer(_)) {
         effects.extend(handle_viewer(&mut state, cmd));
+        return (state, effects);
+    }
+
+    // The F4 built-in editor, likewise, replaces the panels full-screen and
+    // owns input focus while open (builtin-editor "Full-screen editor
+    // chrome").
+    if matches!(state.phase, UiPhase::Editor(_)) {
+        effects.extend(handle_editor(&mut state, cmd));
         return (state, effects);
     }
 
@@ -657,11 +752,32 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::RequestExternalEditor => effects.extend(handle_request_external_editor(&mut state)),
             Command::ExternalEditorSpawnFailed { message } => state.panel_mut(state.active).last_error = Some(message),
 
+            Command::RequestEditor => effects.extend(handle_request_editor(&mut state)),
+            Command::EditorOpened(editor) => {
+                // Mirrors the `Command::ViewerOpened` clear: a prior failed
+                // F3/F4 attempt may have left `last_error` set (§7 error
+                // policy).
+                state.panel_mut(state.active).last_error = None;
+                state.phase = UiPhase::Editor(*editor);
+            }
+            Command::EditorTooLarge { path, size: _ } => {
+                // builtin-editor "Large file redirects to the viewer": the
+                // notice lands on the panel's mini-status (the same surface
+                // `Command::ViewerOpenFailed` uses) since the viewer chrome
+                // itself has no room reserved for a banner; it's visible the
+                // moment the user returns from the viewer to the panels.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                state.panel_mut(state.active).last_error =
+                    Some(format!("{name} is too large for the editor (10 MB limit) — opened in the viewer"));
+                effects.push(Effect::OpenViewer { path });
+            }
+            Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+
             Command::Tick(_) => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
             _ => {}
         },
-        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) => {
+        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) | UiPhase::Editor(_) => {
             unreachable!("handled above")
         }
     }
@@ -940,6 +1056,174 @@ fn handle_request_external_editor(state: &mut State) -> Vec<Effect> {
         // are no-ops with nothing eligible selected.
         Err(external_editor::TargetError::IsDirectory) => vec![],
     }
+}
+
+// ---------------------------------------------------------------------
+// F4 built-in editor (M5)
+// ---------------------------------------------------------------------
+
+/// F4 from a panel: the external editor takes precedence when configured
+/// (builtin-editor "External editor takes precedence") — reusing
+/// `handle_request_external_editor`'s own entry/directory resolution rather
+/// than duplicating it. Otherwise, on a file (not `..`, not a directory),
+/// kick off the size-gated open; the size cap itself is enforced by
+/// `EditorState::open` on the TUI side once `Effect::OpenEditor` runs
+/// (builtin-editor "Editor invocation and size cap").
+fn handle_request_editor(state: &mut State) -> Vec<Effect> {
+    if state.editor.is_some() {
+        return handle_request_external_editor(state);
+    }
+    let side = state.active;
+    let panel = state.panel(side);
+    let Some(entry) = panel.selected() else { return vec![] };
+    if entry.is_dir_like() {
+        return vec![];
+    }
+    let path = panel.cwd.join(&entry.name);
+    state.panel_mut(side).last_error = None;
+    vec![Effect::OpenEditor { path }]
+}
+
+/// The editor body's visible row count for a given terminal height: the
+/// header and F-key bar each reserve one row, exactly like the viewer's
+/// `body_rows` (kept as a one-line duplicate here rather than a cross-crate
+/// dependency, since `core::update` needs it for `ensure_caret_visible` and
+/// cannot depend on `filecommand-tui`).
+fn editor_viewport(term_size: (u16, u16)) -> (usize, usize) {
+    (term_size.1.saturating_sub(2).max(1) as usize, term_size.0.max(1) as usize)
+}
+
+/// Drive every command while the editor is open (gated in [`update`] by
+/// `UiPhase::Editor`). Saving is the one operation here that needs I/O
+/// (`EditorState::save` writes to disk), so it is dispatched as
+/// `Effect::SaveEditor` and applied only once `Command::EditorSaved`/
+/// `EditorSaveFailed` reply — mirroring how `handle_viewer` defers the
+/// viewer's own I/O to effects and re-enters through their replies (design
+/// D1/D2).
+fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let UiPhase::Editor(mut editor) = std::mem::replace(&mut state.phase, UiPhase::Panels) else {
+        unreachable!("handle_editor only called when phase is Editor");
+    };
+    let (rows, cols) = editor_viewport(state.term_size);
+    match cmd {
+        Command::EditorChar(c) => editor.type_char(c),
+        Command::EditorNewline => editor.insert_newline(),
+        Command::EditorBackspace => editor.backspace(),
+        Command::EditorMove(m) => match m {
+            EditorMove::Left => editor.move_left(),
+            EditorMove::Right => editor.move_right(),
+            EditorMove::Up => editor.move_up(),
+            EditorMove::Down => editor.move_down(),
+            EditorMove::Home => editor.move_home(),
+            EditorMove::End => editor.move_end(),
+            EditorMove::PageUp(rows) => editor.move_page_up(rows),
+            EditorMove::PageDown(rows) => editor.move_page_down(rows),
+        },
+        Command::EditorToggleMode => editor.toggle_mode(),
+        Command::EditorMark => editor.start_mark(),
+        Command::EditorCut => editor.cut_selection(),
+        Command::EditorCopy => editor.copy_selection(),
+        Command::EditorPaste => editor.paste(),
+        Command::EditorUndo => editor.undo(),
+
+        Command::EditorSearchStart => editor.search_prompt = Some(String::new()),
+        Command::EditorSearchChar(c) => {
+            if let Some(p) = &mut editor.search_prompt {
+                p.push(c);
+            }
+        }
+        Command::EditorSearchBackspace => {
+            if let Some(p) = &mut editor.search_prompt {
+                p.pop();
+            }
+        }
+        Command::EditorSearchCancel => editor.search_prompt = None,
+        Command::EditorSearchConfirm => {
+            if let Some(pattern) = editor.search_prompt.take() {
+                if !pattern.is_empty() {
+                    editor.find_next(&pattern);
+                }
+            }
+        }
+
+        Command::EditorReplaceStart => editor.replace_prompt = Some(ReplacePrompt::Pattern(String::new())),
+        Command::EditorReplaceChar(c) => {
+            if let Some(prompt) = &mut editor.replace_prompt {
+                match prompt {
+                    ReplacePrompt::Pattern(p) => p.push(c),
+                    ReplacePrompt::Replacement { replacement, .. } => replacement.push(c),
+                }
+            }
+        }
+        Command::EditorReplaceBackspace => {
+            if let Some(prompt) = &mut editor.replace_prompt {
+                match prompt {
+                    ReplacePrompt::Pattern(p) => {
+                        p.pop();
+                    }
+                    ReplacePrompt::Replacement { replacement, .. } => {
+                        replacement.pop();
+                    }
+                }
+            }
+        }
+        Command::EditorReplaceCancel => editor.replace_prompt = None,
+        // Enter: the pattern stage advances to the replacement stage (an
+        // empty pattern instead cancels the prompt outright — nothing to
+        // search for); the replacement stage performs the replacement
+        // (builtin-editor "Replace substitutes a match").
+        Command::EditorReplaceConfirm => {
+            if let Some(prompt) = editor.replace_prompt.take() {
+                match prompt {
+                    ReplacePrompt::Pattern(pattern) if !pattern.is_empty() => {
+                        editor.replace_prompt = Some(ReplacePrompt::Replacement { pattern, replacement: String::new() });
+                    }
+                    ReplacePrompt::Pattern(_) => {}
+                    ReplacePrompt::Replacement { pattern, replacement } => {
+                        editor.replace_first(&pattern, &replacement);
+                    }
+                }
+            }
+        }
+
+        Command::EditorSave => {
+            effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: false });
+        }
+        Command::EditorSaved { editor: saved, then_quit } => {
+            if then_quit {
+                // Phase was already reset to `Panels` by the `mem::replace`
+                // above; leaving it as-is is the exit.
+                return effects;
+            }
+            editor = *saved;
+            editor.quit_confirm = false;
+        }
+        Command::EditorSaveFailed { message } => {
+            editor.save_error = Some(message);
+            editor.quit_confirm = false;
+        }
+
+        Command::EditorRequestQuit => {
+            if editor.is_modified() {
+                editor.quit_confirm = true;
+            } else {
+                // Unmodified: exits directly (builtin-editor "Quitting an
+                // unmodified buffer exits directly") — phase stays `Panels`.
+                return effects;
+            }
+        }
+        Command::EditorConfirmQuitSave => {
+            effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: true });
+        }
+        Command::EditorConfirmQuitDiscard => return effects,
+        Command::EditorCancelQuit => editor.quit_confirm = false,
+
+        _ => {}
+    }
+    editor.ensure_caret_visible(rows, cols);
+    state.phase = UiPhase::Editor(editor);
+    effects
 }
 
 // ---------------------------------------------------------------------

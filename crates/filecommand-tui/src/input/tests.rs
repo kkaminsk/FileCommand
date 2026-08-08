@@ -452,13 +452,17 @@ fn entries_are_irrelevant_to_key_mapping() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn f3_opens_the_viewer_and_plain_f4_opens_the_external_editor() {
+fn f3_opens_the_viewer_and_plain_f4_requests_the_editor() {
     assert_eq!(map(plain(KeyCode::F(3)), &panels()), Some(Command::RequestViewer));
-    assert_eq!(map(plain(KeyCode::F(4)), &panels()), Some(Command::RequestExternalEditor));
+    // `RequestEditor` (not the M4 `RequestExternalEditor` directly) is the
+    // F4 keybinding target from M5 on — it resolves the external-editor
+    // precedence itself (builtin-editor "External editor takes
+    // precedence").
+    assert_eq!(map(plain(KeyCode::F(4)), &panels()), Some(Command::RequestEditor));
 }
 
 #[test]
-fn ctrl_f4_still_means_sort_by_extension_not_the_external_editor() {
+fn ctrl_f4_still_means_sort_by_extension_not_the_editor() {
     assert_eq!(map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()), Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension }));
 }
 
@@ -519,4 +523,94 @@ fn viewer_search_prompt_owns_the_keyboard_while_open() {
     assert_eq!(map_viewer_key(plain(KeyCode::Backspace), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchBackspace)));
     assert_eq!(map_viewer_key(plain(KeyCode::Enter), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchConfirm)));
     assert_eq!(map_viewer_key(plain(KeyCode::Esc), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchCancel)));
+}
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+fn open_editor(text: &str) -> filecommand_core::editor::EditorState {
+    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes())
+}
+
+#[test]
+fn editor_phase_is_not_routed_through_map_key() {
+    let state = state_with(UiPhase::Editor(open_editor("abc\n")));
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), None, "the event loop must call map_editor_key directly instead");
+}
+
+#[test]
+fn editor_fkeys_map_to_save_mark_replace_search_and_quit() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), Some(Command::EditorSave));
+    assert_eq!(map_editor_key(plain(KeyCode::F(3)), &e, 20), Some(Command::EditorMark));
+    assert_eq!(map_editor_key(plain(KeyCode::F(4)), &e, 20), Some(Command::EditorReplaceStart));
+    assert_eq!(map_editor_key(plain(KeyCode::F(7)), &e, 20), Some(Command::EditorSearchStart));
+    assert_eq!(map_editor_key(plain(KeyCode::F(10)), &e, 20), Some(Command::EditorRequestQuit));
+}
+
+#[test]
+fn editor_printable_keys_type_and_insert_toggles_overwrite() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('x')), &e, 20), Some(Command::EditorChar('x')));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorNewline));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Insert), &e, 20), Some(Command::EditorToggleMode));
+}
+
+#[test]
+fn editor_movement_keys_carry_the_visible_row_count_for_paging() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(plain(KeyCode::Left), &e, 20), Some(Command::EditorMove(EditorMove::Left)));
+    assert_eq!(map_editor_key(plain(KeyCode::Right), &e, 20), Some(Command::EditorMove(EditorMove::Right)));
+    assert_eq!(map_editor_key(plain(KeyCode::Up), &e, 20), Some(Command::EditorMove(EditorMove::Up)));
+    assert_eq!(map_editor_key(plain(KeyCode::Down), &e, 20), Some(Command::EditorMove(EditorMove::Down)));
+    assert_eq!(map_editor_key(plain(KeyCode::Home), &e, 20), Some(Command::EditorMove(EditorMove::Home)));
+    assert_eq!(map_editor_key(plain(KeyCode::End), &e, 20), Some(Command::EditorMove(EditorMove::End)));
+    assert_eq!(map_editor_key(plain(KeyCode::PageUp), &e, 20), Some(Command::EditorMove(EditorMove::PageUp(20))));
+    assert_eq!(map_editor_key(plain(KeyCode::PageDown), &e, 20), Some(Command::EditorMove(EditorMove::PageDown(20))));
+}
+
+#[test]
+fn editor_cut_copy_paste_undo_use_ctrl_bindings() {
+    let e = open_editor("abc\n");
+    assert_eq!(map_editor_key(key(KeyCode::Char('x'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCut));
+    assert_eq!(map_editor_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCopy));
+    assert_eq!(map_editor_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorPaste));
+    assert_eq!(map_editor_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorUndo));
+}
+
+#[test]
+fn editor_search_prompt_owns_the_keyboard_while_open() {
+    let mut e = open_editor("abc\n");
+    e.search_prompt = Some("ab".to_string());
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), None, "F-keys are swallowed by the prompt");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('c')), &e, 20), Some(Command::EditorSearchChar('c')));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorSearchBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorSearchConfirm));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorSearchCancel));
+}
+
+#[test]
+fn editor_replace_prompt_owns_the_keyboard_while_open() {
+    let mut e = open_editor("abc\n");
+    e.replace_prompt = Some(filecommand_core::editor::ReplacePrompt::Pattern("x".to_string()));
+    assert_eq!(map_editor_key(plain(KeyCode::F(7)), &e, 20), None, "F-keys are swallowed by the prompt");
+    assert_eq!(map_editor_key(plain(KeyCode::Char('y')), &e, 20), Some(Command::EditorReplaceChar('y')));
+    assert_eq!(map_editor_key(plain(KeyCode::Backspace), &e, 20), Some(Command::EditorReplaceBackspace));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorReplaceConfirm));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorReplaceCancel));
+}
+
+#[test]
+fn editor_quit_confirm_owns_y_n_and_esc_over_everything_else() {
+    let mut e = open_editor("abc\n");
+    e.quit_confirm = true;
+    assert_eq!(map_editor_key(plain(KeyCode::Char('y')), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Char('Y')), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Enter), &e, 20), Some(Command::EditorConfirmQuitSave));
+    assert_eq!(map_editor_key(plain(KeyCode::Char('n')), &e, 20), Some(Command::EditorConfirmQuitDiscard));
+    assert_eq!(map_editor_key(plain(KeyCode::Esc), &e, 20), Some(Command::EditorCancelQuit));
+    // F2 (save) must not leak through the confirm.
+    assert_eq!(map_editor_key(plain(KeyCode::F(2)), &e, 20), None);
 }

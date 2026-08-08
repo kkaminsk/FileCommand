@@ -214,6 +214,7 @@ dependencies = [
  "crossterm",
  "filecommand-core",
  "insta",
+ "proptest",
  "ratatui",
  "unicode-width 0.1.14",
 ]

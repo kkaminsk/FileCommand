@@ -1804,3 +1804,335 @@ fn a_timed_out_query_answered_late_with_no_info_is_silently_dropped_once_superse
     );
     let _ = current_request;
 }
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+use crate::editor::{EditorMove, EditorState, EntryMode, ReplacePrompt};
+
+fn editor_with(lines: &[&str]) -> EditorState {
+    let text = lines.join("\n");
+    let mut bytes = text.into_bytes();
+    if !lines.is_empty() {
+        bytes.push(b'\n');
+    }
+    EditorState::from_bytes(PathBuf::from("/left/edit.txt"), &bytes)
+}
+
+/// A real on-disk file to back tests that exercise an actual
+/// `EditorState::save` round trip (the `Effect::SaveEditor` reply tests),
+/// rather than a bare in-memory `from_bytes` buffer whose path doesn't
+/// exist.
+fn editor_with_temp_file(name: &str, lines: &[&str]) -> EditorState {
+    let dir = std::env::temp_dir().join(format!("filecommand-update-test-editor-{}-{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("file.txt");
+    let mut text = lines.join("\n");
+    if !lines.is_empty() {
+        text.push('\n');
+    }
+    std::fs::write(&path, &text).unwrap();
+    match EditorState::open(&path).unwrap() {
+        crate::editor::LoadResult::Loaded(e) => e,
+        crate::editor::LoadResult::TooLarge { .. } => panic!("test fixture unexpectedly exceeds the editor size cap"),
+    }
+}
+
+fn editor_state(editor: EditorState) -> State {
+    State { phase: UiPhase::Editor(editor), ..test_state(UiPhase::Panels) }
+}
+
+#[test]
+fn f4_with_no_editor_configured_opens_the_built_in_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (state, effects) = update(state, Command::RequestEditor);
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/report.txt") }]);
+    assert_eq!(state.phase, UiPhase::Panels, "phase flips only once EditorOpened comes back — opening is I/O");
+}
+
+#[test]
+fn f4_with_an_external_editor_configured_takes_precedence_over_the_built_in_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(
+        matches!(effects.as_slice(), [Effect::RunExternalEditor(_, PanelSide::Left)]),
+        "external editor takes precedence: no OpenEditor effect, got {effects:?}"
+    );
+}
+
+#[test]
+fn f4_on_a_directory_or_empty_panel_does_not_open_the_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(effects.is_empty());
+
+    let state = test_state(UiPhase::Panels);
+    let (_, effects) = update(state, Command::RequestEditor);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn editor_opened_enters_the_editor_phase_with_the_loaded_buffer() {
+    let state = test_state(UiPhase::Panels);
+    let editor = editor_with(&["line one", "line two"]);
+    let (state, effects) = update(state, Command::EditorOpened(Box::new(editor)));
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::Editor(e) => assert_eq!(e.lines, vec!["line one".to_string(), "line two".to_string(), String::new()]),
+        other => panic!("expected UiPhase::Editor, got {other:?}"),
+    }
+}
+
+#[test]
+fn editor_too_large_opens_the_viewer_instead_with_an_inline_notice() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::EditorTooLarge { path: PathBuf::from("/left/huge.log"), size: 20_000_000 });
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/huge.log") }]);
+    assert_eq!(state.phase, UiPhase::Panels);
+    let message = state.left.last_error.expect("a notice explaining the redirect");
+    assert!(message.contains("huge.log"), "{message}");
+    assert!(message.contains("10 MB"), "{message}");
+}
+
+#[test]
+fn editor_open_failed_surfaces_an_inline_error() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::EditorOpenFailed { message: "access denied".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
+}
+
+#[test]
+fn typing_in_the_editor_inserts_and_marks_the_buffer_modified() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorChar('X'));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines[0], "Xabc");
+    assert!(e.is_modified());
+}
+
+#[test]
+fn editor_move_commands_move_the_caret() {
+    let state = editor_state(editor_with(&["hello"]));
+    let (state, _) = update(state, Command::EditorMove(EditorMove::Right));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.caret.col, 1);
+    let (state, _) = update(state, Command::EditorMove(EditorMove::End));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.caret.col, 5);
+}
+
+#[test]
+fn insert_toggles_overwrite_mode() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorToggleMode);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.mode, EntryMode::Overwrite);
+}
+
+#[test]
+fn mark_cut_copy_paste_flow_through_the_reducer() {
+    let state = editor_state(editor_with(&["a", "b", "c"]));
+    let (state, _) = update(state, Command::EditorMark);
+    let (state, _) = update(state, Command::EditorMove(EditorMove::Down));
+    let (state, _) = update(state, Command::EditorCut);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines, vec!["c".to_string(), String::new()]);
+    assert_eq!(e.clipboard, vec!["a".to_string(), "b".to_string()]);
+
+    let (state, _) = update(state, Command::EditorPaste);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines, vec!["a".to_string(), "b".to_string(), "c".to_string(), String::new()]);
+}
+
+#[test]
+fn undo_flows_through_the_reducer() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorMove(EditorMove::End));
+    let (state, _) = update(state, Command::EditorChar('d'));
+    let (state, _) = update(state, Command::EditorUndo);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.lines[0], "abc");
+}
+
+#[test]
+fn search_prompt_confirm_moves_the_caret_to_the_next_match() {
+    let state = editor_state(editor_with(&["needle here", "another needle"]));
+    let (state, _) = update(state, Command::EditorSearchStart);
+    let (state, _) = update(state, Command::EditorSearchChar('n'));
+    let (state, _) = update(state, Command::EditorSearchChar('e'));
+    let (state, _) = update(state, Command::EditorSearchConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.search_prompt.is_none(), "the prompt closes on confirm");
+    assert_eq!(e.caret, crate::editor::Caret { line: 1, col: 8 });
+}
+
+#[test]
+fn search_prompt_backspace_and_cancel_edit_and_close_the_prompt() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, _) = update(state, Command::EditorSearchStart);
+    let (state, _) = update(state, Command::EditorSearchChar('x'));
+    let (state, _) = update(state, Command::EditorSearchBackspace);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.search_prompt.as_deref(), Some(""));
+    let (state, _) = update(state, Command::EditorSearchCancel);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.search_prompt, None);
+}
+
+#[test]
+fn replace_prompt_advances_from_pattern_to_replacement_then_replaces() {
+    let state = editor_state(editor_with(&["hello world"]));
+    let (state, _) = update(state, Command::EditorReplaceStart);
+    let (state, _) = update(state, Command::EditorReplaceChar('w'));
+    let (state, _) = update(state, Command::EditorReplaceChar('o'));
+    let (state, _) = update(state, Command::EditorReplaceChar('r'));
+    let (state, _) = update(state, Command::EditorReplaceChar('l'));
+    let (state, _) = update(state, Command::EditorReplaceChar('d'));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, Some(ReplacePrompt::Pattern("world".to_string())));
+
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, Some(ReplacePrompt::Replacement { pattern: "world".to_string(), replacement: String::new() }));
+
+    let (state, _) = update(state, Command::EditorReplaceChar('X'));
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, None, "the prompt closes once the replacement runs");
+    assert_eq!(e.lines[0], "hello X");
+    assert!(e.is_modified());
+}
+
+#[test]
+fn replace_confirm_with_an_empty_pattern_cancels_rather_than_advancing() {
+    let state = editor_state(editor_with(&["hello"]));
+    let (state, _) = update(state, Command::EditorReplaceStart);
+    let (state, _) = update(state, Command::EditorReplaceConfirm);
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.replace_prompt, None);
+}
+
+#[test]
+fn editor_save_dispatches_the_save_effect_and_the_reply_updates_the_saved_snapshot() {
+    let mut editor = editor_with_temp_file("save-effect", &["abc"]);
+    editor.type_char('X');
+    assert!(editor.is_modified());
+    let state = editor_state(editor.clone());
+    let (state, effects) = update(state, Command::EditorSave);
+    match effects.as_slice() {
+        [Effect::SaveEditor { editor: e, then_quit: false }] => assert_eq!(e.lines, editor.lines),
+        other => panic!("expected a single SaveEditor effect, got {other:?}"),
+    }
+    // The buffer is unchanged until the reply arrives — save is I/O.
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.is_modified());
+
+    // Mirrors what the TUI's effect executor actually does: clone the
+    // editor into the effect, call the real (I/O-performing) `save()` on
+    // it, then reply with the post-save state.
+    let mut saved = editor;
+    saved.save().unwrap();
+    assert!(!saved.is_modified(), "sanity: a real save clears the modified flag on the saved copy");
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: false });
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.is_modified(), "the post-save snapshot from the reply clears the modified flag");
+}
+
+#[test]
+fn editor_save_failed_surfaces_an_inline_message_without_losing_the_buffer() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, effects) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert_eq!(e.save_error.as_deref(), Some("disk full"));
+    assert!(e.is_modified(), "a failed save must not silently discard the unsaved edit");
+}
+
+#[test]
+fn f10_on_an_unmodified_buffer_exits_directly() {
+    let state = editor_state(editor_with(&["abc"]));
+    let (state, effects) = update(state, Command::EditorRequestQuit);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn f10_on_a_modified_buffer_raises_the_save_on_exit_confirm() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, effects) = update(state, Command::EditorRequestQuit);
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.quit_confirm);
+}
+
+#[test]
+fn cancelling_the_save_on_exit_confirm_returns_to_editing() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorCancelQuit);
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.quit_confirm);
+}
+
+#[test]
+fn discarding_at_the_save_on_exit_confirm_exits_without_saving() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitDiscard);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn confirming_save_at_the_save_on_exit_confirm_dispatches_a_save_that_quits() {
+    let mut editor = editor_with_temp_file("quit-save", &["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor.clone());
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitSave);
+    match effects.as_slice() {
+        [Effect::SaveEditor { then_quit: true, .. }] => {}
+        other => panic!("expected a SaveEditor effect with then_quit: true, got {other:?}"),
+    }
+    // Still in the editor until the save actually lands.
+    assert!(matches!(state.phase, UiPhase::Editor(_)));
+
+    let mut saved = editor;
+    saved.save().unwrap();
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: true });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels, "a successful save-then-quit closes the editor");
+}
+
+#[test]
+fn a_failed_save_during_quit_aborts_the_quit_and_keeps_editing() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitSave);
+    assert!(matches!(effects.as_slice(), [Effect::SaveEditor { then_quit: true, .. }]));
+
+    let (state, _) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected the failed save to abort the quit and stay in the editor") };
+    assert_eq!(e.save_error.as_deref(), Some("disk full"));
+    assert!(!e.quit_confirm, "the confirm dialog itself closes so the user can see and act on the error");
+}

@@ -10,6 +10,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use filecommand_core::config::{KeyBinding, Keys};
+use filecommand_core::editor::{EditorMove, EditorState};
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
 use filecommand_core::listing::SortMode;
@@ -42,6 +43,13 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
         // of `map_key` while the viewer is open (viewer: Frame-less
         // full-screen chrome — "Viewer owns focus while open").
         UiPhase::Viewer(_) => None,
+        // The editor likewise owns its own key routing (`map_editor_key`).
+        // It needs no I/O, but its page-size parameter is the editor body's
+        // row count (term_size.1 - 2, full width, no panel layout) rather
+        // than `map_key`'s panel-layout-derived `page_size`, so the event
+        // loop calls it directly the same way it does for the viewer
+        // (builtin-editor "Full-screen editor chrome").
+        UiPhase::Editor(_) => None,
         _ => {
             if state.quick_search.is_some() {
                 return map_quick_search_key(key);
@@ -109,6 +117,76 @@ fn is_plain(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
+/// Map a key while the F4 built-in editor is open. Unlike the viewer, the
+/// editor's own commands need no file I/O to resolve (design D1's
+/// in-memory buffer), so this returns a plain `Command` rather than an
+/// intermediate enum the event loop has to resolve further — but the event
+/// loop still calls it directly rather than through `map_key`, since its
+/// `rows_visible` page-size parameter is the editor body's own row count,
+/// not a panel's (see `UiPhase::Editor(_) => None` in `map_key`).
+///
+/// Precedence, highest first: the save-on-exit confirm, then the
+/// search-and-replace prompt, then the plain-search prompt, then normal
+/// editing — exactly one of these ever owns a given key, mirroring how
+/// `map_viewer_key` lets `search_input` claim the keyboard first.
+pub fn map_editor_key(key: KeyEvent, editor: &EditorState, rows_visible: usize) -> Option<Command> {
+    if editor.quit_confirm {
+        return match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::EditorConfirmQuitSave),
+            KeyCode::Char('n') | KeyCode::Char('N') => Some(Command::EditorConfirmQuitDiscard),
+            KeyCode::Esc => Some(Command::EditorCancelQuit),
+            _ => None,
+        };
+    }
+    if editor.replace_prompt.is_some() {
+        return match key.code {
+            KeyCode::Enter => Some(Command::EditorReplaceConfirm),
+            KeyCode::Esc => Some(Command::EditorReplaceCancel),
+            KeyCode::Backspace => Some(Command::EditorReplaceBackspace),
+            KeyCode::Char(c) if is_plain(&key) => Some(Command::EditorReplaceChar(c)),
+            _ => None,
+        };
+    }
+    if editor.search_prompt.is_some() {
+        return match key.code {
+            KeyCode::Enter => Some(Command::EditorSearchConfirm),
+            KeyCode::Esc => Some(Command::EditorSearchCancel),
+            KeyCode::Backspace => Some(Command::EditorSearchBackspace),
+            KeyCode::Char(c) if is_plain(&key) => Some(Command::EditorSearchChar(c)),
+            _ => None,
+        };
+    }
+    let rows = rows_visible.max(1);
+    match key.code {
+        KeyCode::F(2) => Some(Command::EditorSave),
+        KeyCode::F(3) => Some(Command::EditorMark),
+        KeyCode::F(4) => Some(Command::EditorReplaceStart),
+        KeyCode::F(7) => Some(Command::EditorSearchStart),
+        KeyCode::F(10) => Some(Command::EditorRequestQuit),
+        KeyCode::Insert => Some(Command::EditorToggleMode),
+        KeyCode::Left => Some(Command::EditorMove(EditorMove::Left)),
+        KeyCode::Right => Some(Command::EditorMove(EditorMove::Right)),
+        KeyCode::Up => Some(Command::EditorMove(EditorMove::Up)),
+        KeyCode::Down => Some(Command::EditorMove(EditorMove::Down)),
+        KeyCode::Home => Some(Command::EditorMove(EditorMove::Home)),
+        KeyCode::End => Some(Command::EditorMove(EditorMove::End)),
+        KeyCode::PageUp => Some(Command::EditorMove(EditorMove::PageUp(rows))),
+        KeyCode::PageDown => Some(Command::EditorMove(EditorMove::PageDown(rows))),
+        KeyCode::Enter => Some(Command::EditorNewline),
+        KeyCode::Backspace => Some(Command::EditorBackspace),
+        // Conventional cut/copy/paste/undo bindings: the spec leaves the
+        // exact keys up to the implementation (only F3 Mark is named), and
+        // these don't collide with anything else the editor's own keymap
+        // claims.
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::EditorCut),
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::EditorCopy),
+        KeyCode::Char('v') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::EditorPaste),
+        KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => Some(Command::EditorUndo),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::EditorChar(c)),
+        _ => None,
+    }
+}
+
 fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
     let active = state.active;
     let typing = !state.command_line.is_empty();
@@ -139,7 +217,12 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
 
         KeyCode::F(3) => Some(Command::RequestViewer),
-        KeyCode::F(4) => Some(Command::RequestExternalEditor),
+        // `RequestEditor` resolves the external-editor/built-in/size-cap
+        // precedence itself (builtin-editor "External editor takes
+        // precedence"); it supersedes the M4 `RequestExternalEditor` as the
+        // F4 keybinding target, though that command (and its handler) stays
+        // in place, reused internally.
+        KeyCode::F(4) => Some(Command::RequestEditor),
         KeyCode::F(5) => Some(Command::RequestCopy),
         KeyCode::F(6) => Some(Command::RequestMove),
         KeyCode::F(7) => Some(Command::RequestMkdir),

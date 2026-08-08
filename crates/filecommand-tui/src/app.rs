@@ -12,6 +12,7 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
+use filecommand_core::editor::{EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
@@ -87,6 +88,10 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                             let source = rt.viewer_source.as_ref().map(|(_, s)| s);
                             input::map_viewer_key(key, viewer, rows_visible)
                                 .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
+                        }
+                        UiPhase::Editor(editor) => {
+                            let rows_visible = views::editor::body_rows(state.term_size.1);
+                            input::map_editor_key(key, editor, rows_visible)
                         }
                         _ => {
                             let page_size = layout::compute(state.term_size).entries_visible;
@@ -335,6 +340,32 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
                 }
             },
+            Effect::OpenEditor { path } => match EditorState::open(&path) {
+                // Synchronous, like `Effect::OpenViewer`: the whole read is
+                // bounded by the 10 MB cap, so this is cheap enough for the
+                // input path rather than warranting a worker thread (design
+                // D1).
+                Ok(EditorLoadResult::Loaded(editor)) => {
+                    let _ = rt.tx.send(Command::EditorOpened(Box::new(editor)));
+                }
+                Ok(EditorLoadResult::TooLarge { size }) => {
+                    let _ = rt.tx.send(Command::EditorTooLarge { path, size });
+                }
+                Err(e) => {
+                    let _ = rt.tx.send(Command::EditorOpenFailed { message: e.to_string() });
+                }
+            },
+            Effect::SaveEditor { editor, then_quit } => {
+                let mut editor = *editor;
+                match editor.save() {
+                    Ok(()) => {
+                        let _ = rt.tx.send(Command::EditorSaved { editor: Box::new(editor), then_quit });
+                    }
+                    Err(e) => {
+                        let _ = rt.tx.send(Command::EditorSaveFailed { message: e.to_string() });
+                    }
+                }
+            }
         }
     }
     Ok(quit)
@@ -446,7 +477,16 @@ fn draw(
     guard.terminal.draw(|frame| {
         let area = frame.area();
         let depth = ColorDepth::Ansi16;
-        views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
+        // `views::render` takes `frame.buffer_mut()`, a mutable borrow that
+        // ends when the call returns — only then can `frame.set_cursor_position`
+        // borrow `frame` again, which is why the cursor position travels
+        // back as a return value instead of being set from inside `render`
+        // itself (builtin-editor "Full-screen editor chrome" — caret as the
+        // terminal cursor).
+        let cursor = views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
+        if let Some((x, y)) = cursor {
+            frame.set_cursor_position((x, y));
+        }
     })?;
     Ok(())
 }

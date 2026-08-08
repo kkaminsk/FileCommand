@@ -91,6 +91,22 @@ impl EntryMode {
     }
 }
 
+/// A caret-movement request the `input/` layer maps a key to; `PageUp`/
+/// `PageDown` carry the body's visible row count, mirroring
+/// `panel::CursorMove`'s `Up(usize)`/`Down(usize)` (the editor itself has no
+/// notion of the rendered viewport).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMove {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+    PageUp(usize),
+    PageDown(usize),
+}
+
 /// The caret position: a zero-based line index and a zero-based `char`
 /// column within that line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -107,6 +123,18 @@ pub enum LoadResult {
     /// The file is `size` bytes, at or above [`EDITOR_MAX_BYTES`]; the
     /// caller should redirect to the F3 viewer instead.
     TooLarge { size: u64 },
+}
+
+/// The F4-in-editor search-and-replace prompt's two stages: the literal
+/// search pattern first, then the replacement text, entered in sequence
+/// with Enter advancing from one to the next (builtin-editor "Replace
+/// substitutes a match"). Ephemeral UI state, held alongside the buffer the
+/// same way the F3 viewer keeps its own `search_input` prompt on
+/// `ViewerState`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplacePrompt {
+    Pattern(String),
+    Replacement { pattern: String, replacement: String },
 }
 
 /// The core, terminal-independent state of one open F4 editor session.
@@ -135,6 +163,26 @@ pub struct EditorState {
     saved_snapshot: Vec<String>,
     /// The last-run literal search/replace pattern, if any.
     pub search_pattern: Option<String>,
+    /// The topmost line/leftmost column currently scrolled into view — pure
+    /// render-viewport state, kept alongside the buffer (rather than
+    /// recomputed fresh every frame in the TUI) so it only moves when the
+    /// caret actually leaves the visible window, not on every redraw. Kept
+    /// in sync by [`Self::ensure_caret_visible`].
+    pub top_line: usize,
+    pub left_col: usize,
+    /// The F7 search prompt's in-progress pattern, or `None` when the
+    /// prompt is closed (builtin-editor "Search moves to the next match").
+    pub search_prompt: Option<String>,
+    /// The F4-in-editor search-and-replace prompt, or `None` when closed.
+    pub replace_prompt: Option<ReplacePrompt>,
+    /// Set by F10 when the buffer is modified, raising the save-on-exit
+    /// confirmation; cleared once the user answers it (builtin-editor
+    /// "Modified indicator and save-on-exit prompt").
+    pub quit_confirm: bool,
+    /// The message from the most recent failed F2 save (including a failed
+    /// save attempted as part of the save-on-exit confirm), or `None`.
+    /// Cleared by the next edit or successful save.
+    pub save_error: Option<String>,
 }
 
 impl EditorState {
@@ -157,6 +205,12 @@ impl EditorState {
             undo_snapshot: None,
             saved_snapshot: lines,
             search_pattern: None,
+            top_line: 0,
+            left_col: 0,
+            search_prompt: None,
+            replace_prompt: None,
+            quit_confirm: false,
+            save_error: None,
         }
     }
 
@@ -182,11 +236,12 @@ impl EditorState {
         self.lines != self.saved_snapshot
     }
 
-    /// F2: write the buffer back to `self.path` in place, UTF-8 encoded,
-    /// using the recorded line ending between lines (so a file that ended
-    /// without a trailing newline still doesn't gain one, and vice versa),
-    /// then clear the modified state (builtin-editor "Save in place …").
-    pub fn save(&mut self) -> io::Result<()> {
+    /// The buffer encoded exactly as it would be written to disk: UTF-8,
+    /// joined with the recorded line ending (so a file that ended without a
+    /// trailing newline still doesn't gain one, and vice versa). Shared by
+    /// [`Self::save`] and [`Self::byte_len`] so the header's byte-size
+    /// figure always matches what F2 would actually write.
+    fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         for (i, line) in self.lines.iter().enumerate() {
             if i > 0 {
@@ -194,8 +249,24 @@ impl EditorState {
             }
             bytes.extend_from_slice(line.as_bytes());
         }
+        bytes
+    }
+
+    /// The buffer's current size in bytes, were it saved right now (builtin-
+    /// editor "Full-screen editor chrome" — header byte-size figure).
+    pub fn byte_len(&self) -> u64 {
+        self.to_bytes().len() as u64
+    }
+
+    /// F2: write the buffer back to `self.path` in place, UTF-8 encoded,
+    /// using the recorded line ending between lines (so a file that ended
+    /// without a trailing newline still doesn't gain one, and vice versa),
+    /// then clear the modified state (builtin-editor "Save in place …").
+    pub fn save(&mut self) -> io::Result<()> {
+        let bytes = self.to_bytes();
         std::fs::write(to_extended_path(&self.path), &bytes)?;
         self.saved_snapshot = self.lines.clone();
+        self.save_error = None;
         Ok(())
     }
 
@@ -411,6 +482,85 @@ impl EditorState {
             self.caret.col = self.caret.col.min(line_len);
         }
     }
+
+    // -- caret movement -----------------------------------------------------
+
+    fn clamp_col(&mut self) {
+        let len = self.lines[self.caret.line].chars().count();
+        self.caret.col = self.caret.col.min(len);
+    }
+
+    pub fn move_left(&mut self) {
+        if self.caret.col > 0 {
+            self.caret.col -= 1;
+        } else if self.caret.line > 0 {
+            self.caret.line -= 1;
+            self.caret.col = self.lines[self.caret.line].chars().count();
+        }
+    }
+
+    pub fn move_right(&mut self) {
+        let len = self.lines[self.caret.line].chars().count();
+        if self.caret.col < len {
+            self.caret.col += 1;
+        } else if self.caret.line + 1 < self.lines.len() {
+            self.caret.line += 1;
+            self.caret.col = 0;
+        }
+    }
+
+    pub fn move_up(&mut self) {
+        if self.caret.line > 0 {
+            self.caret.line -= 1;
+            self.clamp_col();
+        }
+    }
+
+    pub fn move_down(&mut self) {
+        if self.caret.line + 1 < self.lines.len() {
+            self.caret.line += 1;
+            self.clamp_col();
+        }
+    }
+
+    pub fn move_home(&mut self) {
+        self.caret.col = 0;
+    }
+
+    pub fn move_end(&mut self) {
+        self.caret.col = self.lines[self.caret.line].chars().count();
+    }
+
+    pub fn move_page_up(&mut self, rows: usize) {
+        self.caret.line = self.caret.line.saturating_sub(rows);
+        self.clamp_col();
+    }
+
+    pub fn move_page_down(&mut self, rows: usize) {
+        self.caret.line = (self.caret.line + rows).min(self.lines.len().saturating_sub(1));
+        self.clamp_col();
+    }
+
+    /// Scroll the render viewport (`top_line`/`left_col`) by the minimum
+    /// amount needed to keep the caret inside a `visible_rows` x
+    /// `visible_cols` window — a no-op if it's already visible. Called after
+    /// every caret-moving or buffer-editing command so the TUI's renderer
+    /// never has to reason about scrolling itself (builtin-editor
+    /// "Full-screen editor chrome").
+    pub fn ensure_caret_visible(&mut self, visible_rows: usize, visible_cols: usize) {
+        let rows = visible_rows.max(1);
+        let cols = visible_cols.max(1);
+        if self.caret.line < self.top_line {
+            self.top_line = self.caret.line;
+        } else if self.caret.line >= self.top_line + rows {
+            self.top_line = self.caret.line + 1 - rows;
+        }
+        if self.caret.col < self.left_col {
+            self.left_col = self.caret.col;
+        } else if self.caret.col >= self.left_col + cols {
+            self.left_col = self.caret.col + 1 - cols;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -429,6 +579,12 @@ mod tests {
             undo_snapshot: None,
             saved_snapshot: lines.iter().map(|s| s.to_string()).collect(),
             search_pattern: None,
+            top_line: 0,
+            left_col: 0,
+            search_prompt: None,
+            replace_prompt: None,
+            quit_confirm: false,
+            save_error: None,
         }
     }
 
@@ -795,5 +951,89 @@ mod tests {
         e.caret.col = 1;
         e.type_char('b');
         assert!(e.is_modified());
+    }
+
+    // -- caret movement -----------------------------------------------------
+
+    #[test]
+    fn left_right_move_within_a_line_and_wrap_at_line_boundaries() {
+        let mut e = state(&["ab", "cd"]);
+        e.caret = Caret { line: 0, col: 0 };
+        e.move_left(); // already at start of buffer: no-op
+        assert_eq!(e.caret, Caret { line: 0, col: 0 });
+        e.caret.col = 2; // end of "ab"
+        e.move_right(); // wraps to the start of the next line
+        assert_eq!(e.caret, Caret { line: 1, col: 0 });
+        e.move_left(); // wraps back to the end of the previous line
+        assert_eq!(e.caret, Caret { line: 0, col: 2 });
+    }
+
+    #[test]
+    fn up_down_clamp_the_column_to_the_shorter_line() {
+        let mut e = state(&["longer line", "x"]);
+        e.caret = Caret { line: 0, col: 8 };
+        e.move_down();
+        assert_eq!(e.caret, Caret { line: 1, col: 1 }, "column clamps to the shorter line's length");
+        e.move_up();
+        assert_eq!(e.caret, Caret { line: 0, col: 1 }, "moving back up does not restore the original column");
+    }
+
+    #[test]
+    fn home_and_end_move_to_the_line_boundaries() {
+        let mut e = state(&["hello"]);
+        e.caret.col = 2;
+        e.move_end();
+        assert_eq!(e.caret.col, 5);
+        e.move_home();
+        assert_eq!(e.caret.col, 0);
+    }
+
+    #[test]
+    fn page_up_and_down_move_by_the_given_row_count_and_clamp() {
+        let mut e = state(&["a", "b", "c", "d", "e"]);
+        e.caret.line = 1;
+        e.move_page_down(2);
+        assert_eq!(e.caret.line, 3);
+        e.move_page_down(10);
+        assert_eq!(e.caret.line, 4, "clamps to the last line");
+        e.move_page_up(2);
+        assert_eq!(e.caret.line, 2);
+        e.move_page_up(100);
+        assert_eq!(e.caret.line, 0, "saturates rather than underflowing");
+    }
+
+    #[test]
+    fn ensure_caret_visible_scrolls_the_minimum_amount_needed() {
+        let owned: Vec<String> = (0..20).map(|i| format!("line{i}")).collect();
+        let borrowed: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let mut e = state(&borrowed);
+        e.caret.line = 15;
+        e.ensure_caret_visible(10, 80);
+        assert_eq!(e.top_line, 6, "scrolls just enough to bring line 15 into a 10-row window");
+        e.caret.line = 0;
+        e.ensure_caret_visible(10, 80);
+        assert_eq!(e.top_line, 0, "scrolling back up snaps top_line to the caret's line");
+    }
+
+    #[test]
+    fn ensure_caret_visible_is_a_no_op_when_already_in_view() {
+        let mut e = state(&["a", "b", "c"]);
+        e.top_line = 0;
+        e.caret.line = 1;
+        e.ensure_caret_visible(10, 80);
+        assert_eq!(e.top_line, 0);
+    }
+
+    // -- byte length ----------------------------------------------------
+
+    #[test]
+    fn byte_len_matches_what_save_actually_writes() {
+        let path = temp_file("byte-len", b"ab\r\ncd");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        assert_eq!(editor.byte_len(), 6); // "ab\r\ncd"
+        editor.type_char('!'); // caret starts at (0,0): "!ab\r\ncd"
+        assert_eq!(editor.byte_len(), 7);
+        editor.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len() as u64, editor.byte_len());
     }
 }

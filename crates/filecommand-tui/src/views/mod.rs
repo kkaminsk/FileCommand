@@ -4,6 +4,7 @@ pub mod conflict_dialog;
 pub mod delete_confirm;
 pub mod destination_input;
 pub mod drive_select;
+pub mod editor;
 pub mod error_dialog;
 pub mod info_panel;
 pub mod keybar;
@@ -14,6 +15,7 @@ pub mod progress_dialog;
 pub mod quit_dialog;
 pub mod skipped_summary;
 pub mod splash;
+pub mod tab_strip;
 pub mod viewer;
 
 use filecommand_core::fs_ops::dialog::RunningDialog;
@@ -33,6 +35,12 @@ use crate::layout;
 /// window backing an active `UiPhase::Viewer` (design D1 — the TUI owns the
 /// `ByteSource`, `core::State` never does); it is ignored in every other
 /// phase.
+///
+/// Returns the real terminal cursor's `(x, y)` position when the current
+/// phase wants one shown (only `UiPhase::Editor`, for the caret) — `None`
+/// otherwise, which the caller must treat as "leave the cursor hidden"
+/// since a stale position from a previous frame's phase would otherwise
+/// linger.
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -41,17 +49,21 @@ pub fn render(
     identity_lines: &[String; 4],
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
-) {
+) -> Option<(u16, u16)> {
     match &state.phase {
         UiPhase::Splash { .. } => {
             splash::render_splash(buf, area, &state.theme, depth, identity_lines);
+            None
         }
         UiPhase::Placeholder => {
             placeholder::render_placeholder(buf, area, &state.theme, depth);
+            None
         }
         UiPhase::Viewer(v) => {
             viewer::render_viewer(buf, area, v, &state.theme, depth, viewer_source);
+            None
         }
+        UiPhase::Editor(e) => editor::render_editor(buf, area, e, &state.theme, depth),
         UiPhase::Panels
         | UiPhase::QuitConfirm
         | UiPhase::FileOpSetup(_)
@@ -99,6 +111,7 @@ pub fn render(
                 }
                 _ => {}
             }
+            None
         }
     }
 }

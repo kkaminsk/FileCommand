@@ -483,6 +483,18 @@ impl PanelState {
         self.apply_tab_list(list, new_active);
     }
 
+    /// Each tab's directory, in tab order — cheap to call every frame for
+    /// tab-strip label rendering since it clones only the directory
+    /// `PathBuf`s, never the full [`TabData`] (which carries each tab's
+    /// entire entry list). See [`Self::full_tab_list`] for the equivalent
+    /// that also carries state, used when actually switching tabs (panel-
+    /// tabs "Tab label rendering and active styling").
+    pub fn tab_dirs(&self) -> Vec<PathBuf> {
+        let mut list: Vec<PathBuf> = self.tabs.iter().map(|t| t.cwd.clone()).collect();
+        list.insert(self.active_tab_index.min(list.len()), self.cwd.clone());
+        list
+    }
+
     /// Alt+`n`: activate the tab at one-based position `n`. Out of range
     /// (including `n == 0`) is a no-op (panel-tabs "Switch tab
     /// (Alt+1..9)").
@@ -1311,6 +1323,19 @@ mod tests {
 
             p.switch_tab(3);
             assert_eq!(p.cwd, PathBuf::from(r"C:\3"));
+        }
+
+        #[test]
+        fn tab_dirs_reflects_order_and_the_active_tabs_live_directory() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\1"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\2"));
+            p.open_tab();
+            p.begin_new_listing(PathBuf::from(r"C:\3"));
+            assert_eq!(p.tab_dirs(), vec![PathBuf::from(r"C:\1"), PathBuf::from(r"C:\2"), PathBuf::from(r"C:\3")]);
+
+            p.switch_tab(1);
+            assert_eq!(p.tab_dirs(), vec![PathBuf::from(r"C:\1"), PathBuf::from(r"C:\2"), PathBuf::from(r"C:\3")], "order is stable across switches");
         }
 
         #[test]

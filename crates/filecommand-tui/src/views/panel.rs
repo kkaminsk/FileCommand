@@ -13,6 +13,7 @@ use ratatui::layout::Rect;
 
 use crate::style::role_style;
 use crate::views::info_panel;
+use crate::views::tab_strip;
 
 const SIZE_COL_W: usize = 9;
 const DATE_COL_W: usize = 8;
@@ -59,16 +60,36 @@ pub fn render_panel(
     let title_x = x0 + 1 + ((w.saturating_sub(2)).saturating_sub(display_width(&title)) / 2) as u16;
     buf.set_string(title_x, y0, clip(&title, w.saturating_sub(2)), title_style);
 
+    // The compact tab strip (panel-tabs "Tab strip visibility"), shown only
+    // with 2+ tabs, is a full-width row nested directly below the top
+    // border — inside this panel's own Rect rather than a row carved out of
+    // `layout::compute`'s shared rect — so the clock overlay and F9 menu
+    // bar, both keyed to that unmodified outer rect, need no changes
+    // (design D4). It has no left/right frame verticals of its own; its
+    // `tab.active`/`tab.inactive` backgrounds (cyan/blue) already match the
+    // panel frame's palette, so it reads as an extension of the border.
+    let has_strip = area.height >= 4 && tab_strip::is_visible(panel);
+    if has_strip {
+        let strip_area = Rect { x: x0, y: y0 + 1, width: area.width, height: 1 };
+        tab_strip::render_tab_strip(buf, strip_area, panel, theme, depth);
+    }
+    let reserved = if has_strip { 3 } else { 2 }; // top(+strip) + bottom border
+    if area.height < reserved {
+        return;
+    }
+    let body_y0 = y0 + if has_strip { 2 } else { 1 };
+    let body_h = area.height - reserved;
+
     // Info mode replaces the whole body — header row included — with the
-    // stacked info boxes, keeping only the panel's own double-line border.
+    // stacked info boxes, keeping only the panel's own double-line border
+    // (and the tab strip, if shown).
     if panel.display_mode == DisplayMode::Info {
-        let body_h = area.height.saturating_sub(2);
         for row in 0..body_h {
-            let y = y0 + 1 + row;
+            let y = body_y0 + row;
             buf.set_string(x0, y, "\u{2551}", frame_style);
             buf.set_string(x0 + area.width - 1, y, "\u{2551}", frame_style);
         }
-        let inner = Rect { x: x0 + 1, y: y0 + 1, width: area.width - 2, height: body_h };
+        let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
         render_bottom_border(buf, area, panel, frame_style, ministatus_style);
         return;
@@ -84,13 +105,13 @@ pub fn render_panel(
         pad_to_width(&header_label("Date", SortColumn::Date, panel), DATE_COL_W - 1),
         pad_to_width("Time", TIME_COL_W - 1),
     );
-    buf.set_string(x0, y0 + 1, "\u{2551}", frame_style);
-    buf.set_string(x0 + 1, y0 + 1, pad_to_width(&header, w.saturating_sub(2)), header_style);
-    buf.set_string(x0 + area.width - 1, y0 + 1, "\u{2551}", frame_style);
+    buf.set_string(x0, body_y0, "\u{2551}", frame_style);
+    buf.set_string(x0 + 1, body_y0, pad_to_width(&header, w.saturating_sub(2)), header_style);
+    buf.set_string(x0 + area.width - 1, body_y0, "\u{2551}", frame_style);
 
     // Entry rows.
-    let rows_start = y0 + 2;
-    let rows_h = area.height.saturating_sub(3); // top, header, bottom
+    let rows_start = body_y0 + 1;
+    let rows_h = body_h.saturating_sub(1); // header row
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);

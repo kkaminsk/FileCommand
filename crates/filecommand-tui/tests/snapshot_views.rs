@@ -11,6 +11,7 @@ use ratatui::buffer::Buffer;
 use ratatui::Terminal;
 
 use filecommand_core::drives::DriveSelect;
+use filecommand_core::editor::EditorState;
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
 use filecommand_core::menu::{MenuId, MenuState};
@@ -472,4 +473,183 @@ fn viewer_replaces_the_panels_full_screen() {
     let text = render_viewer_to_text(80, 24, &state, Some(&source));
     assert!(!text.contains('\u{2554}'), "no panel border while the viewer is open:\n{text}");
     assert!(text.contains("sample.txt"), "the header shows the open file:\n{text}");
+}
+
+// ---------------------------------------------------------------------
+// M5: F4 built-in editor
+// ---------------------------------------------------------------------
+
+fn editor_state(editor: EditorState) -> State {
+    State { phase: UiPhase::Editor(editor), ..State::empty(Theme::classic()) }
+}
+
+#[test]
+fn snapshot_editor_chrome_unmodified() {
+    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    insta::assert_snapshot!("editor_chrome_unmodified", text);
+}
+
+#[test]
+fn snapshot_editor_header_position_and_modified_indicator() {
+    // 440 lines ("line one".."line 440") plus a trailing empty line from the
+    // final newline (matching how `logical_lines`/`from_bytes` model every
+    // other file in this codebase), caret on line 12 column 8 (both
+    // 1-based, matching the spec's header example), buffer modified.
+    let content: String = (1..=440).map(|i| format!("line {i}\n")).collect();
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes());
+    editor.caret.line = 11;
+    editor.caret.col = 7;
+    editor.type_char('!');
+    editor.caret.line = 11;
+    editor.caret.col = 7;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let header = text.lines().next().unwrap();
+    assert!(header.contains("Edit: C:\\big.txt *"), "`{header}`");
+    assert!(header.contains("Line 12/441   Col 8"), "`{header}`");
+    insta::assert_snapshot!("editor_header_position_and_modified", header);
+}
+
+#[test]
+fn snapshot_editor_overwrite_indicator() {
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    editor.toggle_mode();
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let header = text.lines().next().unwrap();
+    assert!(header.trim_end().ends_with("Ovr"), "`{header}`");
+    insta::assert_snapshot!("editor_overwrite_indicator", header);
+}
+
+#[test]
+fn snapshot_editor_keybar() {
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let last = text.lines().last().unwrap();
+    assert!(last.trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "`{last}`");
+    insta::assert_snapshot!("editor_keybar", last);
+}
+
+#[test]
+fn snapshot_editor_marked_selection() {
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n");
+    editor.start_mark();
+    editor.move_down();
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    insta::assert_snapshot!("editor_marked_selection", text);
+}
+
+#[test]
+fn snapshot_editor_save_on_exit_confirm() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n");
+    editor.type_char('!');
+    editor.quit_confirm = true;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Save changes to notes.txt?"), "{text}");
+    insta::assert_snapshot!("editor_save_on_exit_confirm", text);
+}
+
+#[test]
+fn editor_replaces_the_panels_full_screen() {
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n");
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!text.contains('\u{2554}'), "no panel border while the editor is open:\n{text}");
+    assert!(text.contains("f.txt"), "the header shows the open file:\n{text}");
+}
+
+// ---------------------------------------------------------------------
+// M5: panel tabs — tab strip
+// ---------------------------------------------------------------------
+
+fn panel_with_tabs(cwds: &[&str]) -> PanelState {
+    let mut panel = complete_panel(cwds[0], 0);
+    for cwd in &cwds[1..] {
+        panel.open_tab();
+        panel.begin_new_listing(PathBuf::from(cwd));
+        panel.entries = fixed_entries();
+        panel.progress = ListingProgress::Complete { count: panel.entries.len() };
+    }
+    panel.switch_tab(1);
+    panel
+}
+
+#[test]
+fn snapshot_tab_strip_hidden_with_a_single_tab() {
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    // The left panel's top border stays at row 0 — no strip row inserted.
+    assert!(text.lines().next().unwrap().starts_with('\u{2554}'), "{}", text.lines().next().unwrap());
+}
+
+#[test]
+fn snapshot_tab_strip_full_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\alpha", r"C:\beta"]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let strip_row = text.lines().nth(1).unwrap();
+    assert!(strip_row.contains("1:ALPHA"), "`{strip_row}`");
+    assert!(strip_row.contains("2:BETA"), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_full_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_body_shrinks_by_one_row() {
+    let one_tab = base_state(UiPhase::Panels, Theme::classic());
+    let one_tab_text = render_to_text(80, 24, &one_tab, ColorDepth::Ansi16);
+    let mut two_tabs = base_state(UiPhase::Panels, Theme::classic());
+    two_tabs.left = panel_with_tabs(&[r"C:\alpha", r"C:\beta"]);
+    let two_tabs_text = render_to_text(80, 24, &two_tabs, ColorDepth::Ansi16);
+    // Both variants fill the same 24 rows; the strip trades one entry row
+    // for itself rather than growing the panel (panel-tabs "Strip appears
+    // and reclaims a row with two tabs").
+    assert_eq!(one_tab_text.lines().count(), two_tabs_text.lines().count());
+}
+
+/// The first `width` *characters* (not bytes — a tab-strip row can contain
+/// multi-byte box-drawing glyphs) of a rendered row, isolating the left
+/// panel's half of a two-panel row.
+fn left_half(row: &str, width: usize) -> String {
+    row.chars().take(width).collect()
+}
+
+#[test]
+fn snapshot_tab_strip_truncated_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\b"]);
+    let l = filecommand_tui::layout::compute((26, 24));
+    let text = render_to_text(26, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(strip_row.contains('\u{2026}'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_truncated_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_number_only_labels() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\other"]);
+    let l = filecommand_tui::layout::compute((14, 24));
+    let text = render_to_text(14, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(!strip_row.contains(':'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_number_only_labels", strip_row);
+}
+
+#[test]
+fn snapshot_tab_strip_scrolled_with_overflow_markers() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let cwds: Vec<String> = (1..=12).map(|i| format!(r"C:\dir{i}")).collect();
+    let cwd_refs: Vec<&str> = cwds.iter().map(String::as_str).collect();
+    state.left = panel_with_tabs(&cwd_refs);
+    state.left.switch_tab(6); // land somewhere in the middle
+    let l = filecommand_tui::layout::compute((30, 24));
+    let text = render_to_text(30, 24, &state, ColorDepth::Ansi16);
+    let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(strip_row.contains('\u{25C4}') || strip_row.contains('\u{25BA}'), "`{strip_row}`");
+    insta::assert_snapshot!("tab_strip_scrolled_with_markers", strip_row);
 }
