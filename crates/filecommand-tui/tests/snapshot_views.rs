@@ -1041,6 +1041,34 @@ fn snapshot_fkey_bar_under_each_new_theme() {
 }
 
 #[test]
+fn snapshot_file_action_menu_dialog_non_executable() {
+    // file-action-menu "Menu contents, ordering, and navigation":
+    // non-executable targets list View, Edit, Copy, Rename, Move, Delete
+    // with View highlighted first, and no Run entry.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!text.contains("Run"), "a non-executable target must not list Run");
+    assert!(text.contains("View") && text.contains("Edit") && text.contains("Copy"));
+    assert!(text.contains("Rename") && text.contains("Move") && text.contains("Delete"));
+    insta::assert_snapshot!("file_action_menu_dialog_non_executable", text);
+}
+
+#[test]
+fn snapshot_file_action_menu_dialog_executable() {
+    // file-action-menu "Menu contents, ordering, and navigation": an
+    // executable target lists Run first (default-highlighted).
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Run"), "an executable target must list Run");
+    let run_pos = text.find("Run").unwrap();
+    let view_pos = text.find("View").unwrap();
+    assert!(run_pos < view_pos, "Run must render before View");
+    insta::assert_snapshot!("file_action_menu_dialog_executable", text);
+}
+
+#[test]
 fn snapshot_help_window_topic_list() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.help = Some(filecommand_core::dialogs::HelpState::new());

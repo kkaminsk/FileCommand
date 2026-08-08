@@ -4,11 +4,12 @@
 use super::conflict::ConflictInfo;
 use super::error::{ErrorInfo, SkippedItem};
 use super::job::{JobKind, ProgressInfo, SourceItem};
+use std::ffi::OsString;
 use std::path::PathBuf;
 
-/// Pre-job setup dialogs: gathering a destination/name (Copy, Move, Mkdir)
-/// or a delete confirmation, before any `Job` has been dispatched to the
-/// worker.
+/// Pre-job setup dialogs: gathering a destination/name (Copy, Move, Mkdir),
+/// a new in-place name (Rename), or a delete confirmation, before any `Job`
+/// has been dispatched to the worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileOpSetup {
     /// Text-input dialog. For Copy/Move, `input` is the destination path
@@ -25,6 +26,12 @@ pub enum FileOpSetup {
         /// now runs the job.
         confirmed_once: bool,
     },
+    /// The file-action menu's in-place Rename: a text-input dialog
+    /// pre-filled with `original_name`, renaming within `source_dir`
+    /// (file-action-menu "In-place Rename"). Reuses the same
+    /// `Command::FileOpInputChar`/`FileOpInputBackspace`/`FileOpConfirm`/
+    /// `FileOpCancel` commands `DestinationInput` uses.
+    RenameInput { source_dir: PathBuf, original_name: OsString, is_dir: bool, input: String },
 }
 
 /// Dialogs shown while a `Job` is in flight on the worker thread.

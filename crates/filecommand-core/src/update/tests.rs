@@ -753,11 +753,31 @@ fn enter_with_an_empty_buffer_still_navigates() {
     assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
 }
 
+// Superseded by the file-action menu (BREAKING, command-line "Enter on an
+// executable opens the menu instead of spawning"): Enter on an executable no
+// longer spawns it directly on the first keystroke — it opens the menu with
+// Run first and highlighted, so `enter_on_an_executable_target_spawns_it_
+// through_the_shell` becomes the two tests below: the first Enter opens the
+// menu (no spawn), and a second Enter (activating the highlighted Run entry)
+// is what actually spawns it.
 #[test]
-fn enter_on_an_executable_target_spawns_it_through_the_shell() {
+fn enter_on_an_executable_target_opens_the_menu_with_run_first_and_does_not_spawn() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("setup.exe", 1)];
-    let (_, effects) = update(state, Command::Enter);
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty(), "no direct spawn on the first Enter, got {effects:?}");
+    let menu = state.file_action_menu.as_ref().expect("Enter on a file opens the file-action menu");
+    assert_eq!(menu.target_name, OsString::from("setup.exe"));
+    assert_eq!(menu.entries[0], FileActionMenuEntry::Run, "an executable target lists Run first");
+    assert_eq!(menu.selected(), FileActionMenuEntry::Run, "Run is highlighted by default");
+}
+
+#[test]
+fn enter_enter_on_an_executable_spawns_it_through_the_shell() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("setup.exe", 1)];
+    let (state, _) = update(state, Command::Enter); // opens the menu, Run highlighted
+    let (_, effects) = update(state, Command::FileActionMenuConfirm); // activates Run
     match effects.as_slice() {
         [Effect::RunShellCommand(inv, side)] => {
             assert_eq!(inv.args.last().unwrap(), "\"setup.exe\"");
@@ -768,12 +788,361 @@ fn enter_on_an_executable_target_spawns_it_through_the_shell() {
     }
 }
 
+// Superseded by the file-action menu (file-action-menu "Enter on a file
+// opens the action menu"): Enter on a non-executable file used to be a dead
+// key; it now opens the menu instead of doing nothing.
 #[test]
-fn enter_on_a_plain_file_does_nothing() {
+fn enter_on_a_plain_file_opens_the_action_menu_without_spawning_anything() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("readme.txt", 1)];
-    let (_, effects) = update(state, Command::Enter);
+    let (state, effects) = update(state, Command::Enter);
     assert!(effects.is_empty());
+    let menu = state.file_action_menu.as_ref().expect("Enter on a non-executable file opens the file-action menu");
+    assert_eq!(menu.target_name, OsString::from("readme.txt"));
+    assert!(!menu.entries.contains(&FileActionMenuEntry::Run), "non-executable: no Run entry");
+    assert_eq!(menu.selected(), FileActionMenuEntry::View, "View is highlighted by default");
+}
+
+// ---------------------------------------------------------------------
+// file-action-menu: navigation, dismissal, selection independence,
+// precedence over a non-empty command buffer, and per-action routing.
+// ---------------------------------------------------------------------
+
+/// Cursor on `cursor_on` among `names`, menu already open.
+fn opened_menu_state(names: &[&str], cursor_on: &str) -> State {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = names.iter().map(|n| file_entry(n, 1)).collect();
+    state.left.cursor = names.iter().position(|n| *n == cursor_on).unwrap();
+    let (state, _) = update(state, Command::Enter);
+    assert!(state.file_action_menu.is_some(), "setup precondition: the menu must be open");
+    state
+}
+
+#[test]
+fn file_action_menu_does_not_consume_or_alter_the_selection() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("report.txt", 2), file_entry("c.txt", 3), file_entry("d.txt", 4), file_entry("e.txt", 5)];
+    for n in ["a.txt", "report.txt", "c.txt", "d.txt", "e.txt"] {
+        state.left.selected.insert(OsString::from(n));
+    }
+    state.left.cursor = 1; // report.txt
+    let selected_before = state.left.selected.clone();
+
+    let (state, _) = update(state, Command::Enter);
+    let menu = state.file_action_menu.as_ref().expect("menu opens");
+    assert_eq!(menu.target_name, OsString::from("report.txt"), "the menu targets only the cursor entry");
+    assert_eq!(state.left.selected, selected_before, "opening the menu does not touch the selection");
+    assert_eq!(state.left.selected.len(), 5);
+
+    let (state, _) = update(state, Command::FileActionMenuCancel);
+    assert_eq!(state.left.selected, selected_before, "closing the menu leaves the selection intact");
+}
+
+#[test]
+fn file_action_menu_does_not_open_when_the_command_buffer_is_non_empty() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("readme.txt", 1)];
+    let state = type_line(state, "dir");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(state.file_action_menu.is_none(), "a non-empty command buffer takes precedence over the menu");
+    assert!(matches!(effects.first(), Some(Effect::RunShellCommand(..))), "the typed command still runs, got {effects:?}");
+}
+
+#[test]
+fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (state, effects) = update(state, Command::Enter);
+    assert!(state.file_action_menu.is_none(), "Enter on a directory must not open the menu");
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+}
+
+#[test]
+fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    // Non-executable: View, Edit, Copy, Rename, Move, Delete (6 entries).
+    let (state, _) = update(state, Command::FileActionMenuMove(-5));
+    assert_eq!(state.file_action_menu.as_ref().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
+    let (state, _) = update(state, Command::FileActionMenuMove(100));
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert_eq!(menu.cursor, menu.entries.len() - 1, "Down past the last entry clamps, it does not wrap");
+    assert_eq!(menu.selected(), FileActionMenuEntry::Delete);
+}
+
+#[test]
+fn file_action_menu_esc_closes_with_no_action_and_leaves_the_cursor_and_panel_untouched() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, effects) = update(state, Command::FileActionMenuCancel);
+    assert!(state.file_action_menu.is_none());
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.cursor, 0);
+}
+
+#[test]
+fn file_action_menu_first_letter_hotkey_activates_directly() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("notes.txt"));
+        }
+        other => panic!("expected the Delete hotkey to open DeleteConfirm, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_action_menu_unknown_hotkey_is_a_no_op() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, effects) = update(state, Command::FileActionMenuHotkey('Z'));
+    assert!(state.file_action_menu.is_some(), "an unmatched hotkey leaves the menu open");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn file_action_menu_targets_the_entry_it_opened_on_even_if_the_cursor_drifts_from_a_background_listing_refresh() {
+    // Regression: ListingChunk is applied unconditionally regardless of any
+    // open modal (including this menu), and insert_streamed re-pins the
+    // cursor to row 0 whenever cursor_user_moved is still false — the
+    // normal state right after Enter opened the menu. The menu must keep
+    // acting on the entry it was opened on (`b.txt`), never on whatever a
+    // background listing update lands under the cursor in the meantime.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("b.txt", 1)];
+    state.left.cursor = 0;
+    let (state, _) = update(state, Command::Enter); // opens the menu on b.txt
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert_eq!(menu.target_name, OsString::from("b.txt"));
+
+    // A background listing chunk inserts a.txt, which sorts ahead of
+    // b.txt, and re-pins the (not-yet-user-moved) cursor to row 0.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a.txt", 1)] });
+    assert_eq!(state.left.cursor, 0, "setup precondition: the cursor drifted onto a.txt");
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("a.txt"));
+
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("b.txt"), "must target the entry the menu opened on, not the drifted cursor");
+        }
+        other => panic!("expected DeleteConfirm targeting b.txt (the menu's original target), got {other:?}"),
+    }
+}
+
+#[test]
+fn file_action_menu_view_routes_to_the_f3_viewer_path() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, effects) = update(state, Command::FileActionMenuConfirm); // View is highlighted first
+    assert!(state.file_action_menu.is_none());
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(state.phase, UiPhase::Panels, "opening is I/O; the phase flips only once ViewerOpened comes back");
+}
+
+#[test]
+fn file_action_menu_edit_routes_to_the_f4_edit_path() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, _) = update(state, Command::FileActionMenuMove(1)); // Edit
+    let (state, effects) = update(state, Command::FileActionMenuConfirm);
+    assert!(state.file_action_menu.is_none());
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+}
+
+#[test]
+fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_only() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("report.txt", 2)];
+    state.left.selected.insert(OsString::from("a.txt")); // an unrelated selection must not leak in
+    state.left.cursor = 1; // report.txt
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::FileActionMenuMove(2)); // View, Edit, Copy
+    let (state, effects) = update(state, Command::FileActionMenuConfirm);
+    assert!(effects.is_empty(), "opening the destination dialog is not itself a mutation");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, input, .. }) => {
+            assert_eq!(kind, JobKind::Copy);
+            assert_eq!(sources.len(), 1, "scoped to the menu's target only, not the selection");
+            assert_eq!(sources[0].original_name, OsString::from("report.txt"));
+            assert_eq!(input, PathBuf::from("/right").display().to_string(), "pre-filled with the opposite panel's path");
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_action_menu_move_opens_the_f6_destination_dialog_scoped_to_the_target_only() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, _) = update(state, Command::FileActionMenuMove(4)); // View, Edit, Copy, Rename, Move
+    let (state, _) = update(state, Command::FileActionMenuConfirm);
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, .. }) => {
+            assert_eq!(kind, JobKind::Move);
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("notes.txt"));
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn file_action_menu_delete_requires_the_existing_confirmation_and_declining_deletes_nothing() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    let (state, effects) = update(state, Command::FileOpCancel);
+    assert_eq!(state.phase, UiPhase::Panels, "declining returns to the panels");
+    assert!(effects.is_empty(), "nothing runs, nothing is deleted");
+}
+
+#[test]
+fn activating_a_mutating_menu_action_changes_nothing_before_its_dialog_is_accepted() {
+    // Copy, Move, Rename, and Delete each only *open* a setup dialog on
+    // activation — no `Effect::RunJob` (the only mutation-triggering effect)
+    // is emitted until that dialog's own Confirm (file-action-menu "No
+    // mutation without an intervening dialog").
+    for hotkey in ['C', 'M', 'R', 'D'] {
+        let state = opened_menu_state(&["notes.txt"], "notes.txt");
+        let (state, effects) = update(state, Command::FileActionMenuHotkey(hotkey));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::RunJob(_))), "hotkey {hotkey:?} must not run a job on activation alone");
+        assert!(matches!(state.phase, UiPhase::FileOpSetup(_)), "hotkey {hotkey:?} should have opened a setup dialog, got {:?}", state.phase);
+    }
+}
+
+#[test]
+fn cancelling_the_interposed_destination_dialog_after_move_starts_no_job() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('M'));
+    let (state, effects) = update(state, Command::FileOpCancel);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// file-action-menu: in-place Rename
+// ---------------------------------------------------------------------
+
+#[test]
+fn rename_pre_fills_the_current_name() {
+    let state = opened_menu_state(&["draft.txt"], "draft.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::RenameInput { original_name, input, .. }) => {
+            assert_eq!(original_name, OsString::from("draft.txt"));
+            assert_eq!(input, "draft.txt");
+        }
+        other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn rename_confirm_dispatches_a_rename_job_scoped_to_the_target_in_its_own_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("draft.txt", 1)];
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
+    // Clear the "draft.txt" pre-fill via Backspace, then type the new name —
+    // driven the same way a real edit of the input would be (file-action-menu
+    // "Accepting the dialog SHALL rename the entry ... with the value
+    // `final.txt`").
+    let state = (0.."draft.txt".len()).fold(state, |s, _| update(s, Command::FileOpInputBackspace).0);
+    let state = "final.txt".chars().fold(state, |s, c| update(s, Command::FileOpInputChar(c)).0);
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::RenameInput { input, .. }) => assert_eq!(input, "final.txt"),
+        other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
+    }
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => {
+            assert_eq!(job.kind, JobKind::Rename);
+            assert_eq!(job.sources.len(), 1);
+            assert_eq!(job.sources[0].original_name, OsString::from("draft.txt"));
+            assert_eq!(job.sources[0].path, PathBuf::from(r"C:\NORTON\draft.txt"));
+            assert_eq!(job.source_dir, PathBuf::from(r"C:\NORTON"));
+            assert_eq!(job.dest_dir, PathBuf::from(r"C:\NORTON"), "the entry stays in the same directory");
+            assert_eq!(job.new_dir_name, Some(OsString::from("final.txt")));
+        }
+        other => panic!("expected exactly one RunJob effect, got {other:?}"),
+    }
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { kind: JobKind::Rename, .. }, .. }));
+}
+
+/// The reducer carries a case-only edit of the pre-filled name through to
+/// the job exactly as typed, without normalizing it away — the identity-
+/// aware case-only rename itself happens in the job engine, once dispatched
+/// (`fs_ops::worker::run_rename`; see `rename_case_only_change_succeeds_via_
+/// identity_check` in `fs_ops::worker::tests`) (file-action-menu "Case-only
+/// rename works").
+#[test]
+fn rename_case_only_edit_reaches_the_job_unchanged() {
+    let state = opened_menu_state(&["readme.md"], "readme.md");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
+    let state = (0.."readme.md".len()).fold(state, |s, _| update(s, Command::FileOpInputBackspace).0);
+    let state = "README.md".chars().fold(state, |s, c| update(s, Command::FileOpInputChar(c)).0);
+    let (_, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => {
+            assert_eq!(job.sources[0].original_name, OsString::from("readme.md"));
+            assert_eq!(job.new_dir_name, Some(OsString::from("README.md")));
+        }
+        other => panic!("expected exactly one RunJob effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn rename_esc_renames_nothing() {
+    let state = opened_menu_state(&["draft.txt"], "draft.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
+    let (state, effects) = update(state, Command::FileOpCancel);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert!(effects.is_empty(), "Esc must not dispatch a job");
+}
+
+#[test]
+fn rename_collision_and_error_surface_through_the_existing_operation_dialogs() {
+    // Once dispatched, a Rename job is just another `Job` running through
+    // the ordinary `FileOpRunning` machinery — `JobConflict`/`JobError`
+    // fold into `RunningDialog::Conflict`/`RunningDialog::Error` exactly as
+    // they do for Copy/Move/Delete, regardless of `kind` (file-action-menu
+    // "Rename collisions/failures must surface through the existing
+    // overwrite-conflict and error-recovery dialogs").
+    let running = running_progress_state(JobKind::Rename, "/left", "/left");
+    let (state, _) = update(running, Command::JobConflict(sample_conflict()));
+    assert!(
+        matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { kind: JobKind::Rename, .. }, .. }),
+        "a rename collision surfaces the existing conflict dialog, got {:?}",
+        state.phase
+    );
+
+    let running = running_progress_state(JobKind::Rename, "/left", "/left");
+    let err = ErrorInfo { path: PathBuf::from("/left/draft.txt"), message: "access denied".to_string() };
+    let (state, _) = update(running, Command::JobError(err));
+    assert!(
+        matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Error { kind: JobKind::Rename, .. }, .. }),
+        "a rename error surfaces the existing error dialog, got {:?}",
+        state.phase
+    );
+}
+
+#[test]
+fn rename_success_rereads_the_affected_panel() {
+    let mut state = test_state(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/left"),
+        dialog: RunningDialog::Progress { kind: JobKind::Rename, progress: ProgressInfo::starting(1, 0) },
+    });
+    state.left.cwd = PathBuf::from("/left");
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
+    );
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert!(
+        effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, path } if path.as_path() == std::path::Path::new("/left"))),
+        "the panel showing the renamed entry's directory is re-read, got {effects:?}"
+    );
 }
 
 #[test]

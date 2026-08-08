@@ -18,6 +18,7 @@ fn title_for(kind: JobKind) -> &'static str {
         JobKind::Move => "Moving",
         JobKind::Mkdir => "Creating Directory",
         JobKind::Delete => "Deleting",
+        JobKind::Rename => "Renaming",
     }
 }
 

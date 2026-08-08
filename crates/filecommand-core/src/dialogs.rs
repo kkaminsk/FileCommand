@@ -4,6 +4,12 @@
 //! Both dialogs are simple enough (a cursor over a fixed or config-loaded
 //! list) that they share this one small module rather than each getting a
 //! file of their own.
+//!
+//! The Enter-on-file action menu (file-action-menu) lives here too: its
+//! state is the same shape (a cursor over a fixed list), just with a
+//! per-open entry list rather than a config-loaded one.
+
+use std::ffi::OsString;
 
 /// The open F2 user menu: just a cursor over `State::user_menu_entries`,
 /// which is loaded once at startup from `usermenu.toml` and does not change
@@ -61,6 +67,100 @@ impl ThemePickerState {
         let len = crate::theme::BUILTIN_THEME_NAMES.len();
         let next = self.highlight as isize + delta;
         self.highlight = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Enter-on-file action menu (file-action-menu)
+// ---------------------------------------------------------------------
+
+/// One entry in the file-action menu, in menu order. `Run` is included only
+/// when the target is executable, and always sorts first (file-action-menu
+/// "Menu contents, ordering, and navigation").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileActionMenuEntry {
+    Run,
+    View,
+    Edit,
+    Copy,
+    Rename,
+    Move,
+    Delete,
+}
+
+impl FileActionMenuEntry {
+    /// Display label. Its first character is also the entry's first-letter
+    /// hotkey (file-action-menu "pressing an entry's first letter SHALL
+    /// activate that entry directly").
+    pub fn label(self) -> &'static str {
+        match self {
+            FileActionMenuEntry::Run => "Run",
+            FileActionMenuEntry::View => "View",
+            FileActionMenuEntry::Edit => "Edit",
+            FileActionMenuEntry::Copy => "Copy",
+            FileActionMenuEntry::Rename => "Rename",
+            FileActionMenuEntry::Move => "Move",
+            FileActionMenuEntry::Delete => "Delete",
+        }
+    }
+}
+
+/// The open Enter-on-file action menu: the name of the cursor entry it
+/// targets (captured at open time, independent of the panel's
+/// multi-selection — file-action-menu "Enter on a file opens the action
+/// menu": "SHALL NOT consume or alter the multi-entry selection"), its
+/// ordered entry list, and the highlighted row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileActionMenuState {
+    pub target_name: OsString,
+    pub entries: Vec<FileActionMenuEntry>,
+    pub cursor: usize,
+}
+
+impl FileActionMenuState {
+    /// Opens with the first entry highlighted — `Run` when `executable`,
+    /// else `View` (file-action-menu "Menu contents, ordering, and
+    /// navigation").
+    pub fn new(target_name: OsString, executable: bool) -> FileActionMenuState {
+        let mut entries = Vec::with_capacity(7);
+        if executable {
+            entries.push(FileActionMenuEntry::Run);
+        }
+        entries.extend([
+            FileActionMenuEntry::View,
+            FileActionMenuEntry::Edit,
+            FileActionMenuEntry::Copy,
+            FileActionMenuEntry::Rename,
+            FileActionMenuEntry::Move,
+            FileActionMenuEntry::Delete,
+        ]);
+        FileActionMenuState { target_name, entries, cursor: 0 }
+    }
+
+    /// Move the highlight by `delta`, clamped within the entry list — same
+    /// clamp-not-wrap convention as [`UserMenuState::move_cursor`].
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.entries.len();
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    pub fn selected(&self) -> FileActionMenuEntry {
+        self.entries[self.cursor]
+    }
+
+    /// The entry whose label starts with `c` (case-insensitive), preferring
+    /// the first match in menu order. This resolves the `R`un/`R`ename
+    /// collision in favor of Run, which — when present — is always listed
+    /// first (design D1) (file-action-menu "First-letter hotkey activates
+    /// directly").
+    pub fn hotkey_action(&self, c: char) -> Option<FileActionMenuEntry> {
+        let want = c.to_ascii_uppercase();
+        self.entries.iter().copied().find(|e| e.label().chars().next().map(|f| f.to_ascii_uppercase()) == Some(want))
     }
 }
 
@@ -316,6 +416,56 @@ mod tests {
         assert_eq!(picker.highlight, last);
         picker.move_cursor(1);
         assert_eq!(picker.highlight, last, "clamped at the end, not wrapped");
+    }
+
+    #[test]
+    fn file_action_menu_lists_run_first_only_when_executable() {
+        let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
+        assert_eq!(m.entries[0], FileActionMenuEntry::View, "non-executable: View highlighted first");
+        assert!(!m.entries.contains(&FileActionMenuEntry::Run));
+        assert_eq!(m.selected(), FileActionMenuEntry::View);
+
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
+        assert_eq!(m.entries[0], FileActionMenuEntry::Run, "executable: Run highlighted first");
+        assert_eq!(m.selected(), FileActionMenuEntry::Run);
+        assert_eq!(
+            m.entries,
+            vec![
+                FileActionMenuEntry::Run,
+                FileActionMenuEntry::View,
+                FileActionMenuEntry::Edit,
+                FileActionMenuEntry::Copy,
+                FileActionMenuEntry::Rename,
+                FileActionMenuEntry::Move,
+                FileActionMenuEntry::Delete,
+            ]
+        );
+    }
+
+    #[test]
+    fn file_action_menu_move_cursor_clamps_at_both_ends() {
+        let mut m = FileActionMenuState::new(OsString::from("notes.txt"), false);
+        m.move_cursor(-3);
+        assert_eq!(m.cursor, 0);
+        m.move_cursor(100);
+        assert_eq!(m.cursor, m.entries.len() - 1);
+    }
+
+    #[test]
+    fn file_action_menu_hotkey_matches_first_letter_case_insensitively() {
+        let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
+        assert_eq!(m.hotkey_action('d'), Some(FileActionMenuEntry::Delete));
+        assert_eq!(m.hotkey_action('D'), Some(FileActionMenuEntry::Delete));
+        assert_eq!(m.hotkey_action('z'), None);
+    }
+
+    #[test]
+    fn file_action_menu_hotkey_r_prefers_run_over_rename_when_both_present() {
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
+        assert_eq!(m.hotkey_action('r'), Some(FileActionMenuEntry::Run));
+
+        let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
+        assert_eq!(m.hotkey_action('r'), Some(FileActionMenuEntry::Rename), "no Run entry: R falls through to Rename");
     }
 
     #[test]

@@ -18,6 +18,11 @@ pub enum JobKind {
     Move,
     Delete,
     Mkdir,
+    /// In-place rename within `source_dir`, including identity-aware
+    /// case-only rename (file-action-menu "In-place Rename"). Uses the same
+    /// `new_dir_name` field Mkdir uses for its new name, here holding the
+    /// entry's new name instead.
+    Rename,
 }
 
 /// One source item, keyed by its original on-disk name (selection identity)
@@ -32,16 +37,20 @@ pub struct SourceItem {
     pub is_dir: bool,
 }
 
-/// A single Copy/Move/Delete/Mkdir request. `dest_dir` is the destination
-/// directory for Copy/Move and the parent directory for Mkdir; `Delete`
-/// leaves it equal to `source_dir` (unused, but keeps the type uniform for
-/// panel-re-read matching in `core::update`).
+/// A single Copy/Move/Delete/Mkdir/Rename request. `dest_dir` is the
+/// destination directory for Copy/Move and the parent directory for Mkdir;
+/// `Delete` leaves it equal to `source_dir` (unused, but keeps the type
+/// uniform for panel-re-read matching in `core::update`). `Rename` likewise
+/// sets `dest_dir` equal to `source_dir` — the renamed entry stays put — and
+/// carries its single source's new name in `new_dir_name`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub kind: JobKind,
     pub sources: Vec<SourceItem>,
     pub source_dir: PathBuf,
     pub dest_dir: PathBuf,
+    /// The new directory's name for Mkdir, or the target entry's new name
+    /// for Rename; unused by Copy/Move/Delete.
     pub new_dir_name: Option<OsString>,
 }
 
