@@ -1,0 +1,28 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+expression: text
+---
+╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
+║Name↓        │ Size    Date    Time   ║║Name↓        │ Size    Date    Time   ║
+║..           │ ▶UP--DI                ║║..           │ ▶UP--DI                ║
+║docs         │ ▶SUB-DI 01-02-2 03:0   ║║docs         │ ▶SUB-DI 01-02-2 03:0   ║
+║Cargo.toml   │ 612     01-02-2 03:0   ║║Cargo.toml   │ 612     01-02-2 03:0   ║
+║readme.txt   │ 12K     01-02-2 03:0   ║║readme.txt   │ 12K     01-02-2 03:0   ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                              ╔══ readme.txt ══╗                              ║
+║                              ║ View           ║                              ║
+║                              ║ Edit           ║                              ║
+║                              ║ Copy           ║                              ║
+║                              ║ Rename         ║                              ║
+║                              ║ Move           ║                              ║
+║                              ║ Delete         ║                              ║
+║                              ╚════════════════╝                              ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
+C:\Users\demo\left>_                                                            
+1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit

@@ -27,6 +27,7 @@ pub fn run_job(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
         JobKind::Delete => run_delete(job, fs, sink),
         JobKind::Copy => run_copy_or_move(job, fs, sink, false),
         JobKind::Move => run_copy_or_move(job, fs, sink, true),
+        JobKind::Rename => run_rename(job, fs, sink),
     }
 }
 
@@ -504,6 +505,80 @@ fn run_move_same_volume(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) 
     sink.done(if cancelled { JobOutcome::Cancelled { skipped } } else { JobOutcome::Completed { skipped } });
 }
 
+// ---------------------------------------------------------------------
+// Rename (file-action-menu "In-place Rename")
+// ---------------------------------------------------------------------
+
+/// In-place rename of the job's single source within `source_dir` (equal to
+/// `dest_dir`, per the `Job` doc). Mirrors [`run_move_same_volume`]'s
+/// identity-aware conflict check — a case-only rename onto the same
+/// underlying file is never treated as "target already exists" — but always
+/// targets `new_dir_name` rather than the source's own original name, and
+/// never falls back to a copy-then-delete cross-volume path since a rename
+/// never leaves its own directory. Collisions and errors surface through the
+/// same `sink.conflict`/`sink.error` calls every other job uses, so the
+/// existing `operation-dialogs` conflict/error dialogs render unchanged
+/// (file-action-menu "Rename collisions/failures must surface through the
+/// existing overwrite-conflict and error-recovery dialogs").
+fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
+    let mut progress = ProgressInfo::starting(1, 0);
+    sink.progress(progress.clone());
+
+    let Some(src) = job.sources.first() else {
+        sink.done(JobOutcome::Completed { skipped: vec![] });
+        return;
+    };
+    let new_name = job.new_dir_name.clone().unwrap_or_default();
+    progress.current_file = new_name.clone();
+
+    let target = job.dest_dir.join(&new_name);
+    let mut final_target = target.clone();
+    let mut skipped = Vec::new();
+
+    if let Ok(target_md) = fs.metadata(&target) {
+        let src_id = fs.metadata(&src.path).ok().and_then(|m| m.file_id);
+        let same_identity = matches!((src_id, target_md.file_id), (Some(a), Some(b)) if a == b);
+        if !same_identity {
+            let info = ConflictInfo {
+                source_name: src.original_name.clone(),
+                source_size: fs.metadata(&src.path).map(|m| m.size).unwrap_or(0),
+                source_modified: fs.metadata(&src.path).ok().and_then(|m| m.modified).map(DateTime::from_system_time),
+                target_path: target.clone(),
+                target_size: target_md.size,
+                target_modified: target_md.modified.map(DateTime::from_system_time),
+            };
+            match sink.conflict(info) {
+                ConflictChoice::Overwrite | ConflictChoice::OverwriteAll => {
+                    let _ = fs.set_readonly(&target, false);
+                    let _ = if target_md.is_dir { fs.remove_dir(&target) } else { fs.remove_file(&target) };
+                }
+                ConflictChoice::Skip | ConflictChoice::SkipAll => {
+                    skipped.push(SkippedItem { path: target, reason: "target already exists".to_string() });
+                    sink.done(JobOutcome::Completed { skipped });
+                    return;
+                }
+                ConflictChoice::Rename(renamed_to) => final_target = job.dest_dir.join(renamed_to),
+            }
+        }
+    }
+
+    let mut error_policy = ErrorPolicy::new();
+    let outcome = attempt_with_recovery(&src.path, &mut error_policy, sink, || fs.rename(&src.path, &final_target));
+    let job_outcome = match outcome {
+        RetryOutcome::Done => {
+            progress.files_done = 1;
+            sink.progress(progress.clone());
+            JobOutcome::Completed { skipped }
+        }
+        RetryOutcome::Skip(reason) => {
+            skipped.push(SkippedItem { path: src.path.clone(), reason });
+            JobOutcome::Completed { skipped }
+        }
+        RetryOutcome::Abort => JobOutcome::Cancelled { skipped },
+    };
+    sink.done(job_outcome);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -794,6 +869,79 @@ mod tests {
         // the underlying `rename` still succeeds since FakeFs treats it as a
         // plain move.
         assert!(matches!(sink.outcome, Some(JobOutcome::Completed { .. })));
+    }
+
+    // -------------------------------------------------------------
+    // JobKind::Rename (file-action-menu "In-place Rename")
+    // -------------------------------------------------------------
+
+    fn rename_job(dir: &str, old: &str, new: &str) -> Job {
+        Job {
+            kind: JobKind::Rename,
+            sources: vec![source(old, &format!("{dir}/{old}"))],
+            source_dir: PathBuf::from(dir),
+            dest_dir: PathBuf::from(dir),
+            new_dir_name: Some(OsString::from(new)),
+        }
+    }
+
+    #[test]
+    fn rename_renames_the_entry_in_place() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/d"));
+        fake.add_file(Path::new("/d/draft.txt"), 4);
+        let job = rename_job("/d", "draft.txt", "final.txt");
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+        assert!(matches!(sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()));
+        assert!(fake.metadata(Path::new("/d/final.txt")).is_ok());
+        assert!(fake.metadata(Path::new("/d/draft.txt")).is_err());
+    }
+
+    #[test]
+    fn rename_case_only_change_succeeds_via_identity_check() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/d"));
+        fake.add_file(Path::new("/d/readme.md"), 4);
+        let job = rename_job("/d", "readme.md", "README.md");
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+        assert!(matches!(sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()));
+        assert!(fake.metadata(Path::new("/d/README.md")).is_ok());
+    }
+
+    #[test]
+    fn rename_onto_an_existing_different_file_asks_for_conflict_resolution() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/d"));
+        fake.add_file(Path::new("/d/a.txt"), 4);
+        fake.add_file(Path::new("/d/b.txt"), 9);
+        let job = rename_job("/d", "a.txt", "b.txt");
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Skip);
+        run_job(&job, &fake, &mut sink);
+        match sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => assert_eq!(skipped.len(), 1, "the conflict was surfaced and Skip was honored"),
+            other => panic!("expected a Completed outcome with one skip, got {other:?}"),
+        }
+        // Declining (Skip) must leave both files untouched.
+        assert!(fake.metadata(Path::new("/d/a.txt")).is_ok());
+        assert_eq!(fake.metadata(Path::new("/d/b.txt")).unwrap().size, 9);
+    }
+
+    #[test]
+    fn rename_overwrite_conflict_choice_replaces_the_target() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/d"));
+        fake.add_file(Path::new("/d/a.txt"), 4);
+        fake.add_file(Path::new("/d/b.txt"), 9);
+        let job = rename_job("/d", "a.txt", "b.txt");
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Overwrite);
+        run_job(&job, &fake, &mut sink);
+        assert!(matches!(sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()));
+        assert!(fake.metadata(Path::new("/d/a.txt")).is_err());
+        assert_eq!(fake.metadata(Path::new("/d/b.txt")).unwrap().size, 4, "b.txt now holds a.txt's renamed content");
     }
 
     #[test]

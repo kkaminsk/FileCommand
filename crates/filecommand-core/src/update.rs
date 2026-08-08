@@ -5,11 +5,11 @@
 //! events alike. It performs no I/O, spawns no threads, and reads no clock;
 //! callers supply the current time via [`Command::Tick`].
 
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, UserMenuEntry};
-use crate::dialogs::{HelpState, UserMenuState};
+use crate::dialogs::{FileActionMenuEntry, FileActionMenuState, HelpState, UserMenuState};
 use crate::drives::{self, DriveSelect};
 use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
@@ -129,6 +129,10 @@ pub struct State {
     pub find_file: Option<FindFileState>,
     /// The F2 user-menu overlay, or `None` when closed.
     pub user_menu: Option<UserMenuState>,
+    /// The Enter-on-file action menu, or `None` when closed. Opened by
+    /// `handle_enter` and dismissed by activating an entry or Esc
+    /// (file-action-menu "Enter on a file opens the action menu").
+    pub file_action_menu: Option<FileActionMenuState>,
     /// The F1 Help window (and, nested within it, the About dialog), or
     /// `None` when closed.
     pub help: Option<HelpState>,
@@ -195,6 +199,7 @@ impl State {
             fuzzy_jump: None,
             find_file: None,
             user_menu: None,
+            file_action_menu: None,
             help: None,
             startup_warning: None,
         }
@@ -576,6 +581,18 @@ pub enum Command {
     /// existing Esc/Enter-dismiss convention) (user-menu "Malformed file
     /// warns and falls back without overwriting").
     DismissStartupWarning,
+
+    // Enter-on-file action menu (file-action-menu).
+    /// Up/Down: move the highlight, clamped at both ends.
+    FileActionMenuMove(isize),
+    /// Enter: activate the highlighted entry and close the menu.
+    FileActionMenuConfirm,
+    /// Esc: close the menu with no action taken.
+    FileActionMenuCancel,
+    /// A first-letter hotkey: activate the matching entry directly, exactly
+    /// as if it had been highlighted and confirmed (file-action-menu
+    /// "First-letter hotkey activates directly").
+    FileActionMenuHotkey(char),
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -794,6 +811,10 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     }
     if state.user_menu.is_some() && is_user_menu_command(&cmd) {
         effects.extend(handle_user_menu(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.file_action_menu.is_some() && is_file_action_menu_command(&cmd) {
+        effects.extend(handle_file_action_menu(&mut state, cmd));
         return (state, effects);
     }
     if state.help.is_some() && is_help_command(&cmd) {
@@ -1611,9 +1632,9 @@ fn active_selection_sources(state: &State) -> Vec<SourceItem> {
 /// F5/F6/F7: enter the destination/name-input setup dialog. A no-op for
 /// Copy/Move when there is nothing selected; Mkdir is always available.
 fn enter_file_op_setup(state: &mut State, kind: JobKind) {
-    let side = state.active;
-    let source_dir = state.panel(side).cwd.clone();
     if kind == JobKind::Mkdir {
+        let side = state.active;
+        let source_dir = state.panel(side).cwd.clone();
         state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: String::new() });
         return;
     }
@@ -1621,6 +1642,15 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
     if sources.is_empty() {
         return;
     }
+    enter_file_op_setup_for_sources(state, kind, sources);
+}
+
+/// Shared by `enter_file_op_setup` (F5/F6, selection- or cursor-scoped) and
+/// the file-action menu's Copy/Move (cursor-entry-only, D3) — the setup
+/// dialog itself doesn't care which chose its `sources`.
+fn enter_file_op_setup_for_sources(state: &mut State, kind: JobKind, sources: Vec<SourceItem>) {
+    let side = state.active;
+    let source_dir = state.panel(side).cwd.clone();
     let prefill = state.panel(side.toggle()).cwd.display().to_string();
     state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: prefill });
 }
@@ -1628,14 +1658,155 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
 /// F8: enter the delete-confirmation dialog. A no-op when there is nothing
 /// selected.
 fn enter_delete_confirm(state: &mut State) {
-    let side = state.active;
-    let source_dir = state.panel(side).cwd.clone();
     let sources = active_selection_sources(state);
     if sources.is_empty() {
         return;
     }
+    enter_delete_confirm_for_sources(state, sources);
+}
+
+/// Shared by `enter_delete_confirm` (F8) and the file-action menu's Delete
+/// (cursor-entry-only, D3).
+fn enter_delete_confirm_for_sources(state: &mut State, sources: Vec<SourceItem>) {
+    let side = state.active;
+    let source_dir = state.panel(side).cwd.clone();
     let needs_second_confirm = sources.iter().any(|s| s.is_dir);
     state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false });
+}
+
+/// The file-action menu's Rename: enter the in-place rename input dialog,
+/// pre-filled with the target's current name (file-action-menu "In-place
+/// Rename": "pre-filled with the target entry's current name").
+fn enter_rename_input(state: &mut State, original_name: OsString, is_dir: bool) {
+    let side = state.active;
+    let source_dir = state.panel(side).cwd.clone();
+    let input = original_name.to_string_lossy().into_owned();
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
+}
+
+// ---------------------------------------------------------------------
+// Enter-on-file action menu (file-action-menu)
+// ---------------------------------------------------------------------
+
+fn is_file_action_menu_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::FileActionMenuMove(_) | Command::FileActionMenuConfirm | Command::FileActionMenuCancel | Command::FileActionMenuHotkey(_)
+    )
+}
+
+/// Drive the Enter-on-file action menu (gated in [`update`] by
+/// `state.file_action_menu`) — navigation, dismissal, and activation
+/// (file-action-menu "Menu contents, ordering, and navigation").
+fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.file_action_menu.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::FileActionMenuMove(delta) => {
+            state.file_action_menu.as_mut().unwrap().move_cursor(delta);
+            vec![]
+        }
+        Command::FileActionMenuCancel => {
+            state.file_action_menu = None;
+            vec![]
+        }
+        Command::FileActionMenuConfirm => {
+            let menu = state.file_action_menu.take().unwrap();
+            let target_name = menu.target_name.clone();
+            activate_file_action(state, menu.selected(), target_name)
+        }
+        Command::FileActionMenuHotkey(c) => {
+            let menu = state.file_action_menu.as_ref().unwrap();
+            let action = menu.hotkey_action(c);
+            match action {
+                Some(action) => {
+                    let target_name = menu.target_name.clone();
+                    state.file_action_menu = None;
+                    activate_file_action(state, action, target_name)
+                }
+                None => vec![],
+            }
+        }
+        _ => vec![],
+    }
+}
+
+/// Route an activated menu entry into its existing capability flow, applied
+/// to `target_name` — the entry the menu was opened on, captured in
+/// `FileActionMenuState` at open time and threaded through here rather than
+/// re-read from the panel's live cursor, which can drift while the menu (a
+/// modal overlay) is open: a background `ListingChunk`/`ListingComplete` is
+/// applied unconditionally regardless of any open modal and resets the
+/// cursor to row 0 whenever the panel hasn't seen a user-driven move since
+/// the listing began (file-action-menu "Menu actions route to existing
+/// flows").
+fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_name: OsString) -> Vec<Effect> {
+    let side = state.active;
+    match action {
+        // Run: the same suspended-shell spawn path a typed command line
+        // uses, and the only way to reach it now that Enter no longer
+        // spawns an executable directly (command-line: "Enter on an
+        // executable opens the menu instead of spawning").
+        FileActionMenuEntry::Run => {
+            let Some(_) = named_entry_source(state, side, &target_name) else { return vec![] };
+            let name = target_name.to_string_lossy().into_owned();
+            let cwd = state.panel(side).cwd.clone();
+            // Quoted so a name with spaces reaches the shell as one token.
+            let text = format!("\"{name}\"");
+            vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side)]
+        }
+        // View/Edit: the exact F3/F4 core paths, unchanged.
+        FileActionMenuEntry::View => handle_request_viewer(state),
+        FileActionMenuEntry::Edit => handle_request_editor(state),
+        // Copy/Move/Delete: the existing F5/F6/F8 setup dialogs, scoped to
+        // the menu's target entry only — never the panel's selection (D3).
+        FileActionMenuEntry::Copy => {
+            if let Some(source) = named_entry_source(state, side, &target_name) {
+                enter_file_op_setup_for_sources(state, JobKind::Copy, vec![source]);
+            }
+            vec![]
+        }
+        FileActionMenuEntry::Move => {
+            if let Some(source) = named_entry_source(state, side, &target_name) {
+                enter_file_op_setup_for_sources(state, JobKind::Move, vec![source]);
+            }
+            vec![]
+        }
+        FileActionMenuEntry::Delete => {
+            if let Some(source) = named_entry_source(state, side, &target_name) {
+                enter_delete_confirm_for_sources(state, vec![source]);
+            }
+            vec![]
+        }
+        // Rename: new in-place variant (file-action-menu "In-place Rename").
+        FileActionMenuEntry::Rename => {
+            if let Some(source) = named_entry_source(state, side, &target_name) {
+                enter_rename_input(state, source.original_name, source.is_dir);
+            }
+            vec![]
+        }
+    }
+}
+
+/// The panel entry on `side` named `name` as a single-item `SourceItem`,
+/// ignoring the panel's cursor position and selection entirely — used only
+/// by the file-action menu, which targets the entry it was opened on
+/// (captured by name in `FileActionMenuState`) regardless of any cursor
+/// drift from a background listing refresh or any multi-entry selection
+/// (design D3; file-action-menu "Enter on a file opens the action menu":
+/// "SHALL NOT consume or alter the multi-entry selection"). Returns `None`
+/// if the named entry is no longer present (e.g. deleted or renamed away by
+/// something else while the menu was open) or is a directory-like pseudo
+/// entry, matching the existing not-found-is-a-no-op behavior of every
+/// other dialog-open path.
+fn named_entry_source(state: &State, side: PanelSide, name: &OsStr) -> Option<SourceItem> {
+    let panel = state.panel(side);
+    let entry = panel.entries.iter().find(|e| e.name == name)?;
+    if entry.kind == EntryKind::ParentDir {
+        return None;
+    }
+    Some(SourceItem { original_name: entry.name.clone(), path: panel.cwd.join(&entry.name), is_dir: entry.is_dir_like() })
 }
 
 fn panels_matching(state: &State, dirs: &[&PathBuf]) -> Vec<PanelSide> {
@@ -1726,6 +1897,39 @@ fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effe
                 }
             }
             _ => UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once }),
+        },
+        FileOpSetup::RenameInput { source_dir, original_name, is_dir, mut input } => match cmd {
+            Command::FileOpInputChar(c) => {
+                input.push(c);
+                UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input })
+            }
+            Command::FileOpInputBackspace => {
+                input.pop();
+                UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input })
+            }
+            Command::FileOpCancel => UiPhase::Panels,
+            Command::FileOpConfirm => {
+                let trimmed = input.trim();
+                if trimmed.is_empty() {
+                    return UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
+                }
+                let source = SourceItem { original_name: original_name.clone(), path: source_dir.join(&original_name), is_dir };
+                let job = Job {
+                    kind: JobKind::Rename,
+                    sources: vec![source],
+                    source_dir: source_dir.clone(),
+                    dest_dir: source_dir.clone(),
+                    new_dir_name: Some(OsString::from(trimmed)),
+                };
+                let running = UiPhase::FileOpRunning {
+                    source_dir: job.source_dir.clone(),
+                    dest_dir: job.dest_dir.clone(),
+                    dialog: RunningDialog::Progress { kind: JobKind::Rename, progress: ProgressInfo::starting(0, 0) },
+                };
+                effects.push(Effect::RunJob(job));
+                running
+            }
+            _ => UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input }),
         },
     }
 }
@@ -1831,9 +2035,12 @@ fn handle_file_op_running(
 }
 
 /// Enter: run the typed command line if there is one, otherwise act on the
-/// entry under the cursor — descend into a directory, or spawn an
-/// executable target through the same suspended-shell path a typed command
-/// uses.
+/// entry under the cursor — descend into a directory, or open the
+/// file-action menu for a file (file-action-menu "Enter on a file opens the
+/// action menu"). Spawning an executable directly on Enter is gone; the
+/// menu's Run entry is now the only way to reach the suspended-shell spawn
+/// path (command-line: "Enter on an executable opens the menu instead of
+/// spawning").
 fn handle_enter(state: &mut State) -> Vec<Effect> {
     if !state.command_line.trim().is_empty() {
         return run_command_line(state);
@@ -1845,14 +2052,10 @@ fn handle_enter(state: &mut State) -> Vec<Effect> {
     let Some(entry) = state.panel(side).selected() else { return vec![] };
     match entry.kind {
         EntryKind::File => {
-            let name = entry.name.to_string_lossy().into_owned();
-            if !shell::is_executable_name(&name, &state.shell.pathext) {
-                return vec![];
-            }
-            let cwd = state.panel(side).cwd.clone();
-            // Quoted so a name with spaces reaches the shell as one token.
-            let text = format!("\"{name}\"");
-            vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side)]
+            let name = entry.name.clone();
+            let executable = shell::is_executable_name(&name.to_string_lossy(), &state.shell.pathext);
+            state.file_action_menu = Some(FileActionMenuState::new(name, executable));
+            vec![]
         }
         EntryKind::ParentDir => handle_parent(state, side),
         EntryKind::Directory => {
