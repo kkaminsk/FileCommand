@@ -338,7 +338,12 @@ pub enum Command {
     /// panic).
     ViewerOpenFailed { message: String },
     /// Reply to `Effect::RunViewerSearch` (viewer: F7 streaming search).
-    ViewerSearchResult { offset: Option<u64>, match_range: Option<(u64, u64)> },
+    /// `request` echoes the id `Effect::RunViewerSearch` was issued with, so
+    /// a reply from a search superseded by a since-closed/reopened viewer
+    /// session (`ViewerState::search_request`) is recognized as stale and
+    /// dropped rather than applied to whatever viewer session happens to be
+    /// open when it arrives.
+    ViewerSearchResult { offset: Option<u64>, match_range: Option<(u64, u64)>, request: u64 },
     /// Reply to `Effect::RunExternalEditor` when the editor could not be
     /// spawned (external-editor: Editor spawn errors do not crash the app).
     ExternalEditorSpawnFailed { message: String },
@@ -388,7 +393,9 @@ pub enum Effect {
     /// Run the F7 streaming search from `start_offset` for `pattern`
     /// against `path`, reporting the match back via
     /// `Command::ViewerSearchResult` (viewer: F7 streaming search).
-    RunViewerSearch { path: PathBuf, start_offset: u64, pattern: Vec<u8> },
+    /// `request` must be echoed back unchanged in the `ViewerSearchResult`
+    /// reply so a stale reply can be told apart from the current search.
+    RunViewerSearch { path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64 },
     /// Suspend the TUI, launch the external editor per `EditorInvocation`,
     /// wait for it to exit, then restore and re-read the panel side that
     /// owned the cursor entry — the same suspend/restore seam
@@ -582,7 +589,15 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
 
             Command::RequestViewer => effects.extend(handle_request_viewer(&mut state)),
-            Command::ViewerOpened { path, file_len } => state.phase = UiPhase::Viewer(ViewerState::new(path, file_len)),
+            Command::ViewerOpened { path, file_len } => {
+                // A prior failed F3/F4 attempt may have left `last_error`
+                // set on this panel; a successful open has clearly moved
+                // past it, so the mini-status line must not keep showing
+                // the stale message (§7 error policy — errors are surfaced
+                // until superseded by success, not left to linger).
+                state.panel_mut(state.active).last_error = None;
+                state.phase = UiPhase::Viewer(ViewerState::new(path, file_len));
+            }
             Command::ViewerOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
             Command::RequestExternalEditor => effects.extend(handle_request_external_editor(&mut state)),
             Command::ExternalEditorSpawnFailed { message } => state.panel_mut(state.active).last_error = Some(message),
@@ -806,12 +821,28 @@ fn handle_viewer(state: &mut State, cmd: Command) -> Vec<Effect> {
                 viewer.search_pattern = Some(pattern_bytes.clone());
                 let path = viewer.path.clone();
                 let start_offset = viewer.top_offset;
+                // A fresh request id per search, mirroring
+                // `PanelState::info_request` — lets a reply be matched
+                // against the search that's still outstanding, so an
+                // out-of-order or superseded-session reply is dropped
+                // rather than applied (viewer: F7 streaming search
+                // staleness).
+                let request = state.next_request_id();
+                viewer.search_request = Some(request);
                 state.phase = UiPhase::Viewer(viewer);
-                effects.push(Effect::RunViewerSearch { path, start_offset, pattern: pattern_bytes });
+                effects.push(Effect::RunViewerSearch { path, start_offset, pattern: pattern_bytes, request });
                 return effects;
             }
         }
-        Command::ViewerSearchResult { offset: Some(offset), match_range } => {
+        // Only apply a reply whose id matches this session's outstanding
+        // search. A mismatch means either a stale reply from a search this
+        // same session has since superseded, or one from a viewer session
+        // that has since closed and been reopened (a fresh `ViewerState`
+        // starts with `search_request: None`, which can never equal a real
+        // request id) — either way it is silently dropped instead of
+        // jumping the user to a bogus offset with a phantom match
+        // highlight.
+        Command::ViewerSearchResult { offset: Some(offset), match_range, request } if viewer.search_request == Some(request) => {
             viewer.set_top_offset(offset);
             viewer.last_match = match_range;
         }
@@ -837,7 +868,19 @@ fn handle_request_external_editor(state: &mut State) -> Vec<Effect> {
     let name = entry.name.clone();
     let cwd = panel.cwd.clone();
     match external_editor::resolve(state.editor.as_deref(), &cwd, &name, is_dir) {
-        Ok(invocation) => vec![Effect::RunExternalEditor(invocation, side)],
+        Ok(invocation) => {
+            // Mirrors the `Command::ViewerOpened` clear: a prior failed F3/F4
+            // attempt may have left `last_error` set, and successfully
+            // dispatching the editor spawn has clearly moved past it — the
+            // mini-status line must not keep showing the stale message while
+            // the editor runs (§7 error policy). The eventual successful
+            // return also clears it again via `Command::RereadPanel` ->
+            // `begin_new_listing`, but that round trip only happens once the
+            // editor process exits, so this clears it immediately rather
+            // than leaving the stale message up for the whole edit session.
+            state.panel_mut(side).last_error = None;
+            vec![Effect::RunExternalEditor(invocation, side)]
+        }
         Err(external_editor::TargetError::Unconfigured) => {
             state.panel_mut(side).last_error = Some(external_editor::NO_EDITOR_CONFIGURED_MESSAGE.to_string());
             vec![]

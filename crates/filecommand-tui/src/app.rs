@@ -62,9 +62,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     let identity_lines = identity::identity_lines(year);
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
-    // `PATHEXT` and the configured shell are read once here so `update`
-    // stays a pure function of `State` rather than of the environment.
-    state.shell = ShellConfig::from_env(config.shell.clone());
+    apply_config(&mut state, &config);
     state.history = config::load_history(Path::new(config::HISTORY_FILE));
 
     let (tx, rx) = mpsc::channel::<Command>();
@@ -135,6 +133,18 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
         }
     }
+}
+
+/// Snapshot config-driven values into `State` at startup: the configured
+/// shell/`PATHEXT` and the F4 external-editor command, so `update` stays a
+/// pure function of `State` rather than reading the environment or config
+/// itself. Factored out of `run` so the config-driven startup wiring is
+/// testable without a real terminal (regression coverage for the F4
+/// external-editor command silently never reaching `State` — see
+/// `apply_config_wires_the_configured_editor_and_shell_into_state` below).
+fn apply_config(state: &mut State, config: &config::Config) {
+    state.shell = ShellConfig::from_env(config.shell.clone());
+    state.editor = config.editor.clone();
 }
 
 /// Resolve a viewer key's meaning into a core `Command`. Simple toggles pass
@@ -309,8 +319,8 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     let _ = rt.tx.send(Command::ViewerOpenFailed { message: e.to_string() });
                 }
             },
-            Effect::RunViewerSearch { path, start_offset, pattern } => {
-                worker::spawn_viewer_search(path, start_offset, pattern, rt.tx.clone());
+            Effect::RunViewerSearch { path, start_offset, pattern, request } => {
+                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
             }
             Effect::RunExternalEditor(invocation, side) => match run_external_editor(guard, &invocation)? {
                 Ok(()) => {
@@ -457,6 +467,30 @@ mod tests {
             ("/bin/sh".to_string(), vec!["-c".to_string(), "exit 0".to_string()])
         };
         EditorInvocation { program, leading_args, file_arg: OsString::from(file_arg), cwd: std::env::temp_dir() }
+    }
+
+    /// Regression test for the F4 external editor being silently dead: a
+    /// config-driven startup (via `config::parse`, the real parsing path,
+    /// not a hand-built `Config`) must populate `state.editor`, mirroring
+    /// the already-wired `state.shell`. Before this fix, `run()` never
+    /// assigned `state.editor` at all, so `editor =` in `config.toml` was
+    /// parsed correctly but never reached `State`.
+    #[test]
+    fn apply_config_wires_the_configured_editor_and_shell_into_state() {
+        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n");
+        let mut state = State::empty(Theme::classic());
+        assert_eq!(state.editor, None, "sanity: editor starts unset before wiring");
+        apply_config(&mut state, &config);
+        assert_eq!(state.editor.as_deref(), Some("code --wait"));
+        assert_eq!(state.shell.shell.as_deref(), Some("pwsh -NoLogo -Command"));
+    }
+
+    #[test]
+    fn apply_config_leaves_editor_unset_when_config_omits_it() {
+        let config = config::parse("splash = false\n");
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &config);
+        assert_eq!(state.editor, None);
     }
 
     #[test]

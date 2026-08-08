@@ -228,6 +228,81 @@ fn paint_match_overlay(buf: &mut Buffer, x: u16, y: u16, row: &BodyRow, col_star
     }
 }
 
+/// Bytes of margin read on each side of the visible window before decoding,
+/// so a multi-byte UTF-8 character split by `forward::next_line_start`'s /
+/// `backward::previous_line_start`'s byte-count hard-split (when no newline
+/// is found within their cap) is never fed to `decode_lossy` starting or
+/// ending mid-sequence — the margin `viewer::decode::decode_lossy`'s own doc
+/// comment calls for. 3 bytes covers the longest run of continuation bytes
+/// in a valid UTF-8 sequence (a 4-byte encoding has 3).
+const UTF8_BOUNDARY_MARGIN: usize = 3;
+
+fn is_utf8_continuation_byte(b: u8) -> bool {
+    b & 0b1100_0000 == 0b1000_0000
+}
+
+/// The encoded length of the UTF-8 sequence led by `b`, or `1` for an ASCII
+/// byte or an invalid lead byte (`decode_lossy` handles the actual
+/// substitution; this is only used to decide where to trim a possibly
+/// truncated trailing sequence).
+fn utf8_sequence_len(b: u8) -> usize {
+    if b & 0b1000_0000 == 0 {
+        1
+    } else if b & 0b1110_0000 == 0b1100_0000 {
+        2
+    } else if b & 0b1111_0000 == 0b1110_0000 {
+        3
+    } else if b & 0b1111_1000 == 0b1111_0000 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Read the visible text window with a small margin on each side (see
+/// [`UTF8_BOUNDARY_MARGIN`]), then trim back to the nearest valid UTF-8
+/// boundary at both ends. Returns the trimmed bytes and the absolute offset
+/// its first byte sits at.
+///
+/// Without this, a hard-split anchor landing mid-character — which the
+/// bounded backward/forward scans can do, since they split purely by byte
+/// count when no newline is found within their cap — would decode as a
+/// spurious replacement character right at the render window's edge.
+fn read_text_window(source: &ByteSource, top_offset: u64, chunk_size: usize) -> (Vec<u8>, u64) {
+    let margin_start = top_offset.min(UTF8_BOUNDARY_MARGIN as u64);
+    let read_start = top_offset - margin_start;
+    let raw = source.read_range(read_start, chunk_size + margin_start as usize + UTF8_BOUNDARY_MARGIN);
+
+    // Skip forward past any continuation bytes at the front: they belong to
+    // a character that started before the window (possibly mid-character at
+    // `top_offset` itself), which cannot be decoded correctly without the
+    // rest of that character. Landing on the next full character instead of
+    // the fragment is what avoids the spurious replacement character.
+    let mut start = margin_start as usize;
+    while start < raw.len() && is_utf8_continuation_byte(raw[start]) {
+        start += 1;
+    }
+
+    // Trim a truncated sequence at the back the same way: a lead byte near
+    // the end whose continuation bytes were not all read is left for the
+    // next window rather than decoded as a spurious replacement character.
+    let mut end = raw.len();
+    let scan_from = end.saturating_sub(UTF8_BOUNDARY_MARGIN + 1).max(start);
+    for i in (scan_from..end).rev() {
+        if is_utf8_continuation_byte(raw[i]) {
+            continue;
+        }
+        let seq_len = utf8_sequence_len(raw[i]);
+        if seq_len > 1 && i + seq_len > end {
+            end = i;
+        }
+        break;
+    }
+
+    let window = if start < end { raw[start..end].to_vec() } else { Vec::new() };
+    (window, read_start + start as u64)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_text_body(
     buf: &mut Buffer,
@@ -240,8 +315,8 @@ fn render_text_body(
     text_style: Style,
     match_style: Style,
 ) {
-    let raw = source.read_range(viewer.top_offset, DEFAULT_CHUNK_SIZE);
-    let lines = raw_lines_stripped(&raw, viewer.top_offset);
+    let (raw, base) = read_text_window(source, viewer.top_offset, DEFAULT_CHUNK_SIZE);
+    let lines = raw_lines_stripped(&raw, base);
     let rows = build_text_rows(viewer, &lines, w, body_rows_count);
     let match_span = compute_match_span(viewer, &lines);
     for (i, row) in rows.iter().enumerate() {
@@ -425,6 +500,29 @@ mod tests {
         let text = render(&viewer, None, Rect { x: 0, y: 0, width: 40, height: 5 });
         assert!(text.contains("f.txt"));
         assert!(text.contains("1Help"));
+    }
+
+    #[test]
+    fn text_mode_render_does_not_corrupt_a_multibyte_char_split_by_the_hard_split_cap() {
+        use filecommand_core::viewer::backward::DEFAULT_MAX_LINE_LEN;
+        use filecommand_core::viewer::forward::next_line_start;
+
+        // A long newline-free run of 3-byte CJK characters, comfortably past
+        // the 64 KiB hard-split cap so `next_line_start` must hard-split
+        // somewhere in the run; 65536 (the cap) is not a multiple of 3, so
+        // the split necessarily lands mid-character.
+        let ch = '\u{4e2d}'; // "中", 3 UTF-8 bytes
+        let content: String = std::iter::repeat_n(ch, 30_000).collect();
+        let src = temp_source("cjk-hard-split", content.as_bytes());
+
+        let split_at = next_line_start(&src, 0, DEFAULT_MAX_LINE_LEN);
+        assert_eq!(split_at, DEFAULT_MAX_LINE_LEN as u64, "sanity: the hard split lands exactly at the cap");
+        assert_ne!(split_at % 3, 0, "sanity: the split point must land mid-character for this fixture to be meaningful");
+
+        let mut viewer = ViewerState::new(PathBuf::from("cjk.txt"), src.len());
+        viewer.top_offset = split_at;
+        let text = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 40, height: 6 });
+        assert!(!text.contains('\u{fffd}'), "spurious replacement character at the render window boundary:\n{text}");
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
 /// "Search is bounded and streaming"). Reopens the file rather than sharing
 /// the render loop's cached `ByteSource` across threads — a fresh mmap open
 /// is cheap and keeps the two paths independent.
-pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, tx: Sender<Command>) {
+pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let result = match ByteSource::open(&path) {
             Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
@@ -87,7 +87,7 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, t
             Some((start, end)) => (Some(start), Some((start, end))),
             None => (None, None),
         };
-        let _ = tx.send(Command::ViewerSearchResult { offset, match_range });
+        let _ = tx.send(Command::ViewerSearchResult { offset, match_range, request });
     });
 }
 
@@ -200,11 +200,12 @@ mod tests {
     fn spawn_viewer_search_reports_the_match_back_on_the_channel() {
         let path = temp_file("found", b"the quick brown fox jumps over the lazy dog");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"brown".to_vec(), tx);
+        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, tx);
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Command::ViewerSearchResult { offset, match_range }) => {
+            Ok(Command::ViewerSearchResult { offset, match_range, request }) => {
                 assert_eq!(offset, Some(10));
                 assert_eq!(match_range, Some((10, 15)));
+                assert_eq!(request, 7, "the request id must be echoed back unchanged");
             }
             other => panic!("expected ViewerSearchResult, got {other:?}"),
         }
@@ -214,9 +215,9 @@ mod tests {
     fn spawn_viewer_search_reports_no_match_as_none() {
         let path = temp_file("not-found", b"the quick brown fox");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"zebra".to_vec(), tx);
+        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, tx);
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Command::ViewerSearchResult { offset: None, match_range: None }) => {}
+            Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
         }
     }
@@ -225,9 +226,9 @@ mod tests {
     fn spawn_viewer_search_on_an_unopenable_path_reports_no_match_instead_of_panicking() {
         let missing = std::env::temp_dir().join("filecommand-tui-worker-viewer-test-does-not-exist.bin");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(missing, 0, b"x".to_vec(), tx);
+        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, tx);
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(Command::ViewerSearchResult { offset: None, match_range: None }) => {}
+            Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
         }
     }

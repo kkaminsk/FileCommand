@@ -66,7 +66,12 @@ pub fn resolve(editor: Option<&str>, cwd: &Path, entry_name: &OsString, is_dir: 
     // `is_configured`/the check above guarantee at least one non-blank
     // token, so `split_spec` never returns empty here.
     let program = parts.remove(0);
-    Ok(EditorInvocation { program, leading_args: parts, file_arg: entry_name.clone(), cwd: cwd.to_path_buf() })
+    // Route the program path and `cwd` through the same `\\?\` verbatim-path
+    // helper `shell::build_command` uses, so an editor configured with a
+    // long quoted program path, or a panel directory near/over `MAX_PATH`,
+    // still spawns correctly.
+    let program = shell::spawn_safe_path(Path::new(&program)).to_string_lossy().into_owned();
+    Ok(EditorInvocation { program, leading_args: parts, file_arg: entry_name.clone(), cwd: shell::spawn_safe_path(cwd) })
 }
 
 /// The fixed message shown when F4 is pressed with no `editor =` configured
@@ -140,6 +145,16 @@ mod tests {
         let raw = OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).to_os_string();
         let inv = resolve(Some("notepad"), Path::new("/work"), &raw, false).unwrap();
         assert_eq!(inv.file_arg, raw);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_uses_a_verbatim_cwd_for_a_panel_directory_near_max_path() {
+        let long_component = "c".repeat(250);
+        let long_cwd = PathBuf::from(format!(r"C:\{long_component}"));
+        let inv = resolve(Some("notepad"), &long_cwd, &name("report.txt"), false).unwrap();
+        assert!(inv.cwd.to_string_lossy().starts_with(r"\\?\"), "expected a verbatim cwd, got {:?}", inv.cwd);
+        assert!(inv.cwd.to_string_lossy().ends_with(&long_component));
     }
 
     #[test]

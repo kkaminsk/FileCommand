@@ -1284,6 +1284,21 @@ fn viewer_open_failed_surfaces_an_inline_error_on_the_active_panel_instead_of_op
     assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
 }
 
+#[test]
+fn a_subsequently_successful_f3_open_clears_a_stale_last_error_from_an_earlier_failed_attempt() {
+    let mut state = test_state(UiPhase::Panels);
+    let (state_after_failure, _) = update(state.clone(), Command::ViewerOpenFailed { message: "access denied".to_string() });
+    assert_eq!(state_after_failure.left.last_error.as_deref(), Some("access denied"));
+
+    state.left.last_error = Some("access denied".to_string());
+    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/notes.txt"), file_len: 10 });
+    assert_eq!(
+        state.left.last_error, None,
+        "a successful F3 open must clear a stale error left by an earlier failed attempt"
+    );
+    assert!(matches!(state.phase, UiPhase::Viewer(_)));
+}
+
 fn opened_viewer_state(file_len: u64) -> State {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/f.txt"), file_len });
@@ -1362,11 +1377,12 @@ fn viewer_search_confirm_dispatches_the_search_effect_and_keeps_the_pattern() {
     let (state, _) = update(state, Command::ViewerSearchChar('a'));
     let (state, _) = update(state, Command::ViewerSearchChar('b'));
     let (state, effects) = update(state, Command::ViewerSearchConfirm);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    let request = v.search_request.expect("a search request id must be minted and recorded");
     assert_eq!(
         effects,
-        vec![Effect::RunViewerSearch { path: PathBuf::from("/left/f.txt"), start_offset: 0, pattern: b"ab".to_vec() }]
+        vec![Effect::RunViewerSearch { path: PathBuf::from("/left/f.txt"), start_offset: 0, pattern: b"ab".to_vec(), request }]
     );
-    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
     assert_eq!(v.search_pattern, Some(b"ab".to_vec()));
     assert_eq!(v.search_input, None, "the prompt closes once the search is dispatched");
 }
@@ -1395,10 +1411,27 @@ fn empty_search_pattern_does_not_dispatch_a_search() {
     assert_eq!(v.search_pattern, None);
 }
 
+/// Run a real F7 search-confirm sequence so the returned state carries the
+/// actual outstanding `search_request` id, mirroring how the TUI event loop
+/// would drive it (`ViewerSearchStart` -> typed chars -> `ViewerSearchConfirm`).
+fn viewer_with_pattern_confirmed(state: State, pattern: &str) -> (State, u64) {
+    let (state, _) = update(state, Command::ViewerSearchStart);
+    let mut state = state;
+    for c in pattern.chars() {
+        let (s, _) = update(state, Command::ViewerSearchChar(c));
+        state = s;
+    }
+    let (state, _) = update(state, Command::ViewerSearchConfirm);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    let request = v.search_request.expect("search confirm must record an outstanding request id");
+    (state, request)
+}
+
 #[test]
 fn viewer_search_result_moves_the_top_anchor_and_highlights_the_match() {
     let state = opened_viewer_state(1000);
-    let (state, _) = update(state, Command::ViewerSearchResult { offset: Some(250), match_range: Some((250, 256)) });
+    let (state, request) = viewer_with_pattern_confirmed(state, "ab");
+    let (state, _) = update(state, Command::ViewerSearchResult { offset: Some(250), match_range: Some((250, 256)), request });
     let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
     assert_eq!(v.top_offset, 250);
     assert_eq!(v.last_match, Some((250, 256)));
@@ -1410,9 +1443,67 @@ fn viewer_search_result_with_no_match_leaves_the_top_anchor_untouched() {
     if let UiPhase::Viewer(v) = &mut state.phase {
         v.top_offset = 40;
     }
-    let (state, _) = update(state, Command::ViewerSearchResult { offset: None, match_range: None });
+    let (state, request) = viewer_with_pattern_confirmed(state, "zz");
+    let (state, _) = update(state, Command::ViewerSearchResult { offset: None, match_range: None, request });
     let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
     assert_eq!(v.top_offset, 40);
+}
+
+#[test]
+fn a_stale_out_of_order_search_reply_is_dropped_not_applied() {
+    // The M3-style staleness race: a first search is confirmed (minting
+    // request id N), then — before its reply arrives — a second search is
+    // confirmed (minting N+1) which is the one still outstanding. The first
+    // search's (now stale) reply must be silently dropped rather than
+    // clobbering the top offset/match the second search is still waiting
+    // on to fill in.
+    let mut state = opened_viewer_state(1000);
+    if let UiPhase::Viewer(v) = &mut state.phase {
+        v.top_offset = 5;
+    }
+    let (state, stale_request) = viewer_with_pattern_confirmed(state, "first");
+    let (state, current_request) = viewer_with_pattern_confirmed(state, "second");
+    assert_ne!(stale_request, current_request);
+
+    // The stale reply from the first (superseded) search arrives late.
+    let (state, _) =
+        update(state, Command::ViewerSearchResult { offset: Some(900), match_range: Some((900, 905)), request: stale_request });
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.top_offset, 5, "a stale reply must not move the top offset");
+    assert_eq!(v.last_match, None, "a stale reply must not set a phantom match highlight");
+
+    // The still-current search's reply, once it arrives, is applied.
+    let (state, _) = update(
+        state,
+        Command::ViewerSearchResult { offset: Some(700), match_range: Some((700, 706)), request: current_request },
+    );
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.top_offset, 700);
+    assert_eq!(v.last_match, Some((700, 706)));
+}
+
+#[test]
+fn a_stale_search_reply_for_a_closed_and_reopened_viewer_session_is_dropped() {
+    // A search is confirmed against one open file, then the viewer is
+    // closed and a different file opened (or even the same file reopened —
+    // it is a fresh session either way, per `ViewerState::new`). The first
+    // session's stale reply must not be applied to the new session even
+    // though `state.phase` is `UiPhase::Viewer(_)` again by the time it
+    // arrives.
+    let state = opened_viewer_state(1000);
+    let (state, stale_request) = viewer_with_pattern_confirmed(state, "needle");
+
+    let (state, _) = update(state, Command::ViewerClose);
+    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/other.txt"), file_len: 200 });
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.search_request, None, "a freshly opened session has no outstanding search");
+
+    let (state, _) =
+        update(state, Command::ViewerSearchResult { offset: Some(50), match_range: Some((50, 56)), request: stale_request });
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.path, PathBuf::from("/left/other.txt"));
+    assert_eq!(v.top_offset, 0, "the stale reply from the closed session must not move the new session's top offset");
+    assert_eq!(v.last_match, None, "the stale reply must not set a phantom match highlight on the new session");
 }
 
 #[test]
@@ -1494,4 +1585,19 @@ fn external_editor_spawn_failure_surfaces_an_inline_error_without_crashing() {
     assert!(effects.is_empty());
     assert_eq!(state.left.last_error.as_deref(), Some("program not found"));
     assert_eq!(state.phase, UiPhase::Panels, "still running, not crashed");
+}
+
+#[test]
+fn a_subsequently_successful_f4_launch_clears_a_stale_last_error_from_an_earlier_failed_attempt() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    state.left.last_error = Some("program not found".to_string());
+
+    let (state, effects) = update(state, Command::RequestExternalEditor);
+    assert_eq!(
+        state.left.last_error, None,
+        "successfully dispatching the F4 editor spawn must clear a stale error from an earlier failed attempt"
+    );
+    assert!(matches!(effects.as_slice(), [Effect::RunExternalEditor(_, PanelSide::Left)]));
 }

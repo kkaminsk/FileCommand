@@ -63,6 +63,16 @@ pub struct ViewerState {
     /// `viewer.match` role (viewer: F7 streaming search — "Match becomes
     /// the top anchor and is highlighted").
     pub last_match: Option<(u64, u64)>,
+    /// The id of the most recently issued `RunViewerSearch` request for this
+    /// viewer session, or `None` if no search is outstanding — mirrors
+    /// `PanelState::info_request`/`DriveSelect::generation` (design: async
+    /// reply staleness). Freshly `None` on every new session (a session is
+    /// scoped to one `ViewerState`, created anew per `ViewerOpened`), so a
+    /// reply from a search started in a session that has since closed (or
+    /// been replaced by reopening — even on the same file) never matches
+    /// the new session's outstanding id and is dropped rather than jumping
+    /// the user to a bogus offset with a phantom match highlight.
+    pub search_request: Option<u64>,
 }
 
 impl ViewerState {
@@ -79,6 +89,7 @@ impl ViewerState {
             search_input: None,
             search_pattern: None,
             last_match: None,
+            search_request: None,
         }
     }
 
