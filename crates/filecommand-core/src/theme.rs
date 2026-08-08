@@ -344,6 +344,23 @@ impl Theme {
         self.roles.iter()
     }
 
+    /// Apply optional truecolor `#RRGGBB` overrides on top of an already-built
+    /// theme's mandatory ANSI-16 values. Each entry is `(role, fg override,
+    /// bg override)`; `None` leaves that side ANSI-16-only.
+    fn with_truecolor_overrides(mut self, overrides: &[(Role, Option<Rgb>, Option<Rgb>)]) -> Theme {
+        for (role, fg, bg) in overrides {
+            if let Some(spec) = self.roles.get_mut(role) {
+                if fg.is_some() {
+                    spec.fg_truecolor = *fg;
+                }
+                if bg.is_some() {
+                    spec.bg_truecolor = *bg;
+                }
+            }
+        }
+        self
+    }
+
     pub fn classic() -> Theme {
         use Ansi16::*;
         use ColorValue::{Ansi16 as A, Inherit};
@@ -468,16 +485,286 @@ impl Theme {
         Theme::build("nc-mono", m).expect("nc-mono role table is complete")
     }
 
+    /// Green-phosphor monochrome: green on black base, bright-green
+    /// directories/selection, black-on-green inversions. Built like
+    /// `nc-mono` (a single base hue on black, bright variant for emphasis,
+    /// inversion for active/menu/dialog roles) so no color carries meaning
+    /// that case, position, or inversion doesn't also carry.
+    pub fn terminal_green() -> Theme {
+        use Ansi16::*;
+        use ColorValue::Ansi16 as A;
+        let mut m = BTreeMap::new();
+        let mut set = |role: Role, fg: ColorValue, bg: ColorValue| {
+            m.insert(role, ColorSpecInput::new(fg, bg));
+        };
+        set(Role::ScreenBackdrop, ColorValue::Inherit, A(Black));
+        set(Role::ScreenPlaceholder, A(Green), A(Black));
+        set(Role::PanelFrame, A(Green), A(Black));
+        set(Role::PanelTitleActive, A(Black), A(Green));
+        set(Role::PanelTitleInactive, A(Green), A(Black));
+        set(Role::PanelHeader, A(Green), A(Black));
+        set(Role::PanelFile, A(Green), A(Black));
+        set(Role::PanelDirectory, A(BrightGreen), A(Black));
+        set(Role::PanelCursor, A(Black), A(Green));
+        set(Role::PanelSelected, A(BrightGreen), A(Black));
+        set(Role::PanelMinistatus, A(Green), A(Black));
+        // Monochrome: git status markers carry no hue meaning, same
+        // precedent as `nc-mono`'s marker roles.
+        set(Role::PanelGitModified, A(BrightGreen), A(Black));
+        set(Role::PanelGitUntracked, A(BrightGreen), A(Black));
+        set(Role::PanelGitStaged, A(BrightGreen), A(Black));
+        set(Role::KeybarNumber, A(Green), A(Black));
+        set(Role::KeybarLabel, A(Black), A(Green));
+        set(Role::CommandLine, A(Green), A(Black));
+        set(Role::Clock, A(Black), A(Green));
+        set(Role::MenuBar, A(Black), A(Green));
+        set(Role::MenuBody, A(Black), A(Green));
+        set(Role::MenuHighlight, A(Green), A(Black));
+        set(Role::MenuDisabled, A(BrightBlack), A(Green));
+        set(Role::MenuHotkey, A(Black), A(Green));
+        set(Role::InfoLabel, A(Green), A(Black));
+        set(Role::InfoValue, A(BrightGreen), A(Black));
+        set(Role::InfoBanner, A(BrightGreen), A(Black));
+        set(Role::DialogPrimary, A(Black), A(Green));
+        set(Role::DialogError, A(BrightGreen), A(Black));
+        set(Role::DialogInput, A(Black), A(Green));
+        set(Role::DialogSecondary, A(Black), A(Green));
+        set(Role::ButtonNormal, A(Black), A(Green));
+        set(Role::ButtonFocused, A(Green), A(Black));
+        set(Role::DialogGaugeFilled, A(BrightGreen), A(Green));
+        set(Role::DialogGaugeEmpty, A(Black), A(Green));
+        set(Role::SplashFrame, A(Green), A(Black));
+        set(Role::SplashTitle, A(BrightGreen), A(Black));
+        set(Role::SplashVersion, A(Green), A(Black));
+        set(Role::SplashText, A(Green), A(Black));
+        set(Role::ViewerHeader, A(Black), A(Green));
+        set(Role::ViewerText, A(Green), A(Black));
+        set(Role::ViewerMatch, A(Black), A(Green));
+        set(Role::TabActive, A(Black), A(Green));
+        set(Role::TabInactive, A(Green), A(Black));
+        Theme::build("terminal-green", m)
+            .expect("terminal-green role table is complete")
+            .with_truecolor_overrides(&[
+                (Role::PanelFrame, None, Some(Rgb(0, 40, 0))),
+                (Role::PanelFile, Some(Rgb(51, 204, 51)), Some(Rgb(0, 40, 0))),
+                (Role::PanelDirectory, Some(Rgb(102, 255, 102)), Some(Rgb(0, 40, 0))),
+                (Role::PanelCursor, None, Some(Rgb(51, 204, 51))),
+                (Role::ScreenBackdrop, None, Some(Rgb(0, 40, 0))),
+            ])
+    }
+
+    /// `nc-classic`'s structure with magenta standing in for blue and
+    /// bright-magenta for cyan.
+    pub fn purple_lights() -> Theme {
+        use Ansi16::*;
+        use ColorValue::Ansi16 as A;
+        let mut m = BTreeMap::new();
+        let mut set = |role: Role, fg: ColorValue, bg: ColorValue| {
+            m.insert(role, ColorSpecInput::new(fg, bg));
+        };
+        set(Role::ScreenBackdrop, ColorValue::Inherit, A(Magenta));
+        set(Role::ScreenPlaceholder, A(White), A(Magenta));
+        set(Role::PanelFrame, A(BrightMagenta), A(Magenta));
+        set(Role::PanelTitleActive, A(Black), A(BrightMagenta));
+        set(Role::PanelTitleInactive, A(BrightMagenta), A(Magenta));
+        set(Role::PanelHeader, A(BrightYellow), A(Magenta));
+        set(Role::PanelFile, A(BrightMagenta), A(Magenta));
+        set(Role::PanelDirectory, A(BrightWhite), A(Magenta));
+        set(Role::PanelCursor, A(Black), A(BrightMagenta));
+        set(Role::PanelSelected, A(BrightYellow), A(Magenta));
+        set(Role::PanelMinistatus, A(BrightMagenta), A(Magenta));
+        set(Role::PanelGitModified, A(BrightRed), A(Magenta));
+        set(Role::PanelGitUntracked, A(BrightYellow), A(Magenta));
+        set(Role::PanelGitStaged, A(BrightGreen), A(Magenta));
+        set(Role::KeybarNumber, A(White), A(Black));
+        set(Role::KeybarLabel, A(Black), A(BrightMagenta));
+        set(Role::CommandLine, A(White), A(Black));
+        set(Role::Clock, A(Black), A(BrightMagenta));
+        set(Role::MenuBar, A(Black), A(BrightMagenta));
+        set(Role::MenuBody, A(Black), A(BrightMagenta));
+        set(Role::MenuHighlight, A(White), A(Black));
+        set(Role::MenuHotkey, A(BrightYellow), A(BrightMagenta));
+        set(Role::MenuDisabled, A(White), A(BrightMagenta));
+        set(Role::InfoLabel, A(BrightMagenta), A(Magenta));
+        set(Role::InfoValue, A(BrightYellow), A(Magenta));
+        set(Role::InfoBanner, A(BrightWhite), A(Magenta));
+        set(Role::DialogPrimary, A(Black), A(BrightMagenta));
+        set(Role::DialogError, A(BrightWhite), A(Red));
+        set(Role::DialogInput, A(Black), A(BrightMagenta));
+        set(Role::DialogSecondary, A(Black), A(White));
+        set(Role::ButtonNormal, A(Black), A(White));
+        set(Role::ButtonFocused, A(Black), A(BrightYellow));
+        set(Role::DialogGaugeFilled, A(Magenta), A(BrightMagenta));
+        set(Role::DialogGaugeEmpty, A(Black), A(BrightMagenta));
+        set(Role::SplashFrame, A(BrightMagenta), A(Magenta));
+        set(Role::SplashTitle, A(BrightWhite), A(Magenta));
+        set(Role::SplashVersion, A(White), A(Magenta));
+        set(Role::SplashText, A(BrightMagenta), A(Magenta));
+        set(Role::ViewerHeader, A(Black), A(BrightMagenta));
+        set(Role::ViewerText, A(White), A(Magenta));
+        set(Role::ViewerMatch, A(Black), A(BrightMagenta));
+        set(Role::TabActive, A(Black), A(BrightMagenta));
+        set(Role::TabInactive, A(BrightMagenta), A(Magenta));
+        Theme::build("purple-lights", m)
+            .expect("purple-lights role table is complete")
+            .with_truecolor_overrides(&[
+                (Role::ScreenBackdrop, None, Some(Rgb(48, 0, 64))),
+                (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+                (Role::PanelFile, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+                (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
+            ])
+    }
+
+    /// Amber terminal: yellow on black base, bright-yellow directories,
+    /// bright-white selected entries (kept distinct from the base yellow),
+    /// black-on-yellow inversions.
+    pub fn yellow_storm() -> Theme {
+        use Ansi16::*;
+        use ColorValue::Ansi16 as A;
+        let mut m = BTreeMap::new();
+        let mut set = |role: Role, fg: ColorValue, bg: ColorValue| {
+            m.insert(role, ColorSpecInput::new(fg, bg));
+        };
+        set(Role::ScreenBackdrop, ColorValue::Inherit, A(Black));
+        set(Role::ScreenPlaceholder, A(Yellow), A(Black));
+        set(Role::PanelFrame, A(Yellow), A(Black));
+        set(Role::PanelTitleActive, A(Black), A(Yellow));
+        set(Role::PanelTitleInactive, A(Yellow), A(Black));
+        set(Role::PanelHeader, A(Yellow), A(Black));
+        set(Role::PanelFile, A(Yellow), A(Black));
+        set(Role::PanelDirectory, A(BrightYellow), A(Black));
+        set(Role::PanelCursor, A(Black), A(Yellow));
+        // Selected entries are bright-white, distinct from both the base
+        // yellow (normal files) and bright-yellow (directories).
+        set(Role::PanelSelected, A(BrightWhite), A(Black));
+        set(Role::PanelMinistatus, A(Yellow), A(Black));
+        set(Role::PanelGitModified, A(BrightYellow), A(Black));
+        set(Role::PanelGitUntracked, A(BrightYellow), A(Black));
+        set(Role::PanelGitStaged, A(BrightYellow), A(Black));
+        set(Role::KeybarNumber, A(Yellow), A(Black));
+        set(Role::KeybarLabel, A(Black), A(Yellow));
+        set(Role::CommandLine, A(Yellow), A(Black));
+        set(Role::Clock, A(Black), A(Yellow));
+        set(Role::MenuBar, A(Black), A(Yellow));
+        set(Role::MenuBody, A(Black), A(Yellow));
+        set(Role::MenuHighlight, A(Yellow), A(Black));
+        set(Role::MenuDisabled, A(BrightBlack), A(Yellow));
+        set(Role::MenuHotkey, A(Black), A(Yellow));
+        set(Role::InfoLabel, A(Yellow), A(Black));
+        set(Role::InfoValue, A(BrightYellow), A(Black));
+        set(Role::InfoBanner, A(BrightYellow), A(Black));
+        set(Role::DialogPrimary, A(Black), A(Yellow));
+        // Stays within yellow-storm's own hue family (mirrors
+        // `terminal_green`'s DialogError): no color here carries meaning
+        // that case, position, or inversion doesn't also carry, so this
+        // must not pull in an off-family hue like `Red`.
+        set(Role::DialogError, A(BrightYellow), A(Black));
+        set(Role::DialogInput, A(Black), A(Yellow));
+        set(Role::DialogSecondary, A(Black), A(Yellow));
+        set(Role::ButtonNormal, A(Black), A(Yellow));
+        set(Role::ButtonFocused, A(Yellow), A(Black));
+        set(Role::DialogGaugeFilled, A(BrightYellow), A(Yellow));
+        set(Role::DialogGaugeEmpty, A(Black), A(Yellow));
+        set(Role::SplashFrame, A(Yellow), A(Black));
+        set(Role::SplashTitle, A(BrightYellow), A(Black));
+        set(Role::SplashVersion, A(Yellow), A(Black));
+        set(Role::SplashText, A(Yellow), A(Black));
+        set(Role::ViewerHeader, A(Black), A(Yellow));
+        set(Role::ViewerText, A(Yellow), A(Black));
+        set(Role::ViewerMatch, A(Black), A(Yellow));
+        set(Role::TabActive, A(Black), A(Yellow));
+        set(Role::TabInactive, A(Yellow), A(Black));
+        Theme::build("yellow-storm", m)
+            .expect("yellow-storm role table is complete")
+            .with_truecolor_overrides(&[
+                (Role::PanelFrame, Some(Rgb(255, 191, 0)), None),
+                (Role::PanelFile, Some(Rgb(255, 191, 0)), None),
+                (Role::PanelDirectory, Some(Rgb(255, 214, 51)), None),
+                (Role::PanelCursor, None, Some(Rgb(255, 191, 0))),
+            ])
+    }
+
+    /// High-contrast black-on-bright-white accessibility theme, the light
+    /// counterpart of `nc-mono`: base text black on bright-white, every
+    /// `nc-classic` inversion role renders bright-white on black, and no hue
+    /// is used anywhere — only black, white, and bright-white.
+    pub fn inverted() -> Theme {
+        use Ansi16::*;
+        use ColorValue::Ansi16 as A;
+        let mut m = BTreeMap::new();
+        let mut set = |role: Role, fg: ColorValue, bg: ColorValue| {
+            m.insert(role, ColorSpecInput::new(fg, bg));
+        };
+        set(Role::ScreenBackdrop, ColorValue::Inherit, A(BrightWhite));
+        set(Role::ScreenPlaceholder, A(Black), A(BrightWhite));
+        set(Role::PanelFrame, A(Black), A(BrightWhite));
+        set(Role::PanelTitleActive, A(BrightWhite), A(Black));
+        set(Role::PanelTitleInactive, A(Black), A(BrightWhite));
+        set(Role::PanelHeader, A(Black), A(BrightWhite));
+        set(Role::PanelFile, A(Black), A(BrightWhite));
+        // There is no "brighter than black" text color to lighten
+        // directories/selection the way `nc-mono` brightens White to
+        // BrightWhite on its dark base, so — per D2 — inverted distinguishes
+        // them from body text by inversion instead: bright-white on black,
+        // the same treatment as the cursor bar.
+        set(Role::PanelDirectory, A(BrightWhite), A(Black));
+        set(Role::PanelCursor, A(BrightWhite), A(Black));
+        set(Role::PanelSelected, A(BrightWhite), A(Black));
+        set(Role::PanelMinistatus, A(Black), A(BrightWhite));
+        // No hue anywhere: git status markers read as ordinary bright text.
+        set(Role::PanelGitModified, A(Black), A(BrightWhite));
+        set(Role::PanelGitUntracked, A(Black), A(BrightWhite));
+        set(Role::PanelGitStaged, A(Black), A(BrightWhite));
+        set(Role::KeybarNumber, A(Black), A(BrightWhite));
+        set(Role::KeybarLabel, A(BrightWhite), A(Black));
+        set(Role::CommandLine, A(Black), A(BrightWhite));
+        set(Role::Clock, A(BrightWhite), A(Black));
+        set(Role::MenuBar, A(BrightWhite), A(Black));
+        set(Role::MenuBody, A(BrightWhite), A(Black));
+        set(Role::MenuHighlight, A(Black), A(BrightWhite));
+        set(Role::MenuDisabled, A(White), A(Black));
+        set(Role::MenuHotkey, A(Black), A(BrightWhite));
+        set(Role::InfoLabel, A(Black), A(BrightWhite));
+        set(Role::InfoValue, A(Black), A(BrightWhite));
+        set(Role::InfoBanner, A(Black), A(BrightWhite));
+        set(Role::DialogPrimary, A(BrightWhite), A(Black));
+        set(Role::DialogError, A(BrightWhite), A(Black));
+        set(Role::DialogInput, A(BrightWhite), A(Black));
+        set(Role::DialogSecondary, A(BrightWhite), A(Black));
+        set(Role::ButtonNormal, A(Black), A(BrightWhite));
+        set(Role::ButtonFocused, A(BrightWhite), A(Black));
+        set(Role::DialogGaugeFilled, A(Black), A(BrightWhite));
+        set(Role::DialogGaugeEmpty, A(BrightWhite), A(Black));
+        set(Role::SplashFrame, A(Black), A(BrightWhite));
+        set(Role::SplashTitle, A(Black), A(BrightWhite));
+        set(Role::SplashVersion, A(Black), A(BrightWhite));
+        set(Role::SplashText, A(Black), A(BrightWhite));
+        set(Role::ViewerHeader, A(BrightWhite), A(Black));
+        set(Role::ViewerText, A(Black), A(BrightWhite));
+        set(Role::ViewerMatch, A(BrightWhite), A(Black));
+        set(Role::TabActive, A(BrightWhite), A(Black));
+        set(Role::TabInactive, A(Black), A(BrightWhite));
+        Theme::build("inverted", m).expect("inverted role table is complete")
+    }
+
     /// Resolve a compiled-in theme by name. Returns `None` for unknown names
     /// so callers (config loading) can fall back to the default.
     pub fn by_name(name: &str) -> Option<Theme> {
         match name {
             "nc-classic" => Some(Theme::classic()),
             "nc-mono" => Some(Theme::mono()),
+            "terminal-green" => Some(Theme::terminal_green()),
+            "purple-lights" => Some(Theme::purple_lights()),
+            "yellow-storm" => Some(Theme::yellow_storm()),
+            "inverted" => Some(Theme::inverted()),
             _ => None,
         }
     }
 }
+
+/// All built-in theme names, in menu/picker display order.
+pub const BUILTIN_THEME_NAMES: &[&str] =
+    &["nc-classic", "nc-mono", "terminal-green", "purple-lights", "yellow-storm", "inverted"];
 
 pub const DEFAULT_THEME_NAME: &str = "nc-classic";
 
@@ -621,7 +908,7 @@ mod tests {
 
     #[test]
     fn menu_roles_are_visually_distinct_in_both_themes() {
-        for theme in [Theme::classic(), Theme::mono()] {
+        for theme in all_builtin_themes() {
             let body = theme.get(Role::MenuBody);
             assert_ne!(body, theme.get(Role::MenuHighlight), "{}: selected item must differ from body", theme.name);
             assert_ne!(body, theme.get(Role::MenuDisabled), "{}: disabled item must differ from body", theme.name);
@@ -632,6 +919,222 @@ mod tests {
     fn by_name_resolves_known_themes_and_rejects_unknown() {
         assert!(Theme::by_name("nc-classic").is_some());
         assert!(Theme::by_name("nc-mono").is_some());
+        assert!(Theme::by_name("terminal-green").is_some());
+        assert!(Theme::by_name("purple-lights").is_some());
+        assert!(Theme::by_name("yellow-storm").is_some());
+        assert!(Theme::by_name("inverted").is_some());
         assert!(Theme::by_name("does-not-exist").is_none());
+    }
+
+    /// Every compiled-in theme, keyed the same way `by_name`/the picker
+    /// would enumerate them.
+    fn all_builtin_themes() -> Vec<Theme> {
+        BUILTIN_THEME_NAMES.iter().map(|name| Theme::by_name(name).expect("builtin theme name resolves")).collect()
+    }
+
+    #[test]
+    fn builtin_theme_names_all_resolve_and_match_their_own_name() {
+        for name in BUILTIN_THEME_NAMES {
+            let theme = Theme::by_name(name).unwrap_or_else(|| panic!("{name} should resolve"));
+            assert_eq!(theme.name, *name);
+        }
+    }
+
+    #[test]
+    fn new_themes_are_role_complete() {
+        for theme in [Theme::terminal_green(), Theme::purple_lights(), Theme::yellow_storm(), Theme::inverted()] {
+            for role in ALL_ROLES {
+                let _ = theme.get(*role);
+            }
+            assert_eq!(theme.roles().count(), ALL_ROLES.len(), "{} role count", theme.name);
+        }
+    }
+
+    #[test]
+    fn new_themes_carry_mandatory_ansi16_values_for_every_role() {
+        // `Theme::build` already enforces this at construction time (every
+        // role's fg/bg must resolve to a `ColorValue`), so this test is a
+        // regression tripwire confirming none of the four new tables were
+        // built by bypassing `Theme::build`.
+        for theme in [Theme::terminal_green(), Theme::purple_lights(), Theme::yellow_storm(), Theme::inverted()] {
+            for role in ALL_ROLES {
+                let spec = theme.get(*role);
+                match spec.fg {
+                    ColorValue::Ansi16(_) | ColorValue::Inherit => {}
+                }
+                match spec.bg {
+                    ColorValue::Ansi16(_) | ColorValue::Inherit => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_green_role_anchors_match_spec() {
+        let theme = Theme::terminal_green();
+        let file = theme.get(Role::PanelFile);
+        assert_eq!(file.fg, ColorValue::Ansi16(Ansi16::Green));
+        assert_eq!(file.bg, ColorValue::Ansi16(Ansi16::Black));
+
+        let dir = theme.get(Role::PanelDirectory);
+        assert_eq!(dir.fg, ColorValue::Ansi16(Ansi16::BrightGreen));
+        assert_eq!(dir.bg, ColorValue::Ansi16(Ansi16::Black));
+
+        for role in [Role::PanelCursor, Role::KeybarLabel, Role::MenuBar, Role::DialogPrimary] {
+            let spec = theme.get(role);
+            assert_eq!(spec.fg, ColorValue::Ansi16(Ansi16::Black), "{role} fg");
+            assert_eq!(spec.bg, ColorValue::Ansi16(Ansi16::Green), "{role} bg");
+        }
+    }
+
+    /// theme-system "No color in `terminal-green` SHALL carry meaning that
+    /// is not also carried by case, position, or inversion": every ANSI-16
+    /// name used, across fg and bg of every role, must be Black, Green,
+    /// BrightGreen, or the neutral White/BrightWhite tier — never an
+    /// off-family hue. Regression coverage for the same class of bug as
+    /// `yellow_storm_dialog_error_stays_within_its_own_hue_family` (a
+    /// `DialogError` copy-pasted from a hued theme without adapting it).
+    #[test]
+    fn terminal_green_stays_within_its_own_hue_family() {
+        let theme = Theme::terminal_green();
+        let allowed = [Ansi16::Black, Ansi16::Green, Ansi16::BrightGreen, Ansi16::White, Ansi16::BrightWhite, Ansi16::BrightBlack];
+        for role in ALL_ROLES {
+            let spec = theme.get(*role);
+            for (side, value) in [("fg", spec.fg), ("bg", spec.bg)] {
+                if let ColorValue::Ansi16(a) = value {
+                    assert!(allowed.contains(&a), "{role} {side} uses an off-family hue ({a:?})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn purple_lights_role_anchors_match_spec() {
+        let theme = Theme::purple_lights();
+        assert_eq!(theme.get(Role::ScreenBackdrop).bg, ColorValue::Ansi16(Ansi16::Magenta));
+        let frame = theme.get(Role::PanelFrame);
+        assert_eq!(frame.fg, ColorValue::Ansi16(Ansi16::BrightMagenta));
+        assert_eq!(frame.bg, ColorValue::Ansi16(Ansi16::Magenta));
+
+        let dir = theme.get(Role::PanelDirectory);
+        assert_eq!(dir.fg, ColorValue::Ansi16(Ansi16::BrightWhite));
+        assert_eq!(dir.bg, ColorValue::Ansi16(Ansi16::Magenta));
+
+        let cursor = theme.get(Role::PanelCursor);
+        assert_eq!(cursor.fg, ColorValue::Ansi16(Ansi16::Black));
+        assert_eq!(cursor.bg, ColorValue::Ansi16(Ansi16::BrightMagenta));
+
+        let keybar = theme.get(Role::KeybarLabel);
+        assert_eq!(keybar.fg, ColorValue::Ansi16(Ansi16::Black));
+        assert_eq!(keybar.bg, ColorValue::Ansi16(Ansi16::BrightMagenta));
+    }
+
+    #[test]
+    fn purple_lights_truecolor_overrides_are_present_and_ansi16_stays_mandatory() {
+        let theme = Theme::purple_lights();
+        let frame = theme.get(Role::PanelFrame);
+        // Mandatory ANSI-16 value is still magenta-family regardless of the
+        // truecolor override.
+        assert_eq!(frame.fg, ColorValue::Ansi16(Ansi16::BrightMagenta));
+        assert!(frame.fg_truecolor.is_some(), "purple-lights should offer a truecolor violet override");
+    }
+
+    #[test]
+    fn yellow_storm_base_and_directory_match_spec() {
+        let theme = Theme::yellow_storm();
+        let file = theme.get(Role::PanelFile);
+        assert_eq!(file.fg, ColorValue::Ansi16(Ansi16::Yellow));
+        assert_eq!(file.bg, ColorValue::Ansi16(Ansi16::Black));
+
+        let dir = theme.get(Role::PanelDirectory);
+        assert_eq!(dir.fg, ColorValue::Ansi16(Ansi16::BrightYellow));
+        assert_eq!(dir.bg, ColorValue::Ansi16(Ansi16::Black));
+
+        for role in [Role::PanelCursor, Role::DialogPrimary] {
+            let spec = theme.get(role);
+            assert_eq!(spec.fg, ColorValue::Ansi16(Ansi16::Black), "{role} fg");
+            assert_eq!(spec.bg, ColorValue::Ansi16(Ansi16::Yellow), "{role} bg");
+        }
+    }
+
+    /// theme-system "Selected entries remain distinguishable": yellow-storm
+    /// selection must differ from both normal (yellow) and directory
+    /// (bright-yellow) entries.
+    #[test]
+    fn yellow_storm_selected_entries_are_distinct_from_base_and_directory() {
+        let theme = Theme::yellow_storm();
+        let file = theme.get(Role::PanelFile);
+        let dir = theme.get(Role::PanelDirectory);
+        let selected = theme.get(Role::PanelSelected);
+
+        assert_eq!(selected.fg, ColorValue::Ansi16(Ansi16::BrightWhite));
+        assert_eq!(selected.bg, ColorValue::Ansi16(Ansi16::Black));
+        assert_ne!(selected, file, "selected must differ from a normal file entry");
+        assert_ne!(selected, dir, "selected must differ from a directory entry");
+    }
+
+    /// theme-system "No color in `yellow-storm` SHALL carry meaning that is
+    /// not also carried by case, position, or inversion": every ANSI-16 name
+    /// used, across fg and bg of every role, must be Black, Yellow,
+    /// BrightYellow, or the neutral White/BrightWhite tier — never an
+    /// off-family hue like `Red`. Regression test: `DialogError` originally
+    /// shipped as `BrightWhite`-on-`Red`, copy-pasted from `nc-classic`
+    /// without adapting it to this theme's single-hue constraint.
+    #[test]
+    fn yellow_storm_dialog_error_stays_within_its_own_hue_family() {
+        let theme = Theme::yellow_storm();
+        let allowed = [Ansi16::Black, Ansi16::Yellow, Ansi16::BrightYellow, Ansi16::White, Ansi16::BrightWhite, Ansi16::BrightBlack];
+        for role in ALL_ROLES {
+            let spec = theme.get(*role);
+            for (side, value) in [("fg", spec.fg), ("bg", spec.bg)] {
+                if let ColorValue::Ansi16(a) = value {
+                    assert!(allowed.contains(&a), "{role} {side} uses an off-family hue ({a:?})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inverted_base_and_inversions_match_spec() {
+        let theme = Theme::inverted();
+        let file = theme.get(Role::PanelFile);
+        assert_eq!(file.fg, ColorValue::Ansi16(Ansi16::Black));
+        assert_eq!(file.bg, ColorValue::Ansi16(Ansi16::BrightWhite));
+
+        for role in [Role::PanelCursor, Role::KeybarLabel, Role::Clock, Role::TabActive, Role::DialogPrimary] {
+            let spec = theme.get(role);
+            assert_eq!(spec.fg, ColorValue::Ansi16(Ansi16::BrightWhite), "{role} fg");
+            assert_eq!(spec.bg, ColorValue::Ansi16(Ansi16::Black), "{role} bg");
+        }
+    }
+
+    /// theme-system "No hue is emitted": every ANSI-16 name used by
+    /// `inverted`, across fg and bg of every role, must be one of
+    /// Black/White/BrightBlack/BrightWhite — no chromatic hue anywhere.
+    #[test]
+    fn inverted_uses_no_hue_anywhere() {
+        let theme = Theme::inverted();
+        let allowed = [Ansi16::Black, Ansi16::White, Ansi16::BrightBlack, Ansi16::BrightWhite];
+        for role in ALL_ROLES {
+            let spec = theme.get(*role);
+            for (side, value) in [("fg", spec.fg), ("bg", spec.bg)] {
+                if let ColorValue::Ansi16(a) = value {
+                    assert!(allowed.contains(&a), "{role} {side} uses a hue ({a:?}), inverted must use no hue anywhere");
+                }
+            }
+        }
+    }
+
+    /// theme-system "directories and selected entries remain distinguishable
+    /// ... by case, position, or inversion": `inverted` carries this via
+    /// full inversion since no brighter-than-black text tier exists.
+    #[test]
+    fn inverted_directory_and_selected_are_distinguishable_from_normal_by_inversion() {
+        let theme = Theme::inverted();
+        let file = theme.get(Role::PanelFile);
+        let dir = theme.get(Role::PanelDirectory);
+        let selected = theme.get(Role::PanelSelected);
+        assert_ne!(dir, file, "directory must differ from a normal file entry");
+        assert_ne!(selected, file, "selected must differ from a normal file entry");
     }
 }

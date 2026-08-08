@@ -980,6 +980,67 @@ fn snapshot_user_menu_dialog_empty_state() {
 }
 
 #[test]
+fn snapshot_theme_picker_dialog_with_active_theme_marked() {
+    let mut state = base_state(UiPhase::Panels, Theme::terminal_green());
+    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("terminal-green"));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Themes"));
+    for name in filecommand_core::theme::BUILTIN_THEME_NAMES {
+        assert!(text.contains(name), "`{name}` missing from the picker");
+    }
+    let active_row = text.lines().find(|l| l.contains("terminal-green")).expect("terminal-green row present");
+    assert!(active_row.contains('*'), "the active theme row carries the marker: `{active_row}`");
+    insta::assert_snapshot!("theme_picker_dialog_active_marked", text);
+}
+
+// ---------------------------------------------------------------------
+// visual-themes: representative screens (panels, a dialog, key bar) under
+// each of the four new built-in themes (theme-system "New themes satisfy
+// validation and swap semantics" — task 4.3).
+// ---------------------------------------------------------------------
+
+/// `(theme, snapshot-name fragment)` for each of the four new built-in
+/// themes, so the panels/dialog/key-bar trio below runs identically for all
+/// four without repeating the theme roster by hand.
+fn new_builtin_themes() -> [(Theme, &'static str); 4] {
+    [
+        (Theme::terminal_green(), "terminal_green"),
+        (Theme::purple_lights(), "purple_lights"),
+        (Theme::yellow_storm(), "yellow_storm"),
+        (Theme::inverted(), "inverted"),
+    ]
+}
+
+#[test]
+fn snapshot_full_panels_under_each_new_theme() {
+    for (theme, name) in new_builtin_themes() {
+        let state = base_state(UiPhase::Panels, theme);
+        let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+        insta::assert_snapshot!(format!("full_panels_{name}"), text);
+    }
+}
+
+#[test]
+fn snapshot_quit_confirm_dialog_under_each_new_theme() {
+    for (theme, name) in new_builtin_themes() {
+        let state = base_state(UiPhase::QuitConfirm, theme);
+        let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+        assert!(text.contains("Quit FileCommand?"));
+        insta::assert_snapshot!(format!("quit_confirm_dialog_{name}"), text);
+    }
+}
+
+#[test]
+fn snapshot_fkey_bar_under_each_new_theme() {
+    for (theme, name) in new_builtin_themes() {
+        let state = base_state(UiPhase::Panels, theme);
+        let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+        let last_line = text.lines().last().unwrap_or_default();
+        insta::assert_snapshot!(format!("fkey_bar_last_row_{name}"), last_line);
+    }
+}
+
+#[test]
 fn snapshot_help_window_topic_list() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.help = Some(filecommand_core::dialogs::HelpState::new());

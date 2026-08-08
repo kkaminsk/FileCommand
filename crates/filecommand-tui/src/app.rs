@@ -38,6 +38,9 @@ struct Runtime {
     tx: Sender<Command>,
     active_job: Option<worker::JobHandle>,
     history_path: PathBuf,
+    /// Where `Effect::PersistTheme` writes the `theme =` key back
+    /// (theme-selection "Applied theme persists to configuration").
+    config_path: PathBuf,
     /// The F3 viewer's open byte window, kept here rather than in
     /// `core::State` because `ByteSource` is an I/O handle, not application
     /// state (design D1). Set on `Effect::OpenViewer`, cleared on
@@ -52,7 +55,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     let clock = RealClock::new();
     let wall_clock = RealWallClock;
     let config = config::load(Path::new(CONFIG_FILE));
-    let theme = Theme::by_name(&config.theme).unwrap_or_else(Theme::classic);
+    let theme = resolve_startup_theme(&config);
     let show_splash = config.splash && !no_splash_flag;
     let keys = config.keys.clone();
 
@@ -71,7 +74,8 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     apply_user_menu(&mut state, user_menu);
 
     let (tx, rx) = mpsc::channel::<Command>();
-    let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), viewer_source: None };
+    let mut rt =
+        Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), config_path: PathBuf::from(CONFIG_FILE), viewer_source: None };
 
     if run_effects(effects, &mut guard, &mut rt)? {
         return Ok(());
@@ -142,6 +146,17 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
         }
     }
+}
+
+/// Resolve the startup theme from `config.theme`: an unset key already
+/// defaults to `nc-classic` in `config::Config::default`, and any name that
+/// isn't one of the six built-ins (renamed/typo'd/hand-edited) falls back to
+/// `nc-classic` here (theme-selection "Unknown configured theme falls back
+/// to default"). Factored out of `run` so this fallback composition —
+/// previously a bare inline expression with no direct regression test — is
+/// testable without a real terminal, matching `apply_config`'s rationale.
+fn resolve_startup_theme(config: &config::Config) -> Theme {
+    Theme::by_name(&config.theme).unwrap_or_else(Theme::classic)
 }
 
 /// Snapshot config-driven values into `State` at startup: the configured
@@ -320,6 +335,12 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // A history write failing (read-only directory, full disk)
                 // must never take the session down with it.
                 let _ = config::save_history_file_atomic(&rt.history_path, &file);
+            }
+            Effect::PersistTheme(name) => {
+                // Same tolerance as history: a failed config write must
+                // never take the session down (the theme is already active
+                // in memory either way).
+                let _ = config::save_theme_atomic(&rt.config_path, &name);
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -555,6 +576,38 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
+    }
+
+    /// theme-selection "Applied theme persists to configuration" scenario
+    /// "Unknown configured theme falls back to default": a `config.toml`
+    /// naming a theme that isn't one of the six built-ins (typo, renamed,
+    /// hand-edited) must resolve to `nc-classic`, not panic or silently pick
+    /// something else.
+    #[test]
+    fn resolve_startup_theme_falls_back_to_nc_classic_for_an_unknown_name() {
+        let config = config::parse("theme = \"no-such-theme\"\n");
+        let theme = resolve_startup_theme(&config);
+        assert_eq!(theme.name, Theme::classic().name);
+    }
+
+    /// Same scenario, unset case: an omitted `theme` key already defaults to
+    /// `nc-classic` in `Config::default`, so this exercises the full
+    /// unset -> load -> resolve path end to end.
+    #[test]
+    fn resolve_startup_theme_falls_back_to_nc_classic_when_theme_is_unset() {
+        let config = config::parse("splash = false\n");
+        let theme = resolve_startup_theme(&config);
+        assert_eq!(theme.name, Theme::classic().name);
+    }
+
+    /// Sanity check that a known configured theme round-trips through
+    /// `resolve_startup_theme` unchanged rather than always collapsing to
+    /// the fallback.
+    #[test]
+    fn resolve_startup_theme_loads_a_known_configured_theme() {
+        let config = config::parse("theme = \"terminal-green\"\n");
+        let theme = resolve_startup_theme(&config);
+        assert_eq!(theme.name, Theme::terminal_green().name);
     }
 
     /// Regression test for the M5 review finding: a malformed

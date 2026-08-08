@@ -32,6 +32,39 @@ impl UserMenuState {
 }
 
 // ---------------------------------------------------------------------
+// Options -> Themes picker
+// ---------------------------------------------------------------------
+
+/// The open Options → Themes picker: a cursor over the compiled-in theme
+/// list (`crate::theme::BUILTIN_THEME_NAMES`), opened with the currently
+/// active theme's row pre-highlighted (theme-selection "Options menu opens
+/// the theme picker" — "Active theme is marked and pre-highlighted").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ThemePickerState {
+    pub highlight: usize,
+}
+
+impl ThemePickerState {
+    /// Open the picker with `active_theme_name`'s row highlighted. Falls
+    /// back to the first row if the active theme name is somehow not among
+    /// the built-ins — never happens in practice (every `State::theme` comes
+    /// from `Theme::by_name`), but keeps this infallible rather than
+    /// panicking.
+    pub fn open(active_theme_name: &str) -> ThemePickerState {
+        let highlight = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == active_theme_name).unwrap_or(0);
+        ThemePickerState { highlight }
+    }
+
+    /// Move the highlight by `delta`, clamped within the theme list
+    /// (theme-selection "Picker navigation, apply, and cancel").
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = crate::theme::BUILTIN_THEME_NAMES.len();
+        let next = self.highlight as isize + delta;
+        self.highlight = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+// ---------------------------------------------------------------------
 // F1 Help window + About dialog
 // ---------------------------------------------------------------------
 
@@ -258,6 +291,31 @@ mod tests {
         m.cursor = 1;
         m.move_cursor(1, 0);
         assert_eq!(m.cursor, 0, "an empty menu holds the cursor at zero");
+    }
+
+    #[test]
+    fn theme_picker_opens_with_the_active_theme_highlighted() {
+        let picker = ThemePickerState::open("terminal-green");
+        let expected = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "terminal-green").unwrap();
+        assert_eq!(picker.highlight, expected);
+    }
+
+    #[test]
+    fn theme_picker_open_falls_back_to_the_first_row_for_an_unknown_name() {
+        let picker = ThemePickerState::open("does-not-exist");
+        assert_eq!(picker.highlight, 0);
+    }
+
+    #[test]
+    fn theme_picker_move_cursor_clamps_within_the_theme_list() {
+        let mut picker = ThemePickerState { highlight: 0 };
+        picker.move_cursor(-1);
+        assert_eq!(picker.highlight, 0);
+        let last = crate::theme::BUILTIN_THEME_NAMES.len() - 1;
+        picker.move_cursor(100);
+        assert_eq!(picker.highlight, last);
+        picker.move_cursor(1);
+        assert_eq!(picker.highlight, last, "clamped at the end, not wrapped");
     }
 
     #[test]

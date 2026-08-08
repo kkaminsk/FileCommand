@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, UserMenuEntry};
-use crate::dialogs::{HelpState, UserMenuState};
+use crate::dialogs::{HelpState, ThemePickerState, UserMenuState};
 use crate::drives::{self, DriveSelect};
 use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
@@ -129,6 +129,9 @@ pub struct State {
     pub find_file: Option<FindFileState>,
     /// The F2 user-menu overlay, or `None` when closed.
     pub user_menu: Option<UserMenuState>,
+    /// The Options → Themes picker overlay, or `None` when closed
+    /// (theme-selection "Options menu opens the theme picker").
+    pub theme_picker: Option<ThemePickerState>,
     /// The F1 Help window (and, nested within it, the About dialog), or
     /// `None` when closed.
     pub help: Option<HelpState>,
@@ -195,6 +198,7 @@ impl State {
             fuzzy_jump: None,
             find_file: None,
             user_menu: None,
+            theme_picker: None,
             help: None,
             startup_warning: None,
         }
@@ -554,6 +558,21 @@ pub enum Command {
     /// Esc: close without running anything.
     UserMenuCancel,
 
+    // Options -> Themes picker (visual-themes).
+    /// Opens the picker with the active theme's row pre-highlighted.
+    /// Reached only via `MenuAction::OpenThemes` (Options → Themes), like
+    /// `UserMenuOpen`/`HelpOpen` above.
+    ThemePickerOpen,
+    ThemePickerMove(isize),
+    /// Enter: apply the highlighted theme immediately (switches
+    /// `state.theme` in the same reducer step), persist it to
+    /// `config.toml`, and close the dialog (theme-selection "Picker
+    /// navigation, apply, and cancel").
+    ThemePickerConfirm,
+    /// Esc: close without changing the active theme or touching
+    /// `config.toml`.
+    ThemePickerCancel,
+
     // F1 Help window + About dialog (M5).
     HelpOpen,
     HelpMove(isize),
@@ -603,6 +622,10 @@ pub enum Effect {
     /// directory frecency together (fuzzy-jump "Directory history
     /// persistence"; design D6).
     PersistHistory(config::HistoryFile),
+    /// Rewrite `config.toml`'s `theme =` key atomically after the Options →
+    /// Themes picker applies a theme (theme-selection "Applied theme
+    /// persists to configuration").
+    PersistTheme(String),
     /// Read the logical-drive bitmask (cheap, synchronous) and feed the
     /// letters back as `DriveListReady` before the next paint.
     EnumerateDrives(PanelSide),
@@ -796,6 +819,10 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         effects.extend(handle_user_menu(&mut state, cmd));
         return (state, effects);
     }
+    if state.theme_picker.is_some() && is_theme_picker_command(&cmd) {
+        effects.extend(handle_theme_picker(&mut state, cmd));
+        return (state, effects);
+    }
     if state.help.is_some() && is_help_command(&cmd) {
         effects.extend(handle_help(&mut state, cmd));
         return (state, effects);
@@ -939,6 +966,7 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 state.find_file = Some(FindFileState::new(root));
             }
             Command::UserMenuOpen => state.user_menu = Some(UserMenuState::new()),
+            Command::ThemePickerOpen => state.theme_picker = Some(ThemePickerState::open(&state.theme.name)),
             Command::HelpOpen => state.help = Some(HelpState::new()),
 
             Command::MenuOpen => state.menu = Some(MenuState::opened()),
@@ -1580,6 +1608,7 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::FindFile => Some(Command::FindFileOpen),
         MenuAction::FuzzyJump => Some(Command::FuzzyJumpOpen),
         MenuAction::Quit => Some(Command::RequestQuit),
+        MenuAction::OpenThemes => Some(Command::ThemePickerOpen),
         MenuAction::Unimplemented => None,
     }
 }
@@ -2059,6 +2088,44 @@ fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
                 let side = state.active;
                 let cwd = state.panel(side).cwd.clone();
                 return vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &entry.command, &cwd), side)];
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// Options -> Themes picker (visual-themes)
+// ---------------------------------------------------------------------
+
+fn is_theme_picker_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::ThemePickerMove(_) | Command::ThemePickerConfirm | Command::ThemePickerCancel)
+}
+
+/// Drive the Options → Themes picker (gated in [`update`] by
+/// `state.theme_picker`). Enter applies the highlighted theme immediately —
+/// swapping `state.theme` in this same reducer step, so the very next frame
+/// renders with it — and returns `Effect::PersistTheme` so the TUI event
+/// loop writes it to `config.toml`; Esc closes the dialog leaving both the
+/// active theme and the config file untouched (theme-selection "Picker
+/// navigation, apply, and cancel").
+fn handle_theme_picker(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.theme_picker.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::ThemePickerMove(delta) => {
+            state.theme_picker.as_mut().unwrap().move_cursor(delta);
+        }
+        Command::ThemePickerCancel => state.theme_picker = None,
+        Command::ThemePickerConfirm => {
+            let picker = state.theme_picker.take().unwrap();
+            if let Some(name) = crate::theme::BUILTIN_THEME_NAMES.get(picker.highlight) {
+                if let Some(theme) = Theme::by_name(name) {
+                    state.theme = theme;
+                }
+                return vec![Effect::PersistTheme((*name).to_string())];
             }
         }
         _ => {}

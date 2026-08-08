@@ -228,6 +228,66 @@ pub fn load(path: &Path) -> Config {
 }
 
 // ---------------------------------------------------------------------
+// config.toml theme persistence (visual-themes)
+// ---------------------------------------------------------------------
+
+/// Rewrite `input`'s `theme = "<name>"` line to `theme_name`, replacing the
+/// first top-level (non-comment, non-blank) `theme =` line if one exists, or
+/// appending a fresh one otherwise. Every other line — comments, blank
+/// lines, unrelated keys — is left byte-for-byte untouched, so applying a
+/// theme never clobbers the rest of a hand-edited `config.toml` (design D3;
+/// theme-selection "Applied theme persists to configuration").
+pub fn set_theme_line(input: &str, theme_name: &str) -> String {
+    let quoted_line = format!("theme = {}", toml_quote(theme_name));
+    let mut found = false;
+    let mut out = String::with_capacity(input.len() + quoted_line.len() + 1);
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let is_theme_key = !found
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && trimmed.split_once('=').map(|(k, _)| k.trim() == "theme").unwrap_or(false);
+        if is_theme_key {
+            out.push_str(&quoted_line);
+            found = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !found {
+        out.push_str(&quoted_line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Write the updated `theme =` key to `config.toml` at `path` atomically —
+/// same temp-file-then-rename discipline as [`save_history_atomic`], so a
+/// crash mid-write can never leave a truncated `config.toml` behind
+/// (theme-selection "Config write is atomic"). Reads the existing file (a
+/// missing file is treated as empty, matching [`load`]'s tolerance) so every
+/// other line survives the round trip.
+pub fn save_theme_atomic(path: &Path, theme_name: &str) -> io::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let updated = set_theme_line(&existing, theme_name);
+    let tmp = temp_sibling(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&tmp, updated)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // history.json
 // ---------------------------------------------------------------------
 
@@ -895,6 +955,66 @@ mod tests {
         assert_eq!(parse_binding("F9"), Some(KeyBinding::new(false, false, false, "f9")));
         assert_eq!(parse_binding("ctrl++"), Some(KeyBinding::new(true, false, false, "+")));
         assert_eq!(parse_binding("ctrl"), None);
+    }
+
+    // -------------------------------------------------------------------
+    // config.toml theme persistence (visual-themes)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn set_theme_line_replaces_an_existing_theme_key_leaving_other_lines_untouched() {
+        let input = "splash = true\ntheme = \"nc-classic\"\nshell = \"cmd.exe /C\"\n";
+        let updated = set_theme_line(input, "purple-lights");
+        assert_eq!(updated, "splash = true\ntheme = \"purple-lights\"\nshell = \"cmd.exe /C\"\n");
+    }
+
+    #[test]
+    fn set_theme_line_appends_when_no_theme_key_is_present() {
+        let input = "splash = true\n";
+        let updated = set_theme_line(input, "yellow-storm");
+        assert_eq!(updated, "splash = true\ntheme = \"yellow-storm\"\n");
+    }
+
+    #[test]
+    fn set_theme_line_on_empty_input_yields_just_the_theme_key() {
+        assert_eq!(set_theme_line("", "inverted"), "theme = \"inverted\"\n");
+    }
+
+    #[test]
+    fn set_theme_line_preserves_comments_and_a_commented_out_theme_line() {
+        let input = "# a comment\n# theme = \"ignored\"\ntheme = \"nc-mono\"\n";
+        let updated = set_theme_line(input, "terminal-green");
+        assert_eq!(updated, "# a comment\n# theme = \"ignored\"\ntheme = \"terminal-green\"\n");
+    }
+
+    #[test]
+    fn save_theme_atomic_writes_and_leaves_no_temp_file() {
+        let dir = std::env::temp_dir().join(format!("filecommand-config-theme-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "splash = false\ntheme = \"nc-classic\"\n").unwrap();
+
+        save_theme_atomic(&path, "purple-lights").expect("write theme");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "splash = false\ntheme = \"purple-lights\"\n");
+        assert!(!path.with_file_name("config.toml.tmp").exists(), "temp file must be renamed away");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.theme, "purple-lights");
+        assert!(!loaded.splash, "unrelated keys survive the theme write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_theme_atomic_creates_config_toml_when_missing() {
+        let dir = std::env::temp_dir().join(format!("filecommand-config-theme-test-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        save_theme_atomic(&path, "inverted").expect("write theme to a fresh file");
+        assert_eq!(load(&path).theme, "inverted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

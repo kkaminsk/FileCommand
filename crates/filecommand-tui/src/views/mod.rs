@@ -20,6 +20,7 @@ pub mod skipped_summary;
 pub mod splash;
 pub mod startup_warning;
 pub mod tab_strip;
+pub mod theme_picker;
 pub mod user_menu;
 pub mod viewer;
 
@@ -145,6 +146,9 @@ fn render_phase(
             }
             if let Some(dialog) = &state.user_menu {
                 user_menu::render_user_menu(buf, area, &state.theme, depth, dialog, &state.user_menu_entries);
+            }
+            if let Some(dialog) = &state.theme_picker {
+                theme_picker::render_theme_picker(buf, area, &state.theme, depth, dialog, &state.theme.name);
             }
             if let Some(dialog) = &state.help {
                 help::render_help(buf, area, &state.theme, depth, dialog, identity_lines);
