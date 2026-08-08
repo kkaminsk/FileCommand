@@ -58,6 +58,14 @@ pub fn render(
     viewer_source: Option<&ByteSource>,
 ) -> Option<(u16, u16)> {
     let cursor = render_phase(buf, area, state, depth, identity_lines, clock_text, viewer_source);
+    // The quit-confirmation dialog is drawn above whatever the current phase
+    // painted — panels, the viewer, an open menu, or any other modal
+    // dialog/overlay — since it lives beside the phase rather than inside
+    // it and can open over any of them (application-shell "Quit request
+    // keys and confirmation"; design D5).
+    if state.quit_confirm {
+        quit_dialog::render_quit_dialog(buf, area, &state.theme, depth);
+    }
     // The startup-warning modal is drawn last, over whatever the current
     // phase already painted — it can only ever be raised at the very start
     // of a session (currently: a malformed `usermenu.toml`), so it must stay
@@ -94,7 +102,6 @@ fn render_phase(
         }
         UiPhase::Editor(e) => editor::render_editor(buf, area, e, &state.theme, depth),
         UiPhase::Panels
-        | UiPhase::QuitConfirm
         | UiPhase::FileOpSetup(_)
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
@@ -159,7 +166,6 @@ fn render_phase(
             }
 
             match &state.phase {
-                UiPhase::QuitConfirm => quit_dialog::render_quit_dialog(buf, area, &state.theme, depth),
                 UiPhase::FileOpSetup(setup) => {
                     destination_input::render_destination_input(buf, area, &state.theme, depth, setup);
                     delete_confirm::render_delete_confirm(buf, area, &state.theme, depth, setup);

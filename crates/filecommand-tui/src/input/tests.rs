@@ -47,10 +47,43 @@ fn f10_requests_quit_in_panels_phase() {
 
 #[test]
 fn quit_dialog_maps_y_and_n() {
-    let state = state_with(UiPhase::QuitConfirm);
+    // The dialog is `state.quit_confirm: bool` now, not `UiPhase::QuitConfirm`
+    // — it can be open above any phase (application-shell "Quit request keys
+    // and confirmation"; design D5).
+    let mut state = panels();
+    state.quit_confirm = true;
     assert_eq!(map(plain(KeyCode::Char('y')), &state), Some(Command::ConfirmQuit));
+    assert_eq!(map(plain(KeyCode::Char('Y')), &state), Some(Command::ConfirmQuit));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::ConfirmQuit));
     assert_eq!(map(plain(KeyCode::Char('n')), &state), Some(Command::CancelQuit));
+    assert_eq!(map(plain(KeyCode::Char('N')), &state), Some(Command::CancelQuit));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::CancelQuit));
+}
+
+#[test]
+fn quit_dialog_ctrl_c_confirms() {
+    // Ctrl+C confirms inside the dialog — the "press Ctrl+C again to exit"
+    // convention, satisfying Ctrl+C-Ctrl+C-quits end to end (application-shell
+    // "Quit request keys and confirmation": "Ctrl+C SHALL confirm"; task 2.3).
+    let mut state = panels();
+    state.quit_confirm = true;
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), Some(Command::ConfirmQuit));
+}
+
+#[test]
+fn quit_dialog_outranks_every_other_overlay_and_phase() {
+    // The dialog is checked first of all in `map_key`, above every other
+    // overlay/phase — including the viewer and an open menu, which normally
+    // bypass or precede the generic overlay checks (application-shell "Quit
+    // request keys and confirmation"; design D5).
+    let mut over_viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
+    over_viewer.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Char('y')), &over_viewer), Some(Command::ConfirmQuit));
+
+    let mut over_menu = panels();
+    over_menu.menu = Some(MenuState::opened());
+    over_menu.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Esc), &over_menu), Some(Command::CancelQuit), "not MenuCollapse");
 }
 
 #[test]
@@ -221,11 +254,28 @@ fn up_down_recall_history_only_while_something_is_typed() {
 }
 
 #[test]
-fn esc_clears_the_buffer_and_thereby_releases_up_down() {
-    assert_eq!(map(plain(KeyCode::Esc), &typing("dir")), Some(Command::CommandLineClear));
-    // With the buffer empty again, Up is a cursor move once more.
+fn esc_requests_quit_unconditionally_and_does_not_touch_the_buffer() {
+    // Esc no longer clears the command line — at panel level it always
+    // requests quit, regardless of buffer content (command-line "Command
+    // history navigation": "Esc SHALL NOT clear the buffer"; application-
+    // shell "Quit request keys and confirmation").
+    assert_eq!(map(plain(KeyCode::Esc), &typing("dir")), Some(Command::RequestQuit));
+    assert_eq!(map(plain(KeyCode::Esc), &panels()), Some(Command::RequestQuit), "Esc requests quit even with nothing typed");
+}
+
+#[test]
+fn backspacing_to_empty_releases_up_down_to_the_panel() {
+    // Backspace is now the only way to hand Up/Down back to the panel
+    // cursor: it already pops the buffer in `core::update`, and the mapper
+    // recomputes `typing` fresh from the (now empty) buffer on the very
+    // next key (command-line "Command history navigation": "Backspacing the
+    // buffer to empty SHALL be the mechanism that hands Up/Down back to the
+    // panel").
+    assert_eq!(map(plain(KeyCode::Up), &typing("d")), Some(Command::CommandLineHistoryPrev));
+    assert_eq!(map(plain(KeyCode::Backspace), &typing("d")), Some(Command::CommandLineBackspace));
+    // Once the buffer is empty again, Up/Down move the panel cursor.
     assert_eq!(map(plain(KeyCode::Up), &panels()), Some(Command::MoveCursor(CursorMove::Up(1))));
-    assert_eq!(map(plain(KeyCode::Esc), &panels()), None, "Esc with nothing typed is inert in the panels view");
+    assert_eq!(map(plain(KeyCode::Down), &panels()), Some(Command::MoveCursor(CursorMove::Down(1))));
 }
 
 #[test]
@@ -403,7 +453,17 @@ fn quick_search_owns_printables_and_the_command_line_never_sees_them() {
     state.quick_search = Some("r".to_string());
     assert_eq!(map(plain(KeyCode::Char('e')), &state), Some(Command::QuickSearchChar('e')));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::QuickSearchBackspace));
-    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::QuickSearchEnd));
+}
+
+#[test]
+fn esc_requests_quit_during_type_ahead_instead_of_exiting_it() {
+    // Esc is no longer a type-ahead exit key — it requests quit, and
+    // cancelling that dialog leaves type-ahead active (type-ahead-jump
+    // "Exiting type-ahead and restoring command-line routing": "Esc SHALL
+    // NOT exit type-ahead ... it requests application quit").
+    let mut state = panels();
+    state.quick_search = Some("r".to_string());
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::RequestQuit));
 }
 
 #[test]
@@ -644,17 +704,32 @@ fn ctrl_p_and_ctrl_j_open_quick_filter_and_fuzzy_jump_by_default() {
 }
 
 #[test]
-fn quick_filter_owns_printables_and_backspace_and_esc_but_not_movement() {
+fn quick_filter_owns_printables_and_backspace_but_not_esc_or_movement() {
     let mut state = panels();
     state.left.quick_filter = Some("re".to_string());
     assert_eq!(map(plain(KeyCode::Char('p')), &state), Some(Command::QuickFilterChar('p')));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::QuickFilterBackspace));
-    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::QuickFilterEnd));
+    // Esc no longer exits the filter — it falls through to the unconditional
+    // panel-level quit request (quick-filter "Clearing the quick filter":
+    // "Esc SHALL NOT exit the filter ... it requests application quit").
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::RequestQuit));
     // Movement/Enter fall through to the ordinary panel mapping — the
     // filter narrows what they can land on, but doesn't intercept them
     // (quick-filter "Navigation is restricted to matching entries").
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MoveCursor(CursorMove::Down(1))));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::Enter));
+}
+
+#[test]
+fn quick_filter_activation_key_toggles_the_filter_off_when_active() {
+    // The activation key is a toggle: with no filter active it starts one;
+    // with a filter already active on the panel, it exits and clears it
+    // instead (quick-filter "Clearing the quick filter": "the activation
+    // key toggles the filter").
+    let mut state = panels();
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
+    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterEnd));
 }
 
 #[test]
@@ -673,7 +748,8 @@ fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
     // Regression: Alt+letter must not be able to start type-ahead
     // (`QuickSearchStart`) while `panel.quick_filter` is already active on
     // the active panel — the two input modes are mutually exclusive, and
-    // Esc (`QuickFilterEnd`) is the documented way out of the filter first.
+    // the activation key toggling the filter off is the documented way out
+    // of the filter first (quick-filter "Clearing the quick filter").
     let mut state = panels();
     state.left.quick_filter = Some("re".to_string());
     assert_eq!(
@@ -684,6 +760,82 @@ fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
     // Once the filter is cleared, Alt+letter starts type-ahead normally.
     state.left.quick_filter = None;
     assert_eq!(map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state), Some(Command::QuickSearchStart('r')));
+}
+
+// ---------------------------------------------------------------------
+// quit-keys: Ctrl+C requests quit everywhere except the built-in editor
+// ---------------------------------------------------------------------
+
+#[test]
+fn ctrl_c_requests_quit_from_panels_in_any_command_line_state() {
+    // Idle panel, mid-typing, under an active quick filter, and during
+    // type-ahead all route Ctrl+C to `RequestQuit` (application-shell
+    // "Quit request keys and confirmation": "Ctrl+C SHALL request quit ...
+    // panels in any state").
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &panels()), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &typing("dir")), Some(Command::RequestQuit));
+
+    let mut filtering = panels();
+    filtering.left.quick_filter = Some("re".to_string());
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &filtering), Some(Command::RequestQuit));
+
+    let mut searching = panels();
+    searching.quick_search = Some("r".to_string());
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &searching), Some(Command::RequestQuit));
+}
+
+#[test]
+fn ctrl_c_requests_quit_from_the_viewer() {
+    let v = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), Some(ViewerInput::Cmd(Command::RequestQuit)));
+    // Still true while the F7 search prompt is open.
+    let mut v = v;
+    v.search_input = Some(String::new());
+    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), Some(ViewerInput::Cmd(Command::RequestQuit)));
+}
+
+#[test]
+fn ctrl_c_in_the_built_in_editor_still_copies() {
+    // The sole exclusion: the editor's own Ctrl+C=Copy binding must survive
+    // untouched (application-shell "Quit request keys and confirmation":
+    // "in the built-in editor Ctrl+C SHALL remain Copy").
+    let e = EditorState::from_bytes(PathBuf::from("f.txt"), b"");
+    assert_eq!(map_editor_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCopy));
+}
+
+#[test]
+fn ctrl_c_requests_quit_with_a_pull_down_menu_open() {
+    let mut state = panels();
+    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), Some(Command::RequestQuit));
+}
+
+#[test]
+fn ctrl_c_requests_quit_from_modal_dialogs_and_overlays() {
+    // A representative sample of the modal dialogs/overlays beside the
+    // phase: fuzzy jump, find file, user menu, theme picker, file action
+    // menu, help, drive select, and the file-op setup/running dialogs.
+    let mut fuzzy = panels();
+    fuzzy.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &fuzzy), Some(Command::RequestQuit));
+
+    let mut find = panels();
+    find.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &find), Some(Command::RequestQuit));
+
+    let mut user_menu = panels();
+    user_menu.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &user_menu), Some(Command::RequestQuit));
+
+    let mut drive = panels();
+    drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec![], None));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &drive), Some(Command::RequestQuit));
+
+    assert_eq!(
+        map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()),
+        Some(Command::RequestQuit)
+    );
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &progress_state()), Some(Command::RequestQuit));
 }
 
 #[test]

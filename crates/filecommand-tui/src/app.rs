@@ -90,20 +90,32 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let cmd = match &state.phase {
-                        UiPhase::Viewer(viewer) => {
-                            let rows_visible = views::viewer::body_rows(state.term_size.1);
-                            let source = rt.viewer_source.as_ref().map(|(_, s)| s);
-                            input::map_viewer_key(key, viewer, rows_visible)
-                                .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
-                        }
-                        UiPhase::Editor(editor) => {
-                            let rows_visible = views::editor::body_rows(state.term_size.1);
-                            input::map_editor_key(key, editor, rows_visible)
-                        }
-                        _ => {
-                            let page_size = layout::compute(state.term_size).entries_visible;
-                            input::map_key(key, &state, page_size, &keys)
+                    // The quit-confirmation dialog outranks the viewer/editor's
+                    // own direct-dispatch key routing: once it is up, every key
+                    // goes through `map_key` (which checks `quit_confirm`
+                    // first), regardless of `state.phase` — the same way it
+                    // outranks every other overlay inside `map_key` itself
+                    // (application-shell "Quit request keys and
+                    // confirmation"; design D5).
+                    let cmd = if state.quit_confirm {
+                        let page_size = layout::compute(state.term_size).entries_visible;
+                        input::map_key(key, &state, page_size, &keys)
+                    } else {
+                        match &state.phase {
+                            UiPhase::Viewer(viewer) => {
+                                let rows_visible = views::viewer::body_rows(state.term_size.1);
+                                let source = rt.viewer_source.as_ref().map(|(_, s)| s);
+                                input::map_viewer_key(key, viewer, rows_visible)
+                                    .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
+                            }
+                            UiPhase::Editor(editor) => {
+                                let rows_visible = views::editor::body_rows(state.term_size.1);
+                                input::map_editor_key(key, editor, rows_visible)
+                            }
+                            _ => {
+                                let page_size = layout::compute(state.term_size).entries_visible;
+                                input::map_key(key, &state, page_size, &keys)
+                            }
                         }
                     };
                     match cmd {
