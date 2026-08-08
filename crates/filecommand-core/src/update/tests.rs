@@ -1222,3 +1222,276 @@ fn a_panel_not_in_info_mode_issues_no_info_query_when_it_navigates() {
     let (_, effects) = update(state, Command::Enter);
     assert!(!effects.iter().any(|e| matches!(e, Effect::QueryInfo { .. })));
 }
+
+// ---------------------------------------------------------------------
+// M4: F3 viewer & F4 external editor
+// ---------------------------------------------------------------------
+
+#[test]
+fn f3_on_a_file_dispatches_open_viewer_without_touching_the_filesystem() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 42)];
+    let (state, effects) = update(state, Command::RequestViewer);
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+    // Nothing changed yet — the phase flips only once `ViewerOpened` comes
+    // back, since opening is I/O and `update` performs none itself.
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn f3_on_a_directory_or_parent_dir_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (_, effects) = update(state, Command::RequestViewer);
+    assert!(effects.is_empty());
+
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry::parent_dir()];
+    let (_, effects) = update(state, Command::RequestViewer);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn f3_on_an_empty_panel_is_a_no_op() {
+    let state = test_state(UiPhase::Panels);
+    let (_, effects) = update(state, Command::RequestViewer);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn viewer_opened_enters_the_viewer_phase_at_the_start_of_the_file() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::Viewer(v) => {
+            assert_eq!(v.path, PathBuf::from("/left/big.log"));
+            assert_eq!(v.file_len, 5_000_000_000);
+            assert_eq!(v.top_offset, 0);
+            assert_eq!(v.mode, crate::viewer::ViewMode::Text);
+            assert!(!v.wrap);
+        }
+        other => panic!("expected UiPhase::Viewer, got {other:?}"),
+    }
+}
+
+#[test]
+fn viewer_open_failed_surfaces_an_inline_error_on_the_active_panel_instead_of_opening() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::ViewerOpenFailed { message: "access denied".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
+}
+
+fn opened_viewer_state(file_len: u64) -> State {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/f.txt"), file_len });
+    state
+}
+
+#[test]
+fn f10_closes_the_viewer_and_returns_focus_to_the_panels() {
+    let state = opened_viewer_state(1000);
+    let (state, effects) = update(state, Command::ViewerClose);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn f4_in_the_viewer_toggles_mode_and_the_key_bar_label_swaps() {
+    let state = opened_viewer_state(1000);
+    let (state, effects) = update(state, Command::ViewerToggleMode);
+    assert!(effects.is_empty());
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.mode, crate::viewer::ViewMode::Hex);
+    assert_eq!(v.mode.toggle_label(), "ASCII");
+
+    let (state, _) = update(state, Command::ViewerToggleMode);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.mode, crate::viewer::ViewMode::Text);
+    assert_eq!(v.mode.toggle_label(), "Hex");
+}
+
+#[test]
+fn f2_in_the_viewer_toggles_wrap_and_resets_horizontal_scroll() {
+    let mut state = opened_viewer_state(1000);
+    if let UiPhase::Viewer(v) = &mut state.phase {
+        v.h_scroll = 12;
+    }
+    let (state, _) = update(state, Command::ViewerToggleWrap);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert!(v.wrap);
+    assert_eq!(v.h_scroll, 0);
+}
+
+#[test]
+fn viewer_set_top_clamps_to_the_file_length() {
+    let state = opened_viewer_state(100);
+    let (state, _) = update(state, Command::ViewerSetTop(1_000_000));
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.top_offset, 100);
+}
+
+#[test]
+fn viewer_set_h_scroll_updates_the_column_indicator() {
+    let state = opened_viewer_state(1000);
+    let (state, _) = update(state, Command::ViewerSetHScroll(30));
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.h_scroll, 30);
+}
+
+#[test]
+fn viewer_keys_are_not_forwarded_to_panels_while_the_viewer_is_open() {
+    // ToggleActivePanel is a Panels-phase command; while the viewer owns
+    // the phase it must be swallowed rather than mutating panel focus
+    // (viewer: Frame-less full-screen chrome — "Viewer owns focus while
+    // open").
+    let state = opened_viewer_state(1000);
+    let active_before = state.active;
+    let (state, effects) = update(state, Command::ToggleActivePanel);
+    assert_eq!(state.active, active_before);
+    assert!(effects.is_empty());
+    assert!(matches!(state.phase, UiPhase::Viewer(_)));
+}
+
+#[test]
+fn viewer_search_confirm_dispatches_the_search_effect_and_keeps_the_pattern() {
+    let state = opened_viewer_state(1000);
+    let (state, _) = update(state, Command::ViewerSearchStart);
+    let (state, _) = update(state, Command::ViewerSearchChar('a'));
+    let (state, _) = update(state, Command::ViewerSearchChar('b'));
+    let (state, effects) = update(state, Command::ViewerSearchConfirm);
+    assert_eq!(
+        effects,
+        vec![Effect::RunViewerSearch { path: PathBuf::from("/left/f.txt"), start_offset: 0, pattern: b"ab".to_vec() }]
+    );
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.search_pattern, Some(b"ab".to_vec()));
+    assert_eq!(v.search_input, None, "the prompt closes once the search is dispatched");
+}
+
+#[test]
+fn viewer_search_backspace_and_cancel_edit_the_in_progress_pattern() {
+    let state = opened_viewer_state(1000);
+    let (state, _) = update(state, Command::ViewerSearchStart);
+    let (state, _) = update(state, Command::ViewerSearchChar('x'));
+    let (state, _) = update(state, Command::ViewerSearchBackspace);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.search_input, Some(String::new()));
+
+    let (state, _) = update(state, Command::ViewerSearchCancel);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.search_input, None);
+}
+
+#[test]
+fn empty_search_pattern_does_not_dispatch_a_search() {
+    let state = opened_viewer_state(1000);
+    let (state, _) = update(state, Command::ViewerSearchStart);
+    let (state, effects) = update(state, Command::ViewerSearchConfirm);
+    assert!(effects.is_empty());
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.search_pattern, None);
+}
+
+#[test]
+fn viewer_search_result_moves_the_top_anchor_and_highlights_the_match() {
+    let state = opened_viewer_state(1000);
+    let (state, _) = update(state, Command::ViewerSearchResult { offset: Some(250), match_range: Some((250, 256)) });
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.top_offset, 250);
+    assert_eq!(v.last_match, Some((250, 256)));
+}
+
+#[test]
+fn viewer_search_result_with_no_match_leaves_the_top_anchor_untouched() {
+    let mut state = opened_viewer_state(1000);
+    if let UiPhase::Viewer(v) = &mut state.phase {
+        v.top_offset = 40;
+    }
+    let (state, _) = update(state, Command::ViewerSearchResult { offset: None, match_range: None });
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    assert_eq!(v.top_offset, 40);
+}
+
+#[test]
+fn f4_from_a_panel_with_no_editor_configured_shows_the_message_and_spawns_nothing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (state, effects) = update(state, Command::RequestExternalEditor);
+    assert!(effects.is_empty());
+    assert_eq!(state.left.last_error.as_deref(), Some(crate::external_editor::NO_EDITOR_CONFIGURED_MESSAGE));
+}
+
+#[test]
+fn f4_from_a_panel_with_a_blank_editor_command_is_also_treated_as_unset() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("   ".to_string());
+    state.left.entries = vec![file_entry("report.txt", 10)];
+    let (_, effects) = update(state, Command::RequestExternalEditor);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn f4_on_a_directory_entry_does_not_launch_the_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![dir_entry("sub")];
+    let (state, effects) = update(state, Command::RequestExternalEditor);
+    assert!(effects.is_empty());
+    assert_eq!(state.left.last_error, None, "a directory target is silently ignored, not an error dialog");
+}
+
+#[test]
+fn f4_on_parent_dir_does_not_launch_the_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![Entry::parent_dir()];
+    let (_, effects) = update(state, Command::RequestExternalEditor);
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn f4_launches_the_configured_editor_on_the_file_under_the_cursor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\work");
+    state.right.entries = vec![file_entry("report.txt", 10)];
+    let (_, effects) = update(state, Command::RequestExternalEditor);
+    match effects.as_slice() {
+        [Effect::RunExternalEditor(inv, PanelSide::Right)] => {
+            assert_eq!(inv.program, "notepad");
+            assert_eq!(inv.file_arg, OsString::from("report.txt"));
+            assert_eq!(inv.cwd, PathBuf::from(r"C:\work"));
+        }
+        other => panic!("expected a single RunExternalEditor effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn f4_passes_the_original_os_string_file_name_through_without_lossy_conversion() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let raw = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).to_os_string();
+        let mut state = test_state(UiPhase::Panels);
+        state.editor = Some("notepad".to_string());
+        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None }];
+        let (_, effects) = update(state, Command::RequestExternalEditor);
+        match effects.as_slice() {
+            [Effect::RunExternalEditor(inv, _)] => assert_eq!(inv.file_arg, raw),
+            other => panic!("expected a single RunExternalEditor effect, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn external_editor_spawn_failure_surfaces_an_inline_error_without_crashing() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::ExternalEditorSpawnFailed { message: "program not found".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.last_error.as_deref(), Some("program not found"));
+    assert_eq!(state.phase, UiPhase::Panels, "still running, not crashed");
+}

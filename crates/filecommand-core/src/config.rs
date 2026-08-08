@@ -1,9 +1,10 @@
 //! Minimal `config.toml` reader plus the on-disk persistence helpers.
 //!
-//! Recognized keys: `splash` (bool), `theme` (string), `shell` (string), and
-//! the overridable bindings `key.paste_name` / `key.paste_path`. Missing
-//! files and unrecognized or malformed lines are tolerated; unrecognized
-//! keys are ignored.
+//! Recognized keys: `splash` (bool), `theme` (string), `shell` (string),
+//! `editor` (string, the F4 external-editor command), and the overridable
+//! bindings `key.paste_name` / `key.paste_path`. Missing files and
+//! unrecognized or malformed lines are tolerated; unrecognized keys are
+//! ignored.
 //!
 //! Command history persists to `history.json` next to the config, written
 //! atomically (temp file + rename) so a crash mid-write can never leave a
@@ -69,12 +70,17 @@ pub struct Config {
     /// `shell = ` verbatim. `None` means "use the platform default"; see
     /// [`crate::shell::resolve_shell`].
     pub shell: Option<String>,
+    /// `editor = ` verbatim, the F4 external-editor command. `None` (also
+    /// yielded by a blank/empty value) means unset: F4 shows a "no editor
+    /// configured" message instead of spawning anything (external-editor:
+    /// Config-driven external editor command — "Editor command unset").
+    pub editor: Option<String>,
     pub keys: Keys,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { splash: true, theme: DEFAULT_THEME_NAME.to_string(), shell: None, keys: Keys::default() }
+        Config { splash: true, theme: DEFAULT_THEME_NAME.to_string(), shell: None, editor: None, keys: Keys::default() }
     }
 }
 
@@ -130,6 +136,13 @@ pub fn parse(input: &str) -> Config {
                 if let Some(s) = parse_string(value) {
                     if !s.trim().is_empty() {
                         config.shell = Some(s);
+                    }
+                }
+            }
+            "editor" => {
+                if let Some(s) = parse_string(value) {
+                    if !s.trim().is_empty() {
+                        config.editor = Some(s);
                     }
                 }
             }
@@ -358,6 +371,15 @@ mod tests {
         assert_eq!(parse("shell = \"powershell\"\n").shell.as_deref(), Some("powershell"));
         assert_eq!(parse("shell = pwsh -NoLogo -Command\n").shell.as_deref(), Some("pwsh -NoLogo -Command"));
         assert_eq!(parse("shell = \n").shell, None);
+    }
+
+    #[test]
+    fn parses_editor_quoted_and_bare_and_treats_blank_as_unset() {
+        assert_eq!(parse("editor = \"notepad\"\n").editor.as_deref(), Some("notepad"));
+        assert_eq!(parse("editor = code --wait\n").editor.as_deref(), Some("code --wait"));
+        assert_eq!(parse("editor = \n").editor, None);
+        assert_eq!(parse("editor = \"\"\n").editor, None);
+        assert_eq!(parse("").editor, None);
     }
 
     #[test]

@@ -8,6 +8,7 @@ description = "Platform-agnostic application logic for FileCommand (no terminal 
 
 [dependencies]
 unicode-width = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

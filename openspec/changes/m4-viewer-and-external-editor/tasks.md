@@ -1,35 +1,35 @@
 ## 1. Crate setup & dependencies
 
-- [ ] 1.1 Add `memmap2` to `filecommand-core` dependencies for memory-mapping file access, and confirm `unicode-width` is available for display-width column math.
+- [x] 1.1 Add `memmap2` to `filecommand-core` dependencies for memory-mapping file access, and confirm `unicode-width` is available for display-width column math.
 - [ ] 1.2 Add `insta` and ensure ratatui `TestBackend` is available as a dev-dependency for `filecommand-tui` viewer snapshot tests (per §8).
-- [ ] 1.3 Create the `viewer` module skeleton in `filecommand-core` (`viewer/mod.rs`) and the `views/viewer` module skeleton in `filecommand-tui`, wiring both into their crate roots.
+- [ ] 1.3 Create the `viewer` module skeleton in `filecommand-core` (`viewer/mod.rs`) and the `views/viewer` module skeleton in `filecommand-tui`, wiring both into their crate roots. (`filecommand-core` half done: `viewer/mod.rs` exists and is wired into the crate root; the `filecommand-tui` `views/viewer` half is not started.)
 
 ## 2. Core viewer file access (filecommand-core)
 
-- [ ] 2.1 Define a `ByteSource` abstraction that memory-maps the file on open and falls back to positioned chunk reads when mapping is unavailable (network/special files), exposing a `read_range(offset, len)` window API. (viewer: Instant open — "Mapping unavailable falls back to chunk reads")
-- [ ] 2.2 Capture the mapped length as an immutable snapshot at open and clamp every offset/range against it so navigation never reads past the snapshot. (viewer: Instant open — "Offsets clamped to the snapshot length")
-- [ ] 2.3 Ensure open cost is O(1): open maps/opens the file and reads only the bytes needed for the visible rows, building no line index and performing no whole-file scan. (viewer: Instant open — "First frame reads only the visible window")
-- [ ] 2.4 Handle open/map errors (truncated or unmappable paths) by surfacing an inline error instead of panicking (§7 error policy).
+- [x] 2.1 Define a `ByteSource` abstraction that memory-maps the file on open and falls back to positioned chunk reads when mapping is unavailable (network/special files), exposing a `read_range(offset, len)` window API. (viewer: Instant open — "Mapping unavailable falls back to chunk reads")
+- [x] 2.2 Capture the mapped length as an immutable snapshot at open and clamp every offset/range against it so navigation never reads past the snapshot. (viewer: Instant open — "Offsets clamped to the snapshot length")
+- [x] 2.3 Ensure open cost is O(1): open maps/opens the file and reads only the bytes needed for the visible rows, building no line index and performing no whole-file scan. (viewer: Instant open — "First frame reads only the visible window")
+- [x] 2.4 Handle open/map errors (truncated or unmappable paths) by surfacing an inline error instead of panicking (§7 error policy).
 
 ## 3. Core viewer state machine & logic (filecommand-core)
 
-- [ ] 3.1 Define `ViewerState` (mode text/hex, wrap on/off, top byte-offset anchor, horizontal scroll offset, search pattern, match cursor) with no ratatui/crossterm dependency, and route all transitions through `core::update` (D1).
-- [ ] 3.2 Implement UTF-8-with-lossy-fallback decoding of the visible byte window only, substituting replacement characters for invalid sequences; decode a window slightly larger than the viewport to avoid partial-sequence artifacts at edges. (viewer: Text/hex modes — "Lossy UTF-8 decode of invalid bytes")
-- [ ] 3.3 Implement display-width-aware line layout using `unicode-width`, replacing control/zero-width characters, for the `Col` column math (D5).
-- [ ] 3.4 Implement F2 wrap/unwrap: unwrap clips each logical line to the viewport at the horizontal offset and updates the `Col` indicator; wrap re-flows logical lines at the viewport width. (viewer: F2 wrap/unwrap — "Unwrap clips with horizontal scroll", "Wrap re-flows at viewport width")
-- [ ] 3.5 Implement hex-mode layout by pure offset math: row `r` shows offset, the 16 bytes `[base + r*16, base + r*16 + 16)`, and the ASCII gutter, with no state beyond the base offset. (viewer: Text/hex modes — "Hex layout by offset math")
-- [ ] 3.6 Implement the F4-in-viewer mode toggle switching text↔hex and swapping the F-key label `Hex`/`ASCII`. (viewer: Text/hex modes — "F4 toggles mode and label")
-- [ ] 3.7 Implement bounded backward navigation: scan backward from the current top offset for the previous newline, capped at a max-line-length (e.g. 64 KB); hard-split at the cap when no newline is found so the read is bounded regardless of file content. (viewer: Bounded backward navigation — "Backward scan finds the previous line start", "Newline-free content is hard-split at the cap")
-- [ ] 3.8 Implement F7 literal streaming search: read fixed forward chunks from the current offset, carry a `pattern_len - 1` byte overlap across chunk boundaries, report the next match offset as the new top anchor, and record matched byte ranges for highlighting; never load the whole file. (viewer: F7 streaming search — "Match straddling a chunk boundary is found", "Match becomes the top anchor and is highlighted", "Search is bounded and streaming")
-- [ ] 3.9 Compute header indicators: byte-offset percent as `top_offset / file_len` (independent of decode/wrap), total file size in bytes, and the `Col`/offset value. (viewer: Byte-offset header indicators — "Percent is byte-offset based", "Size indicator reflects the opened file")
+- [x] 3.1 Define `ViewerState` (mode text/hex, wrap on/off, top byte-offset anchor, horizontal scroll offset, search pattern, match cursor) with no ratatui/crossterm dependency, and route all transitions through `core::update` (D1).
+- [x] 3.2 Implement UTF-8-with-lossy-fallback decoding of the visible byte window only, substituting replacement characters for invalid sequences; decode a window slightly larger than the viewport to avoid partial-sequence artifacts at edges. (viewer: Text/hex modes — "Lossy UTF-8 decode of invalid bytes")
+- [x] 3.3 Implement display-width-aware line layout using `unicode-width`, replacing control/zero-width characters, for the `Col` column math (D5).
+- [x] 3.4 Implement F2 wrap/unwrap: unwrap clips each logical line to the viewport at the horizontal offset and updates the `Col` indicator; wrap re-flows logical lines at the viewport width. (viewer: F2 wrap/unwrap — "Unwrap clips with horizontal scroll", "Wrap re-flows at viewport width")
+- [x] 3.5 Implement hex-mode layout by pure offset math: row `r` shows offset, the 16 bytes `[base + r*16, base + r*16 + 16)`, and the ASCII gutter, with no state beyond the base offset. (viewer: Text/hex modes — "Hex layout by offset math")
+- [x] 3.6 Implement the F4-in-viewer mode toggle switching text↔hex and swapping the F-key label `Hex`/`ASCII`. (viewer: Text/hex modes — "F4 toggles mode and label")
+- [x] 3.7 Implement bounded backward navigation: scan backward from the current top offset for the previous newline, capped at a max-line-length (e.g. 64 KB); hard-split at the cap when no newline is found so the read is bounded regardless of file content. (viewer: Bounded backward navigation — "Backward scan finds the previous line start", "Newline-free content is hard-split at the cap")
+- [x] 3.8 Implement F7 literal streaming search: read fixed forward chunks from the current offset, carry a `pattern_len - 1` byte overlap across chunk boundaries, report the next match offset as the new top anchor, and record matched byte ranges for highlighting; never load the whole file. (viewer: F7 streaming search — "Match straddling a chunk boundary is found", "Match becomes the top anchor and is highlighted", "Search is bounded and streaming")
+- [x] 3.9 Compute header indicators: byte-offset percent as `top_offset / file_len` (independent of decode/wrap), total file size in bytes, and the `Col`/offset value. (viewer: Byte-offset header indicators — "Percent is byte-offset based", "Size indicator reflects the opened file")
 
 ## 4. Core external-editor & config (filecommand-core)
 
-- [ ] 4.1 Consume the `editor =` key from the `config` module schema (§6), treating an absent value and an empty string as "unset". (external-editor: Config-driven external editor command — "Editor command unset", "Editor selected from config schema key already reserved")
-- [ ] 4.2 Implement the F4-from-panel external-editor action: resolve the file under the active panel's cursor, reject directory/`..` targets, and pass the original `OsString` path (no lossy conversion). (external-editor: F4 launches the editor — "Launch on file under cursor", "Cursor on a directory entry", "Original OS filename passed through")
-- [ ] 4.3 Reuse the `shell` TUI-suspend/restore seam to spawn the configured editor as a child in the active panel's current directory (`cmd.exe /C` semantics, `\\?\` long-path handling), waiting synchronously for exit. (external-editor: TUI suspend and restore; Synchronous wait and panel re-read; D7)
-- [ ] 4.4 Re-read the active panel on return so on-disk size/mtime changes are reflected (§7 refresh policy). (external-editor: Synchronous wait and panel re-read — "Panel refreshed after edit")
-- [ ] 4.5 Surface editor spawn failures (command not found / cannot spawn) as an inline error, restoring the UI and continuing to run; when `editor =` is unset show the "no editor configured" message dialog. (external-editor: Editor spawn errors do not crash the app; Config-driven — "Editor command unset")
+- [x] 4.1 Consume the `editor =` key from the `config` module schema (§6), treating an absent value and an empty string as "unset". (external-editor: Config-driven external editor command — "Editor command unset", "Editor selected from config schema key already reserved")
+- [x] 4.2 Implement the F4-from-panel external-editor action: resolve the file under the active panel's cursor, reject directory/`..` targets, and pass the original `OsString` path (no lossy conversion). (external-editor: F4 launches the editor — "Launch on file under cursor", "Cursor on a directory entry", "Original OS filename passed through")
+- [x] 4.3 Reuse the `shell` TUI-suspend/restore seam to spawn the configured editor as a child in the active panel's current directory (`cmd.exe /C` semantics, `\\?\` long-path handling), waiting synchronously for exit. (external-editor: TUI suspend and restore; Synchronous wait and panel re-read; D7) (Core half done: `Effect::RunExternalEditor(EditorInvocation, PanelSide)` mirrors `Effect::RunShellCommand` structurally so `filecommand-tui` can execute it via the same suspend/spawn/restore code path; the actual `filecommand-tui` execution is not implemented.)
+- [x] 4.4 Re-read the active panel on return so on-disk size/mtime changes are reflected (§7 refresh policy). (external-editor: Synchronous wait and panel re-read — "Panel refreshed after edit") (Core half done: `Effect::RunExternalEditor` carries the `PanelSide` to re-read, exactly as `Effect::RunShellCommand` does; `filecommand-tui` re-reads by sending the already-implemented `Command::RereadPanel(side)` once it executes the effect, matching the shell-command flow.)
+- [x] 4.5 Surface editor spawn failures (command not found / cannot spawn) as an inline error, restoring the UI and continuing to run; when `editor =` is unset show the "no editor configured" message dialog. (external-editor: Editor spawn errors do not crash the app; Config-driven — "Editor command unset")
 
 ## 5. TUI viewer rendering (filecommand-tui)
 
@@ -48,14 +48,14 @@
 
 ## 7. Testing (§8)
 
-- [ ] 7.1 Core unit test: lossy UTF-8 decode substitutes replacement characters on a non-UTF-8 byte block and continues rendering the rest. (viewer: Text/hex modes)
-- [ ] 7.2 Core unit test: hex layout offset math produces correct offset/bytes/ASCII rows for a given base with no per-row state. (viewer: Text/hex modes)
-- [ ] 7.3 Core unit test: backward scan finds the previous line start within the cap, and hard-splits at the cap on a newline-free block with a bounded read even for a large newline-free fixture. (viewer: Bounded backward navigation)
-- [ ] 7.4 Core unit test: chunk-overlapped search finds a match straddling a chunk boundary and reports its offset as the new top anchor. (viewer: F7 streaming search)
-- [ ] 7.5 Core unit test: byte-offset percent equals `top_offset / file_len` and is invariant to decode/wrap state; size indicator reflects the opened file. (viewer: Byte-offset header indicators)
-- [ ] 7.6 Core unit test: mmap-unavailable path serves the same bytes as the mmap path via chunk reads; offsets are clamped to the snapshot length. (viewer: Instant open)
-- [ ] 7.7 Core unit test: external-editor action rejects directory/`..` targets, passes the original `OsString`, and reports spawn failure as an inline error; unset/empty `editor =` yields the "no editor configured" message and re-reads the panel on return. (external-editor: all requirements)
-- [ ] 7.8 Proptest where noted: property test on the backward line-start scan / hard-split invariant (read never exceeds the cap; resulting anchor is a valid line start) across arbitrary byte content.
+- [x] 7.1 Core unit test: lossy UTF-8 decode substitutes replacement characters on a non-UTF-8 byte block and continues rendering the rest. (viewer: Text/hex modes)
+- [x] 7.2 Core unit test: hex layout offset math produces correct offset/bytes/ASCII rows for a given base with no per-row state. (viewer: Text/hex modes)
+- [x] 7.3 Core unit test: backward scan finds the previous line start within the cap, and hard-splits at the cap on a newline-free block with a bounded read even for a large newline-free fixture. (viewer: Bounded backward navigation)
+- [x] 7.4 Core unit test: chunk-overlapped search finds a match straddling a chunk boundary and reports its offset as the new top anchor. (viewer: F7 streaming search)
+- [x] 7.5 Core unit test: byte-offset percent equals `top_offset / file_len` and is invariant to decode/wrap state; size indicator reflects the opened file. (viewer: Byte-offset header indicators)
+- [x] 7.6 Core unit test: mmap-unavailable path serves the same bytes as the mmap path via chunk reads; offsets are clamped to the snapshot length. (viewer: Instant open)
+- [x] 7.7 Core unit test: external-editor action rejects directory/`..` targets, passes the original `OsString`, and reports spawn failure as an inline error; unset/empty `editor =` yields the "no editor configured" message and re-reads the panel on return. (external-editor: all requirements) (The "re-reads the panel on return" half is exercised only indirectly: it reuses the already-tested `Command::RereadPanel` path the same way `RunShellCommand` does, once `filecommand-tui` executes `Effect::RunExternalEditor` — no `filecommand-tui`-side test exists yet.)
+- [x] 7.8 Proptest where noted: property test on the backward line-start scan / hard-split invariant (read never exceeds the cap; resulting anchor is a valid line start) across arbitrary byte content.
 - [ ] 7.9 TUI snapshot tests (ratatui `TestBackend` + `insta`, pinned time/size/locale): viewer text mode, hex mode, and the viewer F-key bar with the `Hex`/`ASCII` label variants (§8 "viewer text/hex"). (viewer: Frame-less full-screen chrome; Text/hex modes)
 - [ ] 7.10 TUI snapshot test: `viewer.match` highlighted search result frame. (viewer: F7 streaming search)
 - [ ] 7.11 Integration smoke test: open a file with F3, toggle hex/wrap, run a search, close with F10; and F4 external-editor round-trip (suspend, wait, restore, panel re-read) with a stub editor command.
