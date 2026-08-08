@@ -1,0 +1,5 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+expression: text.lines().next().unwrap()
+---
+  Left     Files     Commands     Options     Right

@@ -1,0 +1,13 @@
+[package]
+name = "filecommand-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Platform-agnostic application logic for FileCommand (no terminal dependencies)"
+
+[dependencies]
+unicode-width = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

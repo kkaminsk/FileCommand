@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = ["crates/filecommand-core", "crates/filecommand-tui"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["The FileCommand Authors"]
+repository = "https://github.com/example/filecommand"
+
+[workspace.dependencies]
+unicode-width = "0.1"
+ratatui = "0.29"
+crossterm = "0.28"
+insta = "1"
+proptest = "1"

@@ -1,0 +1,28 @@
+---
+source: crates/filecommand-tui/tests/snapshots.rs
+expression: "render(&state, (80, 24))"
+---
+╔═══════════ C:\Users\demo ════════════╗╔══════ C:\Users\demo\Documents ═3:04 PM
+║Name↓        │ Size    Date    Time   ║║Name↓        │ Size    Date    Time   ║
+║..           │ ▶UP--DI                ║║                                      ║
+║Documents    │ ▶SUB-DI 08-07-2 14:3   ║║                                      ║
+║notes.txt    │ 2K      08-07-2 09:0   ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+╚═════════ Documents  SUB-DIR ═════════╝╚══════════ Reading… 12,345 ═══════════╝
+C:\Users\demo>_                                                                 
+1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit
