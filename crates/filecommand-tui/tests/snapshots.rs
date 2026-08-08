@@ -65,10 +65,14 @@ fn sample_state(theme: Theme) -> State {
     State { left, right, ..State::empty(theme) }
 }
 
+/// Pinned so the clock widget's top-right-corner glyphs don't make every
+/// snapshot in this file non-deterministic.
+const FIXED_CLOCK_TEXT: &str = "3:04 PM";
+
 fn render(state: &State, size: (u16, u16)) -> String {
     let area = Rect { x: 0, y: 0, width: size.0, height: size.1 };
     let mut buf = Buffer::empty(area);
-    views::render(&mut buf, area, state, ColorDepth::Ansi16, &fixed_identity());
+    views::render(&mut buf, area, state, ColorDepth::Ansi16, &fixed_identity(), FIXED_CLOCK_TEXT);
     buffer_to_text(&buf, area)
 }
 

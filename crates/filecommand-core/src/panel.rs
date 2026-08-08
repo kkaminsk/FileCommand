@@ -70,6 +70,12 @@ pub struct PanelState {
     /// Async Info-mode values; all `None` (rendered `…`) until their worker
     /// queries resolve.
     pub info: InfoValues,
+    /// The id of the most recently issued `QueryInfo` request for this
+    /// panel, or `None` if none is outstanding. `Command::InfoResolved`
+    /// only applies a result whose id matches this — otherwise it is a
+    /// stale answer from a superseded request (e.g. a double Ctrl+R) and is
+    /// dropped rather than clobbering a fresher one.
+    pub info_request: Option<u64>,
     pub progress: ListingProgress,
     /// Once the user explicitly moves the cursor, streamed inserts stop
     /// yanking it back to row 0.
@@ -91,6 +97,7 @@ impl PanelState {
             sort_direction: SortDirection::Asc,
             display_mode: DisplayMode::default(),
             info: InfoValues::default(),
+            info_request: None,
             progress: ListingProgress::Streaming { count: 0 },
             cursor_user_moved: false,
             last_error: None,
@@ -168,8 +175,11 @@ impl PanelState {
         self.selected.clear();
         // Directory-scoped Info values (and the drive's, if the drive
         // changed) no longer describe what the panel shows. The sort mode
-        // and display mode deliberately survive a re-read.
+        // and display mode deliberately survive a re-read. Any outstanding
+        // Info query is now moot too — `begin_listing` mints a fresh one if
+        // the panel is still in Info mode.
         self.info = InfoValues::default();
+        self.info_request = None;
     }
 
     /// Drop any selected names that no longer appear in `entries` — used

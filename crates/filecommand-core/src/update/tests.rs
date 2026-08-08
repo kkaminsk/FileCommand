@@ -967,12 +967,13 @@ fn drive_list_opens_the_dialog_and_requests_every_label_lazily() {
     assert_eq!(dialog.target, PanelSide::Left);
     assert_eq!(dialog.drives.len(), 3, "every letter is present on the first frame");
     assert!(dialog.drives.iter().all(|d| d.label.is_none()), "labels are still pending");
+    let generation = dialog.generation;
     assert_eq!(
         effects,
         vec![
-            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'A' },
-            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'C' },
-            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'D' },
+            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'A', generation },
+            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'C', generation },
+            Effect::FetchDriveLabel { target: PanelSide::Left, letter: 'D', generation },
         ]
     );
 }
@@ -991,8 +992,11 @@ fn a_resolved_label_fills_in_place_without_moving_other_rows() {
         test_state(UiPhase::Panels),
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['A', 'C'] },
     );
-    let (state, effects) =
-        update(state, Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()) });
+    let generation = state.drive_select.as_ref().unwrap().generation;
+    let (state, effects) = update(
+        state,
+        Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation },
+    );
     assert!(effects.is_empty());
     let dialog = state.drive_select.unwrap();
     assert_eq!(dialog.drives, vec![DriveEntry { letter: 'A', label: None }, DriveEntry { letter: 'C', label: Some("OS".to_string()) }]);
@@ -1004,11 +1008,14 @@ fn a_label_arriving_after_the_dialog_closed_is_discarded() {
         test_state(UiPhase::Panels),
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] },
     );
+    let generation = state.drive_select.as_ref().unwrap().generation;
     let (state, _) = update(state, Command::DriveSelectCancel);
     assert!(state.drive_select.is_none());
 
-    let (state, effects) =
-        update(state, Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()) });
+    let (state, effects) = update(
+        state,
+        Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation },
+    );
     assert!(state.drive_select.is_none(), "a stale result must not resurrect the dialog");
     assert!(effects.is_empty());
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "and must not touch the panel");
@@ -1020,10 +1027,43 @@ fn a_label_for_a_superseded_target_panel_is_discarded() {
         test_state(UiPhase::Panels),
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] },
     );
+    let first_generation = state.drive_select.as_ref().unwrap().generation;
     // The dialog was reopened for the other panel before the label landed.
     let (state, _) = update(state, Command::DriveListReady { target: PanelSide::Right, drives: vec!['C'] });
-    let (state, _) = update(state, Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()) });
+    let (state, _) = update(
+        state,
+        Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation: first_generation },
+    );
     assert_eq!(state.drive_select.unwrap().drives[0].label, None);
+}
+
+#[test]
+fn a_stale_drive_label_from_a_quick_reopen_of_the_same_target_is_discarded_but_the_fresher_one_applies() {
+    // Regression coverage for the out-of-order-completion race: the user
+    // cancels and reopens the drive dialog for the *same* panel before the
+    // first fetch lands (Alt+F1, Esc, Alt+F1 again). `target` alone can't
+    // tell the two sessions apart — only `generation` can.
+    let (state, _) =
+        update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
+    let first_generation = state.drive_select.as_ref().unwrap().generation;
+
+    let (state, _) = update(state, Command::DriveSelectCancel);
+    let (state, _) =
+        update(state, Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
+    let second_generation = state.drive_select.as_ref().unwrap().generation;
+    assert_ne!(first_generation, second_generation, "reopening mints a fresh generation");
+
+    let (state, _) = update(
+        state,
+        Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("STALE".to_string()), generation: first_generation },
+    );
+    assert_eq!(state.drive_select.as_ref().unwrap().drives[0].label, None, "the stale (first-generation) answer is dropped");
+
+    let (state, _) = update(
+        state,
+        Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("FRESH".to_string()), generation: second_generation },
+    );
+    assert_eq!(state.drive_select.unwrap().drives[0].label, Some("FRESH".to_string()), "the current generation's answer applies");
 }
 
 #[test]
@@ -1086,7 +1126,8 @@ fn ctrl_l_toggles_info_for_one_panel_only() {
     let (state, effects) = update(state, Command::ToggleInfoMode(PanelSide::Left));
     assert_eq!(state.left.display_mode, DisplayMode::Info);
     assert_eq!(state.right.display_mode, DisplayMode::Full, "the opposite panel is untouched");
-    assert_eq!(effects, vec![Effect::QueryInfo { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    let request = state.left.info_request.expect("a request id was minted");
+    assert_eq!(effects, vec![Effect::QueryInfo { panel: PanelSide::Left, path: PathBuf::from("/left"), request }]);
 
     let (state, effects) = update(state, Command::ToggleInfoMode(PanelSide::Left));
     assert_eq!(state.left.display_mode, DisplayMode::Full);
@@ -1098,9 +1139,12 @@ fn info_values_start_pending_and_resolve_in_place() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::ToggleInfoMode(PanelSide::Left));
     assert_eq!(state.left.info, InfoValues::default(), "every value starts unresolved");
 
+    let request = state.left.info_request.unwrap();
     let values = InfoValues { file_count: Some(12), dir_count: Some(3), ..InfoValues::default() };
-    let (state, effects) =
-        update(state, Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), values: values.clone() });
+    let (state, effects) = update(
+        state,
+        Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, values: values.clone() },
+    );
     assert!(effects.is_empty());
     assert_eq!(state.left.info, values);
 }
@@ -1108,17 +1152,20 @@ fn info_values_start_pending_and_resolve_in_place() {
 #[test]
 fn an_info_result_for_a_directory_the_panel_left_is_discarded() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::ToggleInfoMode(PanelSide::Left));
+    let request = state.left.info_request.unwrap();
     let values = InfoValues { file_count: Some(12), ..InfoValues::default() };
-    let (state, _) = update(state, Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), values });
+    let (state, _) =
+        update(state, Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), request, values });
     assert_eq!(state.left.info, InfoValues::default(), "a result for another directory is dropped");
 }
 
 #[test]
 fn an_info_result_arriving_after_info_mode_was_left_is_discarded() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::ToggleInfoMode(PanelSide::Left));
+    let request = state.left.info_request.unwrap();
     let (state, _) = update(state, Command::ToggleInfoMode(PanelSide::Left)); // back to Full
     let values = InfoValues { file_count: Some(12), ..InfoValues::default() };
-    let (state, _) = update(state, Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), values });
+    let (state, _) = update(state, Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, values });
     assert_eq!(state.left.info, InfoValues::default());
 }
 
@@ -1129,8 +1176,43 @@ fn navigating_while_in_info_mode_re_queries_for_the_new_directory() {
     let (state, _) = update(state, Command::ToggleInfoMode(PanelSide::Left));
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
-    assert!(effects.contains(&Effect::QueryInfo { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }));
+    let request = state.left.info_request.expect("navigating while in Info mode mints a fresh request");
+    assert!(effects.contains(&Effect::QueryInfo { panel: PanelSide::Left, path: PathBuf::from("/left/sub"), request }));
     assert_eq!(state.left.info, InfoValues::default(), "the previous directory's figures are cleared");
+}
+
+#[test]
+fn a_stale_info_result_from_an_out_of_order_reread_is_discarded_but_the_fresher_one_applies() {
+    // Regression coverage for the out-of-order-completion race: a double
+    // Ctrl+R (or any two RereadPanel commands landing before the first
+    // reply arrives) mints two different request ids for the *same*
+    // directory, so `path` equality alone can't tell the stale reply apart
+    // from the current one.
+    let (state, _) = update(test_state(UiPhase::Panels), Command::ToggleInfoMode(PanelSide::Left));
+    let first_request = state.left.info_request.unwrap();
+
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second_request = state.left.info_request.unwrap();
+    assert_ne!(first_request, second_request, "re-reading mints a fresh request id even for the same path");
+
+    let stale_values = InfoValues { file_count: Some(999), ..InfoValues::default() };
+    let (state, _) = update(
+        state,
+        Command::InfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: first_request, values: stale_values },
+    );
+    assert_eq!(state.left.info, InfoValues::default(), "the stale (first-request) answer is dropped");
+
+    let fresh_values = InfoValues { file_count: Some(7), ..InfoValues::default() };
+    let (state, _) = update(
+        state,
+        Command::InfoResolved {
+            panel: PanelSide::Left,
+            path: PathBuf::from("/left"),
+            request: second_request,
+            values: fresh_values.clone(),
+        },
+    );
+    assert_eq!(state.left.info, fresh_values, "the current request's answer applies");
 }
 
 #[test]

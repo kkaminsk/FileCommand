@@ -11,13 +11,13 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
-use filecommand_core::clock::Clock;
+use filecommand_core::clock::{format_clock, Clock, WallClock};
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::{config, drives, identity, update, Command, Effect, State};
 
-use crate::clock::RealClock;
+use crate::clock::{RealClock, RealWallClock};
 use crate::input;
 use crate::layout;
 use crate::terminal::TerminalGuard;
@@ -41,6 +41,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     let mut guard = TerminalGuard::new()?;
 
     let clock = RealClock::new();
+    let wall_clock = RealWallClock;
     let config = config::load(Path::new(CONFIG_FILE));
     let theme = Theme::by_name(&config.theme).unwrap_or_else(Theme::classic);
     let show_splash = config.splash && !no_splash_flag;
@@ -65,7 +66,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
         return Ok(());
     }
     let (mut state, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
-    draw(&mut guard, &state, &identity_lines)?;
+    draw(&mut guard, &state, &identity_lines, &wall_clock)?;
 
     loop {
         let (s, mut dirty) = drain_events(state, &rx, &mut guard, &mut rt)?;
@@ -112,7 +113,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             // its very first appearance rather than a frame later.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
-            draw(&mut guard, &state, &identity_lines)?;
+            draw(&mut guard, &state, &identity_lines, &wall_clock)?;
         }
     }
 }
@@ -184,8 +185,8 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // first painted frame already lists every letter.
                 let _ = rt.tx.send(Command::DriveListReady { target, drives: drives::enumerate_drives() });
             }
-            Effect::FetchDriveLabel { target, letter } => worker::spawn_drive_label(target, letter, rt.tx.clone()),
-            Effect::QueryInfo { panel, path } => worker::spawn_info_query(panel, path, rt.tx.clone()),
+            Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
+            Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
         }
     }
     Ok(quit)
@@ -244,11 +245,13 @@ fn wait_for_key() -> io::Result<()> {
     Ok(())
 }
 
-fn draw(guard: &mut TerminalGuard, state: &State, identity_lines: &[String; 4]) -> io::Result<()> {
+fn draw(guard: &mut TerminalGuard, state: &State, identity_lines: &[String; 4], wall_clock: &dyn WallClock) -> io::Result<()> {
+    let (hour, minute) = wall_clock.now_local();
+    let clock_text = format_clock(hour, minute);
     guard.terminal.draw(|frame| {
         let area = frame.area();
         let depth = ColorDepth::Ansi16;
-        views::render(frame.buffer_mut(), area, state, depth, identity_lines);
+        views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text);
     })?;
     Ok(())
 }

@@ -32,6 +32,10 @@ fn pinned_identity_lines() -> [String; 4] {
     ]
 }
 
+/// Pinned so the clock widget's top-right-corner glyphs don't make every
+/// full-screen snapshot in this file non-deterministic.
+const FIXED_CLOCK_TEXT: &str = "3:04 PM";
+
 fn fixed_date() -> DateTime {
     DateTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4 }
 }
@@ -80,7 +84,7 @@ fn render_to_text(width: u16, height: u16, state: &State, depth: ColorDepth) -> 
     terminal
         .draw(|frame| {
             let area = frame.area();
-            views::render(frame.buffer_mut(), area, state, depth, &identity_lines);
+            views::render(frame.buffer_mut(), area, state, depth, &identity_lines, FIXED_CLOCK_TEXT);
         })
         .expect("draw into TestBackend");
     buffer_to_text(terminal.backend().buffer())
@@ -203,6 +207,31 @@ fn snapshot_command_line_recalling_history() {
     state.history_cursor = Some(1);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("command_line_history_recall", command_line_row(&text));
+}
+
+#[test]
+fn the_clock_is_drawn_over_the_right_end_of_the_right_panel_s_top_border() {
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    assert!(top.ends_with(FIXED_CLOCK_TEXT), "`{top}`");
+}
+
+#[test]
+fn the_f9_bar_hides_the_clock_and_closing_it_restores_the_clock() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let without_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(without_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock shows with the bar closed");
+
+    state.menu = Some(MenuState::opened());
+    let with_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!with_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is hidden while F9 is open");
+
+    // Esc-ing the bar closed (state.menu back to None) restores it — same
+    // as any other frame where the bar isn't open.
+    state.menu = None;
+    let restored = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(restored.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is restored once the bar closes");
 }
 
 #[test]

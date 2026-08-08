@@ -32,6 +32,13 @@ pub struct DriveSelect {
     pub target: PanelSide,
     pub drives: Vec<DriveEntry>,
     pub selected: usize,
+    /// Identifies this dialog "session" so a label fetch from a
+    /// since-closed-and-reopened dialog for the same `target` can be told
+    /// apart from one belonging to the dialog currently on screen. Callers
+    /// that care (`crate::update`) overwrite this with a freshly minted id
+    /// right after construction; tests that don't care about the race are
+    /// free to leave it at the default `0`.
+    pub generation: u64,
 }
 
 impl DriveSelect {
@@ -42,7 +49,7 @@ impl DriveSelect {
         let selected = current
             .and_then(|c| drives.iter().position(|d| d.letter.eq_ignore_ascii_case(&c)))
             .unwrap_or(0);
-        DriveSelect { target, drives, selected }
+        DriveSelect { target, drives, selected, generation: 0 }
     }
 
     pub fn selected_letter(&self) -> Option<char> {

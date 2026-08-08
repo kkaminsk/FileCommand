@@ -23,10 +23,10 @@ const CHUNK_SIZE: usize = 256;
 /// unreachable network shares block here, never in the render loop; the
 /// dialog shows the drive with a blank label meanwhile, and a result that
 /// arrives after the dialog closed is discarded by `core::update`.
-pub fn spawn_drive_label(target: PanelSide, letter: char, tx: Sender<Command>) {
+pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let label = drives::volume_info(letter).map(|(label, _serial)| label);
-        let _ = tx.send(Command::DriveLabelResolved { target, letter, label });
+        let _ = tx.send(Command::DriveLabelResolved { target, letter, label, generation });
     });
 }
 
@@ -35,10 +35,10 @@ pub fn spawn_drive_label(target: PanelSide, letter: char, tx: Sender<Command>) {
 /// The whole set is sent as one result: these queries hit the same volume
 /// and complete together, and a single fill-in keeps the panel from
 /// repainting several times in a row.
-pub fn spawn_info_query(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let values = gather_info(&StdFsReader, &path);
-        let _ = tx.send(Command::InfoResolved { panel, path, values });
+        let _ = tx.send(Command::InfoResolved { panel, path, request, values });
     });
 }
 

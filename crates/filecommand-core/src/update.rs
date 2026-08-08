@@ -87,6 +87,12 @@ pub struct State {
     pub phase: UiPhase,
     pub theme: Theme,
     pub term_size: (u16, u16),
+    /// Monotonic source for request/generation ids (`PanelState::info_request`,
+    /// `DriveSelect::generation`) that let a worker reply be matched against
+    /// the request that's still current, so an out-of-order completion from
+    /// a superseded request is dropped instead of silently overwriting a
+    /// fresher answer. See [`State::next_request_id`].
+    pub request_seq: u64,
 }
 
 impl State {
@@ -132,11 +138,21 @@ impl State {
             phase: UiPhase::Panels,
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
+            request_seq: 0,
         }
     }
 
     fn too_small(size: (u16, u16)) -> bool {
         size.0 < MIN_COLS || size.1 < MIN_ROWS
+    }
+
+    /// Mint a new, never-repeated request id. Used to tag an outstanding
+    /// async request (an Info query, a drive-label fetch) so that when its
+    /// answer comes back, `update` can tell a still-current request from
+    /// one a newer request has since superseded.
+    fn next_request_id(&mut self) -> u64 {
+        self.request_seq += 1;
+        self.request_seq
     }
 
     /// Build the initial state and the effects needed to kick off both
@@ -272,8 +288,8 @@ pub enum Command {
     JobConflict(ConflictInfo),
     JobError(ErrorInfo),
     JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
-    DriveLabelResolved { target: PanelSide, letter: char, label: Option<String> },
-    InfoResolved { panel: PanelSide, path: PathBuf, values: InfoValues },
+    DriveLabelResolved { target: PanelSide, letter: char, label: Option<String>, generation: u64 },
+    InfoResolved { panel: PanelSide, path: PathBuf, request: u64, values: InfoValues },
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -302,10 +318,14 @@ pub enum Effect {
     /// Read the logical-drive bitmask (cheap, synchronous) and feed the
     /// letters back as `DriveListReady` before the next paint.
     EnumerateDrives(PanelSide),
-    /// Fetch one drive's volume label on a worker thread.
-    FetchDriveLabel { target: PanelSide, letter: char },
-    /// Gather the Info panel's async values on a worker thread.
-    QueryInfo { panel: PanelSide, path: PathBuf },
+    /// Fetch one drive's volume label on a worker thread. `generation`
+    /// travels with the result so a reply from a since-superseded dialog
+    /// session can be told apart from the current one.
+    FetchDriveLabel { target: PanelSide, letter: char, generation: u64 },
+    /// Gather the Info panel's async values on a worker thread. `request`
+    /// travels with the result so a reply from a since-superseded query can
+    /// be told apart from the current one.
+    QueryInfo { panel: PanelSide, path: PathBuf, request: u64 },
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -336,17 +356,17 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // Async drive/Info results are applied only when they still describe
     // what is on screen; a stale answer is dropped, never rendered.
     match cmd {
-        Command::DriveLabelResolved { target, letter, label } => {
+        Command::DriveLabelResolved { target, letter, label, generation } => {
             if let Some(dialog) = &mut state.drive_select {
-                if dialog.target == target {
+                if dialog.target == target && dialog.generation == generation {
                     dialog.apply_label(letter, label);
                 }
             }
             return (state, effects);
         }
-        Command::InfoResolved { panel, path, values } => {
+        Command::InfoResolved { panel, path, request, values } => {
             let p = state.panel_mut(panel);
-            if p.display_mode == DisplayMode::Info && p.cwd == path {
+            if p.display_mode == DisplayMode::Info && p.cwd == path && p.info_request == Some(request) {
                 p.info = values;
             }
             return (state, effects);
@@ -474,10 +494,13 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
             Command::DriveListReady { target, drives } => {
                 let current = drives::drive_letter_of(&state.panel(target).cwd);
+                let generation = state.next_request_id();
                 for letter in &drives {
-                    effects.push(Effect::FetchDriveLabel { target, letter: *letter });
+                    effects.push(Effect::FetchDriveLabel { target, letter: *letter, generation });
                 }
-                state.drive_select = Some(DriveSelect::new(target, drives, current));
+                let mut dialog = DriveSelect::new(target, drives, current);
+                dialog.generation = generation;
+                state.drive_select = Some(dialog);
             }
             Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
 
@@ -628,16 +651,19 @@ fn jump_to_prefix(state: &mut State, pattern: &str) {
 // ---------------------------------------------------------------------
 
 fn toggle_info_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
-    let panel = state.panel_mut(side);
-    panel.display_mode = match panel.display_mode {
-        DisplayMode::Full => DisplayMode::Info,
-        DisplayMode::Info => DisplayMode::Full,
-    };
-    if panel.display_mode == DisplayMode::Info {
+    let entering_info = state.panel(side).display_mode == DisplayMode::Full;
+    if entering_info {
+        let request = state.next_request_id();
+        let panel = state.panel_mut(side);
+        panel.display_mode = DisplayMode::Info;
         // Every value starts pending; the worker fills them in place.
         panel.info = InfoValues::default();
-        vec![Effect::QueryInfo { panel: side, path: panel.cwd.clone() }]
+        panel.info_request = Some(request);
+        vec![Effect::QueryInfo { panel: side, path: panel.cwd.clone(), request }]
     } else {
+        let panel = state.panel_mut(side);
+        panel.display_mode = DisplayMode::Full;
+        panel.info_request = None;
         vec![]
     }
 }
@@ -1047,9 +1073,14 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
     state.panel_mut(side).begin_new_listing(path.clone());
     let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
     // A panel sitting in Info mode needs its drive/directory figures
-    // re-gathered for wherever it just landed.
+    // re-gathered for wherever it just landed. A fresh request id is
+    // minted even when the path is unchanged (e.g. a re-read), so an
+    // answer to a since-superseded query for the same path is still
+    // recognized as stale and dropped.
     if state.panel(side).display_mode == DisplayMode::Info {
-        effects.push(Effect::QueryInfo { panel: side, path });
+        let request = state.next_request_id();
+        state.panel_mut(side).info_request = Some(request);
+        effects.push(Effect::QueryInfo { panel: side, path, request });
     }
     effects
 }

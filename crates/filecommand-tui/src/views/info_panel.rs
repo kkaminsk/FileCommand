@@ -39,8 +39,9 @@ pub fn render_info(
     let bottom = area.y + area.height;
 
     // Banner box: the identity lines verbatim, the same strings the splash
-    // and the About dialog use.
-    let banner: Vec<String> = identity_lines.iter().map(|l| center(l, inner_w)).collect();
+    // and the About dialog use. No label/value split applies here, so the
+    // "value" half of each row is empty.
+    let banner: Vec<(String, String)> = identity_lines.iter().map(|l| (center(l, inner_w), String::new())).collect();
     y = draw_box(buf, area.x, y, bottom, inner_w, None, &banner, label_style, banner_style, banner_style);
 
     for info_box in info_boxes(values, drive_letter_of(cwd)) {
@@ -59,24 +60,67 @@ pub fn render_info(
     }
 }
 
-/// `label` left, value right-aligned, with the split point recorded so the
-/// two halves can take different roles.
-fn box_rows(info_box: &InfoBox, inner_w: usize) -> Vec<String> {
+/// `label` left, value right-aligned. Returns each row's full text paired
+/// with the (possibly truncated) value text alone, so the caller can find
+/// the label/value split by measuring the value's own display width — it is
+/// always flush against the box's right inner edge — rather than searching
+/// the row for a run of spaces, which collapses to a single column (and so
+/// becomes unfindable) once the value is long enough to butt right up
+/// against the label.
+fn box_rows(info_box: &InfoBox, inner_w: usize) -> Vec<(String, String)> {
     info_box
         .fields
         .iter()
         .map(|field| {
             let label = format!(" {}", field.label);
-            let used = display_width(&label) + display_width(&field.value) + 1;
-            let gap = " ".repeat(inner_w.saturating_sub(used).max(1));
-            pad_to_width(&format!("{label}{gap}{}", field.value), inner_w)
+            let label_w = display_width(&label);
+            // At least one column must separate label and value; if the
+            // label alone doesn't leave room for that, the value is dropped
+            // rather than colliding with the label.
+            let available_for_value = inner_w.saturating_sub(label_w + 1);
+            let value = truncate_with_ellipsis(&field.value, available_for_value);
+            let value_w = display_width(&value);
+            let gap = " ".repeat(inner_w.saturating_sub(label_w + value_w));
+            let row = pad_to_width(&format!("{label}{gap}{value}"), inner_w);
+            (row, value)
         })
         .collect()
 }
 
-/// Draw one framed box and return the y directly below it. `value_style`
-/// applies from the first run of two spaces onward, which is where a
-/// right-aligned value begins.
+/// Truncate `s` to at most `max_w` display columns, replacing the tail with
+/// a single `…` when it doesn't fit — never silently dropping characters
+/// without signaling that it happened.
+fn truncate_with_ellipsis(s: &str, max_w: usize) -> String {
+    if display_width(s) <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = max_w - 1; // reserve one column for the ellipsis itself
+    let mut out = String::new();
+    let mut acc = 0usize;
+    for ch in s.chars() {
+        let cw = display_width(&ch.to_string());
+        if acc + cw > budget {
+            break;
+        }
+        out.push(ch);
+        acc += cw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
+/// Draw one framed box and return the y directly below it. Each row pairs
+/// its full text with its (possibly empty) value substring; `value_style`
+/// is applied to exactly that substring, right-flush against the box's
+/// inner edge — a structural split, not a re-derived one, so it stays
+/// correct even when the gap between label and value has collapsed to a
+/// single column.
 #[allow(clippy::too_many_arguments)]
 fn draw_box(
     buf: &mut Buffer,
@@ -85,7 +129,7 @@ fn draw_box(
     bottom: u16,
     inner_w: usize,
     title: Option<&str>,
-    rows: &[String],
+    rows: &[(String, String)],
     frame_style: ratatui::style::Style,
     text_style: ratatui::style::Style,
     value_style: ratatui::style::Style,
@@ -103,21 +147,16 @@ fn draw_box(
     buf.set_string(x, y, &top, frame_style);
     y += 1;
 
-    for row in rows {
+    for (row, value) in rows {
         if y + 1 >= bottom {
             break;
         }
         buf.set_string(x, y, "\u{2502}", frame_style);
         buf.set_string(x + 1, y, row, text_style);
-        // Re-style the value half. Splitting on the padded gap keeps the
-        // label cyan and the figure bright-yellow without threading a
-        // second string through.
-        if let Some(split) = row.rfind("  ") {
-            let value = row[split..].trim_start();
-            if !value.is_empty() {
-                let col = x + 1 + display_width(&row[..row.len() - value.len()]) as u16;
-                buf.set_string(col, y, value, value_style);
-            }
+        // Re-style the value half, right-flush against the inner edge.
+        if !value.is_empty() {
+            let col = x + 1 + (inner_w - display_width(value)) as u16;
+            buf.set_string(col, y, value, value_style);
         }
         buf.set_string(x + 1 + inner_w as u16, y, "\u{2502}", frame_style);
         y += 1;
@@ -153,7 +192,7 @@ fn replace_at(s: &str, at: usize, insert: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use filecommand_core::info::PENDING;
+    use filecommand_core::info::{InfoField, PENDING};
 
     fn identity() -> [String; 4] {
         [
@@ -258,5 +297,94 @@ mod tests {
         render_info(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &InfoValues::default(), Path::new(r"C:\"), &identity());
         let text: String = (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y))).map(|(x, y)| buf[(x, y)].symbol()).collect();
         assert!(text.trim().is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // Value truncation (long values at a narrow width)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn truncate_with_ellipsis_leaves_short_values_untouched() {
+        assert_eq!(truncate_with_ellipsis("OK", 10), "OK");
+        assert_eq!(truncate_with_ellipsis("exact", 5), "exact");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_cuts_the_tail_and_signals_it() {
+        let out = truncate_with_ellipsis("A very long volume label indeed", 10);
+        assert_eq!(display_width(&out), 10);
+        assert!(out.ends_with('\u{2026}'), "`{out}`");
+        assert!(out.starts_with("A very lo"), "`{out}`");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_handles_degenerate_widths() {
+        assert_eq!(truncate_with_ellipsis("anything", 0), "");
+        assert_eq!(truncate_with_ellipsis("anything", 1), "\u{2026}");
+    }
+
+    #[test]
+    fn box_rows_truncates_the_value_not_the_label_when_the_gap_collapses() {
+        let info_box = InfoBox {
+            title: "Drive C:".to_string(),
+            fields: vec![InfoField { label: "Volume label".to_string(), value: "A very long volume label indeed".to_string() }],
+        };
+        // Just wide enough for the label plus a one-column gap plus a
+        // handful of value columns — the exact scenario that used to make
+        // `row.rfind("  ")` fail to find any split at all.
+        let rows = box_rows(&info_box, 24);
+        assert_eq!(rows.len(), 1);
+        let (row, value) = &rows[0];
+        assert_eq!(display_width(row), 24, "the row is still padded to the full inner width");
+        assert!(row.starts_with(" Volume label"), "the label survives intact: `{row}`");
+        assert!(value.ends_with('\u{2026}'), "the value carries the ellipsis: `{value}`");
+        assert!(row.ends_with(value.as_str()), "the (truncated) value is flush against the right edge: `{row}`");
+    }
+
+    #[test]
+    fn a_long_volume_label_at_a_narrow_width_renders_with_an_ellipsis_and_keeps_its_label() {
+        let area = Rect { x: 0, y: 0, width: 26, height: 22 };
+        let mut buf = Buffer::empty(area);
+        let values = InfoValues { volume_label: Some("A very long volume label indeed".to_string()), ..InfoValues::default() };
+        render_info(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &values, Path::new(r"C:\"), &identity());
+        let text: String = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Volume label"), "the label is not eaten by the truncated value:\n{text}");
+        assert!(text.contains('\u{2026}'), "the overlong value is truncated with an ellipsis:\n{text}");
+        assert!(!text.contains("A very long volume label indeed"), "the full untruncated value must not appear:\n{text}");
+    }
+
+    #[test]
+    fn the_value_role_still_applies_to_a_truncated_value() {
+        // Regression check for the label/value color split breaking once
+        // the gap between them collapses to one space.
+        let area = Rect { x: 0, y: 0, width: 26, height: 22 };
+        let mut buf = Buffer::empty(area);
+        let values = InfoValues { volume_label: Some("A very long volume label indeed".to_string()), ..InfoValues::default() };
+        render_info(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &values, Path::new(r"C:\"), &identity());
+
+        let theme = Theme::classic();
+        let value_style = role_style(&theme, Role::InfoValue, ColorDepth::Ansi16);
+        let label_style = role_style(&theme, Role::InfoLabel, ColorDepth::Ansi16);
+
+        // Row 6 is the "Volume label" row of the Drive box (banner: 4 lines
+        // + top border; System box: label + top/bottom; Drive box title +
+        // this is its first field row) — rather than hardcode that, scan
+        // for the row containing the label and assert its rightmost cell
+        // (the end of the truncated, ellipsis-terminated value) carries the
+        // value role while the label's own cell carries the label role.
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if row.contains("Volume label") {
+                let last_cell = &buf[(area.x + area.width - 2, y)]; // inside the right frame glyph
+                assert_eq!(Some(last_cell.fg), value_style.fg, "the truncated value's trailing cell should carry the value role");
+                let label_cell = &buf[(area.x + 2, y)]; // inside "Volume label"'s first letter
+                assert_eq!(Some(label_cell.fg), label_style.fg, "the label's own cell should carry the label role");
+                return;
+            }
+        }
+        panic!("Volume label row not found:\n{}", (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n"));
     }
 }
