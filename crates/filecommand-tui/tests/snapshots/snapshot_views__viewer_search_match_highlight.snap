@@ -1,0 +1,28 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+expression: text
+---
+ sample.txt                                                Col 0   Size 44   0% 
+the quick brown fox jumps over the lazy dog                                     
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+1Help 2Unwrap 4Hex 7Search 10Quit

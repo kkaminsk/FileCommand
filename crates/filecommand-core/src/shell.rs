@@ -8,6 +8,29 @@
 use std::path::{Path, PathBuf};
 
 use crate::config::{DEFAULT_UNIX_SHELL, DEFAULT_WINDOWS_SHELL};
+use crate::fs_ops::path::to_extended_path;
+
+/// Windows historically limits an unprefixed path to ~260 characters
+/// (`MAX_PATH`). Below that threshold [`spawn_safe_path`] leaves `path`
+/// untouched, so a spawned shell's ordinary working directory is not shown
+/// to the user with the `\\?\` verbatim prefix; at or beyond it, the same
+/// `\\?\` (or `\\?\UNC\`) prefix `fs_ops`/`listing` already apply to every
+/// real filesystem access ([`to_extended_path`]) is applied here too.
+const MAX_PATH_SAFE_THRESHOLD: usize = 240;
+
+/// Make `path` safe to hand to `CreateProcess` (via
+/// `std::process::Command::current_dir`/program path) even when it is near
+/// or past Windows' `MAX_PATH`, by reusing the same `\\?\` verbatim-prefix
+/// helper `fs_ops`/`listing` use for real filesystem access. A no-op for
+/// short paths (see [`MAX_PATH_SAFE_THRESHOLD`]), relative paths, and on
+/// non-Windows targets.
+pub(crate) fn spawn_safe_path(path: &Path) -> PathBuf {
+    if path.as_os_str().len() >= MAX_PATH_SAFE_THRESHOLD {
+        to_extended_path(path)
+    } else {
+        path.to_path_buf()
+    }
+}
 
 /// The extensions Windows treats as directly executable when no `PATHEXT`
 /// environment variable is readable, plus `.lnk` shortcuts which `cmd.exe`
@@ -131,12 +154,15 @@ pub fn resolve_shell(configured: Option<&str>) -> ShellSpec {
 }
 
 /// Build the full invocation for `user_text`, run from `cwd` (the active
-/// panel's directory).
+/// panel's directory). Both the program path and `cwd` are routed through
+/// [`spawn_safe_path`] so a shell configured with a long quoted program path,
+/// or a panel directory near/over `MAX_PATH`, still spawns correctly.
 pub fn build_command(configured: Option<&str>, user_text: &str, cwd: &Path) -> Invocation {
     let spec = resolve_shell(configured);
     let mut args = spec.args;
     args.push(user_text.to_string());
-    Invocation { program: spec.program, args, cwd: cwd.to_path_buf() }
+    let program = spawn_safe_path(Path::new(&spec.program)).to_string_lossy().into_owned();
+    Invocation { program, args, cwd: spawn_safe_path(cwd) }
 }
 
 /// Whether `name` names something the shell would execute directly: a
@@ -245,5 +271,31 @@ mod tests {
     fn split_spec_drops_empty_runs() {
         assert_eq!(split_spec("  cmd.exe   /C  "), vec!["cmd.exe".to_string(), "/C".to_string()]);
         assert!(split_spec("   ").is_empty());
+    }
+
+    #[test]
+    fn spawn_safe_path_leaves_ordinary_short_paths_untouched() {
+        let p = Path::new(r"C:\NORTON");
+        assert_eq!(spawn_safe_path(p), p.to_path_buf());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_safe_path_prefixes_paths_near_or_over_max_path_with_the_verbatim_form() {
+        let long_component = "a".repeat(250);
+        let long_path = PathBuf::from(format!(r"C:\{long_component}"));
+        let safe = spawn_safe_path(&long_path);
+        assert!(safe.to_string_lossy().starts_with(r"\\?\"), "expected a verbatim prefix, got {safe:?}");
+        assert!(safe.to_string_lossy().ends_with(&long_component));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_command_uses_a_verbatim_cwd_for_a_panel_directory_near_max_path() {
+        let long_component = "b".repeat(250);
+        let long_cwd = PathBuf::from(format!(r"D:\{long_component}"));
+        let inv = build_command(None, "dir", &long_cwd);
+        assert!(inv.cwd.to_string_lossy().starts_with(r"\\?\"), "expected a verbatim cwd, got {:?}", inv.cwd);
+        assert!(inv.cwd.to_string_lossy().ends_with(&long_component));
     }
 }

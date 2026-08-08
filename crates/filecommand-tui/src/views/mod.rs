@@ -14,9 +14,11 @@ pub mod progress_dialog;
 pub mod quit_dialog;
 pub mod skipped_summary;
 pub mod splash;
+pub mod viewer;
 
 use filecommand_core::fs_ops::dialog::RunningDialog;
 use filecommand_core::theme::ColorDepth;
+use filecommand_core::viewer::ByteSource;
 use filecommand_core::{PanelSide, State, UiPhase};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -24,17 +26,31 @@ use ratatui::layout::Rect;
 use crate::layout;
 
 /// Render the entire screen for the current `state`. Pure with respect to
-/// state — never mutates it, never performs I/O. `clock_text` is the
+/// state — never mutates it, never performs I/O itself. `clock_text` is the
 /// already-formatted `h:mm a` wall-clock reading (the TUI reads the real
 /// clock; tests pin a fixed string), following the same "input alongside
-/// state" pattern as `identity_lines`.
-pub fn render(buf: &mut Buffer, area: Rect, state: &State, depth: ColorDepth, identity_lines: &[String; 4], clock_text: &str) {
+/// state" pattern as `identity_lines`. `viewer_source` is the open byte
+/// window backing an active `UiPhase::Viewer` (design D1 — the TUI owns the
+/// `ByteSource`, `core::State` never does); it is ignored in every other
+/// phase.
+pub fn render(
+    buf: &mut Buffer,
+    area: Rect,
+    state: &State,
+    depth: ColorDepth,
+    identity_lines: &[String; 4],
+    clock_text: &str,
+    viewer_source: Option<&ByteSource>,
+) {
     match &state.phase {
         UiPhase::Splash { .. } => {
             splash::render_splash(buf, area, &state.theme, depth, identity_lines);
         }
         UiPhase::Placeholder => {
             placeholder::render_placeholder(buf, area, &state.theme, depth);
+        }
+        UiPhase::Viewer(v) => {
+            viewer::render_viewer(buf, area, v, &state.theme, depth, viewer_source);
         }
         UiPhase::Panels
         | UiPhase::QuitConfirm

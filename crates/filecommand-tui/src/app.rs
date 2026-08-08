@@ -12,13 +12,16 @@ use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
+use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
 use filecommand_core::theme::{ColorDepth, Theme};
-use filecommand_core::{config, drives, identity, update, Command, Effect, State};
+use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
+use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
+use filecommand_core::{config, drives, identity, update, Command, Effect, State, UiPhase};
 
 use crate::clock::{RealClock, RealWallClock};
-use crate::input;
+use crate::input::{self, ViewerInput};
 use crate::layout;
 use crate::terminal::TerminalGuard;
 use crate::views;
@@ -34,6 +37,11 @@ struct Runtime {
     tx: Sender<Command>,
     active_job: Option<worker::JobHandle>,
     history_path: PathBuf,
+    /// The F3 viewer's open byte window, kept here rather than in
+    /// `core::State` because `ByteSource` is an I/O handle, not application
+    /// state (design D1). Set on `Effect::OpenViewer`, cleared on
+    /// `Command::ViewerClose` — the only path out of `UiPhase::Viewer`.
+    viewer_source: Option<(PathBuf, ByteSource)>,
 }
 
 pub fn run(no_splash_flag: bool) -> io::Result<()> {
@@ -54,19 +62,17 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     let identity_lines = identity::identity_lines(year);
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
-    // `PATHEXT` and the configured shell are read once here so `update`
-    // stays a pure function of `State` rather than of the environment.
-    state.shell = ShellConfig::from_env(config.shell.clone());
+    apply_config(&mut state, &config);
     state.history = config::load_history(Path::new(config::HISTORY_FILE));
 
     let (tx, rx) = mpsc::channel::<Command>();
-    let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE) };
+    let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), viewer_source: None };
 
     if run_effects(effects, &mut guard, &mut rt)? {
         return Ok(());
     }
     let (mut state, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
-    draw(&mut guard, &state, &identity_lines, &wall_clock)?;
+    draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
 
     loop {
         let (s, mut dirty) = drain_events(state, &rx, &mut guard, &mut rt)?;
@@ -75,8 +81,19 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
         if event::poll(POLL_INTERVAL)? {
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let page_size = layout::compute(state.term_size).entries_visible;
-                    match input::map_key(key, &state, page_size, &keys) {
+                    let cmd = match &state.phase {
+                        UiPhase::Viewer(viewer) => {
+                            let rows_visible = views::viewer::body_rows(state.term_size.1);
+                            let source = rt.viewer_source.as_ref().map(|(_, s)| s);
+                            input::map_viewer_key(key, viewer, rows_visible)
+                                .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
+                        }
+                        _ => {
+                            let page_size = layout::compute(state.term_size).entries_visible;
+                            input::map_key(key, &state, page_size, &keys)
+                        }
+                    };
+                    match cmd {
                         Some(cmd) => {
                             let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
                             if quit {
@@ -113,7 +130,101 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
             // its very first appearance rather than a frame later.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
-            draw(&mut guard, &state, &identity_lines, &wall_clock)?;
+            draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+        }
+    }
+}
+
+/// Snapshot config-driven values into `State` at startup: the configured
+/// shell/`PATHEXT` and the F4 external-editor command, so `update` stays a
+/// pure function of `State` rather than reading the environment or config
+/// itself. Factored out of `run` so the config-driven startup wiring is
+/// testable without a real terminal (regression coverage for the F4
+/// external-editor command silently never reaching `State` — see
+/// `apply_config_wires_the_configured_editor_and_shell_into_state` below).
+fn apply_config(state: &mut State, config: &config::Config) {
+    state.shell = ShellConfig::from_env(config.shell.clone());
+    state.editor = config.editor.clone();
+}
+
+/// Resolve a viewer key's meaning into a core `Command`. Simple toggles pass
+/// straight through; scrolling needs the open `ByteSource` to compute the
+/// new offset (backward/forward line-start scans, or hex row math) — the
+/// I/O `core::update` itself must stay free of (design D1). `None` when
+/// there is no byte source yet (the brief window before the first frame) or
+/// the key has no effect (e.g. an arrow key with nothing open).
+fn resolve_viewer_navigation(viewer: &ViewerState, source: Option<&ByteSource>, action: ViewerInput, rows_visible: usize) -> Option<Command> {
+    match action {
+        ViewerInput::Cmd(cmd) => Some(cmd),
+        ViewerInput::ScrollLines(delta) => Some(Command::ViewerSetTop(scroll_lines(viewer, source?, delta))),
+        ViewerInput::ScrollCols(delta) => Some(Command::ViewerSetHScroll((viewer.h_scroll as i64 + delta).max(0) as usize)),
+        ViewerInput::Home => Some(Command::ViewerSetTop(0)),
+        ViewerInput::End => Some(Command::ViewerSetTop(scroll_to_end(viewer, source?, rows_visible))),
+    }
+}
+
+/// Move `viewer.top_offset` by `delta` lines (text mode) or rows (hex mode).
+/// Text mode walks one line at a time via the bounded backward/forward
+/// scans (design D3), stopping early if a scan makes no further progress
+/// (start or end of file) rather than looping past it.
+fn scroll_lines(viewer: &ViewerState, source: &ByteSource, delta: i64) -> u64 {
+    match viewer.mode {
+        ViewMode::Hex => {
+            let step = delta.saturating_mul(HEX_BYTES_PER_ROW as i64);
+            (viewer.top_offset as i64 + step).max(0) as u64
+        }
+        ViewMode::Text => {
+            let cap = backward::DEFAULT_MAX_LINE_LEN;
+            let mut offset = viewer.top_offset;
+            if delta < 0 {
+                for _ in 0..delta.unsigned_abs() {
+                    if offset == 0 {
+                        break;
+                    }
+                    let prev = backward::previous_line_start(source, offset, cap);
+                    if prev == offset {
+                        break;
+                    }
+                    offset = prev;
+                }
+            } else {
+                for _ in 0..delta {
+                    let next = forward::next_line_start(source, offset, cap);
+                    if next <= offset {
+                        break;
+                    }
+                    offset = next;
+                }
+            }
+            offset
+        }
+    }
+}
+
+/// The top offset that shows the file's last page: for hex, the last
+/// `rows_visible` full rows; for text, `rows_visible` lines walked backward
+/// from the end via the same bounded scan `scroll_lines` uses.
+fn scroll_to_end(viewer: &ViewerState, source: &ByteSource, rows_visible: usize) -> u64 {
+    let rows = rows_visible.max(1) as u64;
+    match viewer.mode {
+        ViewMode::Hex => {
+            let total_rows = source.len().div_ceil(HEX_BYTES_PER_ROW as u64);
+            total_rows.saturating_sub(rows) * HEX_BYTES_PER_ROW as u64
+        }
+        ViewMode::Text => {
+            let cap = backward::DEFAULT_MAX_LINE_LEN;
+            let mut offset = source.len();
+            for _ in 0..rows {
+                if offset == 0 {
+                    break;
+                }
+                let prev = backward::previous_line_start(source, offset, cap);
+                if prev == offset {
+                    break;
+                }
+                offset = prev;
+            }
+            offset
         }
     }
 }
@@ -121,6 +232,13 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 /// Apply one command and execute its effects. The `bool` is `true` when the
 /// event loop should exit.
 fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
+    // `ViewerClose` is the only path out of `UiPhase::Viewer` (`update`
+    // never re-enters it once left), so it is also the one place the
+    // cached byte source needs to be dropped — checked before `update`
+    // consumes `cmd`.
+    if matches!(cmd, Command::ViewerClose) {
+        rt.viewer_source = None;
+    }
     let (state, effects) = update(state, cmd);
     let quit = run_effects(effects, guard, rt)?;
     Ok((state, quit))
@@ -187,6 +305,35 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
+            Effect::OpenViewer { path } => match ByteSource::open(&path) {
+                Ok(source) => {
+                    // O(1): opening/mapping touches only the handle and its
+                    // length, never the content (viewer: Instant open), so
+                    // this runs synchronously rather than on a worker
+                    // thread, exactly like `EnumerateDrives`.
+                    let file_len = source.len();
+                    rt.viewer_source = Some((path.clone(), source));
+                    let _ = rt.tx.send(Command::ViewerOpened { path, file_len });
+                }
+                Err(e) => {
+                    let _ = rt.tx.send(Command::ViewerOpenFailed { message: e.to_string() });
+                }
+            },
+            Effect::RunViewerSearch { path, start_offset, pattern, request } => {
+                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
+            }
+            Effect::RunExternalEditor(invocation, side) => match run_external_editor(guard, &invocation)? {
+                Ok(()) => {
+                    // The editor may have written to the file; re-read the
+                    // panel that owned the cursor entry, mirroring
+                    // `RunShellCommand` (external-editor: Synchronous wait
+                    // and panel re-read — "Panel refreshed after edit").
+                    let _ = rt.tx.send(Command::RereadPanel(side));
+                }
+                Err(message) => {
+                    let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
+                }
+            },
         }
     }
     Ok(quit)
@@ -212,6 +359,47 @@ fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::
     }
     wait_for_key()?;
     guard.resume()
+}
+
+/// Suspend the TUI, run the F4 external editor on the real terminal, and
+/// come back — the same suspend/restore seam `run_shell_command` uses
+/// (design D7), reused rather than duplicated (external-editor: TUI suspend
+/// and restore). Unlike a shell command, a spawn failure here must reach
+/// `core::update` as an inline panel error rather than only being printed
+/// to the scrollback, so the `Result` is returned instead of swallowed.
+///
+/// Restore runs on every path — spawn failure, a crash, or a non-zero exit
+/// — so a misbehaving editor can never leave the terminal corrupted
+/// (external-editor: Terminal restored when the editor crashes).
+fn run_external_editor(guard: &mut TerminalGuard, invocation: &EditorInvocation) -> io::Result<Result<(), String>> {
+    guard.suspend()?;
+    let result = spawn_editor_and_wait(invocation);
+    if let Err(message) = &result {
+        let _ = writeln!(io::stdout(), "\r\n{message}");
+    }
+    wait_for_key()?;
+    guard.resume()?;
+    Ok(result)
+}
+
+/// The process-spawn half of [`run_external_editor`], factored out so it is
+/// testable without a real console (`guard.suspend`/`resume` need one; this
+/// does not). `Ok(())` on any exit (including non-zero — matching
+/// `run_shell_command`'s precedent of not treating the child's exit code as
+/// FileCommand's own error); `Err` only when the process could not be
+/// spawned at all (external-editor: Editor spawn errors do not crash the
+/// app).
+fn spawn_editor_and_wait(invocation: &EditorInvocation) -> Result<(), String> {
+    std::process::Command::new(&invocation.program)
+        .args(&invocation.leading_args)
+        .arg(&invocation.file_arg)
+        .current_dir(&invocation.cwd)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map(|_| ())
+        .map_err(|e| format!("Could not run `{}`: {e}", invocation.program))
 }
 
 /// Ctrl+O: hand the screen back so the host terminal's scrollback (which is
@@ -245,13 +433,124 @@ fn wait_for_key() -> io::Result<()> {
     Ok(())
 }
 
-fn draw(guard: &mut TerminalGuard, state: &State, identity_lines: &[String; 4], wall_clock: &dyn WallClock) -> io::Result<()> {
+fn draw(
+    guard: &mut TerminalGuard,
+    state: &State,
+    identity_lines: &[String; 4],
+    wall_clock: &dyn WallClock,
+    viewer_source: Option<&ByteSource>,
+) -> io::Result<()> {
     let (hour, minute) = wall_clock.now_local();
     let clock_text = format_clock(hour, minute);
     guard.terminal.draw(|frame| {
         let area = frame.area();
         let depth = ColorDepth::Ansi16;
-        views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text);
+        views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// A harmless, always-present "editor" invocation per platform — exits
+    /// immediately without touching the file system, so the test exercises
+    /// a real spawn + wait without depending on any real editor being
+    /// installed (external-editor: F4 launches the editor / round-trip with
+    /// a stub editor command).
+    fn stub_invocation(file_arg: &str) -> EditorInvocation {
+        let (program, leading_args) = if cfg!(windows) {
+            ("cmd.exe".to_string(), vec!["/C".to_string(), "exit".to_string()])
+        } else {
+            ("/bin/sh".to_string(), vec!["-c".to_string(), "exit 0".to_string()])
+        };
+        EditorInvocation { program, leading_args, file_arg: OsString::from(file_arg), cwd: std::env::temp_dir() }
+    }
+
+    /// Regression test for the F4 external editor being silently dead: a
+    /// config-driven startup (via `config::parse`, the real parsing path,
+    /// not a hand-built `Config`) must populate `state.editor`, mirroring
+    /// the already-wired `state.shell`. Before this fix, `run()` never
+    /// assigned `state.editor` at all, so `editor =` in `config.toml` was
+    /// parsed correctly but never reached `State`.
+    #[test]
+    fn apply_config_wires_the_configured_editor_and_shell_into_state() {
+        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n");
+        let mut state = State::empty(Theme::classic());
+        assert_eq!(state.editor, None, "sanity: editor starts unset before wiring");
+        apply_config(&mut state, &config);
+        assert_eq!(state.editor.as_deref(), Some("code --wait"));
+        assert_eq!(state.shell.shell.as_deref(), Some("pwsh -NoLogo -Command"));
+    }
+
+    #[test]
+    fn apply_config_leaves_editor_unset_when_config_omits_it() {
+        let config = config::parse("splash = false\n");
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &config);
+        assert_eq!(state.editor, None);
+    }
+
+    #[test]
+    fn spawn_editor_and_wait_succeeds_for_a_real_program() {
+        assert_eq!(spawn_editor_and_wait(&stub_invocation("0")), Ok(()));
+    }
+
+    #[test]
+    fn spawn_editor_and_wait_reports_an_unspawnable_program_as_an_error_without_panicking() {
+        let inv = EditorInvocation {
+            program: "filecommand-definitely-not-a-real-editor-binary".to_string(),
+            leading_args: vec![],
+            file_arg: OsString::from("report.txt"),
+            cwd: std::env::temp_dir(),
+        };
+        let result = spawn_editor_and_wait(&inv);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("filecommand-definitely-not-a-real-editor-binary"));
+    }
+
+    #[test]
+    fn scroll_lines_in_hex_mode_moves_by_whole_rows_and_never_underflows() {
+        let viewer = {
+            let mut v = ViewerState::new(PathBuf::from("f.bin"), 1000);
+            v.mode = ViewMode::Hex;
+            v.top_offset = 32;
+            v
+        };
+        let src = temp_source("hex-mode", b"unused for hex-mode math, which touches no bytes");
+        assert_eq!(scroll_lines(&viewer, &src, 1), 48);
+        assert_eq!(scroll_lines(&viewer, &src, -2), 0);
+    }
+
+    #[test]
+    fn scroll_lines_in_text_mode_walks_line_starts_forward_and_backward() {
+        let src = temp_source("text-mode", b"line1\nline2\nline3\n");
+        let mut viewer = ViewerState::new(PathBuf::from("f.txt"), src.len());
+        viewer.top_offset = 0;
+        assert_eq!(scroll_lines(&viewer, &src, 1), 6);
+        assert_eq!(scroll_lines(&viewer, &src, 2), 12);
+        viewer.top_offset = 12;
+        assert_eq!(scroll_lines(&viewer, &src, -1), 6);
+    }
+
+    #[test]
+    fn scroll_to_end_lands_on_the_files_last_page() {
+        let src = temp_source("scroll-to-end", b"a\nb\nc\nd\ne\n");
+        let viewer = ViewerState::new(PathBuf::from("f.txt"), src.len());
+        // 5 two-byte lines; asking for the last 2 rows lands on "d\n".
+        assert_eq!(scroll_to_end(&viewer, &src, 2), 6);
+    }
+
+    fn temp_source(name: &str, contents: &[u8]) -> ByteSource {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-nav-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("file.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        f.flush().unwrap();
+        ByteSource::open(&path).unwrap()
+    }
 }

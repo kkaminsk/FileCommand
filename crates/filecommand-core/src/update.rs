@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::drives::{self, DriveSelect};
+use crate::external_editor::{self, EditorInvocation};
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
 use crate::info::InfoValues;
@@ -18,6 +19,7 @@ use crate::menu::{MenuAction, MenuId, MenuState};
 use crate::panel::{CursorMove, DisplayMode, PanelState};
 use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
+use crate::viewer::ViewerState;
 
 pub const MIN_COLS: u16 = 80;
 pub const MIN_ROWS: u16 = 24;
@@ -58,6 +60,9 @@ pub enum UiPhase {
     FileOpRunning { source_dir: PathBuf, dest_dir: PathBuf, dialog: RunningDialog },
     /// End-of-job summary, shown only when the job skipped 1+ items.
     FileOpSummary(Vec<SkippedItem>),
+    /// The F3 viewer, open full-screen in place of the panels (viewer:
+    /// Frame-less full-screen chrome — "Viewer owns focus while open").
+    Viewer(ViewerState),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,6 +89,10 @@ pub struct State {
     /// Shell program + PATHEXT, snapshotted from config/environment at
     /// startup so `update` stays a pure function of `State`.
     pub shell: ShellConfig,
+    /// The `editor =` command, snapshotted from config at startup. `None`
+    /// means unset (external-editor: Config-driven external editor
+    /// command).
+    pub editor: Option<String>,
     pub phase: UiPhase,
     pub theme: Theme,
     pub term_size: (u16, u16),
@@ -135,6 +144,7 @@ impl State {
             menu: None,
             drive_select: None,
             shell: ShellConfig::default(),
+            editor: None,
             phase: UiPhase::Panels,
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
@@ -280,6 +290,36 @@ pub enum Command {
     // Info display mode (Ctrl+L).
     ToggleInfoMode(PanelSide),
 
+    // F3 viewer (M4).
+    /// Open the viewer on the file under the active panel's cursor.
+    RequestViewer,
+    /// F10 in the viewer: close it and return focus to the panels.
+    ViewerClose,
+    /// F4 in the viewer: toggle text/hex mode.
+    ViewerToggleMode,
+    /// F2 in the viewer: toggle wrap/unwrap.
+    ViewerToggleWrap,
+    /// Move the top-of-screen anchor to this byte offset (clamped to the
+    /// file length). Used for both forward paging and the backward-scan
+    /// result, which the caller computes via [`crate::viewer::backward`]
+    /// before issuing this command, keeping `update` itself I/O-free.
+    ViewerSetTop(u64),
+    /// Set the unwrap-mode horizontal scroll, in display columns.
+    ViewerSetHScroll(usize),
+    /// F7 in the viewer: open the search prompt.
+    ViewerSearchStart,
+    ViewerSearchChar(char),
+    ViewerSearchBackspace,
+    ViewerSearchCancel,
+    /// Enter on the search prompt: run the search (via
+    /// `Effect::RunViewerSearch`) for the typed pattern.
+    ViewerSearchConfirm,
+
+    // F4 external editor (M4).
+    /// Launch the configured external editor on the file under the active
+    /// panel's cursor.
+    RequestExternalEditor,
+
     // Worker-produced events, re-entering through the same `update` path.
     ListingChunk { panel: PanelSide, entries: Vec<Entry> },
     ListingComplete { panel: PanelSide, total: usize },
@@ -290,6 +330,23 @@ pub enum Command {
     JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
     DriveLabelResolved { target: PanelSide, letter: char, label: Option<String>, generation: u64 },
     InfoResolved { panel: PanelSide, path: PathBuf, request: u64, values: InfoValues },
+    /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
+    /// (viewer: Instant open).
+    ViewerOpened { path: PathBuf, file_len: u64 },
+    /// Reply to `Effect::OpenViewer`: the file could not be opened or
+    /// mapped (§7 error policy — surfaced as an inline error, never a
+    /// panic).
+    ViewerOpenFailed { message: String },
+    /// Reply to `Effect::RunViewerSearch` (viewer: F7 streaming search).
+    /// `request` echoes the id `Effect::RunViewerSearch` was issued with, so
+    /// a reply from a search superseded by a since-closed/reopened viewer
+    /// session (`ViewerState::search_request`) is recognized as stale and
+    /// dropped rather than applied to whatever viewer session happens to be
+    /// open when it arrives.
+    ViewerSearchResult { offset: Option<u64>, match_range: Option<(u64, u64)>, request: u64 },
+    /// Reply to `Effect::RunExternalEditor` when the editor could not be
+    /// spawned (external-editor: Editor spawn errors do not crash the app).
+    ExternalEditorSpawnFailed { message: String },
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -326,6 +383,25 @@ pub enum Effect {
     /// travels with the result so a reply from a since-superseded query can
     /// be told apart from the current one.
     QueryInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Open `path` for the F3 viewer: map/open it and report back its
+    /// length via `Command::ViewerOpened`, or the failure via
+    /// `Command::ViewerOpenFailed`. Cheap enough to run synchronously
+    /// before the next repaint, exactly like `EnumerateDrives` — O(1) per
+    /// the "instant open" requirement, never a worker-thread round trip
+    /// (viewer: Instant open).
+    OpenViewer { path: PathBuf },
+    /// Run the F7 streaming search from `start_offset` for `pattern`
+    /// against `path`, reporting the match back via
+    /// `Command::ViewerSearchResult` (viewer: F7 streaming search).
+    /// `request` must be echoed back unchanged in the `ViewerSearchResult`
+    /// reply so a stale reply can be told apart from the current search.
+    RunViewerSearch { path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64 },
+    /// Suspend the TUI, launch the external editor per `EditorInvocation`,
+    /// wait for it to exit, then restore and re-read the panel side that
+    /// owned the cursor entry — the same suspend/restore seam
+    /// `RunShellCommand` uses (design D7; external-editor: TUI suspend and
+    /// restore, Synchronous wait and panel re-read).
+    RunExternalEditor(EditorInvocation, PanelSide),
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -381,6 +457,14 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         || matches!(cmd, Command::JobProgress(_) | Command::JobConflict(_) | Command::JobError(_) | Command::JobDone { .. })
     {
         effects.extend(handle_file_op(&mut state, cmd));
+        return (state, effects);
+    }
+
+    // The F3 viewer replaces the panels full-screen and owns input focus
+    // while open (viewer: Frame-less full-screen chrome — "Viewer owns
+    // focus while open"), so its commands are handled uniformly here.
+    if matches!(state.phase, UiPhase::Viewer(_)) {
+        effects.extend(handle_viewer(&mut state, cmd));
         return (state, effects);
     }
 
@@ -504,11 +588,27 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
 
+            Command::RequestViewer => effects.extend(handle_request_viewer(&mut state)),
+            Command::ViewerOpened { path, file_len } => {
+                // A prior failed F3/F4 attempt may have left `last_error`
+                // set on this panel; a successful open has clearly moved
+                // past it, so the mini-status line must not keep showing
+                // the stale message (§7 error policy — errors are surfaced
+                // until superseded by success, not left to linger).
+                state.panel_mut(state.active).last_error = None;
+                state.phase = UiPhase::Viewer(ViewerState::new(path, file_len));
+            }
+            Command::ViewerOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+            Command::RequestExternalEditor => effects.extend(handle_request_external_editor(&mut state)),
+            Command::ExternalEditorSpawnFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+
             Command::Tick(_) => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
             _ => {}
         },
-        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => unreachable!("handled above"),
+        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) => {
+            unreachable!("handled above")
+        }
     }
 
     (state, effects)
@@ -665,6 +765,129 @@ fn toggle_info_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
         panel.display_mode = DisplayMode::Full;
         panel.info_request = None;
         vec![]
+    }
+}
+
+// ---------------------------------------------------------------------
+// F3 viewer (M4)
+// ---------------------------------------------------------------------
+
+/// F3: open the viewer on the file under the active panel's cursor. A no-op
+/// on a directory (including `..`) or an empty panel; opening itself is an
+/// `Effect` because it touches the filesystem, which `update` never does
+/// directly (viewer: Instant open).
+fn handle_request_viewer(state: &mut State) -> Vec<Effect> {
+    let side = state.active;
+    let Some(entry) = state.panel(side).selected() else { return vec![] };
+    if entry.is_dir_like() {
+        return vec![];
+    }
+    let path = state.panel(side).cwd.join(&entry.name);
+    vec![Effect::OpenViewer { path }]
+}
+
+/// Drive every command while the viewer is open (gated in [`update`] by
+/// `UiPhase::Viewer`). Byte-level work (backward scan, search) is never
+/// performed here — it requires file I/O that `update` must stay free of —
+/// so `ViewerSetTop` carries an already-computed offset and
+/// `ViewerSearchConfirm` only kicks off `Effect::RunViewerSearch`, whose
+/// result later re-enters as `Command::ViewerSearchResult` (design D1).
+fn handle_viewer(state: &mut State, cmd: Command) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    let UiPhase::Viewer(mut viewer) = std::mem::replace(&mut state.phase, UiPhase::Panels) else {
+        unreachable!("handle_viewer only called when phase is Viewer");
+    };
+    match cmd {
+        Command::ViewerClose => return effects,
+        Command::ViewerToggleMode => viewer.toggle_mode(),
+        Command::ViewerToggleWrap => viewer.toggle_wrap(),
+        Command::ViewerSetTop(offset) => viewer.set_top_offset(offset),
+        Command::ViewerSetHScroll(col) => viewer.h_scroll = col,
+        Command::ViewerSearchStart => viewer.search_input = Some(String::new()),
+        Command::ViewerSearchChar(c) => {
+            if let Some(input) = &mut viewer.search_input {
+                input.push(c);
+            }
+        }
+        Command::ViewerSearchBackspace => {
+            if let Some(input) = &mut viewer.search_input {
+                input.pop();
+            }
+        }
+        Command::ViewerSearchCancel => viewer.search_input = None,
+        Command::ViewerSearchConfirm => {
+            if let Some(pattern) = viewer.search_input.take().filter(|p| !p.is_empty()) {
+                let pattern_bytes = pattern.into_bytes();
+                viewer.search_pattern = Some(pattern_bytes.clone());
+                let path = viewer.path.clone();
+                let start_offset = viewer.top_offset;
+                // A fresh request id per search, mirroring
+                // `PanelState::info_request` — lets a reply be matched
+                // against the search that's still outstanding, so an
+                // out-of-order or superseded-session reply is dropped
+                // rather than applied (viewer: F7 streaming search
+                // staleness).
+                let request = state.next_request_id();
+                viewer.search_request = Some(request);
+                state.phase = UiPhase::Viewer(viewer);
+                effects.push(Effect::RunViewerSearch { path, start_offset, pattern: pattern_bytes, request });
+                return effects;
+            }
+        }
+        // Only apply a reply whose id matches this session's outstanding
+        // search. A mismatch means either a stale reply from a search this
+        // same session has since superseded, or one from a viewer session
+        // that has since closed and been reopened (a fresh `ViewerState`
+        // starts with `search_request: None`, which can never equal a real
+        // request id) — either way it is silently dropped instead of
+        // jumping the user to a bogus offset with a phantom match
+        // highlight.
+        Command::ViewerSearchResult { offset: Some(offset), match_range, request } if viewer.search_request == Some(request) => {
+            viewer.set_top_offset(offset);
+            viewer.last_match = match_range;
+        }
+        _ => {}
+    }
+    state.phase = UiPhase::Viewer(viewer);
+    effects
+}
+
+// ---------------------------------------------------------------------
+// F4 external editor (M4)
+// ---------------------------------------------------------------------
+
+/// F4 from a panel: resolve the cursor entry against the configured
+/// `editor =` command and either dispatch the spawn effect or surface why
+/// not (external-editor: F4 launches the editor, Config-driven external
+/// editor command).
+fn handle_request_external_editor(state: &mut State) -> Vec<Effect> {
+    let side = state.active;
+    let panel = state.panel(side);
+    let Some(entry) = panel.selected() else { return vec![] };
+    let is_dir = entry.is_dir_like();
+    let name = entry.name.clone();
+    let cwd = panel.cwd.clone();
+    match external_editor::resolve(state.editor.as_deref(), &cwd, &name, is_dir) {
+        Ok(invocation) => {
+            // Mirrors the `Command::ViewerOpened` clear: a prior failed F3/F4
+            // attempt may have left `last_error` set, and successfully
+            // dispatching the editor spawn has clearly moved past it — the
+            // mini-status line must not keep showing the stale message while
+            // the editor runs (§7 error policy). The eventual successful
+            // return also clears it again via `Command::RereadPanel` ->
+            // `begin_new_listing`, but that round trip only happens once the
+            // editor process exits, so this clears it immediately rather
+            // than leaving the stale message up for the whole edit session.
+            state.panel_mut(side).last_error = None;
+            vec![Effect::RunExternalEditor(invocation, side)]
+        }
+        Err(external_editor::TargetError::Unconfigured) => {
+            state.panel_mut(side).last_error = Some(external_editor::NO_EDITOR_CONFIGURED_MESSAGE.to_string());
+            vec![]
+        }
+        // The directory case is silently ignored, matching how F5/F6/F8
+        // are no-ops with nothing eligible selected.
+        Err(external_editor::TargetError::IsDirectory) => vec![],
     }
 }
 

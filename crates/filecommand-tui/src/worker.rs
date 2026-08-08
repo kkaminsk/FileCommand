@@ -15,6 +15,8 @@ use filecommand_core::fs_ops::{
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{list_dir_chunked, Entry, FsReader, StdFsReader};
 use filecommand_core::panel::parent_path;
+use filecommand_core::viewer::search::{find_forward, DEFAULT_CHUNK_SIZE};
+use filecommand_core::viewer::ByteSource;
 use filecommand_core::{Command, PanelSide};
 
 const CHUNK_SIZE: usize = 256;
@@ -66,6 +68,27 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
         file_count: Some(files),
         dir_count: Some(dirs),
     }
+}
+
+/// Run the F7 streaming search off the render/input thread: a non-matching
+/// pattern in a multi-GB file can scan the whole file (bounded per step, but
+/// unbounded in total wall time), so this must not block key handling the
+/// way `Effect::OpenViewer`'s O(1) open does (viewer: F7 streaming search —
+/// "Search is bounded and streaming"). Reopens the file rather than sharing
+/// the render loop's cached `ByteSource` across threads — a fresh mmap open
+/// is cheap and keeps the two paths independent.
+pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let result = match ByteSource::open(&path) {
+            Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
+            Err(_) => None,
+        };
+        let (offset, match_range) = match result {
+            Some((start, end)) => (Some(start), Some((start, end))),
+            None => (None, None),
+        };
+        let _ = tx.send(Command::ViewerSearchResult { offset, match_range, request });
+    });
 }
 
 pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
@@ -161,6 +184,54 @@ mod tests {
     use filecommand_core::info::PENDING;
     use filecommand_core::listing::RawDirEntry;
     use std::io;
+    use std::io::Write;
+
+    fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-worker-viewer-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("file.bin");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(contents).unwrap();
+        f.flush().unwrap();
+        path
+    }
+
+    #[test]
+    fn spawn_viewer_search_reports_the_match_back_on_the_channel() {
+        let path = temp_file("found", b"the quick brown fox jumps over the lazy dog");
+        let (tx, rx) = mpsc::channel();
+        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, tx);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Command::ViewerSearchResult { offset, match_range, request }) => {
+                assert_eq!(offset, Some(10));
+                assert_eq!(match_range, Some((10, 15)));
+                assert_eq!(request, 7, "the request id must be echoed back unchanged");
+            }
+            other => panic!("expected ViewerSearchResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_viewer_search_reports_no_match_as_none() {
+        let path = temp_file("not-found", b"the quick brown fox");
+        let (tx, rx) = mpsc::channel();
+        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, tx);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
+            other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_viewer_search_on_an_unopenable_path_reports_no_match_instead_of_panicking() {
+        let missing = std::env::temp_dir().join("filecommand-tui-worker-viewer-test-does-not-exist.bin");
+        let (tx, rx) = mpsc::channel();
+        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, tx);
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
+            other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
+        }
+    }
 
     struct FakeReader(io::Result<Vec<RawDirEntry>>);
 
