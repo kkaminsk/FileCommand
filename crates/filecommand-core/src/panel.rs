@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use crate::git_info::GitInfo;
 use crate::info::InfoValues;
 use crate::listing::{cmp_by_mode, format_count, Entry, EntryKind, SortMode};
 
@@ -108,6 +109,19 @@ pub struct PanelState {
     /// This panel's active tab's zero-based position within the full
     /// (`tabs` + the inline active tab) ordered list.
     pub active_tab_index: usize,
+    /// Async git info for this panel's directory: no branch and no
+    /// per-entry statuses (rendered identically to "outside a repository")
+    /// until the worker thread's `git_info::query` result arrives (git-info
+    /// "Single-reflow appearance with nothing reserved while pending").
+    pub git_info: GitInfo,
+    /// The id of the most recently issued git-info query for this panel, or
+    /// `None` if none is outstanding. Mirrors [`PanelState::info_request`]:
+    /// `Command::GitInfoResolved` only applies a result whose id matches
+    /// this, so a reply for a directory/generation the panel has since
+    /// moved past — including a timed-out query answered late — is dropped
+    /// rather than clobbering a fresher one (git-info "Silent absence on
+    /// timeout and stale-result discarding").
+    pub git_request: Option<u64>,
 }
 
 impl PanelState {
@@ -128,6 +142,8 @@ impl PanelState {
             quick_filter: None,
             tabs: Vec::new(),
             active_tab_index: 0,
+            git_info: GitInfo::none(),
+            git_request: None,
         }
     }
 
@@ -233,6 +249,12 @@ impl PanelState {
         // documented way to clear it deliberately, but a directory change
         // clears it implicitly too.
         self.quick_filter = None;
+        // Directory-scoped git info (like `info` above) no longer describes
+        // what the panel shows; `update::begin_listing` mints a fresh
+        // request and issues `Effect::QueryGitInfo` for wherever the panel
+        // just landed (git-info "Query re-issued on navigation").
+        self.git_info = GitInfo::none();
+        self.git_request = None;
     }
 
     /// Drop any selected names that no longer appear in `entries` — used
@@ -398,6 +420,8 @@ impl PanelState {
             last_error: self.last_error.clone(),
             selected: self.selected.clone(),
             quick_filter: self.quick_filter.clone(),
+            git_info: self.git_info.clone(),
+            git_request: self.git_request,
         }
     }
 
@@ -416,6 +440,8 @@ impl PanelState {
         self.last_error = data.last_error;
         self.selected = data.selected;
         self.quick_filter = data.quick_filter;
+        self.git_info = data.git_info;
+        self.git_request = data.git_request;
     }
 
     /// The full ordered tab list, with the active tab's live state
@@ -493,6 +519,8 @@ pub struct TabData {
     pub last_error: Option<String>,
     pub selected: HashSet<OsString>,
     pub quick_filter: Option<String>,
+    pub git_info: GitInfo,
+    pub git_request: Option<u64>,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single

@@ -12,6 +12,7 @@ use filecommand_core::drives;
 use filecommand_core::fs_ops::{
     CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
 };
+use filecommand_core::git_info;
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{list_dir_chunked, Entry, FsReader, StdFsReader};
 use filecommand_core::panel::parent_path;
@@ -41,6 +42,25 @@ pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sende
     std::thread::spawn(move || {
         let values = gather_info(&StdFsReader, &path);
         let _ = tx.send(Command::InfoResolved { panel, path, request, values });
+    });
+}
+
+/// Run `git_info::query` for `path` on its own dedicated worker thread —
+/// never the shared Info worker, since a slow status call on one panel
+/// must not head-of-line-block the other (design D3; git-info "Background
+/// repository detection"). The result — resolved branch/statuses, or
+/// `GitInfo::none()` for "outside any repository" — is reported back
+/// unconditionally; `core::update`'s generation-key guard
+/// (`PanelState::git_request`) is what decides whether a stale or
+/// timed-out reply actually gets applied. A worker-side timeout that
+/// abandons this thread before it finishes (leaving the uncancellable
+/// libgit2 call to run to completion in the background) is TUI wiring that
+/// lands with the git-info rendering/dialog work; this function itself
+/// never gives up early.
+pub fn spawn_git_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let info = git_info::query(&path);
+        let _ = tx.send(Command::GitInfoResolved { panel, path, request, info });
     });
 }
 

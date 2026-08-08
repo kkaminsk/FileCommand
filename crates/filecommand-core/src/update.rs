@@ -13,6 +13,7 @@ use crate::drives::{self, DriveSelect};
 use crate::external_editor::{self, EditorInvocation};
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
+use crate::git_info::GitInfo;
 use crate::info::InfoValues;
 use crate::listing::{Entry, EntryKind, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
@@ -184,17 +185,22 @@ impl State {
         } else {
             UiPhase::Panels
         };
-        let state = State {
+        let mut state = State {
             left: PanelState::new(left_cwd.clone()),
             right: PanelState::new(right_cwd.clone()),
             phase,
             term_size,
             ..State::empty(theme)
         };
-        let effects = vec![
-            Effect::StartListing { panel: PanelSide::Left, path: left_cwd },
-            Effect::StartListing { panel: PanelSide::Right, path: right_cwd },
+        let mut effects = vec![
+            Effect::StartListing { panel: PanelSide::Left, path: left_cwd.clone() },
+            Effect::StartListing { panel: PanelSide::Right, path: right_cwd.clone() },
         ];
+        // Both panels start their git-info query alongside their first
+        // listing, exactly as a later navigation does (git-info "Background
+        // repository detection").
+        effects.push(git_info_query_effect(&mut state, PanelSide::Left, left_cwd));
+        effects.push(git_info_query_effect(&mut state, PanelSide::Right, right_cwd));
         (state, effects)
     }
 }
@@ -344,6 +350,15 @@ pub enum Command {
     JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
     DriveLabelResolved { target: PanelSide, letter: char, label: Option<String>, generation: u64 },
     InfoResolved { panel: PanelSide, path: PathBuf, request: u64, values: InfoValues },
+    /// Reply to `Effect::QueryGitInfo`: either a resolved repository's
+    /// branch and per-entry statuses, or `GitInfo::none()` for "outside any
+    /// repository" and for a timed-out query (git-info "Background
+    /// repository detection", "Silent absence on timeout and stale-result
+    /// discarding"). `request` is matched against
+    /// `PanelState::git_request` the same way `InfoResolved`'s `request` is
+    /// matched against `info_request`, so a reply for a directory/generation
+    /// the panel has since moved past is dropped.
+    GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo },
     /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
     /// (viewer: Instant open).
     ViewerOpened { path: PathBuf, file_len: u64 },
@@ -397,6 +412,14 @@ pub enum Effect {
     /// travels with the result so a reply from a since-superseded query can
     /// be told apart from the current one.
     QueryInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Run `git_info::query` for `path` on a dedicated worker thread —
+    /// never the shared Info worker, since a slow status call on one panel
+    /// must not head-of-line-block the other (design D3) — and report the
+    /// result back via `Command::GitInfoResolved`. `request` travels with
+    /// the result so a stale or timed-out reply can be told apart from the
+    /// query that's still current (git-info "Background repository
+    /// detection", "Pathspec-scoped status queries").
+    QueryGitInfo { panel: PanelSide, path: PathBuf, request: u64 },
     /// Open `path` for the F3 viewer: map/open it and report back its
     /// length via `Command::ViewerOpened`, or the failure via
     /// `Command::ViewerOpenFailed`. Cheap enough to run synchronously
@@ -458,6 +481,13 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             let p = state.panel_mut(panel);
             if p.display_mode == DisplayMode::Info && p.cwd == path && p.info_request == Some(request) {
                 p.info = values;
+            }
+            return (state, effects);
+        }
+        Command::GitInfoResolved { panel, path, request, info } => {
+            let p = state.panel_mut(panel);
+            if p.cwd == path && p.git_request == Some(request) {
+                p.git_info = info;
             }
             return (state, effects);
         }
@@ -1324,9 +1354,23 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
     if state.panel(side).display_mode == DisplayMode::Info {
         let request = state.next_request_id();
         state.panel_mut(side).info_request = Some(request);
-        effects.push(Effect::QueryInfo { panel: side, path, request });
+        effects.push(Effect::QueryInfo { panel: side, path: path.clone(), request });
     }
+    // Every navigation (and re-read) re-issues the git-info query for
+    // wherever the panel just landed, regardless of display mode — the
+    // branch suffix and marker column are independent of Info mode (git-info
+    // "Query re-issued on navigation").
+    effects.push(git_info_query_effect(state, side, path));
     effects
+}
+
+/// Mint a fresh generation id, record it as `side`'s outstanding git-info
+/// request, and build the effect that runs the query on a worker thread
+/// (git-info "Background repository detection"; design D3).
+fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> Effect {
+    let request = state.next_request_id();
+    state.panel_mut(side).git_request = Some(request);
+    Effect::QueryGitInfo { panel: side, path, request }
 }
 
 fn apply_listing_event(state: &mut State, cmd: Command) {

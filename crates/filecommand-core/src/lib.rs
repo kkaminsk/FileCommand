@@ -12,6 +12,7 @@ pub mod editor;
 pub mod external_editor;
 pub mod fs_ops;
 pub mod fuzzy;
+pub mod git_info;
 pub mod identity;
 pub mod info;
 pub mod listing;

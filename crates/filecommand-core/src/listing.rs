@@ -431,6 +431,76 @@ pub fn list_dir_chunked<F: FnMut(Vec<Entry>)>(
     Ok(total)
 }
 
+// ---------------------------------------------------------------------
+// Tree mode: lazy per-directory child reads (design D7)
+// ---------------------------------------------------------------------
+
+/// `path`'s immediate child directories only, sorted by name — used by Tree
+/// display mode to expand exactly one node at a time. A directory that has
+/// not been expanded is simply never passed to this function, so no
+/// up-front full-drive scan ever happens (additional-panel-modes "Tree
+/// lazy expansion"; design D7). Callers on `filecommand-tui` invoke this
+/// once per node expansion, never eagerly for the whole tree.
+pub fn list_child_dirs(reader: &dyn FsReader, path: &Path) -> io::Result<Vec<Entry>> {
+    let raw = reader.read_dir(path)?;
+    let mut dirs: Vec<Entry> = raw.into_iter().filter(|e| e.is_dir).map(Entry::from).collect();
+    dirs.sort_by(cmp_by_name);
+    Ok(dirs)
+}
+
+// ---------------------------------------------------------------------
+// Find-file (Alt+F7): recursive subtree name search (design D9)
+// ---------------------------------------------------------------------
+
+/// One matched entry from [`find_in_subtree`]: its location relative to the
+/// search root (never absolute, so results display correctly however deep
+/// the walk goes), and the matched entry itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindMatch {
+    /// Path from the search root to (and including) the matched entry,
+    /// e.g. `sub\deeper\name.txt` (find-file "Recursive subtree name
+    /// search").
+    pub relative_path: PathBuf,
+    pub entry: Entry,
+}
+
+/// Walk `root`'s subtree depth-first via `reader`, delivering every entry
+/// whose name contains `pattern` as a case-insensitive substring to
+/// `on_match` as it is found. Matching is performed against each entry's
+/// original name (via lossy display conversion, the same convention
+/// `PanelState::select_matching`/`wildcard_match` already use elsewhere in
+/// this crate), and non-Unicode names are matched and reported safely —
+/// the returned [`FindMatch::entry`] always carries the original
+/// `OsString`, so any later navigation never uses the display form
+/// (find-file "Non-Unicode names are matched and displayed safely"). A
+/// directory that fails to read partway through the walk (permission
+/// denied, since-vanished directory) is skipped rather than aborting the
+/// whole search. Every path traversed goes through `reader`, which for the
+/// real filesystem routes through [`to_long_path`], so long paths are
+/// handled correctly (design D9). This function performs the whole walk in
+/// one call; `filecommand-tui` runs it on a worker thread and streams
+/// `on_match` results back to the UI as they arrive so the walk never
+/// blocks the UI thread (find-file "Non-blocking search with static
+/// progress").
+pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, pattern: &str, mut on_match: F) {
+    let needle = pattern.to_lowercase();
+    // Relative sub-paths pending a read, root itself represented as "".
+    let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
+    while let Some(rel_dir) = stack.pop() {
+        let abs_dir = if rel_dir.as_os_str().is_empty() { root.to_path_buf() } else { root.join(&rel_dir) };
+        let Ok(raw_entries) = reader.read_dir(&abs_dir) else { continue };
+        for raw in raw_entries {
+            let rel_path = rel_dir.join(&raw.name);
+            if !needle.is_empty() && raw.name.to_string_lossy().to_lowercase().contains(&needle) {
+                on_match(FindMatch { relative_path: rel_path.clone(), entry: Entry::from(raw.clone()) });
+            }
+            if raw.is_dir {
+                stack.push(rel_path);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +613,146 @@ mod tests {
         assert_eq!(chunks, vec![3, 3, 3, 1]);
     }
 
+    // -----------------------------------------------------------------
+    // Tree lazy child reads and find-file subtree walk (task 15.8)
+    // -----------------------------------------------------------------
+
+    /// A reader whose answer depends on the directory asked for, so tests
+    /// can model a small multi-level tree without touching the real
+    /// filesystem.
+    struct TreeReader(std::collections::HashMap<PathBuf, Vec<RawDirEntry>>);
+
+    impl FsReader for TreeReader {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
+            self.0.get(path).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such fixture directory"))
+        }
+    }
+
+    fn raw_dir(name: &str) -> RawDirEntry {
+        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None }
+    }
+    fn raw_file(name: &str) -> RawDirEntry {
+        RawDirEntry { name: name.into(), is_dir: false, size: 0, modified: None }
+    }
+
+    #[test]
+    fn list_child_dirs_reads_only_the_requested_directory_and_only_dirs() {
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_dir("sub_a"), raw_file("readme.txt"), raw_dir("sub_b")]);
+        // A deeper directory exists in the fixture but must never be read
+        // by this call — expanding "/root" must not touch its children.
+        fixture.insert(PathBuf::from("/root/sub_a"), vec![raw_dir("deeper")]);
+        let reader = TreeReader(fixture);
+
+        let children = list_child_dirs(&reader, Path::new("/root")).unwrap();
+        let names: Vec<String> = children.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["sub_a", "sub_b"], "only directories, sorted by name, no-up-front deeper read");
+        assert!(children.iter().all(|e| e.kind == EntryKind::Directory));
+    }
+
+    #[test]
+    fn list_child_dirs_on_an_unexpanded_node_is_simply_never_called() {
+        // Tree lazy expansion means an unexpanded directory shows no
+        // children because `filecommand-tui` never calls `list_child_dirs`
+        // for it in the first place — there is nothing for `listing` to
+        // assert here beyond `list_child_dirs` itself doing exactly one
+        // directory's worth of I/O per call, which the test above already
+        // covers (additional-panel-modes "Unexpanded directory shows no
+        // children").
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_dir("sub")]);
+        let reader = TreeReader(fixture);
+        let root_children = list_child_dirs(&reader, Path::new("/root")).unwrap();
+        assert_eq!(root_children.len(), 1);
+        // "/root/sub" was deliberately never inserted into the fixture, so
+        // a premature read attempt would fail loudly rather than silently
+        // succeeding with wrong data.
+    }
+
+    #[test]
+    fn find_in_subtree_matches_nested_entries_with_relative_locations() {
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_dir("sub"), raw_file("report.txt")]);
+        fixture.insert(PathBuf::from("/root/sub"), vec![raw_dir("deeper"), raw_file("report_copy.txt")]);
+        fixture.insert(PathBuf::from("/root/sub/deeper"), vec![raw_file("final_report.txt"), raw_file("unrelated.md")]);
+        let reader = TreeReader(fixture);
+
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "report", |m| matches.push(m));
+        matches.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+        let paths: Vec<PathBuf> = matches.iter().map(|m| m.relative_path.clone()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("report.txt"),
+                PathBuf::from("sub").join("deeper").join("final_report.txt"),
+                PathBuf::from("sub").join("report_copy.txt"),
+            ]
+        );
+        assert!(!paths.contains(&PathBuf::from("sub").join("deeper").join("unrelated.md")));
+    }
+
+    #[test]
+    fn find_in_subtree_matches_are_case_insensitive_and_use_the_original_name() {
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_file("ReadMe.MD")]);
+        let reader = TreeReader(fixture);
+
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "readme", |m| matches.push(m));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.name, OsString::from("ReadMe.MD"), "the returned entry must keep the original OsString name");
+    }
+
+    #[test]
+    fn find_in_subtree_no_matches_yields_an_empty_result() {
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_file("a.txt"), raw_dir("sub")]);
+        fixture.insert(PathBuf::from("/root/sub"), vec![raw_file("b.txt")]);
+        let reader = TreeReader(fixture);
+
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "nonexistent-pattern", |m| matches.push(m));
+        assert!(matches.is_empty());
+    }
+
+    #[test]
+    fn find_in_subtree_skips_an_unreadable_directory_without_aborting_the_walk() {
+        let mut fixture = std::collections::HashMap::new();
+        // "/root/broken" is a directory entry but deliberately has no
+        // fixture data of its own, so `TreeReader::read_dir` fails for it —
+        // the walk must skip past that failure and keep going rather than
+        // losing the rest of the subtree.
+        fixture.insert(PathBuf::from("/root"), vec![raw_dir("broken"), raw_dir("ok")]);
+        fixture.insert(PathBuf::from("/root/ok"), vec![raw_file("target_match.txt")]);
+        let reader = TreeReader(fixture);
+
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "target", |m| matches.push(m));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].relative_path, PathBuf::from("ok").join("target_match.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_in_subtree_matches_non_unicode_names_via_lossy_substring() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut fixture = std::collections::HashMap::new();
+        // "fo\x80report" — an invalid UTF-8 byte sits before an otherwise
+        // matchable ASCII substring.
+        let mut raw_name = vec![0x66, 0x6f, 0x80];
+        raw_name.extend_from_slice(b"report.txt");
+        let name = std::ffi::OsStr::from_bytes(&raw_name).to_os_string();
+        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None }]);
+        let reader = TreeReader(fixture);
+
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "report", |m| matches.push(m));
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].entry.name, name, "matching must not corrupt the original OsString even though it went through lossy conversion");
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -584,6 +794,41 @@ mod tests {
                 let grouped = format_count(n);
                 let digits_only: String = grouped.chars().filter(|c| *c != ',').collect();
                 prop_assert_eq!(digits_only, n.to_string());
+            }
+
+            /// The new M5 fs paths (Tree's per-level `list_child_dirs`
+            /// expansion, the editor's load/save path, find-file's
+            /// subtree walk) all reach the filesystem through repeated
+            /// `Path::join` before a single `to_long_path` call, mirroring
+            /// how `find_in_subtree`'s stack-based walk and Tree's
+            /// node-by-node expansion build up a path one segment at a
+            /// time. Arbitrarily deep joining must stay correctly
+            /// `\\?\`-prefixed and must not lose or reorder segments.
+            #[test]
+            fn to_long_path_handles_arbitrarily_deep_joins(segments in prop::collection::vec("[a-zA-Z0-9_]{1,8}", 1..6)) {
+                #[cfg(windows)]
+                {
+                    let mut joined = PathBuf::from(r"C:\");
+                    for seg in &segments {
+                        joined = joined.join(seg);
+                    }
+                    let long = to_long_path(&joined);
+                    let shown = long.to_string_lossy();
+                    prop_assert!(shown.starts_with(r"\\?\"));
+                    let suffix = segments.join(r"\");
+                    prop_assert!(shown.ends_with(&suffix));
+                    // Idempotent even after the deep join, same as the
+                    // single-level case.
+                    prop_assert_eq!(to_long_path(&long), long);
+                }
+                #[cfg(not(windows))]
+                {
+                    let mut joined = PathBuf::from("/");
+                    for seg in &segments {
+                        joined = joined.join(seg);
+                    }
+                    prop_assert_eq!(to_long_path(&joined), joined);
+                }
             }
         }
     }

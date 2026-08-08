@@ -21,6 +21,15 @@ fn dir_entry(name: &str) -> Entry {
     Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
 }
 
+/// Every navigation/re-read now also issues `Effect::QueryGitInfo`
+/// alongside `Effect::StartListing` (git-info "Query re-issued on
+/// navigation"). Tests that predate git-info and only care about the
+/// listing-related effects filter it out with this helper rather than
+/// asserting on request ids that are incidental to what they're testing.
+fn without_git_info_effects(effects: Vec<Effect>) -> Vec<Effect> {
+    effects.into_iter().filter(|e| !matches!(e, Effect::QueryGitInfo { .. })).collect()
+}
+
 // ---------------------------------------------------------------------
 // M1/M2 regression coverage
 // ---------------------------------------------------------------------
@@ -40,7 +49,7 @@ fn directory_read_returns_intent_effect_without_io() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
     // The panel's own entries were reset locally — no filesystem was touched.
     assert!(state.left.entries.is_empty());
     assert!(matches!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }));
@@ -75,7 +84,7 @@ fn enter_on_parent_dir_navigates_up_and_resets_cursor() {
     state.left.entries = vec![Entry::parent_dir()];
     state.left.cursor = 0;
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
     assert_eq!(state.left.cursor, 0);
 }
 
@@ -150,7 +159,7 @@ fn initial_builds_start_listing_effects_for_both_panels() {
     let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
     assert_eq!(
-        effects,
+        without_git_info_effects(effects),
         vec![
             Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/l") },
             Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/r") },
@@ -386,7 +395,7 @@ fn job_done_with_no_skips_rereads_matching_panels_and_returns_to_panels() {
     );
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(
-        effects,
+        without_git_info_effects(effects),
         vec![
             Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
             Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
@@ -409,7 +418,7 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
         Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
     );
     assert_eq!(state.phase, UiPhase::FileOpSummary(skipped));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
 
     let (state, _) = update(state, Command::FileOpConfirm);
     assert_eq!(state.phase, UiPhase::Panels);
@@ -432,7 +441,7 @@ fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
             dest_dir: PathBuf::from("/somewhere/else"),
         },
     );
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
 }
 
 #[test]
@@ -465,7 +474,7 @@ fn reread_reissues_start_listing_and_clears_the_error() {
     state.left.last_error = Some("boom".to_string());
     state.left.cwd = PathBuf::from("/left");
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
     assert!(state.left.last_error.is_none());
 }
 
@@ -719,7 +728,7 @@ fn enter_with_an_empty_buffer_still_navigates() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (_, effects) = update(state, Command::Enter);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
 }
 
 #[test]
@@ -865,7 +874,7 @@ fn reread_preserves_the_sort_mode() {
     state.left.sort_mode = SortMode::Size;
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
     assert_eq!(state.left.sort_mode, SortMode::Size);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
     assert!(state.left.entries.is_empty(), "a re-read discards the current entries and streams fresh ones");
     assert!(state.left.progress.is_streaming());
 }
@@ -1155,7 +1164,7 @@ fn selecting_a_drive_switches_the_target_panel_to_its_root() {
     let (state, effects) = update(state, Command::DriveSelectConfirm);
     assert!(state.drive_select.is_none(), "confirming closes the dialog");
     assert_eq!(state.right.cwd, PathBuf::from(r"D:\"));
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"D:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"D:\") }]);
 }
 
 #[test]
@@ -1165,7 +1174,7 @@ fn selecting_an_unavailable_drive_surfaces_the_panel_error_state() {
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['A'] },
     );
     let (state, effects) = update(state, Command::DriveSelectConfirm);
-    assert_eq!(effects, vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"A:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"A:\") }]);
     // The worker's read fails and comes back as a normal listing failure —
     // no dedicated hang-prone path.
     let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "device not ready".into() });
@@ -1668,4 +1677,130 @@ fn a_subsequently_successful_f4_launch_clears_a_stale_last_error_from_an_earlier
         "successfully dispatching the F4 editor spawn must clear a stale error from an earlier failed attempt"
     );
     assert!(matches!(effects.as_slice(), [Effect::RunExternalEditor(_, PanelSide::Left)]));
+}
+
+// ---------------------------------------------------------------------
+// M5: git_info — generation-key staleness guard (design D3; git-info
+// "Query re-issued on navigation", "Silent absence on timeout and
+// stale-result discarding")
+// ---------------------------------------------------------------------
+
+#[test]
+fn initial_state_issues_a_git_info_query_for_each_panel() {
+    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
+    let left_request = state.left.git_request.expect("left panel mints a git-info request on startup");
+    let right_request = state.right.git_request.expect("right panel mints a git-info request on startup");
+    assert_ne!(left_request, right_request);
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/l"), request: left_request }));
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Right, path: PathBuf::from("/r"), request: right_request }));
+}
+
+#[test]
+fn navigating_reissues_the_git_info_query_and_clears_the_previous_directorys_info() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    state.left.git_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "the previous directory's git info is cleared, not carried over");
+    let request = state.left.git_request.expect("navigating mints a fresh git-info request");
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/left/sub"), request }));
+}
+
+#[test]
+fn a_reread_mints_a_fresh_git_info_request_even_for_the_same_path() {
+    let state = test_state(UiPhase::Panels);
+    let first_request = state.left.git_request;
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second_request = state.left.git_request.expect("re-reading mints a request id");
+    assert_ne!(Some(second_request), first_request);
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: PathBuf::from("/left"), request: second_request }));
+}
+
+#[test]
+fn a_resolved_git_info_result_is_applied_in_place() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let request = state.left.git_request.unwrap();
+    let info = crate::git_info::GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([(OsString::from("a.txt"), crate::git_info::FileStatus::Modified)]),
+    };
+    let (state, effects) =
+        update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, info: info.clone() });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.git_info, info);
+}
+
+#[test]
+fn a_git_info_result_for_a_directory_the_panel_left_is_discarded() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let request = state.left.git_request.unwrap();
+    let info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, _) = update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), request, info });
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "a result for another directory is dropped");
+}
+
+#[test]
+fn a_stale_git_info_result_from_an_out_of_order_reread_is_discarded_but_the_fresher_one_applies() {
+    // Mirrors `a_stale_info_result_from_an_out_of_order_reread_is_discarded_but_the_fresher_one_applies`:
+    // two RereadPanel commands for the same path mint two different
+    // request ids, so `path` equality alone can't tell the stale reply
+    // apart from the current one — this is also how a timed-out query's
+    // late reply is safely dropped (git-info "Silent absence on timeout
+    // and stale-result discarding").
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let first_request = state.left.git_request.unwrap();
+
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second_request = state.left.git_request.unwrap();
+    assert_ne!(first_request, second_request, "re-reading mints a fresh request id even for the same path");
+
+    let stale_info = crate::git_info::GitInfo { branch: Some("stale-branch".to_string()), ..Default::default() };
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: first_request, info: stale_info },
+    );
+    assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "the stale (first-request) answer is dropped");
+
+    let fresh_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved {
+            panel: PanelSide::Left,
+            path: PathBuf::from("/left"),
+            request: second_request,
+            info: fresh_info.clone(),
+        },
+    );
+    assert_eq!(state.left.git_info, fresh_info, "the current request's answer applies");
+}
+
+#[test]
+fn a_timed_out_query_answered_late_with_no_info_is_silently_dropped_once_superseded() {
+    // A worker-thread timeout is, from the reducer's point of view, just
+    // another reply — it degrades to `GitInfo::none()` — so it goes
+    // through the exact same generation-key guard as any other late
+    // reply: once a fresher request is outstanding, the timed-out query's
+    // eventual answer (of any content) must not clobber it.
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let timed_out_request = state.left.git_request.unwrap();
+
+    let (mut state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let current_request = state.left.git_request.unwrap();
+    state.left.git_info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
+
+    let (state, _) = update(
+        state,
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: timed_out_request, info: GitInfo::none() },
+    );
+    assert_eq!(
+        state.left.git_info.branch.as_deref(),
+        Some("main"),
+        "the timed-out query's late reply must not overwrite the current request's already-applied result"
+    );
+    let _ = current_request;
 }

@@ -305,6 +305,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
+            Effect::QueryGitInfo { panel, path, request } => worker::spawn_git_info_query(panel, path, request, rt.tx.clone()),
             Effect::OpenViewer { path } => match ByteSource::open(&path) {
                 Ok(source) => {
                     // O(1): opening/mapping touches only the handle and its
