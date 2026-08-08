@@ -111,6 +111,21 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
     });
 }
 
+/// Read `path`'s immediate child directories for Tree-mode expansion
+/// (`listing::list_child_dirs`) on a worker thread, reporting them back via
+/// `Command::TreeNodeExpanded`. A read failure (permission denied, a
+/// since-vanished directory) reports an empty child list rather than
+/// aborting — `core::update`'s `TreeState::insert_children` still marks the
+/// node expanded, so a broken node simply shows no children instead of
+/// leaving the query outstanding forever (additional-panel-modes "Children
+/// read on expand"; design D7).
+pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+    std::thread::spawn(move || {
+        let children = filecommand_core::listing::list_child_dirs(&StdFsReader, &path).unwrap_or_default();
+        let _ = tx.send(Command::TreeNodeExpanded { panel, path, children });
+    });
+}
+
 pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let mut total = 0usize;

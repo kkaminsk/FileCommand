@@ -12,10 +12,11 @@ use ratatui::Terminal;
 
 use filecommand_core::drives::DriveSelect;
 use filecommand_core::editor::EditorState;
+use filecommand_core::git_info::{FileStatus, GitInfo};
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
 use filecommand_core::menu::{MenuId, MenuState};
-use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection};
+use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
 use filecommand_core::{PanelSide, State, UiPhase};
@@ -652,4 +653,163 @@ fn snapshot_tab_strip_scrolled_with_overflow_markers() {
     let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(strip_row.contains('\u{25C4}') || strip_row.contains('\u{25BA}'), "`{strip_row}`");
     insta::assert_snapshot!("tab_strip_scrolled_with_markers", strip_row);
+}
+
+// ---------------------------------------------------------------------
+// M5: Brief, Tree, Quick View panel modes; git branch suffix + marker
+// column (additional-panel-modes; git-info)
+// ---------------------------------------------------------------------
+
+#[test]
+fn snapshot_brief_mode_three_name_columns() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut panel = complete_panel(r"C:\Users\demo\left", 0);
+    panel.display_mode = DisplayMode::Brief;
+    panel.entries = std::iter::once(Entry::parent_dir())
+        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None }))
+        .collect();
+    state.left = panel;
+    // A short panel (6 body rows, after the command line and F-key bar
+    // reserve their own rows) so the 9 entries visibly wrap into a second
+    // column rather than all fitting in one (additional-panel-modes "Brief
+    // mode renders three name-only columns").
+    let l = filecommand_tui::layout::compute((80, 10));
+    let text = render_to_text(80, 10, &state, ColorDepth::Ansi16);
+    let first_body_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(!first_body_row.contains("Size"), "Brief mode has no Size/Date/Time header: `{first_body_row}`");
+    assert!(first_body_row.contains("\u{25B6}UP--DIR\u{25C4}"), "`{first_body_row}`");
+    assert!(first_body_row.contains("f5.txt"), "the 7th entry wraps into the second column, on the same row: `{first_body_row}`");
+    insta::assert_snapshot!("brief_mode_three_columns", text);
+}
+
+fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
+    let mut panel = complete_panel(r"C:\Users\demo\left", 0);
+    let mut tree = TreeState::new(PathBuf::from(r"C:\"), prior_mode);
+    tree.insert_children(
+        &PathBuf::from(r"C:\"),
+        vec![
+            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None },
+            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None },
+        ],
+    );
+    tree.cursor = cursor;
+    panel.display_mode = DisplayMode::Tree;
+    panel.tree = Some(tree);
+    panel
+}
+
+#[test]
+fn snapshot_tree_mode_header_root_and_branch_glyphs() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = tree_panel(DisplayMode::Full, 2); // highlight "Beta"
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let l = filecommand_tui::layout::compute((80, 24));
+
+    let header_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
+    assert!(header_row.contains("Tree"), "`{header_row}`");
+
+    let root_row = left_half(text.lines().nth(2).unwrap(), l.left.width as usize);
+    assert!(root_row.contains(r"C:\"), "`{root_row}`");
+
+    assert!(text.contains("ALPHA"), "{text}");
+    assert!(text.contains("BETA"), "{text}");
+    assert!(text.contains('\u{251C}') || text.contains('\u{2514}'), "branch glyphs present:\n{text}");
+
+    let bottom_row = text.lines().nth(l.left.height as usize - 1).unwrap();
+    assert!(bottom_row.contains(r"C:\Beta"), "mini-status shows the highlighted directory's full path: `{bottom_row}`");
+    insta::assert_snapshot!("tree_mode_branches", text);
+}
+
+fn temp_quick_view_file(name: &str, contents: &[u8]) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("filecommand-tui-quickview-snapshot-{}-{}", std::process::id(), name));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("preview.txt");
+    std::fs::write(&path, contents).unwrap();
+    path
+}
+
+#[test]
+fn quick_view_previews_the_opposite_cursor_file() {
+    // Not an `insta` snapshot: the real on-disk temp directory the preview
+    // file lives in (needed so `ByteSource::open` resolves) bakes the
+    // machine-specific temp path into the right panel's title, which would
+    // make a full-screen snapshot non-deterministic across machines/users.
+    // The behavior itself — wrap-on text-head preview, mini-status name +
+    // size — is still fully exercised via direct assertions.
+    let file_path = temp_quick_view_file("text", b"Hello from quick view\nsecond line\n");
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 0);
+    left.display_mode = DisplayMode::QuickView;
+    state.left = left;
+
+    let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
+    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None }];
+    right.progress = ListingProgress::Complete { count: 1 };
+    right.cursor = 0;
+    state.right = right;
+
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    assert!(top.contains("Quick view"), "`{top}`");
+    assert!(text.contains("Hello from quick view"), "the previewed file's head is rendered like the viewer's text mode:\n{text}");
+    assert!(text.contains("second line"), "{text}");
+    let bottom_row = text.lines().nth(21).unwrap();
+    assert!(bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'), "mini-status shows the previewed file's name and size: `{bottom_row}`");
+}
+
+#[test]
+fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 0);
+    left.display_mode = DisplayMode::QuickView;
+    state.left = left;
+
+    let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
+    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None }];
+    right.progress = ListingProgress::Complete { count: 1 };
+    right.cursor = 0;
+    state.right = right;
+
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("\u{25B6}SUB-DIR\u{25C4}"), "{text}");
+    insta::assert_snapshot!("quick_view_sub_dir_indicator", text);
+}
+
+#[test]
+fn snapshot_git_branch_suffix_and_marker_column() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut left = complete_panel(r"C:\Users\demo\left", 1);
+    left.git_info = GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([
+            (std::ffi::OsString::from("Cargo.toml"), FileStatus::Modified),
+            (std::ffi::OsString::from("readme.txt"), FileStatus::Untracked),
+        ]),
+    };
+    state.left = left;
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+
+    let top = text.lines().next().unwrap();
+    assert!(top.contains("(main)"), "branch suffix on the active panel's top border: `{top}`");
+
+    // Rows: 0 = top border, 1 = header, 2 = "..", 3 = "docs", 4 =
+    // "Cargo.toml", 5 = "readme.txt" — the marker cell is the column
+    // immediately after the left frame vertical.
+    let marker_col: Vec<char> = text.lines().skip(2).take(4).map(|line| line.chars().nth(1).unwrap()).collect();
+    assert_eq!(marker_col, vec![' ', ' ', 'M', '?'], "blank/blank/modified/untracked markers: {marker_col:?}");
+    insta::assert_snapshot!("git_branch_suffix_and_marker_column", text);
+}
+
+#[test]
+fn snapshot_git_info_absent_reserves_no_marker_column() {
+    // Outside a repository (the default `GitInfo::none()`), the layout must
+    // be pixel-identical to the pre-git-info M1-M4 rendering — no reserved
+    // blank column (git-info "Single-reflow appearance with nothing
+    // reserved while pending").
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let with_no_git = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let plain = render_to_text(80, 24, &base_state(UiPhase::Panels, Theme::classic()), ColorDepth::Ansi16);
+    assert_eq!(with_no_git, plain);
+    assert!(!with_no_git.lines().next().unwrap().contains('('), "no branch suffix outside a repo");
 }

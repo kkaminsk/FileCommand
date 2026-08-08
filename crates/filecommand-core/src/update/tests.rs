@@ -2136,3 +2136,114 @@ fn a_failed_save_during_quit_aborts_the_quit_and_keeps_editing() {
     assert_eq!(e.save_error.as_deref(), Some("disk full"));
     assert!(!e.quit_confirm, "the confirm dialog itself closes so the user can see and act on the error");
 }
+
+// ---------------------------------------------------------------------
+// M5: Tree display mode (design D7; additional-panel-modes)
+// ---------------------------------------------------------------------
+
+fn dir_child(name: &str) -> Entry {
+    dir_entry(name)
+}
+
+#[test]
+fn entering_tree_mode_roots_at_the_drive_and_requests_the_root_children() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\Users\demo");
+    state.left.display_mode = DisplayMode::Info;
+    let (state, effects) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    assert_eq!(state.left.display_mode, DisplayMode::Tree);
+    let tree = state.left.tree.as_ref().expect("Tree mode populates tree state");
+    assert_eq!(tree.nodes.len(), 1);
+    assert_eq!(tree.nodes[0].path, PathBuf::from(r"C:\"));
+    assert_eq!(tree.prior_mode, DisplayMode::Info, "the pre-Tree display mode is recorded for Enter to restore");
+    assert!(effects.contains(&Effect::ExpandTreeNode { panel: PanelSide::Left, path: PathBuf::from(r"C:\") }));
+}
+
+#[test]
+fn tree_node_expanded_splices_children_into_the_matching_panels_tree() {
+    let mut state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let tree = state.left.tree.as_ref().unwrap();
+    assert_eq!(tree.nodes.len(), 3);
+    assert_eq!(tree.nodes[1].path, PathBuf::from(r"C:\alpha"));
+}
+
+#[test]
+fn a_tree_node_expanded_reply_for_the_other_panel_is_dropped() {
+    let mut state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    // The right panel never entered Tree mode, so it has no tree at all —
+    // a reply naming it must not panic or fabricate one.
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Right, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    assert!(state.right.tree.is_none());
+    assert_eq!(state.left.tree.as_ref().unwrap().nodes.len(), 1, "the left panel's tree is untouched by a reply addressed elsewhere");
+}
+
+#[test]
+fn moving_the_tree_cursor_relists_the_opposite_panel_at_the_highlighted_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let (state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert_eq!(state.left.tree.as_ref().unwrap().cursor, 1);
+    assert!(
+        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\alpha") }),
+        "the opposite (right) panel must be re-listed at the newly highlighted directory"
+    );
+    // Landing on "alpha" (not yet expanded) also requests its children.
+    assert!(!state.left.tree.as_ref().unwrap().nodes[1].expanded);
+}
+
+#[test]
+fn moving_onto_an_unexpanded_node_requests_its_children_but_not_an_already_expanded_one() {
+    let mut state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    let (state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(effects.contains(&Effect::ExpandTreeNode { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }));
+
+    // Expand it, then move away and back — no second expand request for an
+    // already-expanded node.
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha"), children: vec![] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Up(1)));
+    let (_state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::ExpandTreeNode { path, .. } if path == std::path::Path::new(r"C:\alpha"))),
+        "an already-expanded node must not be re-requested: {effects:?}"
+    );
+}
+
+#[test]
+fn enter_on_a_tree_node_restores_the_prior_mode_and_navigates_this_panel_there() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.display_mode = DisplayMode::Brief;
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha"), dir_child("beta")] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1))); // highlight "alpha"
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.display_mode, DisplayMode::Brief, "Enter restores the pre-Tree display mode");
+    assert!(state.left.tree.is_none(), "leaving Tree mode clears the tree state");
+    assert!(
+        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }),
+        "Enter navigates *this* panel to the highlighted directory, not the opposite one"
+    );
+}

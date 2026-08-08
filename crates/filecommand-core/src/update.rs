@@ -18,7 +18,7 @@ use crate::git_info::GitInfo;
 use crate::info::InfoValues;
 use crate::listing::{Entry, EntryKind, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
-use crate::panel::{CursorMove, DisplayMode, PanelState};
+use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
 use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
 use crate::viewer::ViewerState;
@@ -292,6 +292,21 @@ pub enum Command {
     /// Alt+1..9 (one-based).
     SwitchTab(usize),
 
+    // Tree display mode (§4.2), scoped to a panel side.
+    /// Enter Tree mode on `side`, recording its current display mode so
+    /// Enter can restore it, and kicking off the drive root's immediate-
+    /// children read (additional-panel-modes "No up-front full-drive
+    /// scan"; design D7).
+    EnterTreeMode(PanelSide),
+    /// Reply to `Effect::ExpandTreeNode`: `path`'s immediate child
+    /// directories (empty on a read failure — skipped rather than
+    /// aborting, matching `find_in_subtree`'s precedent). Applied only if
+    /// `path` still names a not-yet-expanded node in `panel`'s tree, so a
+    /// reply for a node the tree no longer has (a since-superseded Tree
+    /// session) is silently dropped (additional-panel-modes "Children read
+    /// on expand").
+    TreeNodeExpanded { panel: PanelSide, path: PathBuf, children: Vec<Entry> },
+
     // F9 menu overlay.
     MenuOpen,
     MenuClose,
@@ -493,6 +508,12 @@ pub enum Effect {
     /// query that's still current (git-info "Background repository
     /// detection", "Pathspec-scoped status queries").
     QueryGitInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Read `path`'s immediate child directories for Tree-mode expansion
+    /// (`listing::list_child_dirs`) on a worker thread, reporting them back
+    /// via `Command::TreeNodeExpanded` — one directory's worth of I/O per
+    /// call, never a recursive scan (additional-panel-modes "Children read
+    /// on expand"; design D7).
+    ExpandTreeNode { panel: PanelSide, path: PathBuf },
     /// Open `path` for the F3 viewer: map/open it and report back its
     /// length via `Command::ViewerOpened`, or the failure via
     /// `Command::ViewerOpenFailed`. Cheap enough to run synchronously
@@ -578,6 +599,12 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             return (state, effects);
         }
+        Command::TreeNodeExpanded { panel, path, children } => {
+            if let Some(tree) = state.panel_mut(panel).tree.as_mut() {
+                tree.insert_children(&path, children);
+            }
+            return (state, effects);
+        }
         _ => {}
     }
 
@@ -646,7 +673,14 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             _ => {}
         },
         UiPhase::Panels => match cmd {
-            Command::MoveCursor(m) => state.panel_mut(state.active).move_cursor(m),
+            Command::MoveCursor(m) => {
+                let side = state.active;
+                if state.panel(side).display_mode == DisplayMode::Tree {
+                    effects.extend(handle_tree_cursor_move(&mut state, side, m));
+                } else {
+                    state.panel_mut(side).move_cursor(m);
+                }
+            }
             Command::ToggleActivePanel => state.active = state.active.toggle(),
             Command::Enter => effects.extend(handle_enter(&mut state)),
             Command::ParentDir => {
@@ -723,6 +757,8 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::OpenTab => state.panel_mut(state.active).open_tab(),
             Command::CloseTab => state.panel_mut(state.active).close_tab(),
             Command::SwitchTab(n) => state.panel_mut(state.active).switch_tab(n),
+
+            Command::EnterTreeMode(side) => effects.extend(enter_tree_mode(&mut state, side)),
 
             Command::MenuOpen => state.menu = Some(MenuState::opened()),
             Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
@@ -1600,6 +1636,9 @@ fn handle_enter(state: &mut State) -> Vec<Effect> {
         return run_command_line(state);
     }
     let side = state.active;
+    if state.panel(side).display_mode == DisplayMode::Tree {
+        return handle_tree_enter(state, side);
+    }
     let Some(entry) = state.panel(side).selected() else { return vec![] };
     match entry.kind {
         EntryKind::File => {
@@ -1625,6 +1664,59 @@ fn handle_parent(state: &mut State, side: PanelSide) -> Vec<Effect> {
         Some(parent) => begin_listing(state, side, parent),
         None => vec![],
     }
+}
+
+// ---------------------------------------------------------------------
+// Tree display mode (M5, design D7)
+// ---------------------------------------------------------------------
+
+/// Enter Tree mode on `side`: record the panel's current display mode so
+/// Enter can restore it, root the tree at the panel's drive, and kick off
+/// the drive root's immediate-children read — the only I/O Tree mode
+/// performs up front (additional-panel-modes "No up-front full-drive
+/// scan").
+fn enter_tree_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let panel = state.panel(side);
+    let prior_mode = panel.display_mode;
+    let letter = drives::drive_letter_of(&panel.cwd).unwrap_or('C');
+    let root = drives::drive_root(letter);
+    let p = state.panel_mut(side);
+    p.display_mode = DisplayMode::Tree;
+    p.tree = Some(TreeState::new(root.clone(), prior_mode));
+    vec![Effect::ExpandTreeNode { panel: side, path: root }]
+}
+
+/// Move `side`'s tree cursor, then re-list the opposite panel at whatever
+/// directory is now highlighted (additional-panel-modes "Tree mode drives
+/// the opposite panel"), expanding the newly highlighted node if it hasn't
+/// been already (additional-panel-modes "Children read on expand").
+fn handle_tree_cursor_move(state: &mut State, side: PanelSide, m: CursorMove) -> Vec<Effect> {
+    let (target, needs_expand) = {
+        let Some(tree) = state.panel_mut(side).tree.as_mut() else { return vec![] };
+        tree.move_cursor(m);
+        let Some(node) = tree.selected() else { return vec![] };
+        (node.path.clone(), !node.expanded)
+    };
+    let mut effects = begin_listing(state, side.toggle(), target.clone());
+    if needs_expand {
+        effects.push(Effect::ExpandTreeNode { panel: side, path: target });
+    }
+    effects
+}
+
+/// Enter on a tree node: leave Tree mode, restoring the panel's prior
+/// display mode, and navigate this panel (not the opposite one) to the
+/// highlighted directory (additional-panel-modes "Enter returns to prior
+/// list mode at chosen directory").
+fn handle_tree_enter(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let Some(tree) = &state.panel(side).tree else { return vec![] };
+    let Some(node) = tree.selected() else { return vec![] };
+    let target = node.path.clone();
+    let prior_mode = tree.prior_mode;
+    let p = state.panel_mut(side);
+    p.tree = None;
+    p.display_mode = prior_mode;
+    begin_listing(state, side, target)
 }
 
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {

@@ -117,6 +117,13 @@ pub enum Role {
     PanelCursor,
     PanelSelected,
     PanelMinistatus,
+    /// The M5 git-info status-marker column's `M` (modified) glyph
+    /// (git-info "Per-file status marker column").
+    PanelGitModified,
+    /// The status-marker column's `?` (untracked) glyph.
+    PanelGitUntracked,
+    /// The status-marker column's `+` (staged) glyph.
+    PanelGitStaged,
     KeybarNumber,
     KeybarLabel,
     CommandLine,
@@ -169,6 +176,9 @@ pub const ALL_ROLES: &[Role] = &[
     Role::PanelCursor,
     Role::PanelSelected,
     Role::PanelMinistatus,
+    Role::PanelGitModified,
+    Role::PanelGitUntracked,
+    Role::PanelGitStaged,
     Role::KeybarNumber,
     Role::KeybarLabel,
     Role::CommandLine,
@@ -215,6 +225,9 @@ impl Role {
             Role::PanelCursor => "panel.cursor",
             Role::PanelSelected => "panel.selected",
             Role::PanelMinistatus => "panel.ministatus",
+            Role::PanelGitModified => "panel.git.modified",
+            Role::PanelGitUntracked => "panel.git.untracked",
+            Role::PanelGitStaged => "panel.git.staged",
             Role::KeybarNumber => "keybar.number",
             Role::KeybarLabel => "keybar.label",
             Role::CommandLine => "commandline",
@@ -343,6 +356,12 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(Cyan));
         set(Role::PanelSelected, A(BrightYellow), A(Blue));
         set(Role::PanelMinistatus, A(Cyan), A(Blue));
+        // Conventional git-status hues: red for a working-tree change,
+        // yellow for untracked, green for staged — distinct from every
+        // other panel role so the marker column reads at a glance.
+        set(Role::PanelGitModified, A(BrightRed), A(Blue));
+        set(Role::PanelGitUntracked, A(BrightYellow), A(Blue));
+        set(Role::PanelGitStaged, A(BrightGreen), A(Blue));
         set(Role::KeybarNumber, A(White), A(Black));
         set(Role::KeybarLabel, A(Black), A(Cyan));
         set(Role::CommandLine, A(White), A(Black));
@@ -392,6 +411,12 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(White));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(White), A(Black));
+        // Mono carries no hue meaning (same precedent as `MenuHotkey`
+        // above): all three marker glyphs read as ordinary bright text
+        // rather than color-coded status.
+        set(Role::PanelGitModified, A(BrightWhite), A(Black));
+        set(Role::PanelGitUntracked, A(BrightWhite), A(Black));
+        set(Role::PanelGitStaged, A(BrightWhite), A(Black));
         set(Role::KeybarNumber, A(White), A(Black));
         set(Role::KeybarLabel, A(Black), A(White));
         set(Role::CommandLine, A(White), A(Black));

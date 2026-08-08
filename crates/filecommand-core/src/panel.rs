@@ -34,6 +34,102 @@ pub enum DisplayMode {
     QuickView,
 }
 
+/// One row of a Tree-mode flattened directory tree: an already-visible
+/// directory node, its display depth, whether it has been expanded yet, and
+/// the pre-computed branch-glyph prefix drawn before its name (design D7;
+/// additional-panel-modes "Tree display mode structure and rendering").
+/// `prefix`/`continuation` are computed once at insertion time
+/// ([`TreeState::insert_children`]) rather than derived at render time, so
+/// rendering stays a straightforward per-row lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeNode {
+    pub path: PathBuf,
+    pub depth: usize,
+    pub expanded: bool,
+    /// The `│  `/`├─`/`└─` glyphs (in the cyan frame style) drawn
+    /// immediately before this row's name; empty for the drive-root row
+    /// (additional-panel-modes "Tree branch glyphs and indentation").
+    pub prefix: String,
+    /// The continuation guide inherited by this node's own children when
+    /// they are later spliced in — `prefix` with the trailing connector
+    /// swapped for either `│  ` (more siblings follow at this depth) or
+    /// `   ` (this was the last sibling).
+    continuation: String,
+}
+
+/// A panel's Tree-mode navigation state: the flattened, lazily-expanded
+/// node list plus the display mode to restore when Enter leaves Tree mode
+/// (additional-panel-modes "Tree lazy expansion", "Tree mode drives the
+/// opposite panel"; design D7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TreeState {
+    pub nodes: Vec<TreeNode>,
+    pub cursor: usize,
+    /// The display mode this panel was in before entering Tree mode
+    /// (additional-panel-modes "Enter returns to prior list mode at chosen
+    /// directory").
+    pub prior_mode: DisplayMode,
+}
+
+impl TreeState {
+    /// A freshly entered Tree session rooted at `root` (a drive root, e.g.
+    /// `C:\`), with `prior_mode` recorded so Enter can restore it. The root
+    /// itself is the only node until its children are expanded (additional-
+    /// panel-modes "No up-front full-drive scan").
+    pub fn new(root: PathBuf, prior_mode: DisplayMode) -> TreeState {
+        TreeState { nodes: vec![TreeNode { path: root, depth: 0, expanded: false, prefix: String::new(), continuation: String::new() }], cursor: 0, prior_mode }
+    }
+
+    /// The currently highlighted node, if any.
+    pub fn selected(&self) -> Option<&TreeNode> {
+        self.nodes.get(self.cursor)
+    }
+
+    /// Move the tree cursor exactly like [`PanelState::move_cursor`]'s
+    /// unfiltered path — clamped Up/Down/Home/End over the flat node list.
+    pub fn move_cursor(&mut self, m: CursorMove) {
+        if self.nodes.is_empty() {
+            self.cursor = 0;
+            return;
+        }
+        let last = self.nodes.len() - 1;
+        self.cursor = match m {
+            CursorMove::Up(n) => self.cursor.saturating_sub(n),
+            CursorMove::Down(n) => (self.cursor + n).min(last),
+            CursorMove::Home => 0,
+            CursorMove::End => last,
+        };
+    }
+
+    /// Insert `children` (already-sorted child directories, from
+    /// `listing::list_child_dirs`) beneath the first not-yet-expanded node
+    /// whose path is `path`, computing each new node's branch-glyph prefix
+    /// from its parent's continuation guide. A stale reply — `path` no
+    /// longer present, or already expanded — is a no-op, returning `false`
+    /// (additional-panel-modes "Children read on expand").
+    pub fn insert_children(&mut self, path: &Path, children: Vec<crate::listing::Entry>) -> bool {
+        let Some(idx) = self.nodes.iter().position(|n| n.path == path && !n.expanded) else { return false };
+        self.nodes[idx].expanded = true;
+        let parent_continuation = self.nodes[idx].continuation.clone();
+        let parent_path = self.nodes[idx].path.clone();
+        let depth = self.nodes[idx].depth + 1;
+        let last_i = children.len().saturating_sub(1);
+        let new_nodes: Vec<TreeNode> = children
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| {
+                let is_last = i == last_i;
+                let connector = if is_last { "\u{2514}\u{2500}" } else { "\u{251C}\u{2500}" };
+                let prefix = format!("{parent_continuation}{connector}");
+                let continuation = format!("{parent_continuation}{}", if is_last { "   " } else { "\u{2502}  " });
+                TreeNode { path: parent_path.join(&e.name), depth, expanded: false, prefix, continuation }
+            })
+            .collect();
+        self.nodes.splice(idx + 1..idx + 1, new_nodes);
+        true
+    }
+}
+
 /// Whether a listing is still streaming in from the worker thread, or done.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListingProgress {
@@ -122,6 +218,11 @@ pub struct PanelState {
     /// rather than clobbering a fresher one (git-info "Silent absence on
     /// timeout and stale-result discarding").
     pub git_request: Option<u64>,
+    /// Tree-mode navigation state, `Some` only while `display_mode ==
+    /// DisplayMode::Tree` — `None` the rest of the time, including before
+    /// Tree mode has ever been entered (additional-panel-modes "Tree mode
+    /// drives the opposite panel"; design D7).
+    pub tree: Option<TreeState>,
 }
 
 impl PanelState {
@@ -144,6 +245,7 @@ impl PanelState {
             active_tab_index: 0,
             git_info: GitInfo::none(),
             git_request: None,
+            tree: None,
         }
     }
 
@@ -422,6 +524,7 @@ impl PanelState {
             quick_filter: self.quick_filter.clone(),
             git_info: self.git_info.clone(),
             git_request: self.git_request,
+            tree: self.tree.clone(),
         }
     }
 
@@ -442,6 +545,7 @@ impl PanelState {
         self.quick_filter = data.quick_filter;
         self.git_info = data.git_info;
         self.git_request = data.git_request;
+        self.tree = data.tree;
     }
 
     /// The full ordered tab list, with the active tab's live state
@@ -533,6 +637,7 @@ pub struct TabData {
     pub quick_filter: Option<String>,
     pub git_info: GitInfo,
     pub git_request: Option<u64>,
+    pub tree: Option<TreeState>,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single
@@ -1349,6 +1454,106 @@ mod tests {
             assert_eq!(p.cwd, before, "out-of-range switch must leave the active tab unchanged");
             p.switch_tab(0);
             assert_eq!(p.cwd, before, "n == 0 must also be a no-op");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Tree display mode (task 15.8 / additional-panel-modes)
+    // -----------------------------------------------------------------
+
+    mod tree_tests {
+        use super::*;
+        use crate::listing::Entry as ListEntry;
+
+        fn dir_child(name: &str) -> ListEntry {
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+        }
+
+        #[test]
+        fn new_tree_starts_with_only_the_root_node() {
+            let tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            assert_eq!(tree.nodes.len(), 1);
+            assert_eq!(tree.nodes[0].path, PathBuf::from(r"C:\"));
+            assert_eq!(tree.nodes[0].depth, 0);
+            assert!(!tree.nodes[0].expanded);
+            assert_eq!(tree.cursor, 0);
+            assert_eq!(tree.prior_mode, DisplayMode::Full);
+        }
+
+        #[test]
+        fn insert_children_expands_the_named_node_and_splices_children_beneath_it() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            let ok = tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha"), dir_child("beta")]);
+            assert!(ok);
+            assert!(tree.nodes[0].expanded);
+            assert_eq!(tree.nodes.len(), 3);
+            assert_eq!(tree.nodes[1].path, PathBuf::from(r"C:\alpha"));
+            assert_eq!(tree.nodes[1].depth, 1);
+            assert_eq!(tree.nodes[2].path, PathBuf::from(r"C:\beta"));
+            // Not-last sibling gets the tee glyph, last sibling the corner.
+            assert_eq!(tree.nodes[1].prefix, "\u{251C}\u{2500}");
+            assert_eq!(tree.nodes[2].prefix, "\u{2514}\u{2500}");
+        }
+
+        #[test]
+        fn insert_children_on_a_grandchild_nests_the_prefix_under_its_parents_continuation() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha"), dir_child("beta")]);
+            // "alpha" (index 1) is not the last sibling, so its continuation
+            // guide carries a vertical bar down to its own children.
+            let ok = tree.insert_children(&PathBuf::from(r"C:\alpha"), vec![dir_child("inner")]);
+            assert!(ok);
+            let inner = tree.nodes.iter().find(|n| n.path == Path::new(r"C:\alpha\inner")).unwrap();
+            assert_eq!(inner.depth, 2);
+            assert_eq!(inner.prefix, "\u{2502}  \u{2514}\u{2500}");
+        }
+
+        #[test]
+        fn insert_children_no_up_front_scan_only_the_expanded_node_gains_children() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha"), dir_child("beta")]);
+            // "beta" (index 2) has not been expanded — it must show no
+            // children of its own (additional-panel-modes "Unexpanded
+            // directory shows no children").
+            assert!(!tree.nodes[2].expanded);
+            assert_eq!(tree.nodes.len(), 3, "no other node's children were fetched up front");
+        }
+
+        #[test]
+        fn insert_children_is_a_no_op_for_an_already_expanded_or_absent_node() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            assert!(tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha")]));
+            // Already expanded: a stale/duplicate reply must not double-insert.
+            let ok_again = tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha")]);
+            assert!(!ok_again);
+            assert_eq!(tree.nodes.len(), 2);
+            // Absent path: also a no-op.
+            assert!(!tree.insert_children(&PathBuf::from(r"C:\nowhere"), vec![dir_child("x")]));
+        }
+
+        #[test]
+        fn move_cursor_clamps_over_the_flat_node_list() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha"), dir_child("beta")]);
+            assert_eq!(tree.nodes.len(), 3);
+            tree.move_cursor(CursorMove::Down(1));
+            assert_eq!(tree.cursor, 1);
+            tree.move_cursor(CursorMove::Down(10));
+            assert_eq!(tree.cursor, 2, "clamped to the last node");
+            tree.move_cursor(CursorMove::Home);
+            assert_eq!(tree.cursor, 0);
+            tree.move_cursor(CursorMove::End);
+            assert_eq!(tree.cursor, 2);
+            tree.move_cursor(CursorMove::Up(100));
+            assert_eq!(tree.cursor, 0, "saturating, never underflows");
+        }
+
+        #[test]
+        fn selected_returns_the_node_under_the_cursor() {
+            let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha")]);
+            tree.move_cursor(CursorMove::Down(1));
+            assert_eq!(tree.selected().unwrap().path, PathBuf::from(r"C:\alpha"));
         }
     }
 }

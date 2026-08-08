@@ -70,8 +70,8 @@ pub fn render(
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height));
-            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left, identity_lines);
-            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right, identity_lines);
+            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left, identity_lines, &state.right);
+            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right, identity_lines, &state.left);
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
             // which is what "hides" it; closing the bar simply stops that
