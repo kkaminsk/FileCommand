@@ -3,6 +3,7 @@
 //! entries/dates/sizes, fixed identity lines, fixed terminal size) so
 //! output is deterministic across runs and locales.
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use ratatui::backend::TestBackend;
@@ -15,6 +16,7 @@ use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
 use filecommand_core::menu::{MenuId, MenuState};
 use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection};
 use filecommand_core::theme::{ColorDepth, Theme};
+use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
 use filecommand_core::{PanelSide, State, UiPhase};
 
 use filecommand_tui::views;
@@ -84,7 +86,22 @@ fn render_to_text(width: u16, height: u16, state: &State, depth: ColorDepth) -> 
     terminal
         .draw(|frame| {
             let area = frame.area();
-            views::render(frame.buffer_mut(), area, state, depth, &identity_lines, FIXED_CLOCK_TEXT);
+            views::render(frame.buffer_mut(), area, state, depth, &identity_lines, FIXED_CLOCK_TEXT, None);
+        })
+        .expect("draw into TestBackend");
+    buffer_to_text(terminal.backend().buffer())
+}
+
+/// Same as [`render_to_text`], but also threads through the F3 viewer's
+/// open byte window — needed only while `state.phase` is `UiPhase::Viewer`.
+fn render_viewer_to_text(width: u16, height: u16, state: &State, source: Option<&ByteSource>) -> String {
+    let identity_lines = pinned_identity_lines();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            views::render(frame.buffer_mut(), area, state, ColorDepth::Ansi16, &identity_lines, FIXED_CLOCK_TEXT, source);
         })
         .expect("draw into TestBackend");
     buffer_to_text(terminal.backend().buffer())
@@ -383,4 +400,76 @@ fn a_descending_sort_flips_the_arrow() {
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let header: String = text.lines().nth(1).unwrap().chars().take(40).collect();
     assert!(header.contains("Name\u{2191}"), "`{header}`");
+}
+
+// ---------------------------------------------------------------------
+// M4: F3 viewer
+// ---------------------------------------------------------------------
+
+fn temp_viewer_file(name: &str, contents: &[u8]) -> ByteSource {
+    let dir = std::env::temp_dir().join(format!("filecommand-tui-viewer-snapshot-{}-{}", std::process::id(), name));
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("file.bin");
+    let mut f = std::fs::File::create(&path).unwrap();
+    f.write_all(contents).unwrap();
+    f.flush().unwrap();
+    ByteSource::open(&path).unwrap()
+}
+
+fn viewer_state(filename: &str, source: &ByteSource, mode: ViewMode) -> State {
+    let mut viewer = ViewerState::new(PathBuf::from(filename), source.len());
+    viewer.mode = mode;
+    State { phase: UiPhase::Viewer(viewer), ..State::empty(Theme::classic()) }
+}
+
+#[test]
+fn snapshot_viewer_text_mode() {
+    let source = temp_viewer_file("text-mode", b"The quick brown fox\njumps over the lazy dog.\n");
+    let state = viewer_state("sample.txt", &source, ViewMode::Text);
+    let text = render_viewer_to_text(80, 24, &state, Some(&source));
+    insta::assert_snapshot!("viewer_text_mode", text);
+}
+
+#[test]
+fn snapshot_viewer_hex_mode() {
+    let source = temp_viewer_file("hex-mode", b"Hello, FileCommand! \x00\xff\x1b");
+    let state = viewer_state("sample.bin", &source, ViewMode::Hex);
+    let text = render_viewer_to_text(80, 24, &state, Some(&source));
+    insta::assert_snapshot!("viewer_hex_mode", text);
+}
+
+#[test]
+fn viewer_keybar_label_swaps_hex_and_ascii_by_mode() {
+    let source = temp_viewer_file("keybar-swap", b"data");
+
+    let text_state = viewer_state("sample.txt", &source, ViewMode::Text);
+    let text_row = render_viewer_to_text(80, 24, &text_state, Some(&source));
+    let last = text_row.lines().last().unwrap();
+    assert!(last.trim_end().starts_with("1Help 2Unwrap 4Hex 7Search 10Quit"), "`{last}`");
+    insta::assert_snapshot!("viewer_keybar_hex_label", last);
+
+    let hex_state = viewer_state("sample.bin", &source, ViewMode::Hex);
+    let hex_row = render_viewer_to_text(80, 24, &hex_state, Some(&source));
+    let last = hex_row.lines().last().unwrap();
+    assert!(last.trim_end().starts_with("1Help 2Unwrap 4ASCII 7Search 10Quit"), "`{last}`");
+    insta::assert_snapshot!("viewer_keybar_ascii_label", last);
+}
+
+#[test]
+fn snapshot_viewer_search_match_highlight() {
+    let source = temp_viewer_file("match-highlight", b"the quick brown fox jumps over the lazy dog\n");
+    let mut viewer = ViewerState::new(PathBuf::from("sample.txt"), source.len());
+    viewer.last_match = Some((4, 9)); // "quick"
+    let state = State { phase: UiPhase::Viewer(viewer), ..State::empty(Theme::classic()) };
+    let text = render_viewer_to_text(80, 24, &state, Some(&source));
+    insta::assert_snapshot!("viewer_search_match_highlight", text);
+}
+
+#[test]
+fn viewer_replaces_the_panels_full_screen() {
+    let source = temp_viewer_file("full-screen", b"content\n");
+    let state = viewer_state("sample.txt", &source, ViewMode::Text);
+    let text = render_viewer_to_text(80, 24, &state, Some(&source));
+    assert!(!text.contains('\u{2554}'), "no panel border while the viewer is open:\n{text}");
+    assert!(text.contains("sample.txt"), "the header shows the open file:\n{text}");
 }

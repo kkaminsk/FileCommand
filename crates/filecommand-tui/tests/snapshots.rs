@@ -72,7 +72,7 @@ const FIXED_CLOCK_TEXT: &str = "3:04 PM";
 fn render(state: &State, size: (u16, u16)) -> String {
     let area = Rect { x: 0, y: 0, width: size.0, height: size.1 };
     let mut buf = Buffer::empty(area);
-    views::render(&mut buf, area, state, ColorDepth::Ansi16, &fixed_identity(), FIXED_CLOCK_TEXT);
+    views::render(&mut buf, area, state, ColorDepth::Ansi16, &fixed_identity(), FIXED_CLOCK_TEXT, None);
     buffer_to_text(&buf, area)
 }
 

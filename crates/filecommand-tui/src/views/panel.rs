@@ -141,9 +141,15 @@ fn render_bottom_border(
     ministatus_style: ratatui::style::Style,
 ) {
     let w = area.width as usize;
-    let status_text = match panel.progress {
-        ListingProgress::Streaming { count } => reading_status(count),
-        ListingProgress::Complete { .. } => panel.selected().map(entry_status_line).unwrap_or_default(),
+    // An inline error (a failed listing, a failed F3/F4 dispatch — §7 "panel
+    // shows an inline error state") takes over the mini-status line until
+    // the next successful operation clears it (`begin_new_listing`).
+    let status_text = match &panel.last_error {
+        Some(message) => message.clone(),
+        None => match panel.progress {
+            ListingProgress::Streaming { count } => reading_status(count),
+            ListingProgress::Complete { .. } => panel.selected().map(entry_status_line).unwrap_or_default(),
+        },
     };
     let bottom_y = area.y + area.height - 1;
     let inner_w = w.saturating_sub(2);

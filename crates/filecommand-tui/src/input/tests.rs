@@ -445,3 +445,77 @@ fn entries_are_irrelevant_to_key_mapping() {
     state.left.entries = vec![Entry { name: "a.txt".into(), kind: EntryKind::File, size: 1, modified: None }];
     assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::CommandLineChar('d')));
 }
+
+// ---------------------------------------------------------------------
+// M4: F3 viewer / F4 external editor
+// ---------------------------------------------------------------------
+
+#[test]
+fn f3_opens_the_viewer_and_plain_f4_opens_the_external_editor() {
+    assert_eq!(map(plain(KeyCode::F(3)), &panels()), Some(Command::RequestViewer));
+    assert_eq!(map(plain(KeyCode::F(4)), &panels()), Some(Command::RequestExternalEditor));
+}
+
+#[test]
+fn ctrl_f4_still_means_sort_by_extension_not_the_external_editor() {
+    assert_eq!(map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()), Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension }));
+}
+
+#[test]
+fn the_viewer_phase_is_not_routed_through_the_panel_key_mapper() {
+    // `map_key` hands the viewer off to `map_viewer_key` (called directly by
+    // the event loop, since it needs I/O `map_key` cannot perform) rather
+    // than falling through to panel commands.
+    let src = filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100);
+    let state = state_with(UiPhase::Viewer(src));
+    assert_eq!(map(plain(KeyCode::F(5)), &state), None);
+}
+
+fn open_viewer(mode: filecommand_core::viewer::ViewMode) -> filecommand_core::viewer::ViewerState {
+    let mut v = filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 1000);
+    v.mode = mode;
+    v
+}
+
+#[test]
+fn viewer_f_keys_map_to_the_expected_commands() {
+    let v = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    assert_eq!(map_viewer_key(plain(KeyCode::F(2)), &v, 20), Some(ViewerInput::Cmd(Command::ViewerToggleWrap)));
+    assert_eq!(map_viewer_key(plain(KeyCode::F(4)), &v, 20), Some(ViewerInput::Cmd(Command::ViewerToggleMode)));
+    assert_eq!(map_viewer_key(plain(KeyCode::F(7)), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchStart)));
+    assert_eq!(map_viewer_key(plain(KeyCode::F(10)), &v, 20), Some(ViewerInput::Cmd(Command::ViewerClose)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Esc), &v, 20), Some(ViewerInput::Cmd(Command::ViewerClose)));
+}
+
+#[test]
+fn viewer_navigation_keys_map_to_scroll_deltas_sized_by_the_page() {
+    let v = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    assert_eq!(map_viewer_key(plain(KeyCode::Up), &v, 20), Some(ViewerInput::ScrollLines(-1)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Down), &v, 20), Some(ViewerInput::ScrollLines(1)));
+    assert_eq!(map_viewer_key(plain(KeyCode::PageUp), &v, 20), Some(ViewerInput::ScrollLines(-20)));
+    assert_eq!(map_viewer_key(plain(KeyCode::PageDown), &v, 20), Some(ViewerInput::ScrollLines(20)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Home), &v, 20), Some(ViewerInput::Home));
+    assert_eq!(map_viewer_key(plain(KeyCode::End), &v, 20), Some(ViewerInput::End));
+}
+
+#[test]
+fn viewer_left_right_scroll_only_in_unwrap_mode() {
+    let mut v = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    assert_eq!(map_viewer_key(plain(KeyCode::Right), &v, 20), Some(ViewerInput::ScrollCols(4)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Left), &v, 20), Some(ViewerInput::ScrollCols(-4)));
+    v.wrap = true;
+    assert_eq!(map_viewer_key(plain(KeyCode::Right), &v, 20), None, "wrap mode has no horizontal scroll");
+}
+
+#[test]
+fn viewer_search_prompt_owns_the_keyboard_while_open() {
+    let mut v = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    v.search_input = Some("ab".to_string());
+    // F-keys that would otherwise toggle mode/wrap are swallowed by the
+    // prompt, matching the command line / quick-search precedent.
+    assert_eq!(map_viewer_key(plain(KeyCode::F(4)), &v, 20), None);
+    assert_eq!(map_viewer_key(plain(KeyCode::Char('c')), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchChar('c'))));
+    assert_eq!(map_viewer_key(plain(KeyCode::Backspace), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchBackspace)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Enter), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchConfirm)));
+    assert_eq!(map_viewer_key(plain(KeyCode::Esc), &v, 20), Some(ViewerInput::Cmd(Command::ViewerSearchCancel)));
+}

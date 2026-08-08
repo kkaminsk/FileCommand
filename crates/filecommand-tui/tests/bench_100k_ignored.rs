@@ -74,7 +74,7 @@ fn bench_render_frame_with_100k_entries() {
     terminal
         .draw(|f| {
             let area = f.area();
-            views::render(f.buffer_mut(), area, &state, ColorDepth::Ansi16, &identity_lines, "3:04 PM");
+            views::render(f.buffer_mut(), area, &state, ColorDepth::Ansi16, &identity_lines, "3:04 PM", None);
         })
         .unwrap();
 
@@ -84,7 +84,7 @@ fn bench_render_frame_with_100k_entries() {
         terminal
         .draw(|f| {
             let area = f.area();
-            views::render(f.buffer_mut(), area, &state, ColorDepth::Ansi16, &identity_lines, "3:04 PM");
+            views::render(f.buffer_mut(), area, &state, ColorDepth::Ansi16, &identity_lines, "3:04 PM", None);
         })
         .unwrap();
     }

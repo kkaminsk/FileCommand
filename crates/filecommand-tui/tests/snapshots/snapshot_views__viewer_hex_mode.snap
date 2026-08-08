@@ -1,0 +1,28 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+expression: text
+---
+ sample.bin                                      Offset 00000000   Size 23   0% 
+00000000  48 65 6C 6C 6F 2C 20 46 69 6C 65 43 6F 6D 6D 61  Hello, FileComma     
+00000010  6E 64 21 20 00 FF 1B                             nd! ...              
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+1Help 2Unwrap 4ASCII 7Search 10Quit

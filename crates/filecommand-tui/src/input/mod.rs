@@ -14,6 +14,7 @@ use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
 use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
+use filecommand_core::viewer::ViewerState;
 use filecommand_core::{Command, PanelSide, State, UiPhase};
 
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
@@ -35,12 +36,72 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
         UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
         UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
         UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
+        // The viewer owns its own key routing (`map_viewer_key`), which
+        // needs I/O (a backward/forward line-start scan) that this pure
+        // mapper cannot perform — the event loop calls it directly instead
+        // of `map_key` while the viewer is open (viewer: Frame-less
+        // full-screen chrome — "Viewer owns focus while open").
+        UiPhase::Viewer(_) => None,
         _ => {
             if state.quick_search.is_some() {
                 return map_quick_search_key(key);
             }
             map_panel_key(key, state, page_size, keys)
         }
+    }
+}
+
+/// What a key means while the F3 viewer is open. Simple toggles/prompt edits
+/// map straight to a `Command`; navigation needs a byte-source-backed scan
+/// (design D1's "the caller computes via `crate::viewer::backward`" — down
+/// is the same shape via `crate::viewer::forward`), so it is expressed as a
+/// line/column delta the event loop resolves against the open `ByteSource`
+/// before issuing `Command::ViewerSetTop`/`ViewerSetHScroll`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewerInput {
+    Cmd(Command),
+    /// Move the top-of-screen anchor by this many lines (text mode) or rows
+    /// (hex mode); negative is upward.
+    ScrollLines(i64),
+    /// Move the horizontal scroll by this many display columns (unwrap text
+    /// mode only); negative is leftward.
+    ScrollCols(i64),
+    Home,
+    End,
+}
+
+const VIEWER_H_SCROLL_STEP: i64 = 4;
+
+/// Map a key while the viewer is open. `rows_visible` is the body's row
+/// count (from `views::viewer::body_rows`), used as the Page Up/Down step —
+/// the same "page size follows the layout" convention `map_panel_key` uses.
+pub fn map_viewer_key(key: KeyEvent, viewer: &ViewerState, rows_visible: usize) -> Option<ViewerInput> {
+    // The F7 search prompt owns the keyboard while it is open, exactly like
+    // the command line and quick-search do elsewhere.
+    if viewer.search_input.is_some() {
+        return match key.code {
+            KeyCode::Enter => Some(ViewerInput::Cmd(Command::ViewerSearchConfirm)),
+            KeyCode::Esc => Some(ViewerInput::Cmd(Command::ViewerSearchCancel)),
+            KeyCode::Backspace => Some(ViewerInput::Cmd(Command::ViewerSearchBackspace)),
+            KeyCode::Char(c) if is_plain(&key) => Some(ViewerInput::Cmd(Command::ViewerSearchChar(c))),
+            _ => None,
+        };
+    }
+    let rows = rows_visible.max(1) as i64;
+    match key.code {
+        KeyCode::F(2) => Some(ViewerInput::Cmd(Command::ViewerToggleWrap)),
+        KeyCode::F(4) => Some(ViewerInput::Cmd(Command::ViewerToggleMode)),
+        KeyCode::F(7) => Some(ViewerInput::Cmd(Command::ViewerSearchStart)),
+        KeyCode::F(10) | KeyCode::Esc => Some(ViewerInput::Cmd(Command::ViewerClose)),
+        KeyCode::Up => Some(ViewerInput::ScrollLines(-1)),
+        KeyCode::Down => Some(ViewerInput::ScrollLines(1)),
+        KeyCode::PageUp => Some(ViewerInput::ScrollLines(-rows)),
+        KeyCode::PageDown => Some(ViewerInput::ScrollLines(rows)),
+        KeyCode::Left if !viewer.wrap => Some(ViewerInput::ScrollCols(-VIEWER_H_SCROLL_STEP)),
+        KeyCode::Right if !viewer.wrap => Some(ViewerInput::ScrollCols(VIEWER_H_SCROLL_STEP)),
+        KeyCode::Home => Some(ViewerInput::Home),
+        KeyCode::End => Some(ViewerInput::End),
+        _ => None,
     }
 }
 
@@ -77,6 +138,8 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::F(1) if alt => Some(Command::OpenDriveSelect(PanelSide::Left)),
         KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
 
+        KeyCode::F(3) => Some(Command::RequestViewer),
+        KeyCode::F(4) => Some(Command::RequestExternalEditor),
         KeyCode::F(5) => Some(Command::RequestCopy),
         KeyCode::F(6) => Some(Command::RequestMove),
         KeyCode::F(7) => Some(Command::RequestMkdir),

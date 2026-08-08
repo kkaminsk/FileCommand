@@ -140,6 +140,15 @@ pub enum Role {
     SplashTitle,
     SplashVersion,
     SplashText,
+    /// The F3 viewer's (and, from M5, the editor's) header row: filename,
+    /// col/offset, size, and percent indicators (viewer: Frame-less
+    /// full-screen chrome).
+    ViewerHeader,
+    /// The viewer's text/hex body.
+    ViewerText,
+    /// A search hit's highlighted cells (viewer: F7 streaming search —
+    /// "Match becomes the top anchor and is highlighted").
+    ViewerMatch,
 }
 
 pub const ALL_ROLES: &[Role] = &[
@@ -177,6 +186,9 @@ pub const ALL_ROLES: &[Role] = &[
     Role::SplashTitle,
     Role::SplashVersion,
     Role::SplashText,
+    Role::ViewerHeader,
+    Role::ViewerText,
+    Role::ViewerMatch,
 ];
 
 impl Role {
@@ -218,6 +230,9 @@ impl Role {
             Role::SplashTitle => "splash.title",
             Role::SplashVersion => "splash.version",
             Role::SplashText => "splash.text",
+            Role::ViewerHeader => "viewer.header",
+            Role::ViewerText => "viewer.text",
+            Role::ViewerMatch => "viewer.match",
         }
     }
 }
@@ -341,6 +356,9 @@ impl Theme {
         set(Role::SplashTitle, A(BrightWhite), A(Blue));
         set(Role::SplashVersion, A(White), A(Blue));
         set(Role::SplashText, A(Cyan), A(Blue));
+        set(Role::ViewerHeader, A(Black), A(Cyan));
+        set(Role::ViewerText, A(White), A(Blue));
+        set(Role::ViewerMatch, A(Black), A(Cyan));
         Theme::build("nc-classic", m).expect("nc-classic role table is complete")
     }
 
@@ -389,6 +407,11 @@ impl Theme {
         set(Role::SplashTitle, A(BrightWhite), A(Black));
         set(Role::SplashVersion, A(White), A(Black));
         set(Role::SplashText, A(White), A(Black));
+        // Explicitly called out with the other headers/highlights that
+        // invert to black-on-white in mono (§4.11).
+        set(Role::ViewerHeader, A(Black), A(White));
+        set(Role::ViewerText, A(White), A(Black));
+        set(Role::ViewerMatch, A(Black), A(White));
         Theme::build("nc-mono", m).expect("nc-mono role table is complete")
     }
 

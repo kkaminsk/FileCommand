@@ -12,6 +12,7 @@
 pub mod backward;
 pub mod byte_source;
 pub mod decode;
+pub mod forward;
 pub mod hex;
 pub mod search;
 pub mod state;
