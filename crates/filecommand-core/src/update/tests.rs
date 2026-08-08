@@ -23,11 +23,13 @@ fn dir_entry(name: &str) -> Entry {
 
 /// Every navigation/re-read now also issues `Effect::QueryGitInfo`
 /// alongside `Effect::StartListing` (git-info "Query re-issued on
-/// navigation"). Tests that predate git-info and only care about the
-/// listing-related effects filter it out with this helper rather than
-/// asserting on request ids that are incidental to what they're testing.
+/// navigation"), and `Effect::PersistHistory` (fuzzy-jump "Navigation
+/// records history"; design D6). Tests that predate M5 and only care about
+/// the listing-related effects filter both out with this helper rather than
+/// asserting on request ids/frecency bookkeeping that are incidental to
+/// what they're testing.
 fn without_git_info_effects(effects: Vec<Effect>) -> Vec<Effect> {
-    effects.into_iter().filter(|e| !matches!(e, Effect::QueryGitInfo { .. })).collect()
+    effects.into_iter().filter(|e| !matches!(e, Effect::QueryGitInfo { .. } | Effect::PersistHistory(_))).collect()
 }
 
 // ---------------------------------------------------------------------
@@ -698,11 +700,11 @@ fn running_a_command_records_history_clears_the_buffer_and_persists() {
     assert_eq!(state.prompt(), format!("{}>", PathBuf::from(r"C:\NORTON").display()));
 
     match effects.as_slice() {
-        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(entries)] => {
+        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(file)] => {
             assert_eq!(inv.cwd, PathBuf::from(r"C:\NORTON"));
             assert_eq!(inv.args.last().unwrap(), "dir");
             assert_eq!(*side, PanelSide::Left, "the command ran in the active panel, so that panel is re-read");
-            assert_eq!(entries, &vec!["dir".to_string()]);
+            assert_eq!(file.commands, vec!["dir".to_string()]);
         }
         other => panic!("expected a shell command plus a history write, got {other:?}"),
     }
@@ -963,9 +965,9 @@ fn left_menu_sorts_the_left_panel_even_when_the_right_one_is_focused() {
     state.left.entries = vec![file_entry("b", 1), file_entry("a", 2)];
 
     let (state, _) = update(state, Command::MenuOpen); // Left menu
-    // Opens on Info; Down walks Name, Extension, Modif. time, Size
-    // (the separator is skipped, not counted).
-    let state = (0..4).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
+    // Opens on Brief; Down walks Full, Tree, Quick view, Info, then (the
+    // separator skipped, not counted) Name, Extension, Modif. time, Size.
+    let state = (0..8).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
     assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Size"));
     let (state, _) = update(state, Command::MenuActivate);
 
@@ -975,9 +977,11 @@ fn left_menu_sorts_the_left_panel_even_when_the_right_one_is_focused() {
 
 #[test]
 fn right_menu_targets_the_right_panel() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('r'));
+    // Opens on Brief; Down four times walks Full, Tree, Quick view, Info.
+    let state = (0..4).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
     let (state, effects) = update(state, Command::MenuActivate); // Info
     assert_eq!(state.right.display_mode, DisplayMode::Info);
     assert_eq!(state.left.display_mode, DisplayMode::Full);
@@ -2161,7 +2165,7 @@ fn entering_tree_mode_roots_at_the_drive_and_requests_the_root_children() {
 
 #[test]
 fn tree_node_expanded_splices_children_into_the_matching_panels_tree() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
     let (state, _) = update(
         state,
@@ -2174,7 +2178,7 @@ fn tree_node_expanded_splices_children_into_the_matching_panels_tree() {
 
 #[test]
 fn a_tree_node_expanded_reply_for_the_other_panel_is_dropped() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
     // The right panel never entered Tree mode, so it has no tree at all —
     // a reply naming it must not panic or fabricate one.
@@ -2188,7 +2192,7 @@ fn a_tree_node_expanded_reply_for_the_other_panel_is_dropped() {
 
 #[test]
 fn moving_the_tree_cursor_relists_the_opposite_panel_at_the_highlighted_directory() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
     let (state, _) = update(
         state,
@@ -2206,7 +2210,7 @@ fn moving_the_tree_cursor_relists_the_opposite_panel_at_the_highlighted_director
 
 #[test]
 fn moving_onto_an_unexpanded_node_requests_its_children_but_not_an_already_expanded_one() {
-    let mut state = test_state(UiPhase::Panels);
+    let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
     let (state, _) = update(
         state,
@@ -2246,4 +2250,333 @@ fn enter_on_a_tree_node_restores_the_prior_mode_and_navigates_this_panel_there()
         without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }),
         "Enter navigates *this* panel to the highlighted directory, not the opposite one"
     );
+}
+
+// ---------------------------------------------------------------------
+// M5: Brief/Full/Quick view display-mode switch (design D7)
+// ---------------------------------------------------------------------
+
+#[test]
+fn set_display_mode_switches_the_named_panel_and_clears_tree_state() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.tree = Some(crate::panel::TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full));
+    state.right.display_mode = DisplayMode::Tree;
+    let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Right, mode: DisplayMode::Brief });
+    assert_eq!(state.right.display_mode, DisplayMode::Brief);
+    assert!(state.right.tree.is_none());
+    assert_eq!(state.left.display_mode, DisplayMode::Full, "the other panel is untouched");
+}
+
+// ---------------------------------------------------------------------
+// M5: Ctrl+J fuzzy jump
+// ---------------------------------------------------------------------
+
+fn history_entry(path: &str, count: u32, ms: u64) -> crate::quicksearch::FrecencyEntry {
+    crate::quicksearch::FrecencyEntry { path: PathBuf::from(path), visit_count: count, last_visited_ms: ms }
+}
+
+#[test]
+fn fuzzy_jump_open_and_esc_close_without_navigating() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    assert!(state.fuzzy_jump.is_some());
+    let (state, effects) = update(state, Command::FuzzyJumpCancel);
+    assert!(state.fuzzy_jump.is_none());
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel is unchanged");
+}
+
+#[test]
+fn fuzzy_jump_typing_and_backspace_edit_the_pattern() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let (state, _) = update(state, Command::FuzzyJumpChar('d'));
+    let (state, _) = update(state, Command::FuzzyJumpChar('o'));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "do");
+    let (state, _) = update(state, Command::FuzzyJumpBackspace);
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "d");
+}
+
+#[test]
+fn fuzzy_jump_confirm_navigates_the_active_panel_to_the_highlighted_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.dir_history = vec![history_entry(r"C:\Low", 1, 0), history_entry(r"C:\High", 10, 0)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    // No pattern typed: the full frecency-ranked list shows, most frecent
+    // first, so the default (cursor 0) highlight is `C:\High`.
+    let (state, effects) = update(state, Command::FuzzyJumpConfirm);
+    assert!(state.fuzzy_jump.is_none(), "the dialog closes");
+    assert_eq!(state.right.cwd, PathBuf::from(r"C:\High"));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the opposite panel is unaffected");
+    assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Right, .. })));
+}
+
+#[test]
+fn fuzzy_jump_move_clamps_within_the_currently_filtered_list() {
+    let mut state = test_state(UiPhase::Panels);
+    state.dir_history = vec![history_entry(r"C:\A", 1, 0), history_entry(r"C:\B", 1, 0)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let (state, _) = update(state, Command::FuzzyJumpMove(-5));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 0);
+    let (state, _) = update(state, Command::FuzzyJumpMove(5));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
+}
+
+// ---------------------------------------------------------------------
+// M5: Alt+F7 find file
+// ---------------------------------------------------------------------
+
+fn find_match(rel: &str, name: &str) -> FindMatch {
+    FindMatch { relative_path: PathBuf::from(rel), entry: dir_entry_named(name) }
+}
+
+fn dir_entry_named(name: &str) -> Entry {
+    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None }
+}
+
+#[test]
+fn find_file_open_roots_at_the_active_panels_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    assert_eq!(state.find_file.as_ref().unwrap().root, PathBuf::from(r"C:\proj"));
+}
+
+#[test]
+fn find_file_submit_mints_a_request_and_dispatches_the_walk_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileChar('r'));
+    let (state, effects) = update(state, Command::FindFileSubmit);
+    match effects.as_slice() {
+        [Effect::FindInSubtree { root, pattern, request }] => {
+            assert_eq!(root, &PathBuf::from(r"C:\proj"));
+            assert_eq!(pattern, "r");
+            assert_eq!(state.find_file.as_ref().unwrap().request, Some(*request));
+        }
+        other => panic!("expected exactly one FindInSubtree effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn find_file_matches_from_a_superseded_request_are_dropped() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit); // request 1
+    let (state, _) = update(state, Command::FindFileMatch { request: 999, m: find_match("a.txt", "a.txt") });
+    assert!(state.find_file.as_ref().unwrap().results.is_empty(), "a stale-request match must be dropped");
+}
+
+#[test]
+fn find_file_confirm_navigates_in_place_and_seeds_the_cursor_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let (state, _) = update(state, Command::FindFileMatch { request, m: find_match(r"sub\report.txt", "report.txt") });
+    let (state, effects) = update(state, Command::FindFileConfirm);
+    assert!(state.find_file.is_none(), "the dialog closes");
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj\sub"), "navigates to the match's containing directory");
+    assert_eq!(state.left.pending_cursor_target, Some(OsString::from("report.txt")));
+    assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })));
+}
+
+#[test]
+fn find_file_confirm_with_a_root_level_match_navigates_to_the_root() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\proj");
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let (state, _) = update(state, Command::FindFileMatch { request, m: find_match("readme.txt", "readme.txt") });
+    let (state, _) = update(state, Command::FindFileConfirm);
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj"));
+}
+
+#[test]
+fn find_file_cancel_abandons_the_search_without_navigating() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let (state, effects) = update(state, Command::FindFileCancel);
+    assert!(state.find_file.is_none());
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+}
+
+#[test]
+fn listing_complete_settles_the_cursor_on_a_pending_find_file_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.pending_cursor_target = Some(OsString::from("b.txt"));
+    let (state, _) = update(
+        state,
+        Command::ListingChunk {
+            panel: PanelSide::Left,
+            entries: vec![dir_entry_named("a.txt"), dir_entry_named("b.txt"), dir_entry_named("c.txt")],
+        },
+    );
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 3 });
+    assert_eq!(state.left.cursor, 1);
+    assert!(state.left.pending_cursor_target.is_none(), "consumed once applied");
+}
+
+// ---------------------------------------------------------------------
+// M5: F2 user menu
+// ---------------------------------------------------------------------
+
+#[test]
+fn user_menu_confirm_dispatches_the_highlighted_commands_shell_passthrough() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\Projects\app");
+    state.user_menu_entries = vec![
+        crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() },
+        crate::config::UserMenuEntry { label: "Build".to_string(), command: "cargo build".to_string() },
+    ];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(1));
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none(), "the menu closes");
+    match effects.as_slice() {
+        [Effect::RunShellCommand(inv, side)] => {
+            assert_eq!(inv.cwd, PathBuf::from(r"C:\Projects\app"));
+            assert!(inv.args.iter().any(|a| a.contains("cargo build")), "{:?}", inv.args);
+            assert_eq!(*side, PanelSide::Right);
+        }
+        other => panic!("expected exactly one RunShellCommand effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn user_menu_esc_closes_without_running_anything() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, effects) = update(state, Command::UserMenuCancel);
+    assert!(state.user_menu.is_none());
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn user_menu_move_clamps_and_confirm_on_an_empty_menu_is_a_harmless_close() {
+    let state = test_state(UiPhase::Panels); // user_menu_entries is empty
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(5));
+    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 0);
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none());
+    assert!(effects.is_empty(), "nothing to run on an empty menu");
+}
+
+// ---------------------------------------------------------------------
+// M5: F1 Help window + About dialog
+// ---------------------------------------------------------------------
+
+#[test]
+fn help_opens_with_about_filecommand_highlighted_first() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let help = state.help.unwrap();
+    assert_eq!(help.cursor, 0);
+    assert_eq!(crate::dialogs::HELP_TOPICS[help.cursor], "About FileCommand");
+    assert!(help.page.is_none());
+    assert!(!help.about_open);
+}
+
+#[test]
+fn help_activate_on_about_opens_the_about_dialog_not_a_page() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpActivate);
+    assert!(state.help.as_ref().unwrap().about_open);
+    assert!(state.help.as_ref().unwrap().page.is_none());
+}
+
+#[test]
+fn help_activate_on_a_topic_opens_its_page() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(1)); // "Keyboard reference"
+    let (state, _) = update(state, Command::HelpActivate);
+    assert_eq!(state.help.as_ref().unwrap().page, Some(1));
+}
+
+#[test]
+fn help_cancel_returns_a_page_to_the_list_then_closes_the_window() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(1));
+    let (state, _) = update(state, Command::HelpActivate);
+    assert!(state.help.as_ref().unwrap().page.is_some());
+
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_some(), "Esc from a page returns to the list, not closing the window");
+    assert!(state.help.as_ref().unwrap().page.is_none());
+    assert_eq!(state.help.as_ref().unwrap().cursor, 1, "the highlight is preserved");
+
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_none(), "Esc from the list closes the window");
+}
+
+#[test]
+fn help_cancel_dismisses_about_back_to_the_list_with_about_still_highlighted() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpActivate); // opens About
+    let (state, _) = update(state, Command::HelpCancel);
+    assert!(state.help.is_some());
+    assert!(!state.help.as_ref().unwrap().about_open);
+    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+}
+
+#[test]
+fn help_move_does_not_walk_past_the_ends_of_the_topic_list() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::HelpMove(-5));
+    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+    let last = crate::dialogs::HELP_TOPICS.len() - 1;
+    let state = (0..20).fold(state, |s, _| update(s, Command::HelpMove(1)).0);
+    assert_eq!(state.help.as_ref().unwrap().cursor, last);
+}
+
+// ---------------------------------------------------------------------
+// M5: directory frecency recording + persistence (fuzzy-jump "Navigation
+// records history")
+// ---------------------------------------------------------------------
+
+#[test]
+fn navigating_into_a_directory_records_and_persists_frecency() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    state.clock_ms = 5_000;
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.dir_history, vec![history_entry("/left/sub", 1, 5_000)]);
+    assert!(effects.iter().any(|e| matches!(e, Effect::PersistHistory(file) if file.directories == state.dir_history)));
+}
+
+#[test]
+fn revisiting_a_directory_increments_its_frecency_entry_rather_than_duplicating() {
+    let mut state = test_state(UiPhase::Panels);
+    state.dir_history = vec![history_entry(r"C:\a", 1, 0)];
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left)); // /left, a fresh entry
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left)); // /left again
+    let count = state.dir_history.iter().find(|e| e.path.as_path() == Path::new("/left")).unwrap().visit_count;
+    assert_eq!(count, 2, "re-reading the same directory increments the same entry rather than adding a duplicate");
+}
+
+#[test]
+fn tree_cursor_preview_of_the_opposite_panel_does_not_record_frecency() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
+    let (state, _) = update(
+        state,
+        Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\"), children: vec![dir_child("alpha")] },
+    );
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert!(state.dir_history.is_empty(), "browsing the tree previews the opposite panel; it does not count as a visit");
 }

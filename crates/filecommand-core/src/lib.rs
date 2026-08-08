@@ -7,9 +7,11 @@
 
 pub mod clock;
 pub mod config;
+pub mod dialogs;
 pub mod drives;
 pub mod editor;
 pub mod external_editor;
+pub mod find_file;
 pub mod fs_ops;
 pub mod fuzzy;
 pub mod git_info;

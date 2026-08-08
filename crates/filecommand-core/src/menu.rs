@@ -7,6 +7,7 @@
 //! ([`crate::update`] turns a [`MenuAction`] back into a `Command`).
 
 use crate::listing::SortMode;
+use crate::panel::DisplayMode;
 use crate::PanelSide;
 
 /// The five menus, in bar order.
@@ -73,6 +74,11 @@ impl MenuId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     ToggleInfoMode,
+    /// Switch a panel's display mode directly (Brief/Full/Quick view). Tree
+    /// keeps its own `EnterTree` action since entering it also kicks off
+    /// the root's child-directory read (design D7).
+    SetDisplayMode(DisplayMode),
+    EnterTree,
     SortBy(SortMode),
     Reread,
     DriveSelect,
@@ -84,6 +90,8 @@ pub enum MenuAction {
     DeselectGroup,
     InvertSelection,
     PanelsOnOff,
+    FindFile,
+    FuzzyJump,
     Quit,
     /// Rendered as a real entry so the menu matches its final shape, but
     /// greyed out and unselectable until its milestone lands.
@@ -131,6 +139,10 @@ const fn item(label: &'static str, hotkey_index: usize, shortcut: &'static str, 
 /// The `Left`/`Right` menus mirror each other exactly; only the panel they
 /// act on differs, which [`MenuId::target_side`] resolves.
 const PANEL_MENU: &[MenuEntry] = &[
+    item("Brief", 0, "", MenuAction::SetDisplayMode(DisplayMode::Brief)),
+    item("Full", 0, "", MenuAction::SetDisplayMode(DisplayMode::Full)),
+    item("Tree", 0, "", MenuAction::EnterTree),
+    item("Quick view", 0, "", MenuAction::SetDisplayMode(DisplayMode::QuickView)),
     item("Info", 0, "Ctrl-L", MenuAction::ToggleInfoMode),
     MenuEntry::Separator,
     item("Name", 0, "Ctrl-F3", MenuAction::SortBy(SortMode::Name)),
@@ -164,12 +176,12 @@ const FILES_MENU: &[MenuEntry] = &[
 ];
 
 const COMMANDS_MENU: &[MenuEntry] = &[
-    item("Find file", 0, "Alt-F7", MenuAction::Unimplemented),
+    item("Find file", 0, "Alt-F7", MenuAction::FindFile),
     item("History", 0, "Alt-F8", MenuAction::Unimplemented),
     item("Swap panels", 0, "Ctrl-U", MenuAction::Unimplemented),
     item("Panels on/off", 0, "Ctrl-O", MenuAction::PanelsOnOff),
     item("Compare directories", 0, "", MenuAction::Unimplemented),
-    item("Fuzzy jump", 0, "Ctrl-J", MenuAction::Unimplemented),
+    item("Fuzzy jump", 0, "Ctrl-J", MenuAction::FuzzyJump),
     item("Menu file edit", 0, "", MenuAction::Unimplemented),
 ];
 
@@ -410,14 +422,42 @@ mod tests {
 
     #[test]
     fn not_yet_built_features_render_as_disabled_entries_not_omissions() {
-        let find_file = entries(MenuId::Commands)
+        let history = entries(MenuId::Commands)
             .iter()
             .find_map(|e| match e {
-                MenuEntry::Item(i) if i.label == "Find file" => Some(i),
+                MenuEntry::Item(i) if i.label == "History" => Some(i),
                 _ => None,
             })
-            .expect("Find file is present even though it is unimplemented");
-        assert!(!find_file.is_enabled());
+            .expect("History is present even though it is unimplemented");
+        assert!(!history.is_enabled());
+    }
+
+    #[test]
+    fn find_file_and_fuzzy_jump_are_enabled_m5_entries() {
+        for label in ["Find file", "Fuzzy jump"] {
+            let item = entries(MenuId::Commands)
+                .iter()
+                .find_map(|e| match e {
+                    MenuEntry::Item(i) if i.label == label => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("`{label}` missing from the Commands menu"));
+            assert!(item.is_enabled(), "`{label}` should be enabled now that M5 implements it");
+        }
+    }
+
+    #[test]
+    fn panel_menu_lists_the_display_mode_switches() {
+        let labels: Vec<&str> = entries(MenuId::Left)
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i.label),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        for expected in ["Brief", "Full", "Tree", "Quick view"] {
+            assert!(labels.contains(&expected), "panel menu missing `{expected}`");
+        }
     }
 
     #[test]

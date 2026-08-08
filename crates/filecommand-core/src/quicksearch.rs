@@ -86,6 +86,95 @@ pub fn rank_directories(history: &[FrecencyEntry], pattern: &str, now_ms: u64) -
     matches
 }
 
+// ---------------------------------------------------------------------
+// Ctrl+J fuzzy-jump dialog state
+// ---------------------------------------------------------------------
+
+/// The open Ctrl+J fuzzy-jump dialog: the typed pattern and the highlighted
+/// row. The ranked/filtered list itself is never stored here — it is
+/// recomputed on demand from `State::dir_history` via [`rank_directories`]
+/// so there is exactly one source of truth for "what the list currently
+/// shows" (fuzzy-jump "Fuzzy jump dialog invocation").
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FuzzyJumpState {
+    pub pattern: String,
+    pub cursor: usize,
+}
+
+impl FuzzyJumpState {
+    /// A freshly opened dialog: empty pattern, cursor on the top (most
+    /// frecent) entry.
+    pub fn new() -> FuzzyJumpState {
+        FuzzyJumpState::default()
+    }
+
+    /// Append `c` to the pattern. The cursor resets to the top of the
+    /// newly narrowed list, mirroring how a fresh search naturally starts
+    /// from the best match (fuzzy-jump "Typing narrows to subsequence
+    /// matches").
+    pub fn push(&mut self, c: char) {
+        self.pattern.push(c);
+        self.cursor = 0;
+    }
+
+    /// Backspace: shorten the pattern by one character and reset the
+    /// cursor, mirroring [`Self::push`] (fuzzy-jump "Backspace re-widens
+    /// the list").
+    pub fn backspace(&mut self) {
+        self.pattern.pop();
+        self.cursor = 0;
+    }
+
+    /// Move the highlighted row by `delta`, clamped to `[0, len)`. A no-op
+    /// on an empty list.
+    pub fn move_cursor(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+#[cfg(test)]
+mod fuzzy_jump_state_tests {
+    use super::*;
+
+    #[test]
+    fn typing_and_backspace_reset_the_cursor_to_the_top() {
+        let mut fj = FuzzyJumpState::new();
+        fj.cursor = 2;
+        fj.push('a');
+        assert_eq!(fj.pattern, "a");
+        assert_eq!(fj.cursor, 0);
+
+        fj.cursor = 3;
+        fj.backspace();
+        assert_eq!(fj.pattern, "");
+        assert_eq!(fj.cursor, 0);
+    }
+
+    #[test]
+    fn move_cursor_clamps_within_bounds() {
+        let mut fj = FuzzyJumpState::new();
+        fj.move_cursor(-5, 3);
+        assert_eq!(fj.cursor, 0);
+        fj.move_cursor(10, 3);
+        assert_eq!(fj.cursor, 2);
+        fj.move_cursor(-1, 3);
+        assert_eq!(fj.cursor, 1);
+    }
+
+    #[test]
+    fn move_cursor_on_an_empty_list_holds_at_zero() {
+        let mut fj = FuzzyJumpState::new();
+        fj.cursor = 0;
+        fj.move_cursor(1, 0);
+        assert_eq!(fj.cursor, 0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

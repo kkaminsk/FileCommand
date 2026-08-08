@@ -813,3 +813,163 @@ fn snapshot_git_info_absent_reserves_no_marker_column() {
     assert_eq!(with_no_git, plain);
     assert!(!with_no_git.lines().next().unwrap().contains('('), "no branch suffix outside a repo");
 }
+
+// ---------------------------------------------------------------------
+// M5: quick-filter/type-ahead mini-status, and the fuzzy-jump, find-file,
+// user-menu, and Help/About dialogs (§8; quick-filter, type-ahead-jump,
+// fuzzy-jump, find-file, user-menu, help-and-about)
+// ---------------------------------------------------------------------
+
+/// The active panel's mini-status row — its own bottom border, which for
+/// the standard 80x24 layout is screen row 21 (0-indexed): panels occupy
+/// rows 0..22 of the 24-row screen (`layout::compute` reserves the last 2
+/// for the command line + F-key bar).
+fn mini_status_row(text: &str) -> &str {
+    text.lines().nth(21).unwrap()
+}
+
+#[test]
+fn snapshot_quick_filter_mini_status_replaces_normal_content() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("rep".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("rep"), "`{row}`");
+    insta::assert_snapshot!("quick_filter_mini_status", row);
+}
+
+#[test]
+fn snapshot_type_ahead_mini_status_replaces_normal_content() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.quick_search = Some("re".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("re"), "`{row}`");
+    insta::assert_snapshot!("type_ahead_mini_status", row);
+}
+
+#[test]
+fn type_ahead_mini_status_only_affects_the_active_panel() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.active = PanelSide::Left;
+    state.quick_search = Some("zz".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    // Row 21's left half is the active (left) panel's mini-status; its
+    // right half belongs to the inactive right panel, which must show its
+    // ordinary status instead of the pattern.
+    let row = mini_status_row(&text);
+    let chars: Vec<char> = row.chars().collect();
+    let mid = chars.len() / 2;
+    let left_half: String = chars[..mid].iter().collect();
+    let right_half: String = chars[mid..].iter().collect();
+    assert!(left_half.contains("zz"));
+    assert!(!right_half.contains("zz"));
+}
+
+#[test]
+fn snapshot_fuzzy_jump_dialog() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.dir_history = vec![
+        filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Documents"), visit_count: 5, last_visited_ms: 1_000 },
+        filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Downloads"), visit_count: 1, last_visited_ms: 500 },
+    ];
+    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Fuzzy jump"));
+    assert!(text.contains("Documents") && text.contains("Downloads"));
+    insta::assert_snapshot!("fuzzy_jump_dialog", text);
+}
+
+#[test]
+fn snapshot_find_file_dialog_with_streamed_results() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
+    dialog.push('r');
+    dialog.push('e');
+    dialog.submit(1);
+    dialog.push_match(
+        1,
+        filecommand_core::listing::FindMatch {
+            relative_path: PathBuf::from(r"docs\readme.txt"),
+            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+        },
+    );
+    dialog.mark_done(1);
+    state.find_file = Some(dialog);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Find file"));
+    assert!(text.contains(r"docs\readme.txt"));
+    insta::assert_snapshot!("find_file_dialog_with_results", text);
+}
+
+#[test]
+fn snapshot_find_file_dialog_no_matches() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
+    dialog.push('z');
+    dialog.submit(1);
+    dialog.mark_done(1);
+    state.find_file = Some(dialog);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("No matches"));
+    insta::assert_snapshot!("find_file_dialog_no_matches", text);
+}
+
+#[test]
+fn snapshot_user_menu_dialog_with_entries() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.user_menu_entries = vec![
+        filecommand_core::config::UserMenuEntry { label: "Compress".to_string(), command: "7z a x.7z".to_string() },
+        filecommand_core::config::UserMenuEntry { label: "Backup".to_string(), command: r"robocopy . D:\backup /E".to_string() },
+        filecommand_core::config::UserMenuEntry { label: "Checksum".to_string(), command: "certutil -hashfile x SHA256".to_string() },
+    ];
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Compress") && text.contains("Backup") && text.contains("Checksum"));
+    assert!(!text.contains("robocopy"), "the command string is never shown, only the label");
+    insta::assert_snapshot!("user_menu_dialog_with_entries", text);
+}
+
+#[test]
+fn snapshot_user_menu_dialog_empty_state() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("no entries"));
+    insta::assert_snapshot!("user_menu_dialog_empty", text);
+}
+
+#[test]
+fn snapshot_help_window_topic_list() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Help"));
+    assert!(text.contains("About FileCommand"));
+    assert!(text.contains("FileCommand") && text.contains("Norton Commander"), "shared identity header");
+    insta::assert_snapshot!("help_window_topic_list", text);
+}
+
+#[test]
+fn snapshot_help_window_topic_page() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut help = filecommand_core::dialogs::HelpState::new();
+    help.page = Some(1); // Keyboard reference
+    state.help = Some(help);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("modifier variants"));
+    assert!(!text.contains("About FileCommand"), "the list is replaced by the page");
+    insta::assert_snapshot!("help_window_topic_page", text);
+}
+
+#[test]
+fn snapshot_about_dialog_over_help_window() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let mut help = filecommand_core::dialogs::HelpState::new();
+    help.about_open = true;
+    state.help = Some(help);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("License: MIT OR Apache-2.0"));
+    assert!(text.contains("OK"));
+    insta::assert_snapshot!("about_dialog_over_help_window", text);
+}

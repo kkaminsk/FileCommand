@@ -223,6 +223,12 @@ pub struct PanelState {
     /// Tree mode has ever been entered (additional-panel-modes "Tree mode
     /// drives the opposite panel"; design D7).
     pub tree: Option<TreeState>,
+    /// Set by an M5 find-file navigation (`update::handle_find_file`'s
+    /// `FindFileConfirm`) to the matched entry's original name; consumed
+    /// once this directory's listing reaches `ListingProgress::Complete`,
+    /// settling the cursor there (find-file "Navigate to a chosen result").
+    /// `None` for every ordinary navigation.
+    pub pending_cursor_target: Option<OsString>,
 }
 
 impl PanelState {
@@ -246,6 +252,7 @@ impl PanelState {
             git_info: GitInfo::none(),
             git_request: None,
             tree: None,
+            pending_cursor_target: None,
         }
     }
 
@@ -357,6 +364,12 @@ impl PanelState {
         // just landed (git-info "Query re-issued on navigation").
         self.git_info = GitInfo::none();
         self.git_request = None;
+        // A fresh directory has an entirely different entry set; any
+        // pending find-file cursor target belonged to whatever navigation
+        // just landed here (`begin_listing` sets it *after* calling this),
+        // so an ordinary navigation must not inherit a stale target from an
+        // earlier one.
+        self.pending_cursor_target = None;
     }
 
     /// Drop any selected names that no longer appear in `entries` — used
@@ -525,6 +538,7 @@ impl PanelState {
             git_info: self.git_info.clone(),
             git_request: self.git_request,
             tree: self.tree.clone(),
+            pending_cursor_target: self.pending_cursor_target.clone(),
         }
     }
 
@@ -546,6 +560,7 @@ impl PanelState {
         self.git_info = data.git_info;
         self.git_request = data.git_request;
         self.tree = data.tree;
+        self.pending_cursor_target = data.pending_cursor_target;
     }
 
     /// The full ordered tab list, with the active tab's live state
@@ -638,6 +653,7 @@ pub struct TabData {
     pub git_info: GitInfo,
     pub git_request: Option<u64>,
     pub tree: Option<TreeState>,
+    pub pending_cursor_target: Option<OsString>,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single

@@ -56,6 +56,18 @@ fn git_marker(panel: &PanelState, entry: &filecommand_core::listing::Entry) -> O
     Some((status.marker(), role))
 }
 
+/// The Ctrl+P quick-filter input or the Alt+letter type-ahead pattern,
+/// rendered in the mini-status (`panel.ministatus` role) in place of the
+/// normal status text while either is active — quick filter takes
+/// precedence if somehow both are active at once. `type_ahead` is `None`
+/// whenever `panel` isn't the active one, so the opposite panel's
+/// mini-status is never affected (quick-filter "Quick filter only affects
+/// the active panel"; type-ahead-jump "Mini-status display of the active
+/// pattern").
+fn quick_filter_or_type_ahead_status(panel: &PanelState, type_ahead: Option<&str>) -> Option<String> {
+    panel.quick_filter.clone().or_else(|| type_ahead.map(|p| p.to_string()))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     buf: &mut Buffer,
@@ -66,6 +78,7 @@ pub fn render_panel(
     active: bool,
     identity_lines: &[String; 4],
     opposite: &PanelState,
+    type_ahead: Option<&str>,
 ) {
     if area.width < 4 || area.height < 3 {
         return;
@@ -119,6 +132,14 @@ pub fn render_panel(
     let body_y0 = y0 + if has_strip { 2 } else { 1 };
     let body_h = area.height - reserved;
 
+    // The Ctrl+P quick filter / Alt+letter type-ahead pattern, when either
+    // is active, replaces the normal mini-status content (quick-filter
+    // "Activating the quick filter"; type-ahead-jump "Mini-status display
+    // of the active pattern"). Tree/Quick View compute their own override
+    // (the highlighted path / previewed file) below, which takes
+    // precedence when present.
+    let input_override = quick_filter_or_type_ahead_status(panel, type_ahead);
+
     // Info mode replaces the whole body — header row included — with the
     // stacked info boxes, keeping only the panel's own double-line border
     // (and the tab strip, if shown).
@@ -126,7 +147,7 @@ pub fn render_panel(
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, None);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
         return;
     }
 
@@ -135,7 +156,7 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         render_brief_body(buf, x0, body_y0, w, body_h, panel, theme, depth, active);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, None);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
         return;
     }
 
@@ -144,7 +165,7 @@ pub fn render_panel(
     // modes "Tree display mode structure and rendering").
     if panel.display_mode == DisplayMode::Tree {
         let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
         return;
     }
 
@@ -154,7 +175,7 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::QuickView {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let mini_status = render_quick_view_body(buf, x0, body_y0, w, body_h, opposite, theme, depth);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
         return;
     }
 
@@ -234,7 +255,7 @@ pub fn render_panel(
         }
     }
 
-    render_bottom_border(buf, area, panel, frame_style, ministatus_style, None);
+    render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
 }
 
 /// The `\u{2551}` left/right frame verticals for every row of a body region

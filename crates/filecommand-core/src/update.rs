@@ -8,17 +8,20 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use crate::config;
+use crate::config::{self, UserMenuEntry};
+use crate::dialogs::{HelpState, UserMenuState};
 use crate::drives::{self, DriveSelect};
 use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
+use crate::find_file::FindFileState;
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
 use crate::git_info::GitInfo;
 use crate::info::InfoValues;
-use crate::listing::{Entry, EntryKind, SortMode};
+use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
 use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
+use crate::quicksearch::{self, FrecencyEntry, FuzzyJumpState};
 use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
 use crate::viewer::ViewerState;
@@ -108,6 +111,27 @@ pub struct State {
     /// a superseded request is dropped instead of silently overwriting a
     /// fresher answer. See [`State::next_request_id`].
     pub request_seq: u64,
+    /// Directory frecency history backing the Ctrl+J fuzzy-jump dialog,
+    /// persisted alongside command history in `history.json` (fuzzy-jump
+    /// "Directory history persistence"; design D6).
+    pub dir_history: Vec<FrecencyEntry>,
+    /// The most recent clock reading `Command::Tick` delivered. Used to
+    /// timestamp frecency updates so `update` never reads a clock directly
+    /// — the TUI's injected `Clock` is still the only source of "now".
+    pub clock_ms: u64,
+    /// The F2 user menu's entries, snapshotted from `usermenu.toml` at
+    /// startup (user-menu "Parse label and command entries from
+    /// usermenu.toml").
+    pub user_menu_entries: Vec<UserMenuEntry>,
+    /// The Ctrl+J fuzzy-jump dialog, or `None` when closed.
+    pub fuzzy_jump: Option<FuzzyJumpState>,
+    /// The Alt+F7 find-file dialog, or `None` when closed.
+    pub find_file: Option<FindFileState>,
+    /// The F2 user-menu overlay, or `None` when closed.
+    pub user_menu: Option<UserMenuState>,
+    /// The F1 Help window (and, nested within it, the About dialog), or
+    /// `None` when closed.
+    pub help: Option<HelpState>,
 }
 
 impl State {
@@ -155,6 +179,13 @@ impl State {
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
             request_seq: 0,
+            dir_history: Vec::new(),
+            clock_ms: 0,
+            user_menu_entries: Vec::new(),
+            fuzzy_jump: None,
+            find_file: None,
+            user_menu: None,
+            help: None,
         }
     }
 
@@ -195,6 +226,7 @@ impl State {
             right: PanelState::new(right_cwd.clone()),
             phase,
             term_size,
+            clock_ms: now_ms,
             ..State::empty(theme)
         };
         let mut effects = vec![
@@ -464,6 +496,70 @@ pub enum Command {
     /// Reply to `Effect::RunExternalEditor` when the editor could not be
     /// spawned (external-editor: Editor spawn errors do not crash the app).
     ExternalEditorSpawnFailed { message: String },
+
+    // Ctrl+J fuzzy jump (M5).
+    /// Open the dialog (default binding, overridable via `config.toml`).
+    FuzzyJumpOpen,
+    FuzzyJumpChar(char),
+    FuzzyJumpBackspace,
+    FuzzyJumpMove(isize),
+    /// Enter: navigate the active panel to the highlighted directory and
+    /// close the dialog (fuzzy-jump "Enter navigates the active panel").
+    FuzzyJumpConfirm,
+    /// Esc: close without navigating.
+    FuzzyJumpCancel,
+
+    // Alt+F7 find file (M5).
+    /// Open the dialog, rooted at the active panel's current directory
+    /// (find-file "Find-file invocation").
+    FindFileOpen,
+    FindFileChar(char),
+    FindFileBackspace,
+    /// Enter on the pattern input: kick off `Effect::FindInSubtree`.
+    FindFileSubmit,
+    /// Reply to `Effect::FindInSubtree`: one matched entry, streamed as the
+    /// walk finds it. `request` is matched against `FindFileState::request`
+    /// so a reply from an abandoned/superseded search is dropped (find-file
+    /// "Non-blocking search with static progress").
+    FindFileMatch { request: u64, m: FindMatch },
+    /// Reply to `Effect::FindInSubtree`: the walk has finished.
+    FindFileSearchDone { request: u64 },
+    FindFileMove(isize),
+    /// Enter on a result: navigate the active panel's current tab in place
+    /// and close the dialog (find-file "Navigate to a chosen result").
+    FindFileConfirm,
+    /// Esc: close without navigating, abandoning any in-progress search
+    /// (find-file "Dismiss the find-file dialog").
+    FindFileCancel,
+
+    // F2 user menu (M5).
+    UserMenuOpen,
+    UserMenuMove(isize),
+    /// Enter: run the highlighted entry's command via the shell passthrough
+    /// in the active panel's directory, then close the menu (user-menu "Run
+    /// the selected entry's command via the shell in the active panel
+    /// directory").
+    UserMenuConfirm,
+    /// Esc: close without running anything.
+    UserMenuCancel,
+
+    // F1 Help window + About dialog (M5).
+    HelpOpen,
+    HelpMove(isize),
+    /// Enter / the `Help` button: opens the highlighted topic's page, or
+    /// the About dialog for the special first entry.
+    HelpActivate,
+    /// Esc / the `Cancel` button: dismisses the About dialog back to the
+    /// list, or a topic page back to the list, or closes the window
+    /// entirely from the list.
+    HelpCancel,
+
+    // Panel display-mode switches reachable from the Left/Right menu (M5;
+    // design D7). `Info` and `Tree` keep their own dedicated commands
+    // (`ToggleInfoMode`, `EnterTreeMode`) since each carries extra
+    // bookkeeping (an Info query, a Tree session) this generic command
+    // deliberately does not.
+    SetDisplayMode { side: PanelSide, mode: DisplayMode },
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -487,8 +583,10 @@ pub enum Effect {
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
-    /// Rewrite `history.json` atomically with these entries.
-    PersistHistory(Vec<String>),
+    /// Rewrite `history.json` atomically with the command history and
+    /// directory frecency together (fuzzy-jump "Directory history
+    /// persistence"; design D6).
+    PersistHistory(config::HistoryFile),
     /// Read the logical-drive bitmask (cheap, synchronous) and feed the
     /// letters back as `DriveListReady` before the next paint.
     EnumerateDrives(PanelSide),
@@ -547,6 +645,14 @@ pub enum Effect {
     /// unchanged so the reply knows whether to close the editor once the
     /// write lands (builtin-editor "Save in place …", design D9).
     SaveEditor { editor: Box<EditorState>, then_quit: bool },
+    /// Walk `root`'s subtree for entries whose name contains `pattern` on a
+    /// worker thread, streaming each match back via `Command::FindFileMatch`
+    /// as it's found and finishing with `Command::FindFileSearchDone` —
+    /// never blocking the UI event loop (find-file "Non-blocking search
+    /// with static progress"). `request` travels with every reply so a
+    /// stale/abandoned search's results are dropped once the dialog has
+    /// moved on.
+    FindInSubtree { root: PathBuf, pattern: String, request: u64 },
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -565,6 +671,13 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             (other, false) => other.clone(),
         };
         return (state, effects);
+    }
+
+    // Every `Tick` updates the clock reading `begin_listing` timestamps
+    // frecency visits with, regardless of phase — mirrored generically here
+    // rather than duplicated in every phase arm that might navigate.
+    if let Command::Tick(now) = cmd {
+        state.clock_ms = now;
     }
 
     // Listing events fold in identically regardless of phase — a background
@@ -651,6 +764,26 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         }
         return (state, effects);
     }
+    // The M5 dialogs (fuzzy jump, find file, user menu, Help/About) are
+    // likewise modal overlays beside the phase, each claiming only the
+    // commands it understands while open — the same shape as the two blocks
+    // above.
+    if state.fuzzy_jump.is_some() && is_fuzzy_jump_command(&cmd) {
+        effects.extend(handle_fuzzy_jump(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.find_file.is_some() && is_find_file_command(&cmd) {
+        effects.extend(handle_find_file(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.user_menu.is_some() && is_user_menu_command(&cmd) {
+        effects.extend(handle_user_menu(&mut state, cmd));
+        return (state, effects);
+    }
+    if state.help.is_some() && is_help_command(&cmd) {
+        effects.extend(handle_help(&mut state, cmd));
+        return (state, effects);
+    }
 
     match &state.phase {
         UiPhase::Splash { started_at_ms } => match cmd {
@@ -674,6 +807,14 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         },
         UiPhase::Panels => match cmd {
             Command::MoveCursor(m) => {
+                // A movement key exits type-ahead (if active) *and* is
+                // still applied to the panel cursor as a normal movement,
+                // in the same keystroke — the `input/` mapper emits exactly
+                // this one command for a movement key while type-ahead owns
+                // the keyboard, relying on this side effect to also end the
+                // mode (type-ahead-jump "A movement key exits type-ahead
+                // and is applied to the panel"; design D5).
+                state.quick_search = None;
                 let side = state.active;
                 if state.panel(side).display_mode == DisplayMode::Tree {
                     effects.extend(handle_tree_cursor_move(&mut state, side, m));
@@ -759,6 +900,20 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::SwitchTab(n) => state.panel_mut(state.active).switch_tab(n),
 
             Command::EnterTreeMode(side) => effects.extend(enter_tree_mode(&mut state, side)),
+            Command::SetDisplayMode { side, mode } => {
+                let p = state.panel_mut(side);
+                p.tree = None;
+                p.info_request = None;
+                p.display_mode = mode;
+            }
+
+            Command::FuzzyJumpOpen => state.fuzzy_jump = Some(FuzzyJumpState::new()),
+            Command::FindFileOpen => {
+                let root = state.active_panel().cwd.clone();
+                state.find_file = Some(FindFileState::new(root));
+            }
+            Command::UserMenuOpen => state.user_menu = Some(UserMenuState::new()),
+            Command::HelpOpen => state.help = Some(HelpState::new()),
 
             Command::MenuOpen => state.menu = Some(MenuState::opened()),
             Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
@@ -884,7 +1039,8 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     if let Some(target) = parse_cd(&text) {
         config::push_history(&mut state.history, &text);
         let side = state.active;
-        let mut effects = vec![Effect::PersistHistory(state.history.clone())];
+        let mut effects =
+            vec![Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() })];
         if let Some(path) = resolve_cd_target(&state.panel(side).cwd, &target) {
             effects.extend(begin_listing(state, side, path));
         }
@@ -896,7 +1052,7 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     let cwd = state.active_panel().cwd.clone();
     vec![
         Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side),
-        Effect::PersistHistory(state.history.clone()),
+        Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }),
     ]
 }
 
@@ -1365,6 +1521,8 @@ fn handle_menu(state: &mut State, cmd: Command) -> Option<Command> {
 pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Command> {
     match action {
         MenuAction::ToggleInfoMode => Some(Command::ToggleInfoMode(side)),
+        MenuAction::SetDisplayMode(mode) => Some(Command::SetDisplayMode { side, mode }),
+        MenuAction::EnterTree => Some(Command::EnterTreeMode(side)),
         MenuAction::SortBy(mode) => Some(Command::SetSortMode { side, mode }),
         MenuAction::Reread => Some(Command::RereadPanel(side)),
         MenuAction::DriveSelect => Some(Command::OpenDriveSelect(side)),
@@ -1376,6 +1534,8 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::DeselectGroup => Some(Command::GroupDeselectAll),
         MenuAction::InvertSelection => Some(Command::InvertSelection),
         MenuAction::PanelsOnOff => Some(Command::ShowScrollback),
+        MenuAction::FindFile => Some(Command::FindFileOpen),
+        MenuAction::FuzzyJump => Some(Command::FuzzyJumpOpen),
         MenuAction::Quit => Some(Command::RequestQuit),
         MenuAction::Unimplemented => None,
     }
@@ -1697,7 +1857,7 @@ fn handle_tree_cursor_move(state: &mut State, side: PanelSide, m: CursorMove) ->
         let Some(node) = tree.selected() else { return vec![] };
         (node.path.clone(), !node.expanded)
     };
-    let mut effects = begin_listing(state, side.toggle(), target.clone());
+    let mut effects = begin_listing_inner(state, side.toggle(), target.clone());
     if needs_expand {
         effects.push(Effect::ExpandTreeNode { panel: side, path: target });
     }
@@ -1719,7 +1879,195 @@ fn handle_tree_enter(state: &mut State, side: PanelSide) -> Vec<Effect> {
     begin_listing(state, side, target)
 }
 
+// ---------------------------------------------------------------------
+// Ctrl+J fuzzy jump (M5)
+// ---------------------------------------------------------------------
+
+fn is_fuzzy_jump_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::FuzzyJumpChar(_) | Command::FuzzyJumpBackspace | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel
+    )
+}
+
+/// Drive the fuzzy-jump dialog (gated in [`update`] by `state.fuzzy_jump`).
+/// The ranked/filtered list itself is never stored on the dialog — it is
+/// recomputed from `state.dir_history` each time via
+/// [`quicksearch::rank_directories`], which is why every arm re-derives it
+/// rather than caching (fuzzy-jump "Fuzzy matching of visited directories",
+/// "Frecency ranking").
+fn handle_fuzzy_jump(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.fuzzy_jump.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::FuzzyJumpChar(c) => state.fuzzy_jump.as_mut().unwrap().push(c),
+        Command::FuzzyJumpBackspace => state.fuzzy_jump.as_mut().unwrap().backspace(),
+        Command::FuzzyJumpMove(delta) => {
+            let pattern = state.fuzzy_jump.as_ref().unwrap().pattern.clone();
+            let len = quicksearch::rank_directories(&state.dir_history, &pattern, state.clock_ms).len();
+            state.fuzzy_jump.as_mut().unwrap().move_cursor(delta, len);
+        }
+        Command::FuzzyJumpCancel => state.fuzzy_jump = None,
+        Command::FuzzyJumpConfirm => {
+            let fj = state.fuzzy_jump.take().unwrap();
+            let ranked = quicksearch::rank_directories(&state.dir_history, &fj.pattern, state.clock_ms);
+            if let Some(path) = ranked.get(fj.cursor).map(|e| e.path.clone()) {
+                let side = state.active;
+                return begin_listing(state, side, path);
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// Alt+F7 find file (M5)
+// ---------------------------------------------------------------------
+
+fn is_find_file_command(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::FindFileChar(_)
+            | Command::FindFileBackspace
+            | Command::FindFileSubmit
+            | Command::FindFileMatch { .. }
+            | Command::FindFileSearchDone { .. }
+            | Command::FindFileMove(_)
+            | Command::FindFileConfirm
+            | Command::FindFileCancel
+    )
+}
+
+/// Drive the find-file dialog (gated in [`update`] by `state.find_file`).
+fn handle_find_file(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.find_file.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::FindFileChar(c) => state.find_file.as_mut().unwrap().push(c),
+        Command::FindFileBackspace => state.find_file.as_mut().unwrap().backspace(),
+        Command::FindFileSubmit => {
+            let request = state.next_request_id();
+            let ff = state.find_file.as_mut().unwrap();
+            ff.submit(request);
+            let root = ff.root.clone();
+            let pattern = ff.pattern.clone();
+            return vec![Effect::FindInSubtree { root, pattern, request }];
+        }
+        Command::FindFileMatch { request, m } => state.find_file.as_mut().unwrap().push_match(request, m),
+        Command::FindFileSearchDone { request } => state.find_file.as_mut().unwrap().mark_done(request),
+        Command::FindFileMove(delta) => state.find_file.as_mut().unwrap().move_cursor(delta),
+        // Dismissing abandons any in-progress search: the walk itself has
+        // no cancel signal (like `git_info::query`, it simply finishes and
+        // its late `FindFileMatch`/`FindFileSearchDone` replies find
+        // `state.find_file` already `None` and are silently dropped by the
+        // `state.find_file.is_some()` gate in `update`) (find-file "Esc
+        // cancels").
+        Command::FindFileCancel => state.find_file = None,
+        Command::FindFileConfirm => {
+            let ff = state.find_file.take().unwrap();
+            let Some(m) = ff.selected().cloned() else { return vec![] };
+            let target_dir = match m.relative_path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => ff.root.join(parent),
+                _ => ff.root.clone(),
+            };
+            let side = state.active;
+            let effects = begin_listing(state, side, target_dir);
+            state.panel_mut(side).pending_cursor_target = Some(m.entry.name);
+            return effects;
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// F2 user menu (M5)
+// ---------------------------------------------------------------------
+
+fn is_user_menu_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::UserMenuMove(_) | Command::UserMenuConfirm | Command::UserMenuCancel)
+}
+
+/// Drive the F2 user menu (gated in [`update`] by `state.user_menu`).
+/// Entries themselves live in `state.user_menu_entries`, loaded once at
+/// startup — the menu overlay only tracks the cursor (user-menu "Open the
+/// F2 user menu", "Navigate and dismiss the user menu").
+fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.user_menu.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::UserMenuMove(delta) => {
+            let len = state.user_menu_entries.len();
+            state.user_menu.as_mut().unwrap().move_cursor(delta, len);
+        }
+        Command::UserMenuCancel => state.user_menu = None,
+        Command::UserMenuConfirm => {
+            let menu = state.user_menu.take().unwrap();
+            if let Some(entry) = state.user_menu_entries.get(menu.cursor).cloned() {
+                let side = state.active;
+                let cwd = state.panel(side).cwd.clone();
+                return vec![Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &entry.command, &cwd), side)];
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// F1 Help window + About dialog (M5)
+// ---------------------------------------------------------------------
+
+fn is_help_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::HelpMove(_) | Command::HelpActivate | Command::HelpCancel)
+}
+
+/// Drive the F1 Help window (gated in [`update`] by `state.help`).
+fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.help.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::HelpMove(delta) => {
+            let visible = crate::dialogs::help_topic_visible_rows(crate::dialogs::help_window_height(state.term_size.1));
+            state.help.as_mut().unwrap().move_cursor(delta, visible);
+        }
+        Command::HelpActivate => state.help.as_mut().unwrap().activate(),
+        Command::HelpCancel => {
+            let mut h = state.help.take().unwrap();
+            // `back` returns `true` when it stepped down one level (About
+            // -> list, or page -> list) rather than closing the window
+            // outright; only then is the window kept open.
+            if h.back() {
+                state.help = Some(h);
+            }
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+/// The choke point every deliberate navigation of `side`'s directory flows
+/// through — Enter into a directory, `..`, a typed `cd`, drive select,
+/// Tree's own Enter-to-return, and the M5 fuzzy-jump/find-file dialogs — so
+/// it is also where the Ctrl+J frecency history is recorded and persisted
+/// (fuzzy-jump "Navigation records history"; design D6). Tree's cursor-move
+/// preview of the *opposite* panel deliberately bypasses this (via
+/// [`begin_listing_inner`] directly) since that is the tree being browsed,
+/// not "the user navigating the active panel into a directory" the
+/// fuzzy-jump requirement describes.
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
+    quicksearch::record_visit(&mut state.dir_history, &path, state.clock_ms);
+    let mut effects = begin_listing_inner(state, side, path);
+    effects.push(Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }));
+    effects
+}
+
+fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     state.panel_mut(side).begin_new_listing(path.clone());
     let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
     // A panel sitting in Info mode needs its drive/directory figures
@@ -1765,6 +2113,17 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             p.progress = crate::panel::ListingProgress::Complete { count: total };
             p.clamp_cursor();
             p.reconcile_selection();
+            // A find-file navigation seeds this with the matched entry's
+            // name (`update::handle_find_file`'s `FindFileConfirm`); once
+            // this directory's listing has actually landed, settle the
+            // cursor on it (find-file "Navigate to a chosen result" —
+            // "cursor positioned on the matched entry").
+            if let Some(name) = p.pending_cursor_target.take() {
+                if let Some(idx) = p.entries.iter().position(|e| e.name == name) {
+                    p.cursor = idx;
+                    p.cursor_user_moved = true;
+                }
+            }
         }
         Command::ListingFailed { panel, message } => {
             let p = state.panel_mut(panel);

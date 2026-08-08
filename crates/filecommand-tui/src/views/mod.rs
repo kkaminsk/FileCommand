@@ -6,6 +6,9 @@ pub mod destination_input;
 pub mod drive_select;
 pub mod editor;
 pub mod error_dialog;
+pub mod find_file;
+pub mod fuzzy_jump;
+pub mod help;
 pub mod info_panel;
 pub mod keybar;
 pub mod menubar;
@@ -16,6 +19,7 @@ pub mod quit_dialog;
 pub mod skipped_summary;
 pub mod splash;
 pub mod tab_strip;
+pub mod user_menu;
 pub mod viewer;
 
 use filecommand_core::fs_ops::dialog::RunningDialog;
@@ -70,8 +74,30 @@ pub fn render(
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height));
-            panel::render_panel(buf, l.left, &state.left, &state.theme, depth, state.active == PanelSide::Left, identity_lines, &state.right);
-            panel::render_panel(buf, l.right, &state.right, &state.theme, depth, state.active == PanelSide::Right, identity_lines, &state.left);
+            let left_type_ahead = (state.active == PanelSide::Left).then_some(state.quick_search.as_deref()).flatten();
+            let right_type_ahead = (state.active == PanelSide::Right).then_some(state.quick_search.as_deref()).flatten();
+            panel::render_panel(
+                buf,
+                l.left,
+                &state.left,
+                &state.theme,
+                depth,
+                state.active == PanelSide::Left,
+                identity_lines,
+                &state.right,
+                left_type_ahead,
+            );
+            panel::render_panel(
+                buf,
+                l.right,
+                &state.right,
+                &state.theme,
+                depth,
+                state.active == PanelSide::Right,
+                identity_lines,
+                &state.left,
+                right_type_ahead,
+            );
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
             // which is what "hides" it; closing the bar simply stops that
@@ -87,6 +113,18 @@ pub fn render(
             }
             if let Some(dialog) = &state.drive_select {
                 drive_select::render_drive_select(buf, area, &state.theme, depth, dialog);
+            }
+            if let Some(dialog) = &state.fuzzy_jump {
+                fuzzy_jump::render_fuzzy_jump(buf, area, &state.theme, depth, dialog, &state.dir_history, state.clock_ms);
+            }
+            if let Some(dialog) = &state.find_file {
+                find_file::render_find_file(buf, area, &state.theme, depth, dialog);
+            }
+            if let Some(dialog) = &state.user_menu {
+                user_menu::render_user_menu(buf, area, &state.theme, depth, dialog, &state.user_menu_entries);
+            }
+            if let Some(dialog) = &state.help {
+                help::render_help(buf, area, &state.theme, depth, dialog, identity_lines);
             }
 
             match &state.phase {

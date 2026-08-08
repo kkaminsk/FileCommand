@@ -10,7 +10,9 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use filecommand_core::config::{KeyBinding, Keys};
+use filecommand_core::dialogs::HelpState;
 use filecommand_core::editor::{EditorMove, EditorState};
+use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
 use filecommand_core::listing::SortMode;
@@ -26,6 +28,19 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     }
     if state.menu.is_some() {
         return map_menu_key(key);
+    }
+    // The M5 dialogs are likewise modal overlays beside the phase.
+    if state.fuzzy_jump.is_some() {
+        return map_fuzzy_jump_key(key);
+    }
+    if let Some(dialog) = &state.find_file {
+        return map_find_file_key(key, dialog);
+    }
+    if state.user_menu.is_some() {
+        return map_user_menu_key(key);
+    }
+    if let Some(dialog) = &state.help {
+        return map_help_key(key, dialog);
     }
 
     match &state.phase {
@@ -52,7 +67,7 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
         UiPhase::Editor(_) => None,
         _ => {
             if state.quick_search.is_some() {
-                return map_quick_search_key(key);
+                return map_quick_search_key(key, page_size);
             }
             map_panel_key(key, state, page_size, keys)
         }
@@ -191,6 +206,22 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let active = state.active;
     let typing = !state.command_line.is_empty();
 
+    // The Ctrl+P quick filter, while active on the active panel, claims
+    // plain printables/Backspace/Esc before anything else — but leaves
+    // every other key (movement, Enter, ...) to fall through to the normal
+    // panel handling below, since navigation still applies with the filter
+    // narrowing what it can land on (`PanelState::move_cursor` itself
+    // restricts to visible entries) (quick-filter "Navigation is restricted
+    // to matching entries").
+    if state.active_panel().quick_filter.is_some() {
+        match key.code {
+            KeyCode::Esc => return Some(Command::QuickFilterEnd),
+            KeyCode::Backspace => return Some(Command::QuickFilterBackspace),
+            KeyCode::Char(c) if is_plain(&key) => return Some(Command::QuickFilterChar(c)),
+            _ => {}
+        }
+    }
+
     // Config-overridable bindings win over the compiled-in map, so a user
     // who rebinds Ctrl+] to something else still gets the default meaning
     // of whatever key they moved it to.
@@ -200,9 +231,36 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     if matches_binding(&key, &keys.paste_path) {
         return Some(Command::PasteCursorPath);
     }
+    if matches_binding(&key, &keys.quick_filter) {
+        return Some(Command::QuickFilterStart);
+    }
+    if matches_binding(&key, &keys.fuzzy_jump) {
+        return Some(Command::FuzzyJumpOpen);
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    // Ctrl+T/Ctrl+W/Alt+1..9 panel tabs (panel-tabs "New tab", "Close tab",
+    // "Switch tab"). Checked ahead of the general match below only because
+    // Alt+<digit> would otherwise fall through to nothing (digits aren't
+    // claimed by any other alt-combination here).
+    if ctrl && !alt {
+        match key.code {
+            KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
+            KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
+            _ => {}
+        }
+    }
+    if alt && !ctrl {
+        if let KeyCode::Char(c) = key.code {
+            if let Some(n) = c.to_digit(10) {
+                if (1..=9).contains(&n) {
+                    return Some(Command::SwitchTab(n as usize));
+                }
+            }
+        }
+    }
 
     match key.code {
         // Sort modes: Ctrl+F3..Ctrl+F6 pick a key, Ctrl+F7 restores
@@ -215,7 +273,10 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
 
         KeyCode::F(1) if alt => Some(Command::OpenDriveSelect(PanelSide::Left)),
         KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
+        KeyCode::F(7) if alt => Some(Command::FindFileOpen),
 
+        KeyCode::F(1) => Some(Command::HelpOpen),
+        KeyCode::F(2) => Some(Command::UserMenuOpen),
         KeyCode::F(3) => Some(Command::RequestViewer),
         // `RequestEditor` resolves the external-editor/built-in/size-cap
         // precedence itself (builtin-editor "External editor takes
@@ -285,6 +346,81 @@ fn map_menu_key(key: KeyEvent) -> Option<Command> {
     }
 }
 
+/// Ctrl+J fuzzy-jump dialog (fuzzy-jump "Fuzzy jump dialog invocation").
+fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::FuzzyJumpCancel),
+        KeyCode::Enter => Some(Command::FuzzyJumpConfirm),
+        KeyCode::Backspace => Some(Command::FuzzyJumpBackspace),
+        KeyCode::Up => Some(Command::FuzzyJumpMove(-1)),
+        KeyCode::Down => Some(Command::FuzzyJumpMove(1)),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::FuzzyJumpChar(c)),
+        _ => None,
+    }
+}
+
+/// Alt+F7 find-file dialog. Its own precedence, highest first: the pattern
+/// input stage (no search submitted yet) claims printables/Backspace/Enter;
+/// once a search is in flight (or done), Up/Down/Enter move over and
+/// confirm a result instead (find-file "Find-file invocation", "Navigate to
+/// a chosen result").
+fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
+    if dialog.request.is_none() {
+        return match key.code {
+            KeyCode::Esc => Some(Command::FindFileCancel),
+            KeyCode::Enter => Some(Command::FindFileSubmit),
+            KeyCode::Backspace => Some(Command::FindFileBackspace),
+            KeyCode::Char(c) if is_plain(&key) => Some(Command::FindFileChar(c)),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Esc => Some(Command::FindFileCancel),
+        KeyCode::Enter => Some(Command::FindFileConfirm),
+        KeyCode::Up => Some(Command::FindFileMove(-1)),
+        KeyCode::Down => Some(Command::FindFileMove(1)),
+        _ => None,
+    }
+}
+
+/// F2 user menu (user-menu "Navigate and dismiss the user menu").
+fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::UserMenuCancel),
+        KeyCode::Enter => Some(Command::UserMenuConfirm),
+        KeyCode::Up => Some(Command::UserMenuMove(-1)),
+        KeyCode::Down => Some(Command::UserMenuMove(1)),
+        _ => None,
+    }
+}
+
+/// F1 Help window + About dialog. `H`/`C` activate the `Help`/`Cancel`
+/// buttons exactly like Enter/Esc (help-and-about "Help window buttons");
+/// the About dialog (layered over the list) and a topic page both treat any
+/// of Enter/Esc/`O` as "go back a level", which `Command::HelpCancel`
+/// already implements uniformly via `HelpState::back`.
+fn map_help_key(key: KeyEvent, dialog: &HelpState) -> Option<Command> {
+    if dialog.about_open {
+        return match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => Some(Command::HelpCancel),
+            _ => None,
+        };
+    }
+    if dialog.page.is_some() {
+        return match key.code {
+            KeyCode::Esc => Some(Command::HelpCancel),
+            _ => None,
+        };
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => Some(Command::HelpCancel),
+        KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('H') => Some(Command::HelpActivate),
+        KeyCode::Up => Some(Command::HelpMove(-1)),
+        KeyCode::Down => Some(Command::HelpMove(1)),
+        _ => None,
+    }
+}
+
 fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
     match key.code {
         KeyCode::Esc => Some(Command::DriveSelectCancel),
@@ -298,12 +434,25 @@ fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
 }
 
 /// While the type-ahead jump owns the keyboard, plain printables extend the
-/// pattern and anything else dismisses it — so the command line never sees
-/// a key quick-search consumed, and vice versa.
-fn map_quick_search_key(key: KeyEvent) -> Option<Command> {
+/// pattern and Esc/Backspace/anything-else it doesn't recognize dismiss it
+/// — so the command line never sees a key quick-search consumed, and vice
+/// versa. A movement key (arrows, Home/End, Page Up/Down) is special: it
+/// exits type-ahead *and* is applied to the panel cursor as a normal
+/// movement, in the same keystroke (type-ahead-jump "A movement key exits
+/// type-ahead and is applied to the panel"; design D5) — `core::update`
+/// clears `quick_search` as a side effect of any `MoveCursor` command while
+/// it is active (see `update::UiPhase::Panels` handling), so simply
+/// emitting the movement command here does both at once.
+fn map_quick_search_key(key: KeyEvent, page_size: usize) -> Option<Command> {
     match key.code {
         KeyCode::Backspace => Some(Command::QuickSearchBackspace),
         KeyCode::Char(c) if is_plain(&key) => Some(Command::QuickSearchChar(c)),
+        KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
+        KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
+        KeyCode::PageUp => Some(Command::MoveCursor(CursorMove::Up(page_size))),
+        KeyCode::PageDown => Some(Command::MoveCursor(CursorMove::Down(page_size))),
+        KeyCode::Home => Some(Command::MoveCursor(CursorMove::Home)),
+        KeyCode::End => Some(Command::MoveCursor(CursorMove::End)),
         _ => Some(Command::QuickSearchEnd),
     }
 }

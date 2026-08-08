@@ -64,7 +64,18 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
-    state.history = config::load_history(Path::new(config::HISTORY_FILE));
+    let history_file = config::load_history_file(Path::new(config::HISTORY_FILE));
+    state.history = history_file.commands;
+    state.dir_history = history_file.directories;
+    let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
+    state.user_menu_entries = user_menu.entries;
+    if user_menu.malformed {
+        // There is no general-purpose startup-warning dialog (yet); the
+        // panel's own inline-error mini-status is the established §7
+        // surface for "something's wrong but the app still runs" (user-menu
+        // "Malformed file warns and falls back without overwriting").
+        state.left.last_error = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+    }
 
     let (tx, rx) = mpsc::channel::<Command>();
     let mut rt = Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), viewer_source: None };
@@ -297,10 +308,10 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 let _ = rt.tx.send(Command::RereadPanel(side));
             }
             Effect::ShowScrollback => show_scrollback(guard)?,
-            Effect::PersistHistory(entries) => {
+            Effect::PersistHistory(file) => {
                 // A history write failing (read-only directory, full disk)
                 // must never take the session down with it.
-                let _ = config::save_history_atomic(&rt.history_path, &entries);
+                let _ = config::save_history_file_atomic(&rt.history_path, &file);
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -356,6 +367,9 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     let _ = rt.tx.send(Command::EditorOpenFailed { message: e.to_string() });
                 }
             },
+            Effect::FindInSubtree { root, pattern, request } => {
+                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone());
+            }
             Effect::SaveEditor { editor, then_quit } => {
                 let mut editor = *editor;
                 match editor.save() {

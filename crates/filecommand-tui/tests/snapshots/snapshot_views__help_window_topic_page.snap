@@ -1,0 +1,29 @@
+---
+source: crates/filecommand-tui/tests/snapshot_views.rs
+assertion_line: 959
+expression: text
+---
+╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
+║Name↓        │ Size    Date    Time   ║║Name↓        │ Size    Date    Time   ║
+║..     ╔════════════════════════════ Help ════════════════════════════╗       ║
+║docs   ║                         FileCommand                          ║03:0   ║
+║Cargo.t║          Copyright (C) 2026 The FileCommand Authors          ║03:0   ║
+║readme.║         Inspired by the Norton Commander, 1986-1998          ║03:0   ║
+║       ╠──────────────────────────────────────────────────────────────╣       ║
+║       ║F-key bar modifier variants:                                  ║       ║
+║       ║  Ctrl+F3..F7  Sort by name/ext/time/size/unsorted            ║       ║
+║       ║  Alt+F1/F2    Drive select (left/right panel)                ║       ║
+║       ║  Alt+F7       Find file                                      ║       ║
+║       ║                                                              ║       ║
+║       ║Plain F-keys: F1 Help  F2 User menu  F3 View  F4 Edit         ║       ║
+║       ║F5 Copy  F6 Move/rename  F7 Mkdir  F8 Delete                  ║       ║
+║       ║F9 Menu bar  F10 Quit                                         ║       ║
+║       ║                                                              ║       ║
+║       ║Other bindings:                                               ║       ║
+║       ║  Tab          Switch active panel                            ║       ║
+║       ╠──────────────────────────────────────────────────────────────╣       ║
+║       ║                       Help     Cancel                        ║       ║
+║       ╚══════════════════════════════════════════════════════════════╝       ║
+╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
+C:\Users\demo\left>_                                                            
+1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit

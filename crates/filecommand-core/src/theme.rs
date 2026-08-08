@@ -139,6 +139,10 @@ pub enum Role {
     DialogPrimary,
     DialogError,
     DialogInput,
+    /// The M5 secondary/grey dialog style (black on white, single-line
+    /// frame) — the About dialog is the only v1 user of it (help-and-about
+    /// "About FileCommand dialog"; §10 license).
+    DialogSecondary,
     ButtonNormal,
     ButtonFocused,
     DialogGaugeFilled,
@@ -194,6 +198,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::DialogPrimary,
     Role::DialogError,
     Role::DialogInput,
+    Role::DialogSecondary,
     Role::ButtonNormal,
     Role::ButtonFocused,
     Role::DialogGaugeFilled,
@@ -243,6 +248,7 @@ impl Role {
             Role::DialogPrimary => "dialog.primary",
             Role::DialogError => "dialog.error",
             Role::DialogInput => "dialog.input",
+            Role::DialogSecondary => "dialog.secondary",
             Role::ButtonNormal => "button.normal",
             Role::ButtonFocused => "button.focused",
             Role::DialogGaugeFilled => "dialog.gauge.filled",
@@ -377,6 +383,7 @@ impl Theme {
         set(Role::DialogPrimary, A(Black), A(Cyan));
         set(Role::DialogError, A(BrightWhite), A(Red));
         set(Role::DialogInput, A(Black), A(Cyan));
+        set(Role::DialogSecondary, A(Black), A(White));
         set(Role::ButtonNormal, A(Black), A(White));
         set(Role::ButtonFocused, A(Black), A(BrightYellow));
         set(Role::DialogGaugeFilled, A(Blue), A(Cyan));
@@ -436,6 +443,10 @@ impl Theme {
         set(Role::DialogPrimary, A(Black), A(White));
         set(Role::DialogError, A(BrightWhite), A(Black));
         set(Role::DialogInput, A(Black), A(White));
+        // Mono has no distinct secondary hue to fall back to; it collapses
+        // onto the same black-on-white block as the primary dialog style,
+        // matching how `MenuHotkey` and other roles collapse in mono.
+        set(Role::DialogSecondary, A(Black), A(White));
         set(Role::ButtonNormal, A(Black), A(White));
         set(Role::ButtonFocused, A(White), A(Black));
         set(Role::DialogGaugeFilled, A(BrightWhite), A(White));
