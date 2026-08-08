@@ -10,7 +10,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use filecommand_core::config::{KeyBinding, Keys};
-use filecommand_core::dialogs::HelpState;
+use filecommand_core::dialogs::{FileActionMenuState, HelpState};
 use filecommand_core::editor::{EditorMove, EditorState};
 use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
@@ -48,6 +48,14 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     }
     if let Some(dialog) = &state.help {
         return map_help_key(key, dialog);
+    }
+    // The Enter-on-file action menu is likewise a modal overlay beside the
+    // phase (it opens without changing `state.phase` away from `Panels`),
+    // so it must be checked before the phase match below claims panel/
+    // command-line keys (file-action-menu "Enter on a file opens the action
+    // menu").
+    if let Some(dialog) = &state.file_action_menu {
+        return map_file_action_menu_key(key, dialog);
     }
 
     match &state.phase {
@@ -406,6 +414,25 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
     }
 }
 
+/// The Enter-on-file action menu: Up/Down moves the highlight, Enter
+/// activates it, Esc closes with no action, and any other plain letter is
+/// tried as a first-letter hotkey — `core::update` no-ops it if nothing
+/// matches (file-action-menu "Menu contents, ordering, and navigation":
+/// "Up/Down SHALL move the highlight, Enter SHALL activate the highlighted
+/// entry and close the menu, Esc SHALL close the menu with no action taken,
+/// and pressing an entry's first letter SHALL activate that entry
+/// directly").
+fn map_file_action_menu_key(key: KeyEvent, _dialog: &FileActionMenuState) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::FileActionMenuCancel),
+        KeyCode::Enter => Some(Command::FileActionMenuConfirm),
+        KeyCode::Up => Some(Command::FileActionMenuMove(-1)),
+        KeyCode::Down => Some(Command::FileActionMenuMove(1)),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::FileActionMenuHotkey(c)),
+        _ => None,
+    }
+}
+
 /// F1 Help window + About dialog. `H`/`C` activate the `Help`/`Cancel`
 /// buttons exactly like Enter/Esc (help-and-about "Help window buttons");
 /// the About dialog (layered over the list) and a topic page both treat any
@@ -520,7 +547,10 @@ fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> 
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::FileOpCancel),
             _ => None,
         },
-        FileOpSetup::DestinationInput { .. } => match key.code {
+        // `RenameInput` reuses the same `FileOpInput*`/`FileOpConfirm`/
+        // `FileOpCancel` commands `DestinationInput` uses (fs_ops::dialog
+        // "Reuses the same ... commands `DestinationInput` uses").
+        FileOpSetup::DestinationInput { .. } | FileOpSetup::RenameInput { .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
             KeyCode::Backspace => Some(Command::FileOpInputBackspace),

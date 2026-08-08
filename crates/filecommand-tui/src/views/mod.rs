@@ -6,6 +6,7 @@ pub mod destination_input;
 pub mod drive_select;
 pub mod editor;
 pub mod error_dialog;
+pub mod file_action_menu;
 pub mod find_file;
 pub mod fuzzy_jump;
 pub mod help;
@@ -148,6 +149,9 @@ fn render_phase(
             }
             if let Some(dialog) = &state.help {
                 help::render_help(buf, area, &state.theme, depth, dialog, identity_lines);
+            }
+            if let Some(dialog) = &state.file_action_menu {
+                file_action_menu::render_file_action_menu(buf, area, &state.theme, depth, dialog);
             }
 
             match &state.phase {
