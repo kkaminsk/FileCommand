@@ -21,13 +21,14 @@ use crate::info::InfoValues;
 use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
 use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
+use crate::panel_split;
 use crate::quicksearch::{self, FrecencyEntry, FuzzyJumpState};
 use crate::shell::{self, ShellConfig};
 use crate::theme::Theme;
 use crate::viewer::ViewerState;
 
-pub const MIN_COLS: u16 = 80;
-pub const MIN_ROWS: u16 = 24;
+pub const MIN_COLS: u16 = 60;
+pub const MIN_ROWS: u16 = 16;
 pub const SPLASH_MIN_HOLD_MS: u64 = 800;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,8 +55,8 @@ impl PanelSide {
 pub enum UiPhase {
     Splash { started_at_ms: u64 },
     Panels,
-    /// Terminal is below the 80x24 minimum. Growing back always resolves to
-    /// `Panels`, never back to `Splash`.
+    /// Terminal is below the 60x16 hard floor. Growing back always resolves
+    /// to `Panels`, never back to `Splash`.
     Placeholder,
     /// Gathering input before a Copy/Move/Mkdir/Delete job is dispatched.
     FileOpSetup(FileOpSetup),
@@ -104,6 +105,12 @@ pub struct State {
     pub phase: UiPhase,
     pub theme: Theme,
     pub term_size: (u16, u16),
+    /// The vertical panel split, stored as a left-panel percentage
+    /// (default 50); `filecommand-tui::layout::compute` derives the
+    /// effective column split from this via
+    /// `panel_split::effective_left_width` (panel-split "Split ratio
+    /// semantics and panel minimum").
+    pub split_percent: u16,
     /// Monotonic source for request/generation ids (`PanelState::info_request`,
     /// `DriveSelect::generation`) that let a worker reply be matched against
     /// the request that's still current, so an out-of-order completion from
@@ -204,6 +211,7 @@ impl State {
             phase: UiPhase::Panels,
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
+            split_percent: panel_split::DEFAULT_SPLIT_PERCENT,
             request_seq: 0,
             dir_history: Vec::new(),
             clock_ms: 0,
@@ -286,6 +294,17 @@ pub enum Command {
     Resize(u16, u16),
     /// Current time in ms, supplied by the TUI's injected `Clock`.
     Tick(u64),
+
+    // Adjustable panel split (Ctrl+Left/Ctrl+Right/Ctrl+=; panel-split
+    // "Adjust and reset the panel split").
+    /// Ctrl+Right: move the divider `panel_split::SPLIT_STEP` columns
+    /// right (grows the left panel). A no-op at the right panel's minimum.
+    SplitGrow,
+    /// Ctrl+Left: move the divider `panel_split::SPLIT_STEP` columns left
+    /// (shrinks the left panel). A no-op at the left panel's minimum.
+    SplitShrink,
+    /// Ctrl+=: reset the split to 50/50, unconditionally.
+    SplitReset,
     /// Re-read a panel's directory (Ctrl+R). Also the recovery action
     /// offered after a listing failure, but available at any time.
     RereadPanel(PanelSide),
@@ -653,6 +672,10 @@ pub enum Effect {
     /// Themes picker applies a theme (theme-selection "Applied theme
     /// persists to configuration").
     PersistTheme(String),
+    /// Rewrite `config.toml`'s `panel_split =` key atomically after a
+    /// successful split adjustment or reset (panel-split "Split
+    /// persistence to configuration").
+    PersistPanelSplit(u16),
     /// Read the logical-drive bitmask (cheap, synchronous) and feed the
     /// letters back as `DriveListReady` before the next paint.
     EnumerateDrives(PanelSide),
@@ -1084,6 +1107,15 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
 
+            Command::SplitGrow => effects.extend(adjust_split(&mut state, panel_split::SPLIT_STEP as i32)),
+            Command::SplitShrink => effects.extend(adjust_split(&mut state, -(panel_split::SPLIT_STEP as i32))),
+            Command::SplitReset => {
+                if state.split_percent != panel_split::DEFAULT_SPLIT_PERCENT {
+                    state.split_percent = panel_split::DEFAULT_SPLIT_PERCENT;
+                    effects.push(Effect::PersistPanelSplit(state.split_percent));
+                }
+            }
+
             Command::Tick(_) => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
             _ => {}
@@ -1234,6 +1266,25 @@ fn jump_to_prefix(state: &mut State, pattern: &str) {
         let panel = state.panel_mut(side);
         panel.cursor = index;
         panel.cursor_user_moved = true;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Adjustable panel split (panel-split)
+// ---------------------------------------------------------------------
+
+/// Ctrl+Left/Ctrl+Right: move the divider `delta_cols` columns (negative =
+/// left, positive = right) via `panel_split::adjust_percent`, updating and
+/// persisting `state.split_percent` only when the adjustment doesn't
+/// violate either panel's minimum width — an adjustment at the limit is a
+/// no-op, per panel-split "Adjustment at the limit is a no-op".
+fn adjust_split(state: &mut State, delta_cols: i32) -> Vec<Effect> {
+    match panel_split::adjust_percent(state.split_percent, delta_cols, state.term_size.0) {
+        Some(new_percent) => {
+            state.split_percent = new_percent;
+            vec![Effect::PersistPanelSplit(new_percent)]
+        }
+        None => vec![],
     }
 }
 
@@ -2396,7 +2447,7 @@ fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
     }
     match cmd {
         Command::HelpMove(delta) => {
-            let visible = crate::dialogs::help_topic_visible_rows(crate::dialogs::help_window_height(state.term_size.1));
+            let visible = crate::dialogs::help_topic_visible_rows(crate::dialogs::help_window_height(state.term_size));
             state.help.as_mut().unwrap().move_cursor(delta, visible);
         }
         Command::HelpActivate => state.help.as_mut().unwrap().activate(),

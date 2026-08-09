@@ -1,4 +1,4 @@
-//! "Terminal too small" placeholder, shown below the 80x24 minimum.
+//! "Terminal too small" placeholder, shown below the 60x16 hard floor.
 
 use filecommand_core::listing::display_width;
 use filecommand_core::theme::{ColorDepth, Role, Theme};
@@ -7,7 +7,7 @@ use ratatui::layout::Rect;
 
 use crate::style::role_style;
 
-const MESSAGE: &str = "Terminal too small \u{2014} resize to at least 80x24";
+const MESSAGE: &str = "Terminal too small \u{2014} resize to at least 60x16";
 
 pub fn render_placeholder(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth) {
     let style = role_style(theme, Role::ScreenPlaceholder, depth);

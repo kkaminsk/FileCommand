@@ -98,7 +98,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                     // (application-shell "Quit request keys and
                     // confirmation"; design D5).
                     let cmd = if state.quit_confirm {
-                        let page_size = layout::compute(state.term_size).entries_visible;
+                        let page_size = layout::compute(state.term_size, state.split_percent).entries_visible;
                         input::map_key(key, &state, page_size, &keys)
                     } else {
                         match &state.phase {
@@ -113,7 +113,7 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
                                 input::map_editor_key(key, editor, rows_visible)
                             }
                             _ => {
-                                let page_size = layout::compute(state.term_size).entries_visible;
+                                let page_size = layout::compute(state.term_size, state.split_percent).entries_visible;
                                 input::map_key(key, &state, page_size, &keys)
                             }
                         }
@@ -181,6 +181,7 @@ fn resolve_startup_theme(config: &config::Config) -> Theme {
 fn apply_config(state: &mut State, config: &config::Config) {
     state.shell = ShellConfig::from_env(config.shell.clone());
     state.editor = config.editor.clone();
+    state.split_percent = config.panel_split;
 }
 
 /// Snapshot the F2 user menu into `State` at startup, factored out of `run`
@@ -353,6 +354,11 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // never take the session down (the theme is already active
                 // in memory either way).
                 let _ = config::save_theme_atomic(&rt.config_path, &name);
+            }
+            Effect::PersistPanelSplit(percent) => {
+                // Same tolerance as the theme write above (panel-split
+                // "Split persistence to configuration").
+                let _ = config::save_panel_split_atomic(&rt.config_path, percent);
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -580,6 +586,15 @@ mod tests {
         apply_config(&mut state, &config);
         assert_eq!(state.editor.as_deref(), Some("code --wait"));
         assert_eq!(state.shell.shell.as_deref(), Some("pwsh -NoLogo -Command"));
+    }
+
+    #[test]
+    fn apply_config_wires_the_configured_panel_split_into_state() {
+        let config = config::parse("panel_split = 66\n");
+        let mut state = State::empty(Theme::classic());
+        assert_eq!(state.split_percent, 50, "sanity: split starts at the default before wiring");
+        apply_config(&mut state, &config);
+        assert_eq!(state.split_percent, 66);
     }
 
     #[test]

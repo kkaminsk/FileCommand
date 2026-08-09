@@ -1,0 +1,32 @@
+---
+source: crates/filecommand-tui/tests/snapshot_matrix.rs
+expression: text
+---
+╔═══════════ C:\Users\demo\projects\filecommand ═══════════╗
+║▶UP--DIR◄                                                 ║
+║docs                                                      ║
+║Cargo.toml                                                ║
+║readme.txt                                                ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+╚═════════════════════ docs  SUB-DIR ══════════════════════╝

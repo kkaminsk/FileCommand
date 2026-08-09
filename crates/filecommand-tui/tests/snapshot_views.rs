@@ -285,6 +285,21 @@ fn the_f9_bar_hides_the_clock_and_closing_it_restores_the_clock() {
 }
 
 #[test]
+fn the_clock_hides_entirely_rather_than_colliding_with_a_long_path_title() {
+    // A long right-panel path pushes the centered title's span far enough
+    // right that it would overlap the clock's fixed-width slot in the
+    // corner (responsive-layout "Chrome degradation": "the clock is not
+    // drawn at all and the path title renders normally").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let long_cwd = format!(r"C:\{}", "a".repeat(31));
+    state.right = complete_panel(&long_cwd, 0);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    assert!(!top.contains(FIXED_CLOCK_TEXT), "clock must not partially or fully draw over the title: `{top}`");
+    assert!(top.contains(&long_cwd[..10]), "the path title still renders normally: `{top}`");
+}
+
+#[test]
 fn snapshot_menu_bar_with_left_pulldown_open() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.menu = Some(MenuState::opened());
@@ -654,7 +669,7 @@ fn left_half(row: &str, width: usize) -> String {
 fn snapshot_tab_strip_truncated_labels() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\b"]);
-    let l = filecommand_tui::layout::compute((26, 24));
+    let l = filecommand_tui::layout::compute((26, 24), 50);
     let text = render_to_text(26, 24, &state, ColorDepth::Ansi16);
     let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(strip_row.contains('\u{2026}'), "`{strip_row}`");
@@ -665,7 +680,7 @@ fn snapshot_tab_strip_truncated_labels() {
 fn snapshot_tab_strip_number_only_labels() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left = panel_with_tabs(&[r"C:\filecommand", r"C:\other"]);
-    let l = filecommand_tui::layout::compute((14, 24));
+    let l = filecommand_tui::layout::compute((14, 24), 50);
     let text = render_to_text(14, 24, &state, ColorDepth::Ansi16);
     let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(!strip_row.contains(':'), "`{strip_row}`");
@@ -679,7 +694,7 @@ fn snapshot_tab_strip_scrolled_with_overflow_markers() {
     let cwd_refs: Vec<&str> = cwds.iter().map(String::as_str).collect();
     state.left = panel_with_tabs(&cwd_refs);
     state.left.switch_tab(6); // land somewhere in the middle
-    let l = filecommand_tui::layout::compute((30, 24));
+    let l = filecommand_tui::layout::compute((30, 24), 50);
     let text = render_to_text(30, 24, &state, ColorDepth::Ansi16);
     let strip_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(strip_row.contains('\u{25C4}') || strip_row.contains('\u{25BA}'), "`{strip_row}`");
@@ -704,7 +719,7 @@ fn snapshot_brief_mode_three_name_columns() {
     // reserve their own rows) so the 9 entries visibly wrap into a second
     // column rather than all fitting in one (additional-panel-modes "Brief
     // mode renders three name-only columns").
-    let l = filecommand_tui::layout::compute((80, 10));
+    let l = filecommand_tui::layout::compute((80, 10), 50);
     let text = render_to_text(80, 10, &state, ColorDepth::Ansi16);
     let first_body_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(!first_body_row.contains("Size"), "Brief mode has no Size/Date/Time header: `{first_body_row}`");
@@ -734,7 +749,7 @@ fn snapshot_tree_mode_header_root_and_branch_glyphs() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left = tree_panel(DisplayMode::Full, 2); // highlight "Beta"
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
-    let l = filecommand_tui::layout::compute((80, 24));
+    let l = filecommand_tui::layout::compute((80, 24), 50);
 
     let header_row = left_half(text.lines().nth(1).unwrap(), l.left.width as usize);
     assert!(header_row.contains("Tree"), "`{header_row}`");

@@ -269,6 +269,112 @@ fn placeholder_below_min_and_grows_back_to_panels_never_splash() {
 }
 
 #[test]
+fn too_small_boundary_at_59x16_is_placeholder() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(59, 16));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn too_small_boundary_at_60x15_is_placeholder() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(60, 15));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn too_small_boundary_at_60x16_is_panels() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(60, 16));
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn splash_skipped_when_starting_below_60x16_floor() {
+    let (state, _) = State::initial(Theme::classic(), (59, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn splash_starts_normally_at_exactly_60x16() {
+    let (state, _) = State::initial(Theme::classic(), (60, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
+}
+
+#[test]
+fn placeholder_replaces_splash_when_resized_below_new_floor_mid_splash() {
+    let state = test_state(UiPhase::Splash { started_at_ms: 0 });
+    let (state, _) = update(state, Command::Resize(59, 16));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+    // Enlarging back never returns to Splash, only Panels.
+    let (state, _) = update(state, Command::Resize(60, 16));
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+// ---------------------------------------------------------------------
+// Adjustable panel split (panel-split)
+// ---------------------------------------------------------------------
+
+#[test]
+fn split_grow_moves_divider_two_columns_right() {
+    // panel-split "Divider moves in 2-column steps": 50/50 at 100 columns,
+    // Ctrl+Right widens the left panel to 52.
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (state, effects) = update(state, Command::SplitGrow);
+    assert_eq!(state.split_percent, 52);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(52)]);
+}
+
+#[test]
+fn split_shrink_moves_divider_two_columns_left() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (state, effects) = update(state, Command::SplitShrink);
+    assert_eq!(state.split_percent, 48);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(48)]);
+}
+
+#[test]
+fn split_shrink_is_a_no_op_at_the_minimum() {
+    // panel-split "Adjustment at the limit is a no-op": the right panel is
+    // already at its 20-column minimum (left = 80 of 100).
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    state.split_percent = 80;
+    let (state, effects) = update(state, Command::SplitGrow);
+    assert_eq!(state.split_percent, 80, "no change at the limit");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn split_reset_restores_fifty_fifty() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    state.split_percent = 66;
+    let (state, effects) = update(state, Command::SplitReset);
+    assert_eq!(state.split_percent, 50);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(50)]);
+}
+
+#[test]
+fn split_reset_is_a_no_op_when_already_at_default() {
+    let state = test_state(UiPhase::Panels);
+    assert_eq!(state.split_percent, 50);
+    let (state, effects) = update(state, Command::SplitReset);
+    assert_eq!(state.split_percent, 50);
+    assert!(effects.is_empty(), "no redundant persist when already at the default");
+}
+
+#[test]
+fn split_change_persists_via_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (_, effects) = update(state, Command::SplitGrow);
+    assert!(matches!(effects.as_slice(), [Effect::PersistPanelSplit(_)]));
+}
+
+#[test]
 fn listing_chunk_during_splash_still_updates_panel_state() {
     let state = test_state(UiPhase::Splash { started_at_ms: 0 });
     let entries = vec![file_entry("a", 0)];

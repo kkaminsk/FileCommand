@@ -1,0 +1,19 @@
+---
+source: crates/filecommand-tui/tests/snapshot_matrix.rs
+assertion_line: 105
+expression: text
+---
+╔ C:\Users\demo\projects\file╗
+║▶UP--DIR◄                   ║
+║docs                        ║
+║Cargo.toml                  ║
+║readme.txt                  ║
+║                            ║
+║                            ║
+║                            ║
+║                            ║
+║                            ║
+║                            ║
+║                            ║
+║                            ║
+╚══════ docs  SUB-DIR ═══════╝

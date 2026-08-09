@@ -1,0 +1,14 @@
+---
+source: crates/filecommand-tui/tests/snapshots.rs
+assertion_line: 125
+expression: text
+---
+                                                           
+                                                           
+                                                           
+                                                           
+                                                           
+                                                           
+                                                           
+                                                           
+       Terminal too small — resize to at least 60x16

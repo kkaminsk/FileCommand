@@ -277,6 +277,15 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     if matches_binding(&key, &keys.fuzzy_jump) {
         return Some(Command::FuzzyJumpOpen);
     }
+    if matches_binding(&key, &keys.split_left) {
+        return Some(Command::SplitShrink);
+    }
+    if matches_binding(&key, &keys.split_right) {
+        return Some(Command::SplitGrow);
+    }
+    if matches_binding(&key, &keys.split_reset) {
+        return Some(Command::SplitReset);
+    }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);

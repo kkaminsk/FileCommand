@@ -1,0 +1,32 @@
+---
+source: crates/filecommand-tui/tests/snapshot_matrix.rs
+expression: text
+---
+╔═══════════ C:\Users\demo\projects\filecommand ═══════════╗
+║Name↓                            │ Size    Date    Time   ║
+║..                               │ ▶UP--DI                ║
+║docs                             │ ▶SUB-DI 01-02-2 03:0   ║
+║Cargo.toml                       │ 612     01-02-2 03:0   ║
+║readme.txt                       │ 12K     01-02-2 03:0   ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+║                                                          ║
+╚═════════════════════ docs  SUB-DIR ══════════════════════╝

@@ -1,5 +1,6 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
+assertion_line: 539
 expression: header
 ---
- Edit: f.txt                    Line 1/2   Col 1                          4 Ovr
+ Edit: f.txt                                           Line 1/2   Col 1   4 Ovr
