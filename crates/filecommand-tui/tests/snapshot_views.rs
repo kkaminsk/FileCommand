@@ -175,10 +175,41 @@ fn snapshot_streaming_ministatus() {
 
 #[test]
 fn quit_confirm_dialog_renders_over_panels() {
-    let state = base_state(UiPhase::QuitConfirm, Theme::classic());
+    // Post-quit-keys: the dialog is an overlay beside the phase
+    // (`State::quit_confirm: bool`), not a `UiPhase::QuitConfirm` variant —
+    // it is drawn on top of whatever `state.phase` painted underneath it
+    // (application-shell "Quit request keys and confirmation"; design D5).
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.quit_confirm = true;
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Quit FileCommand?"));
     insta::assert_snapshot!("quit_confirm_dialog", text);
+}
+
+#[test]
+fn quit_confirm_dialog_renders_above_the_viewer() {
+    // task 4.5: the dialog can be raised while the F3 viewer is open — it
+    // lives beside the phase, not inside it, so it must paint over whatever
+    // the viewer drew underneath (application-shell "Quit request keys and
+    // confirmation"; design D5).
+    let source = temp_viewer_file("quit-over-viewer", b"The quick brown fox\njumps over the lazy dog.\n");
+    let mut state = viewer_state("sample.txt", &source, ViewMode::Text);
+    state.quit_confirm = true;
+    let text = render_viewer_to_text(80, 24, &state, Some(&source));
+    assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the viewer");
+    insta::assert_snapshot!("quit_confirm_dialog_over_viewer", text);
+}
+
+#[test]
+fn quit_confirm_dialog_renders_above_an_open_pull_down_menu() {
+    // task 4.5: the dialog can be raised while an F9 pull-down menu is open
+    // — same topmost-overlay contract as above the viewer.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.quit_confirm = true;
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the open pull-down");
+    insta::assert_snapshot!("quit_confirm_dialog_over_pulldown_menu", text);
 }
 
 #[test]
@@ -1038,7 +1069,8 @@ fn snapshot_full_panels_under_each_new_theme() {
 #[test]
 fn snapshot_quit_confirm_dialog_under_each_new_theme() {
     for (theme, name) in new_builtin_themes() {
-        let state = base_state(UiPhase::QuitConfirm, theme);
+        let mut state = base_state(UiPhase::Panels, theme);
+        state.quit_confirm = true;
         let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
         assert!(text.contains("Quit FileCommand?"));
         insta::assert_snapshot!(format!("quit_confirm_dialog_{name}"), text);

@@ -55,7 +55,6 @@ impl PanelSide {
 pub enum UiPhase {
     Splash { started_at_ms: u64 },
     Panels,
-    QuitConfirm,
     /// Terminal is below the 60x16 hard floor. Growing back always resolves
     /// to `Panels`, never back to `Splash`.
     Placeholder,
@@ -156,6 +155,16 @@ pub struct State {
     /// either) it concerns (user-menu "Malformed file warns and falls back
     /// without overwriting").
     pub startup_warning: Option<String>,
+    /// The quit-confirmation dialog, or `false` when closed. Modeled as a
+    /// bare `bool` — like `EditorState::quit_confirm` for the built-in
+    /// editor's own F10 quit prompt — rather than an `Option<T>`, since the
+    /// dialog carries no state of its own (just a Y/N choice). It lives
+    /// beside the phase, not inside it, so it can open above panels, the
+    /// viewer, an open menu, or any other modal dialog/overlay without
+    /// disturbing whatever is underneath; cancelling clears only this flag,
+    /// which is what makes cancel-restores-context exact (application-shell
+    /// "Quit request keys and confirmation"; design D5).
+    pub quit_confirm: bool,
 }
 
 impl State {
@@ -214,6 +223,7 @@ impl State {
             file_action_menu: None,
             help: None,
             startup_warning: None,
+            quit_confirm: false,
         }
     }
 
@@ -800,9 +810,48 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         _ => {}
     }
 
+    // The quit-confirmation dialog is a modal overlay beside the phase, like
+    // the M5 dialogs below, but uniquely reachable from *every* context —
+    // panels, the viewer, an open menu, and every other modal dialog/
+    // overlay, including while a file operation is running — so it is
+    // handled here, ahead of the phase-specific short-circuits that follow,
+    // rather than gated behind any one of them (application-shell "Quit
+    // request keys and confirmation"; design D5).
+    if let Command::RequestQuit = cmd {
+        state.quit_confirm = true;
+        return (state, effects);
+    }
+    if state.quit_confirm {
+        match cmd {
+            Command::ConfirmQuit => {
+                // Confirming while a job is running aborts it first, through
+                // the same cancel path the Progress dialog's own
+                // `Command::FileOpCancelJob` uses (`Effect::CancelJob`),
+                // before quitting (design D3).
+                if matches!(state.phase, UiPhase::FileOpRunning { .. }) {
+                    effects.push(Effect::CancelJob);
+                }
+                state.quit_confirm = false;
+                effects.push(Effect::Quit);
+                return (state, effects);
+            }
+            Command::CancelQuit => {
+                // Clearing only this flag — never touching `state.phase` or
+                // any other overlay field — is what makes cancel restore the
+                // prior context exactly: a still-open viewer, menu, or
+                // dialog, and untouched command-line/quick-filter/type-ahead
+                // state (application-shell "Quit request keys and
+                // confirmation").
+                state.quit_confirm = false;
+                return (state, effects);
+            }
+            _ => {}
+        }
+    }
+
     // File-op setup/running/summary phases (and the job events that drive
     // them) are handled uniformly here, independent of the
-    // Splash/Placeholder/QuitConfirm/Panels phases below.
+    // Splash/Placeholder/Panels phases below.
     if matches!(state.phase, UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_))
         || matches!(cmd, Command::JobProgress(_) | Command::JobConflict(_) | Command::JobError(_) | Command::JobDone { .. })
     {
@@ -891,11 +940,6 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
         },
         UiPhase::Placeholder => {}
-        UiPhase::QuitConfirm => match cmd {
-            Command::ConfirmQuit => effects.push(Effect::Quit),
-            Command::CancelQuit => state.phase = UiPhase::Panels,
-            _ => {}
-        },
         UiPhase::Panels => match cmd {
             Command::MoveCursor(m) => {
                 // A movement key exits type-ahead (if active) *and* is
@@ -919,7 +963,8 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 let side = state.active;
                 effects.extend(handle_parent(&mut state, side));
             }
-            Command::RequestQuit => state.phase = UiPhase::QuitConfirm,
+            // `Command::RequestQuit` is handled globally, above, regardless
+            // of phase — it never reaches this arm.
             Command::RereadPanel(side) => {
                 let path = state.panel(side).cwd.clone();
                 effects.extend(begin_listing(&mut state, side, path));
