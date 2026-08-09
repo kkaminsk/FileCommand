@@ -3147,6 +3147,75 @@ fn user_menu_move_clamps_and_confirm_on_an_empty_menu_is_a_harmless_close() {
 }
 
 // ---------------------------------------------------------------------
+// user-menu-themes-entry: built-in Themes slot
+// ---------------------------------------------------------------------
+
+#[test]
+fn user_menu_down_past_the_last_user_entry_lands_on_themes_and_clamps_there() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![
+        crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() },
+        crate::config::UserMenuEntry { label: "B".to_string(), command: "echo b".to_string() },
+    ];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    // Two user entries (indices 0, 1) plus the built-in slot at index 2.
+    let (state, _) = update(state, Command::UserMenuMove(2));
+    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 2, "Down from the last user entry lands on the built-in Themes slot");
+    let (state, _) = update(state, Command::UserMenuMove(1));
+    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 2, "the built-in slot is the end of the domain: Down holds, it does not wrap");
+}
+
+#[test]
+fn user_menu_confirm_on_themes_opens_the_picker_pre_highlighted_with_no_shell_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.theme = Theme::terminal_green();
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(1)); // off the one user entry, onto the built-in slot
+    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 1);
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none(), "the F2 menu closes");
+    let picker = state.theme_picker.expect("Confirm on the built-in slot opens the theme picker");
+    let expected = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "terminal-green").unwrap();
+    assert_eq!(picker.highlight, expected, "the active theme's row is pre-highlighted, same as the Options -> Themes route");
+    assert!(effects.is_empty(), "no shell effect is emitted for the built-in slot");
+}
+
+#[test]
+fn user_menu_confirm_on_a_user_entry_still_runs_it_via_the_shell_unaffected_by_the_built_in_slot() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.right.cwd = PathBuf::from(r"C:\Projects\app");
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "Build".to_string(), command: "cargo build".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, effects) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none());
+    assert!(state.theme_picker.is_none(), "a user entry never opens the theme picker");
+    match effects.as_slice() {
+        [Effect::RunShellCommand(inv, side)] => {
+            assert_eq!(inv.cwd, PathBuf::from(r"C:\Projects\app"));
+            assert!(inv.args.iter().any(|a| a.contains("cargo build")), "{:?}", inv.args);
+            assert_eq!(*side, PanelSide::Right);
+        }
+        other => panic!("expected exactly one RunShellCommand effect, got {other:?}"),
+    }
+}
+
+#[test]
+fn theme_picker_esc_after_f2_origin_returns_to_the_panels_without_reopening_the_user_menu() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (state, _) = update(state, Command::UserMenuMove(1)); // onto the built-in Themes slot
+    let (state, _) = update(state, Command::UserMenuConfirm);
+    assert!(state.user_menu.is_none() && state.theme_picker.is_some());
+    let (state, effects) = update(state, Command::ThemePickerCancel);
+    assert!(state.theme_picker.is_none(), "the picker closes");
+    assert!(state.user_menu.is_none(), "Esc lands on the panels, not back on the F2 menu (design D5)");
+    assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
 // visual-themes: Options -> Themes picker
 // ---------------------------------------------------------------------
 
