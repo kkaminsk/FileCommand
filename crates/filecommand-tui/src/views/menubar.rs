@@ -4,7 +4,8 @@
 //! panels' top borders and the clock while it is open. Pull-downs are
 //! single-line CP437-framed boxes hanging directly below their title.
 
-use filecommand_core::listing::{display_width, pad_to_width};
+use filecommand_core::dialogs::clamp_overlay_dim;
+use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::menu::{entries, MenuEntry, MenuId, MenuState, ALL_MENUS};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
@@ -21,6 +22,11 @@ const GAP: u16 = 5;
 const ITEM_PAD: usize = 1;
 /// Minimum columns between an item's label and its shortcut hint.
 const SHORTCUT_GAP: usize = 2;
+/// Pull-down minimum interior width/height — small enough that a box is
+/// still legible when clamped (responsive-layout "Unified overlay
+/// geometry").
+const MIN_INNER_W: u16 = 10;
+const MIN_BOX_H: u16 = 3;
 
 /// Where each menu title starts on the bar. Shared by the bar renderer and
 /// the pull-down renderer so a box always hangs under its own title.
@@ -68,7 +74,10 @@ pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
     }
 }
 
-/// One rendered pull-down row: its text and which style it takes.
+/// One rendered pull-down row: its text and which style it takes. When
+/// `inner_w` clamps below the row's natural width, the label+shortcut
+/// combination truncates with `…` rather than silently overflowing
+/// (responsive-layout "Unified overlay geometry").
 fn item_rows(id: MenuId, inner_w: usize) -> Vec<Option<String>> {
     entries(id)
         .iter()
@@ -83,7 +92,7 @@ fn item_rows(id: MenuId, inner_w: usize) -> Vec<Option<String>> {
                     let spacer = " ".repeat(inner_w.saturating_sub(used).max(SHORTCUT_GAP));
                     format!("{pad}{}{spacer}{}{pad}", item.label, item.shortcut)
                 };
-                Some(pad_to_width(&text, inner_w))
+                Some(pad_to_width(&truncate_with_ellipsis(&text, inner_w), inner_w))
             }
         })
         .collect()
@@ -113,27 +122,37 @@ fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
     let disabled_style = role_style(theme, Role::MenuDisabled, depth);
 
     let id = menu.active;
-    let inner_w = pulldown_inner_width(id);
-    let box_w = inner_w + 2;
+    let content_rows = entries(id).len() as u16;
+    // Width and height each clamp independently via the unified overlay
+    // rule's per-dimension helper (responsive-layout "Unified overlay
+    // geometry"); rows available is the terminal height minus the bar's
+    // own row.
+    let avail_h = area.height.saturating_sub(1);
+    let box_w = clamp_overlay_dim(pulldown_inner_width(id) as u16 + 2, MIN_INNER_W + 2, area.width);
+    let box_h = clamp_overlay_dim(content_rows + 2, MIN_BOX_H, avail_h);
+    let inner_w = box_w.saturating_sub(2) as usize;
+    // Frame top + frame bottom take two of the rows we have; if there
+    // isn't room for even an empty framed box, draw nothing rather than a
+    // single overlapping border row.
+    if box_h < 2 {
+        return;
+    }
+    let visible = box_h.saturating_sub(2) as usize;
 
     let title_x = title_positions().iter().find(|(m, _)| *m == id).map(|(_, x)| *x).unwrap_or(LEAD);
     // Hang the box under its title, shifted one column left so the title
-    // sits over the box's interior rather than its frame — and nudged back
-    // on screen if that would overflow the right edge.
+    // sits over the box's interior rather than its frame — and shifted
+    // further left just enough to stay on screen, rather than centering
+    // (responsive-layout "Unified overlay geometry": "Pull-down box shifts
+    // left instead of centering").
     let mut x = area.x + title_x.saturating_sub(1);
     let right_edge = area.x + area.width;
-    if x + box_w as u16 > right_edge {
-        x = right_edge.saturating_sub(box_w as u16);
+    if x + box_w > right_edge {
+        x = right_edge.saturating_sub(box_w);
     }
     let y = area.y + 1;
 
     let rows = item_rows(id, inner_w);
-    let available_rows = area.height.saturating_sub(1) as usize;
-    // Frame top + frame bottom take two of the rows we have.
-    let visible = rows.len().min(available_rows.saturating_sub(2));
-    if visible == 0 || box_w > area.width as usize {
-        return;
-    }
 
     buf.set_string(x, y, format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_w)), body_style);
     for (i, row) in rows.iter().take(visible).enumerate() {
@@ -281,9 +300,23 @@ mod tests {
 
     #[test]
     fn a_short_screen_drops_the_pulldown_rather_than_overflowing() {
-        // Two rows leaves no room for a framed box under the bar.
+        // Two rows leaves no room for even an empty framed box under the
+        // bar — a genuinely zero-space case, not one the unified overlay
+        // rule's "always clamp and draw something" applies to.
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 2);
         assert!(rows[1].trim().is_empty());
+    }
+
+    #[test]
+    fn a_narrow_screen_clamps_and_truncates_rather_than_dropping() {
+        // With *some* room (unlike the zero-space case above), the pull-
+        // down clamps to what's available and truncates item text with
+        // `…`, rather than disappearing (responsive-layout "Unified
+        // overlay geometry").
+        let rows = render(&MenuState::for_menu(MenuId::Commands), 20, 24);
+        assert!(rows[1].contains('\u{250C}') && rows[1].contains('\u{2510}'), "the box still draws: `{}`", rows[1]);
+        let joined = rows.join("\n");
+        assert!(joined.contains('\u{2026}'), "the widest item must truncate with an ellipsis:\n{joined}");
     }
 
     #[test]

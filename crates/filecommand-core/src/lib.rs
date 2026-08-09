@@ -20,6 +20,7 @@ pub mod info;
 pub mod listing;
 pub mod menu;
 pub mod panel;
+pub mod panel_split;
 pub mod quicksearch;
 pub mod shell;
 pub mod theme;

@@ -310,6 +310,57 @@ pub fn entry_status_line(entry: &Entry) -> String {
     }
 }
 
+/// The same fields `entry_status_line` joins into one string, kept apart so
+/// a narrow mini-status can drop them individually — time, then date, then
+/// size — in the same rightmost-first order as the Full-mode column ladder
+/// (responsive-layout "Chrome degradation"). `..`/directories carry their
+/// `UP--DIR`/`SUB-DIR` marker in the size slot and never have a date or
+/// time.
+pub fn entry_status_parts(entry: &Entry) -> (String, Option<String>, Option<String>, Option<String>) {
+    let name = display_name_lossy(entry);
+    match entry.kind {
+        EntryKind::ParentDir => (name, Some("UP--DIR".to_string()), None, None),
+        EntryKind::Directory => (name, Some("SUB-DIR".to_string()), None, None),
+        EntryKind::File => {
+            let size = Some(format_size(entry.size));
+            let date = entry.modified.map(format_date);
+            let time = entry.modified.map(format_time);
+            (name, size, date, time)
+        }
+    }
+}
+
+/// Truncate `s` to at most `max_w` display columns, appending `…` only when
+/// truncation actually occurred (a short-enough `s` is returned unchanged).
+/// Display-width aware (`unicode-width`), used to clamp overlay interiors
+/// and mini-status/command-line text that no longer fits its computed
+/// width (responsive-layout "Unified overlay geometry", "Chrome
+/// degradation").
+pub fn truncate_with_ellipsis(s: &str, max_w: usize) -> String {
+    if display_width(s) <= max_w {
+        return s.to_string();
+    }
+    if max_w == 0 {
+        return String::new();
+    }
+    if max_w == 1 {
+        return "\u{2026}".to_string();
+    }
+    let budget = max_w - 1; // reserve one cell for the ellipsis
+    let mut out = String::new();
+    let mut acc = 0usize;
+    for ch in s.chars() {
+        let cw = display_width(&ch.to_string());
+        if acc + cw > budget {
+            break;
+        }
+        out.push(ch);
+        acc += cw;
+    }
+    out.push('\u{2026}');
+    out
+}
+
 /// Comma-grouped integer, e.g. `12_345 -> "12,345"`.
 pub fn format_count(n: usize) -> String {
     let digits: Vec<u8> = n.to_string().into_bytes();
@@ -570,6 +621,42 @@ mod tests {
         let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None };
         assert_eq!(entry_status_line(&dir), "sub  SUB-DIR");
         assert_eq!(entry_status_line(&Entry::parent_dir()), "..  UP--DIR");
+    }
+
+    #[test]
+    fn entry_status_parts_splits_file_fields() {
+        let dt = DateTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4 };
+        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt) };
+        let (name, size, date, time) = entry_status_parts(&file);
+        assert_eq!(name, "a.txt");
+        assert_eq!(size.as_deref(), Some("100"));
+        assert_eq!(date.as_deref(), Some("01-02-26"));
+        assert_eq!(time.as_deref(), Some("03:04"));
+    }
+
+    #[test]
+    fn entry_status_parts_marks_dirs_and_parent_with_no_date_or_time() {
+        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None };
+        assert_eq!(entry_status_parts(&dir), ("sub".to_string(), Some("SUB-DIR".to_string()), None, None));
+        assert_eq!(entry_status_parts(&Entry::parent_dir()), ("..".to_string(), Some("UP--DIR".to_string()), None, None));
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_leaves_short_strings_untouched() {
+        assert_eq!(truncate_with_ellipsis("abc", 5), "abc");
+        assert_eq!(truncate_with_ellipsis("abc", 3), "abc");
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_appends_only_when_it_truncates() {
+        assert_eq!(truncate_with_ellipsis("abcdef", 4), "abc\u{2026}");
+        assert_eq!(display_width(&truncate_with_ellipsis("abcdef", 4)), 4);
+    }
+
+    #[test]
+    fn truncate_with_ellipsis_handles_degenerate_widths() {
+        assert_eq!(truncate_with_ellipsis("abc", 0), "");
+        assert_eq!(truncate_with_ellipsis("abc", 1), "\u{2026}");
     }
 
     #[cfg(windows)]

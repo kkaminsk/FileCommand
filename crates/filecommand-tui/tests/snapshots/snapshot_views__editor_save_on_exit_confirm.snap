@@ -1,8 +1,9 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
+assertion_line: 570
 expression: text
 ---
- Edit: C:\notes.txt *           Line 1/2   Col 2                              5 
+ Edit: C:\notes.txt *                                      Line 1/2   Col 2   5 
 !abc                                                                            
                                                                                 
                                                                                 

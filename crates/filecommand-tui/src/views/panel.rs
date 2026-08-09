@@ -11,7 +11,8 @@
 use filecommand_core::git_info::FileStatus;
 use filecommand_core::listing::EntryKind;
 use filecommand_core::listing::{
-    display_name_lossy, entry_status_line, format_date, format_size, format_time, pad_to_width, reading_status, sort_arrow, SortColumn,
+    display_name_lossy, entry_status_parts, format_date, format_size, format_time, pad_to_width, reading_status, sort_arrow, truncate_with_ellipsis,
+    SortColumn,
 };
 use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
@@ -28,6 +29,95 @@ use crate::views::viewer::render_text_body;
 const SIZE_COL_W: usize = 9;
 const DATE_COL_W: usize = 8;
 const TIME_COL_W: usize = 5;
+
+/// The Name column never shrinks below this many display cells in Full
+/// mode — the anchor `MIN_NAME_W` for the column ladder (design D3).
+const MIN_NAME_W: usize = 12;
+
+/// Which of the optional Full-mode columns currently render. `size`,
+/// `date`, and `time` are only ever dropped rightmost-first — `date` true
+/// implies `size` true, and `time` true implies both `size` and `date` true
+/// — an invariant [`choose_columns`] maintains by construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ColumnSet {
+    size: bool,
+    date: bool,
+    time: bool,
+}
+
+impl ColumnSet {
+    const FULL: ColumnSet = ColumnSet { size: true, date: true, time: true };
+    const NAME_ONLY: ColumnSet = ColumnSet { size: false, date: false, time: false };
+
+    /// Display cells consumed by the columns after Name (including the
+    /// separator pipe and inter-column spaces), or 0 when only Name renders
+    /// — in which case Name spans the full interior with no pipe or slack.
+    /// `SIZE_COL_W`/`DATE_COL_W`/`TIME_COL_W` are unchanged from the fixed
+    /// 80x24 layout, so the reserved width (and therefore the rendered
+    /// output) at the nominal size is byte-identical to before this change
+    /// (design D3's anchor).
+    fn reserved_w(self) -> usize {
+        if !self.size {
+            return 0;
+        }
+        let mut r = SIZE_COL_W;
+        if self.date {
+            r += DATE_COL_W;
+        }
+        if self.time {
+            r += TIME_COL_W;
+        }
+        r + 3
+    }
+}
+
+/// Chooses the widest column set from the ladder `Name+Size+Date+Time →
+/// Name+Size+Date → Name+Size → Name` that keeps the Name column at least
+/// `MIN_NAME_W` display cells wide, given `interior_w` (the panel's width
+/// inside its border) and `marker_w` (1 when the git status-marker column
+/// is reserved, else 0). Pure in its inputs, so degradation is reversible
+/// by construction: the same `(interior_w, marker_w)` always yields the
+/// same set, whether the panel is narrowing or widening (panel-navigation
+/// "Full display mode layout"; responsive-layout "Degraded band and
+/// per-panel breakpoints").
+fn choose_columns(interior_w: usize, marker_w: usize) -> ColumnSet {
+    let mut cols = ColumnSet::FULL;
+    loop {
+        let name_w = interior_w.saturating_sub(marker_w).saturating_sub(cols.reserved_w());
+        if name_w >= MIN_NAME_W || cols == ColumnSet::NAME_ONLY {
+            return cols;
+        }
+        cols = if cols.time {
+            ColumnSet { time: false, ..cols }
+        } else if cols.date {
+            ColumnSet { date: false, ..cols }
+        } else {
+            ColumnSet::NAME_ONLY
+        };
+    }
+}
+
+/// Assembles a Full-mode row (or header row) string from its four fields,
+/// appending only the blocks `cols` selects — the same function backs both
+/// the header row and every entry row, so "the header row shows exactly the
+/// columns currently rendered" holds by construction.
+fn format_full_row(name_w: usize, cols: ColumnSet, name: &str, size: &str, date: &str, time: &str) -> String {
+    let mut s = pad_to_width(name, name_w);
+    if cols.size {
+        s.push('\u{2502}');
+        s.push(' ');
+        s.push_str(&pad_to_width(size, SIZE_COL_W - 2));
+    }
+    if cols.date {
+        s.push(' ');
+        s.push_str(&pad_to_width(date, DATE_COL_W - 1));
+    }
+    if cols.time {
+        s.push(' ');
+        s.push_str(&pad_to_width(time, TIME_COL_W - 1));
+    }
+    s
+}
 
 /// A column header label, with the sort arrow appended when this column is
 /// the active sort key. `Unsorted` marks no column, so no header shows one.
@@ -68,6 +158,21 @@ fn quick_filter_or_type_ahead_status(panel: &PanelState, type_ahead: Option<&str
     panel.quick_filter.clone().or_else(|| type_ahead.map(|p| p.to_string()))
 }
 
+/// The panel's top-border title string — Quick View's fixed label, or the
+/// current directory path with the M5 git branch-name suffix on the active
+/// panel — exactly as `render_panel` centers and clips it into the top
+/// border. Exposed so callers (the clock/title collision check in
+/// `views::mod`) can compute the title's on-screen span without
+/// duplicating this construction (responsive-layout "Chrome degradation";
+/// git-info "Branch-name border suffix on the active panel").
+pub fn panel_title(panel: &PanelState, active: bool) -> String {
+    match (panel.display_mode, active, &panel.git_info.branch) {
+        (DisplayMode::QuickView, _, _) => " Quick view ".to_string(),
+        (_, true, Some(branch)) => format!(" {} ({branch}) ", panel.cwd.display()),
+        (_, _, _) => format!(" {} ", panel.cwd.display()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     buf: &mut Buffer,
@@ -102,11 +207,7 @@ pub fn render_panel(
     // the M5 git branch-name suffix immediately after the path once its
     // git query has resolved (git-info "Branch-name border suffix on the
     // active panel").
-    let title = match (panel.display_mode, active, &panel.git_info.branch) {
-        (DisplayMode::QuickView, _, _) => " Quick view ".to_string(),
-        (_, true, Some(branch)) => format!(" {} ({branch}) ", panel.cwd.display()),
-        (_, _, _) => format!(" {} ", panel.cwd.display()),
-    };
+    let title = panel_title(panel, active);
     let top = format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(w.saturating_sub(2)));
     buf.set_string(x0, y0, &top, frame_style);
     let title_x = x0 + 1 + ((w.saturating_sub(2)).saturating_sub(display_width(&title)) / 2) as u16;
@@ -188,15 +289,20 @@ pub fn render_panel(
     // pending").
     let has_git = panel.git_info.is_repo();
     let marker_w = if has_git { 1 } else { 0 };
-    let name_w = w.saturating_sub(2).saturating_sub(marker_w + SIZE_COL_W + DATE_COL_W + TIME_COL_W + 3);
+    let interior_w = w.saturating_sub(2);
+    let cols = choose_columns(interior_w, marker_w);
+    let name_w = interior_w.saturating_sub(marker_w).saturating_sub(cols.reserved_w());
     let leading = if has_git { " " } else { "" };
     let header = format!(
-        "{leading}{}{} {} {} {}",
-        pad_to_width(&header_label("Name", SortColumn::Name, panel), name_w),
-        "\u{2502}",
-        pad_to_width(&header_label("Size", SortColumn::Size, panel), SIZE_COL_W - 2),
-        pad_to_width(&header_label("Date", SortColumn::Date, panel), DATE_COL_W - 1),
-        pad_to_width("Time", TIME_COL_W - 1),
+        "{leading}{}",
+        format_full_row(
+            name_w,
+            cols,
+            &header_label("Name", SortColumn::Name, panel),
+            &header_label("Size", SortColumn::Size, panel),
+            &header_label("Date", SortColumn::Date, panel),
+            "Time",
+        )
     );
     buf.set_string(x0, body_y0, "\u{2551}", frame_style);
     buf.set_string(x0 + 1, body_y0, pad_to_width(&header, w.saturating_sub(2)), header_style);
@@ -233,14 +339,7 @@ pub fn render_panel(
                 Some(dt) => (format_date(dt), format_time(dt)),
                 None => (String::new(), String::new()),
             };
-            let rest = format!(
-                "{}{} {} {} {}",
-                pad_to_width(&name, name_w),
-                "\u{2502}",
-                pad_to_width(&size_col, SIZE_COL_W - 2),
-                pad_to_width(&date_col, DATE_COL_W - 1),
-                pad_to_width(&time_col, TIME_COL_W - 1),
-            );
+            let rest = format_full_row(name_w, cols, &name, &size_col, &date_col, &time_col);
             if has_git {
                 let marker = git_marker(panel, entry);
                 let marker_style = if is_selected {
@@ -286,8 +385,17 @@ fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: 
     let selected_style = role_style(theme, Role::PanelSelected, depth);
 
     let inner_w = w.saturating_sub(2);
-    let col_w = inner_w / 3;
-    let col_widths = [col_w, col_w, inner_w.saturating_sub(col_w * 2)];
+    // `max(1, floor(interior_width / 12))` columns, equal widths with the
+    // division remainder given to the last column — at interior 38 this is
+    // still exactly 3 columns of 12/12/14, byte-identical to the old
+    // hardcoded `interior / 3` (design D4; additional-panel-modes "Brief
+    // display mode").
+    let n_cols = (inner_w / 12).max(1);
+    let base_w = inner_w / n_cols;
+    let mut col_widths = vec![base_w; n_cols];
+    if let Some(last) = col_widths.last_mut() {
+        *last += inner_w - base_w * n_cols;
+    }
     let rows_h = body_h as usize;
     // Narrow to the active quick filter's `visible_indices()` (`..` plus
     // name-matching entries), exactly like Full mode above (quick-filter
@@ -433,21 +541,32 @@ fn render_bottom_border(
     status_override: Option<String>,
 ) {
     let w = area.width as usize;
+    let inner_w = w.saturating_sub(2);
+    // The bracketed status text is wrapped in a leading/trailing space (see
+    // `bracketed` below), so the content itself has 2 fewer cells to work
+    // with than the interior.
+    let status_budget = inner_w.saturating_sub(2);
     // An inline error (a failed listing, a failed F3/F4 dispatch — §7 "panel
     // shows an inline error state") takes over the mini-status line until
-    // the next successful operation clears it (`begin_new_listing`).
+    // the next successful operation clears it (`begin_new_listing`). The
+    // multi-select summary takes precedence over the per-entry status while
+    // one or more entries are selected (selection "Selection count and size
+    // summary"); both drop fields/truncate with `…` in ladder order as the
+    // panel narrows (responsive-layout "Chrome degradation").
     let status_text = match status_override {
         Some(text) => text,
         None => match &panel.last_error {
             Some(message) => message.clone(),
             None => match panel.progress {
                 ListingProgress::Streaming { count } => reading_status(count),
-                ListingProgress::Complete { .. } => panel.selected().map(entry_status_line).unwrap_or_default(),
+                ListingProgress::Complete { .. } => match panel.selection_status() {
+                    Some(summary) => truncate_with_ellipsis(&summary, status_budget),
+                    None => panel.selected().map(|e| fit_mini_status(&entry_status_parts(e), status_budget)).unwrap_or_default(),
+                },
             },
         },
     };
     let bottom_y = area.y + area.height - 1;
-    let inner_w = w.saturating_sub(2);
     let bracketed = if status_text.is_empty() { String::new() } else { format!(" {status_text} ") };
     let bracketed = if display_width(&bracketed) > inner_w { clip(&bracketed, inner_w) } else { bracketed };
     let fill_total = inner_w.saturating_sub(display_width(&bracketed));
@@ -469,6 +588,45 @@ fn display_width(s: &str) -> usize {
     filecommand_core::listing::display_width(s)
 }
 
+/// Assembles the widest fitting rendering of `parts` (name/size/date/time,
+/// from `entry_status_parts`) that fits `max_w` display columns, dropping
+/// optional fields in the same rightmost-first order as the Full-mode
+/// column ladder — time, then date, then size — and truncating the name
+/// with `…` only once every other field is gone (responsive-layout "Chrome
+/// degradation"; design D3).
+fn fit_mini_status(parts: &(String, Option<String>, Option<String>, Option<String>), max_w: usize) -> String {
+    let (name, size, date, time) = parts;
+    let build = |include_size: bool, include_date: bool, include_time: bool| -> String {
+        let mut s = name.clone();
+        if include_size {
+            if let Some(sz) = size {
+                s.push_str("  ");
+                s.push_str(sz);
+            }
+        }
+        if include_date {
+            if let Some(d) = date {
+                s.push_str("  ");
+                s.push_str(d);
+            }
+        }
+        if include_time {
+            if let Some(t) = time {
+                s.push(' ');
+                s.push_str(t);
+            }
+        }
+        s
+    };
+    for &(is, id, it) in &[(true, true, true), (true, true, false), (true, false, false)] {
+        let candidate = build(is, id, it);
+        if display_width(&candidate) <= max_w {
+            return candidate;
+        }
+    }
+    truncate_with_ellipsis(name, max_w)
+}
+
 /// Truncate `s` to at most `max_w` display columns without adding padding.
 fn clip(s: &str, max_w: usize) -> String {
     let mut out = String::new();
@@ -482,4 +640,168 @@ fn clip(s: &str, max_w: usize) -> String {
         acc += cw;
     }
     out
+}
+
+/// The Brief-mode column widths for `inner_w` — `max(1, floor(inner_w /
+/// 12))` equal-width columns with the division remainder on the last
+/// column (design D4; additional-panel-modes "Brief display mode"). Shared
+/// between `render_brief_body` and its tests below.
+#[cfg(test)]
+fn brief_column_widths(inner_w: usize) -> Vec<usize> {
+    let n_cols = (inner_w / 12).max(1);
+    let base_w = inner_w / n_cols;
+    let mut col_widths = vec![base_w; n_cols];
+    if let Some(last) = col_widths.last_mut() {
+        *last += inner_w - base_w * n_cols;
+    }
+    col_widths
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn choose_columns_all_four_at_nominal_interior() {
+        // interior 38, no git marker — the 80x24 default-split anchor
+        // (design D3): all four columns render, Name gets 13 cells.
+        let cols = choose_columns(38, 0);
+        assert_eq!(cols, ColumnSet::FULL);
+        let name_w = 38usize.saturating_sub(0).saturating_sub(cols.reserved_w());
+        assert_eq!(name_w, 13);
+    }
+
+    #[test]
+    fn choose_columns_drops_time_first() {
+        // Narrow just enough that Name+Size+Date+Time would leave Name
+        // under 12, but Name+Size+Date still fits at >= 12.
+        let full_name_w = |w: usize| w.saturating_sub(ColumnSet::FULL.reserved_w());
+        let w = (0usize..40).find(|&w| full_name_w(w) < MIN_NAME_W && w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) >= MIN_NAME_W).unwrap();
+        let cols = choose_columns(w, 0);
+        assert_eq!(cols, ColumnSet { size: true, date: true, time: false });
+    }
+
+    #[test]
+    fn choose_columns_drops_date_next() {
+        let two_col = ColumnSet { size: true, date: false, time: false };
+        let w = (0usize..40)
+            .find(|&w| w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) < MIN_NAME_W && w.saturating_sub(two_col.reserved_w()) >= MIN_NAME_W)
+            .unwrap();
+        let cols = choose_columns(w, 0);
+        assert_eq!(cols, two_col);
+    }
+
+    #[test]
+    fn choose_columns_name_only_at_minimum_panel_width() {
+        // A 20-column panel (the panel-split minimum) has interior 18.
+        let cols = choose_columns(18, 0);
+        assert_eq!(cols, ColumnSet::NAME_ONLY);
+        let name_w = 18usize.saturating_sub(cols.reserved_w());
+        assert!(name_w >= MIN_NAME_W, "name_w={name_w} spans the interior at the panel minimum");
+        assert_eq!(name_w, 18);
+    }
+
+    #[test]
+    fn choose_columns_accounts_for_git_marker_width() {
+        // The same interior width with a reserved marker column drops a
+        // column sooner than without one.
+        let without_marker = choose_columns(28, 0);
+        let with_marker = choose_columns(28, 1);
+        assert!(with_marker != ColumnSet::FULL || without_marker == ColumnSet::FULL);
+    }
+
+    #[test]
+    fn fit_mini_status_shows_all_fields_when_it_fits() {
+        let parts = ("a.txt".to_string(), Some("100".to_string()), Some("01-02-26".to_string()), Some("03:04".to_string()));
+        assert_eq!(fit_mini_status(&parts, 80), "a.txt  100  01-02-26 03:04");
+    }
+
+    #[test]
+    fn fit_mini_status_drops_time_then_date_then_size() {
+        let parts = ("a.txt".to_string(), Some("100".to_string()), Some("01-02-26".to_string()), Some("03:04".to_string()));
+        let full = fit_mini_status(&parts, 80);
+        let no_time = fit_mini_status(&parts, display_width(&full) - 1);
+        assert_eq!(no_time, "a.txt  100  01-02-26");
+        let no_date = fit_mini_status(&parts, display_width(&no_time) - 1);
+        assert_eq!(no_date, "a.txt  100");
+        let name_only = fit_mini_status(&parts, display_width(&no_date) - 1);
+        assert_eq!(name_only, "a.txt");
+    }
+
+    #[test]
+    fn fit_mini_status_truncates_the_name_last() {
+        let parts = ("a-very-long-file-name.txt".to_string(), Some("100".to_string()), None, None);
+        assert_eq!(fit_mini_status(&parts, 5), "a-ve\u{2026}");
+    }
+
+    #[test]
+    fn brief_columns_three_at_nominal_interior() {
+        // interior 38 at 80x24 default split — byte-identical to the old
+        // hardcoded `interior / 3`.
+        assert_eq!(brief_column_widths(38), vec![12, 12, 14]);
+    }
+
+    #[test]
+    fn brief_columns_five_at_interior_60() {
+        assert_eq!(brief_column_widths(60).len(), 5);
+    }
+
+    #[test]
+    fn brief_columns_single_at_interior_23() {
+        let widths = brief_column_widths(23);
+        assert_eq!(widths, vec![23]);
+    }
+
+    #[test]
+    fn brief_columns_never_zero_even_at_tiny_widths() {
+        assert_eq!(brief_column_widths(0), vec![0]);
+        assert_eq!(brief_column_widths(1), vec![1]);
+    }
+
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn choose_columns_never_yields_name_under_minimum(
+                interior_w in 20usize..80,
+                marker_w in 0usize..2,
+            ) {
+                let cols = choose_columns(interior_w, marker_w);
+                let name_w = interior_w.saturating_sub(marker_w).saturating_sub(cols.reserved_w());
+                // Below the panel minimum's interior, only the floor
+                // (name-only, spanning what's left) is reachable — the
+                // invariant is guaranteed only once the ladder has room to
+                // work with, i.e. at or above the true minimum interior.
+                if cols != ColumnSet::NAME_ONLY {
+                    prop_assert!(name_w >= MIN_NAME_W);
+                }
+            }
+
+            #[test]
+            fn choose_columns_is_monotonic_in_width(
+                marker_w in 0usize..2,
+                narrow in 20usize..50,
+                widen in 0usize..30,
+            ) {
+                let wide = narrow + widen;
+                let narrow_cols = choose_columns(narrow, marker_w);
+                let wide_cols = choose_columns(wide, marker_w);
+                // A superset relation: every column the narrower width
+                // shows, the wider width shows too.
+                prop_assert!(!narrow_cols.size || wide_cols.size);
+                prop_assert!(!narrow_cols.date || wide_cols.date);
+                prop_assert!(!narrow_cols.time || wide_cols.time);
+            }
+
+            #[test]
+            fn brief_column_count_matches_direct_formula(inner_w in 0usize..200) {
+                let widths = brief_column_widths(inner_w);
+                let expected_n = (inner_w / 12).max(1);
+                prop_assert_eq!(widths.len(), expected_n);
+                prop_assert_eq!(widths.iter().sum::<usize>(), inner_w);
+            }
+        }
+    }
 }

@@ -1,0 +1,6 @@
+---
+source: crates/filecommand-tui/tests/snapshot_matrix.rs
+assertion_line: 113
+expression: text
+---
+1Hlp 2Mnu 3Vew 4Edt 5Cpy 6Ren 7Mkd 8Del 9Pdn 10Qit

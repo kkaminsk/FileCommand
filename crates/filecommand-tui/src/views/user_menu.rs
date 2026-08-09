@@ -3,8 +3,8 @@
 //! (user-menu "Open the F2 user menu").
 
 use filecommand_core::config::UserMenuEntry;
-use filecommand_core::dialogs::UserMenuState;
-use filecommand_core::listing::{display_width, pad_to_width};
+use filecommand_core::dialogs::{overlay_rect, UserMenuState};
+use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -21,30 +21,29 @@ pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Colo
     let highlight = role_style(theme, Role::MenuHighlight, depth);
 
     let widest_label = entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER));
-    let inner_w = (widest_label + 2).clamp(MIN_INNER_W, MAX_INNER_W).min(area.width.saturating_sub(4) as usize).max(display_width(TITLE));
-    let box_w = inner_w as u16 + 2;
-    let rows = entries.len().max(1); // the empty-state placeholder is one row
-    let box_h = rows as u16 + 2;
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let preferred_inner_w = (widest_label + 2).clamp(MIN_INNER_W, MAX_INNER_W).max(display_width(TITLE));
+    let content_rows = entries.len().max(1) as u16; // the empty-state placeholder is one row
+    let r = overlay_rect((preferred_inner_w as u16 + 2, content_rows + 2), (MIN_INNER_W as u16 + 2, 3), (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let visible_rows = box_h.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     buf.set_string(x, y, format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(inner_w)), body);
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(TITLE))) / 2) as u16;
-    buf.set_string(title_x, y, TITLE, body);
+    buf.set_string(title_x, y, truncate_with_ellipsis(TITLE, inner_w), body);
 
     if entries.is_empty() {
         buf.set_string(x, y + 1, "\u{2551}", body);
-        buf.set_string(x + 1, y + 1, pad_to_width(EMPTY_PLACEHOLDER, inner_w), body);
+        buf.set_string(x + 1, y + 1, pad_to_width(&truncate_with_ellipsis(EMPTY_PLACEHOLDER, inner_w), inner_w), body);
         buf.set_string(x + 1 + inner_w as u16, y + 1, "\u{2551}", body);
     } else {
-        for (i, entry) in entries.iter().enumerate() {
+        for (i, entry) in entries.iter().take(visible_rows).enumerate() {
             let ry = y + 1 + i as u16;
             let style = if i == dialog.cursor { highlight } else { body };
             buf.set_string(x, ry, "\u{2551}", body);
-            buf.set_string(x + 1, ry, pad_to_width(&format!(" {}", entry.label), inner_w), style);
+            buf.set_string(x + 1, ry, pad_to_width(&truncate_with_ellipsis(&format!(" {}", entry.label), inner_w), inner_w), style);
             buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
         }
     }

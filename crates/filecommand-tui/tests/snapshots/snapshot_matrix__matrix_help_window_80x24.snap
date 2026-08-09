@@ -1,0 +1,25 @@
+---
+source: crates/filecommand-tui/tests/snapshot_matrix.rs
+expression: text
+---
+                                                                                
+                                                                                
+         ╔═══════════════════════════ Help ═══════════════════════════╗         
+         ║                 FileCommand Version 0.1.0                  ║         
+         ║         Copyright (C) 2026 The FileCommand Authors         ║         
+         ║        Inspired by the Norton Commander, 1986-1998         ║         
+         ╠────────────────────────────────────────────────────────────╣         
+         ║ About FileCommand                                          ║         
+         ║ Keyboard reference                                         ║         
+         ║ Panels and display modes                                   ║         
+         ║ File operations                                            ║         
+         ║ Menus                                                      ║         
+         ║ Viewer                                                     ║         
+         ║ Editor                                                     ║         
+         ║ Command line                                               ║         
+         ║ Modern extras                                              ║         
+         ║ Configuration                                              ║         
+         ║                                                            ║         
+         ╠────────────────────────────────────────────────────────────╣         
+         ║                      Help     Cancel                       ║         
+         ╚════════════════════════════════════════════════════════════╝

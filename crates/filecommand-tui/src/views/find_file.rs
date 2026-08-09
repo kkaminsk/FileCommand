@@ -3,8 +3,9 @@
 //! list with subtree-relative locations (find-file "Find-file invocation",
 //! "Non-blocking search with static progress").
 
+use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::find_file::FindFileState;
-use filecommand_core::listing::{display_width, pad_to_width};
+use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -14,28 +15,35 @@ use crate::style::role_style;
 const TITLE: &str = " Find file ";
 const FIELD_WIDTH: usize = 40;
 const MAX_LIST_ROWS: usize = 10;
+/// Chrome rows other than the (variable) result list: top frame + field row
+/// + status row + bottom frame.
+const CHROME_ROWS: u16 = 4;
 
 pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FindFileState) {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);
 
-    let inner_w = (FIELD_WIDTH + 4).min(area.width.saturating_sub(4) as usize).max(display_width(TITLE));
-    let box_w = inner_w as u16 + 2;
+    let preferred_inner_w = (FIELD_WIDTH + 4).max(display_width(TITLE));
     // frame top + prompt/field row + status row + frame bottom, plus the
     // result list once a search has been submitted.
     let showing_results = dialog.request.is_some();
-    let list_rows = if showing_results { dialog.results.len().clamp(1, MAX_LIST_ROWS) } else { 0 };
-    let box_h = 2 + 2 + list_rows as u16;
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let preferred_list_rows = if showing_results { dialog.results.len().clamp(1, MAX_LIST_ROWS) } else { 0 };
+    let preferred_h = CHROME_ROWS + preferred_list_rows as u16;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, preferred_h), (44, 4), (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    // The clamped height may show fewer result rows than were computed
+    // above (find-file "Non-blocking search with static progress" list
+    // rows recomputed post-clamp; responsive-layout "Unified overlay
+    // geometry").
+    let list_rows = box_h.saturating_sub(CHROME_ROWS) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     buf.set_string(x, y, format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(inner_w)), body);
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(TITLE))) / 2) as u16;
-    buf.set_string(title_x, y, TITLE, body);
+    buf.set_string(title_x, y, truncate_with_ellipsis(TITLE, inner_w), body);
 
     // Bracket-and-dots pattern field (§4.4), fixed once a search has begun.
     let field_w = FIELD_WIDTH.min(inner_w.saturating_sub(2));
@@ -62,14 +70,14 @@ pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Colo
         format!("{} found", dialog.results.len())
     };
     buf.set_string(x, y + 2, "\u{2551}", body);
-    buf.set_string(x + 1, y + 2, pad_to_width(&status, inner_w), body);
+    buf.set_string(x + 1, y + 2, pad_to_width(&truncate_with_ellipsis(&status, inner_w), inner_w), body);
     buf.set_string(x + 1 + inner_w as u16, y + 2, "\u{2551}", body);
 
     for row in 0..list_rows {
         let ry = y + 3 + row as u16;
         buf.set_string(x, ry, "\u{2551}", body);
         let text = match dialog.results.get(row) {
-            Some(m) => pad_to_width(&m.relative_path.display().to_string(), inner_w),
+            Some(m) => pad_to_width(&truncate_with_ellipsis(&m.relative_path.display().to_string(), inner_w), inner_w),
             None => " ".repeat(inner_w),
         };
         let style = if row == dialog.cursor && !dialog.results.is_empty() { highlight_style } else { body };

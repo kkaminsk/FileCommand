@@ -7,7 +7,8 @@
 //! hint rather than Retry/Skip/Skip All/Abort, since there is no per-item
 //! choice to make here.
 
-use filecommand_core::listing::{display_width, pad_to_width};
+use filecommand_core::dialogs::overlay_rect;
+use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -15,18 +16,17 @@ use ratatui::layout::Rect;
 use crate::style::role_style;
 
 const DISMISS_HINT: &str = "Press any key to continue";
+const MIN_INNER_W: usize = 32;
 
 pub fn render_startup_warning(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, message: &str) {
     let body = role_style(theme, Role::DialogError, depth);
 
-    let inner_w = display_width(message).max(display_width(DISMISS_HINT)).max(30) + 2;
-    let box_w = inner_w as u16 + 2;
-    let box_h = 5u16;
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height - box_h) / 2;
+    let preferred_inner_w = display_width(message).max(display_width(DISMISS_HINT)).max(30) + 2;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, 5), (MIN_INNER_W as u16, 5), (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     let title = " Warning ";
     let top = format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(inner_w));
@@ -37,13 +37,13 @@ pub fn render_startup_warning(buf: &mut Buffer, area: Rect, theme: &Theme, depth
 
     let row = |buf: &mut Buffer, dy: u16, text: &str| {
         buf.set_string(x, y + dy, "\u{2551}", body);
-        buf.set_string(x + 1, y + dy, pad_to_width(text, inner_w), body);
+        buf.set_string(x + 1, y + dy, pad_to_width(&truncate_with_ellipsis(text, inner_w), inner_w), body);
         buf.set_string(x + 1 + inner_w as u16, y + dy, "\u{2551}", body);
     };
     row(buf, 1, message);
     row(buf, 2, "");
     row(buf, 3, DISMISS_HINT);
-    buf.set_string(x, y + 4, &bottom, body);
+    buf.set_string(x, y + box_h - 1, &bottom, body);
 }
 
 #[cfg(test)]
