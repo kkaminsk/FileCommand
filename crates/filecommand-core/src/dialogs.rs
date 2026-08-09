@@ -11,6 +11,57 @@
 
 use std::ffi::OsString;
 
+// ---------------------------------------------------------------------
+// Unified overlay geometry (responsive-layout)
+// ---------------------------------------------------------------------
+
+/// A clamped, centered overlay rectangle in terminal-relative coordinates
+/// (`x`/`y` are offsets from the terminal's top-left corner, not absolute
+/// screen coordinates — callers add their own area's origin). Never
+/// `ratatui::Rect`: `filecommand-core` has no UI-framework dependency, so
+/// every view converts this at the call site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlayRect {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// One dimension of the unified overlay-geometry rule (design D6): prefer
+/// `preferred`, but never let it push the overlay closer than a 2-cell
+/// margin to the terminal edge, and never let it shrink below `minimum`
+/// (itself clamped to `terminal`, so a `minimum` larger than the terminal
+/// doesn't overflow it) — `terminal` is the hard ceiling either way. A
+/// direct generalization of the Help window's pre-existing
+/// `help_window_height` (kept for backward-compatible scroll math; see
+/// `help_window_height`'s doc comment).
+pub fn clamp_overlay_dim(preferred: u16, minimum: u16, terminal: u16) -> u16 {
+    let capped = preferred.min(terminal.saturating_sub(2));
+    capped.max(minimum.min(terminal)).min(terminal)
+}
+
+/// The unified overlay-geometry rule (responsive-layout "Unified overlay
+/// geometry"; design D6): given an overlay's `preferred` and `minimum`
+/// sizes and the current `terminal` size (each a `(width, height)` pair),
+/// compute the clamped size via [`clamp_overlay_dim`] on each dimension
+/// independently, then center the result. Shared by every overlay —
+/// splash, Help, About, the operation/input/confirmation/error/progress
+/// dialogs, drive select, find-file, fuzzy jump, user menu, quit dialog —
+/// so they can never disagree about how to fit the screen, and by the F9
+/// pull-down boxes for their width/height clamping (though pull-downs
+/// reposition themselves rather than centering; see `menubar.rs`).
+pub fn overlay_rect(preferred: (u16, u16), minimum: (u16, u16), terminal: (u16, u16)) -> OverlayRect {
+    let width = clamp_overlay_dim(preferred.0, minimum.0, terminal.0);
+    let height = clamp_overlay_dim(preferred.1, minimum.1, terminal.1);
+    OverlayRect {
+        x: terminal.0.saturating_sub(width) / 2,
+        y: terminal.1.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
 /// The open F2 user menu: just a cursor over `State::user_menu_entries`,
 /// which is loaded once at startup from `usermenu.toml` and does not change
 /// while the menu is open (user-menu "Open the F2 user menu", "Navigate and
@@ -268,13 +319,22 @@ impl Default for HelpState {
     }
 }
 
-/// The Help window's total height for a given terminal row count: capped at
-/// the nominal 19 rows (help-and-about "approximately 62x19, capped near
-/// that proportion") but shrinking, down to a small floor, to stay fully
-/// on-screen on a shorter terminal (help-and-about "Help window re-centers
-/// on resize").
-pub fn help_window_height(term_rows: u16) -> u16 {
-    term_rows.clamp(10, 19)
+/// The Help window's preferred and minimum geometry — 62×19 preferred, down
+/// to 40×10 — shared by `crate::update::handle_help`'s scroll math and
+/// `filecommand-tui`'s renderer (via [`overlay_rect`]) so the two never
+/// disagree about the window's actual on-screen size (help-and-about "F1
+/// Help window frame and identity header"). Supersedes the old fixed
+/// `help_window_height(term_rows) -> term_rows.clamp(10, 19)`, which had no
+/// margin and no width dimension — the unified overlay rule generalizes it
+/// (design D6).
+pub const HELP_WINDOW_PREFERRED: (u16, u16) = (62, 19);
+pub const HELP_WINDOW_MINIMUM: (u16, u16) = (40, 10);
+
+/// The Help window's total height for a given terminal size, via the
+/// unified overlay-geometry rule (help-and-about "Help window re-centers on
+/// resize"; responsive-layout "Unified overlay geometry").
+pub fn help_window_height(term_size: (u16, u16)) -> u16 {
+    overlay_rect(HELP_WINDOW_PREFERRED, HELP_WINDOW_MINIMUM, term_size).height
 }
 
 /// The number of topic-list rows visible inside a Help window of
@@ -330,7 +390,9 @@ Other bindings:
   Ctrl+J       Fuzzy directory jump
   Ctrl+T/W     New/close tab
   Alt+1..9     Switch to tab N
-  Alt+letter   Type-ahead jump to entry";
+  Alt+letter   Type-ahead jump to entry
+  Ctrl+Left/Right  Adjust the panel split
+  Ctrl+=       Reset the panel split to 50/50";
 
 const PANELS_AND_DISPLAY_MODES: &str = "\
 Each panel shows a directory listing and can be switched between
@@ -373,12 +435,15 @@ const MODERN_EXTRAS: &str = "\
 Ctrl+P narrows the active panel to substring matches as you type;
 Esc clears it. Ctrl+J opens a fuzzy, frecency-ranked jump list of
 previously visited directories. Ctrl+T/Ctrl+W/Alt+1..9 manage panel
-tabs. Alt+F7 searches the active panel's subtree by name.";
+tabs. Alt+F7 searches the active panel's subtree by name. Ctrl+Left/
+Ctrl+Right adjusts the vertical panel split 2 columns at a time;
+Ctrl+= resets it to 50/50. The split persists across restarts.";
 
 const CONFIGURATION: &str = "\
-config.toml (next to the executable) sets the theme, shell, and F4
-external-editor command, and can remap the quick-filter and fuzzy-
-jump keys. usermenu.toml defines the F2 user menu's entries.";
+config.toml (next to the executable) sets the theme, shell, F4
+external-editor command, and the persisted panel_split percentage,
+and can remap the quick-filter, fuzzy-jump, and panel-split keys.
+usermenu.toml defines the F2 user menu's entries.";
 
 #[cfg(test)]
 mod tests {
@@ -519,11 +584,16 @@ mod tests {
     }
 
     #[test]
-    fn help_window_height_is_capped_and_floored() {
-        assert_eq!(help_window_height(24), 19);
-        assert_eq!(help_window_height(100), 19);
-        assert_eq!(help_window_height(5), 10);
-        assert_eq!(help_window_height(15), 15);
+    fn help_window_height_uses_the_unified_overlay_rule() {
+        // `help_window_height(15) == 15` was the old expectation under the
+        // pre-D6 `clamp(10, 19)` rule with no forced margin; the unified
+        // overlay rule reserves a 2-cell margin, so 15 now clamps to 13 —
+        // an intentional change (D6/D9), not a regression.
+        assert_eq!(help_window_height((80, 24)), 19);
+        assert_eq!(help_window_height((80, 100)), 19);
+        assert_eq!(help_window_height((80, 15)), 13);
+        // Below the minimum (10), the terminal itself is the hard ceiling.
+        assert_eq!(help_window_height((80, 5)), 5);
     }
 
     #[test]
@@ -549,5 +619,70 @@ mod tests {
     #[test]
     fn about_topic_has_no_compiled_page_text_since_it_opens_a_dialog_instead() {
         assert_eq!(topic_page_text(ABOUT_TOPIC_INDEX), "");
+    }
+
+    #[test]
+    fn overlay_rect_at_nominal_size_uses_its_preferred_geometry() {
+        // responsive-layout "Overlay at nominal size uses its preferred
+        // geometry".
+        let r = overlay_rect((52, 10), (30, 8), (80, 24));
+        assert_eq!(r, OverlayRect { x: 14, y: 7, width: 52, height: 10 });
+    }
+
+    #[test]
+    fn overlay_rect_clamps_near_the_floor() {
+        // responsive-layout "Overlay clamps near the floor": preferred
+        // 62x19 at 60x16 clamps to 58x14.
+        let r = overlay_rect((62, 19), (40, 10), (60, 16));
+        assert_eq!(r.width, 58);
+        assert_eq!(r.height, 14);
+        assert_eq!(r.x, 1);
+        assert_eq!(r.y, 1);
+    }
+
+    #[test]
+    fn clamp_overlay_dim_never_exceeds_terminal_even_with_a_huge_minimum() {
+        assert_eq!(clamp_overlay_dim(20, 200, 60), 60);
+    }
+
+    #[test]
+    fn clamp_overlay_dim_respects_the_two_cell_margin() {
+        // Preferred fits the terminal exactly, but the rule still reserves
+        // a 2-cell margin.
+        assert_eq!(clamp_overlay_dim(60, 10, 60), 58);
+    }
+
+    #[test]
+    fn help_window_height_matches_the_new_margin_rule() {
+        // `help_window_height(15) == 15` was the old expectation (no forced
+        // margin, just `clamp(10,19)`); under the new rule this is
+        // `clamp_overlay_dim(19, 10, 15) == 13` (D6/D9's "clamps below the
+        // nominal size" scenario expects a `terminal - 2` margin).
+        assert_eq!(clamp_overlay_dim(19, 10, 15), 13);
+    }
+
+    mod overlay_rect_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn overlay_rect_is_fully_contained_and_at_least_the_clamped_minimum(
+                term_w in 60u16..200,
+                term_h in 16u16..60,
+                pref_w in 1u16..250,
+                pref_h in 1u16..250,
+                min_w in 1u16..60,
+                min_h in 1u16..20,
+            ) {
+                // `preferred >= minimum` per the helper's contract.
+                let preferred = (pref_w.max(min_w), pref_h.max(min_h));
+                let r = overlay_rect(preferred, (min_w, min_h), (term_w, term_h));
+                prop_assert!(r.x + r.width <= term_w, "x={} width={} term_w={}", r.x, r.width, term_w);
+                prop_assert!(r.y + r.height <= term_h, "y={} height={} term_h={}", r.y, r.height, term_h);
+                prop_assert!(r.width >= min_w.min(term_w));
+                prop_assert!(r.height >= min_h.min(term_h));
+            }
+        }
     }
 }

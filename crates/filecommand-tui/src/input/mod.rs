@@ -21,6 +21,16 @@ use filecommand_core::viewer::ViewerState;
 use filecommand_core::{Command, PanelSide, State, UiPhase};
 
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
+    // The quit-confirmation dialog is the topmost modal overlay of all: it
+    // can open above panels, the viewer, an open menu, or any other modal
+    // dialog/overlay, so it is checked before every other overlay below
+    // (application-shell "Quit request keys and confirmation"; design D5).
+    // The event loop routes here for it even while `state.phase` is
+    // `Viewer`/`Editor` — see `app.rs` — except in the editor, whose own
+    // Ctrl+C=Copy binding means this flag can never become true there.
+    if state.quit_confirm {
+        return map_quit_confirm_key(key);
+    }
     // Modal overlays come first: while one is up it owns every key it
     // understands, regardless of the phase underneath. The startup-warning
     // modal is checked first of all since it can only ever be up at the
@@ -62,11 +72,6 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     }
 
     match &state.phase {
-        UiPhase::QuitConfirm => match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::ConfirmQuit),
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::CancelQuit),
-            _ => None,
-        },
         UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
         UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
         UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
@@ -117,6 +122,12 @@ const VIEWER_H_SCROLL_STEP: i64 = 4;
 /// count (from `views::viewer::body_rows`), used as the Page Up/Down step —
 /// the same "page size follows the layout" convention `map_panel_key` uses.
 pub fn map_viewer_key(key: KeyEvent, viewer: &ViewerState, rows_visible: usize) -> Option<ViewerInput> {
+    // Ctrl+C requests quit from the viewer in any state, including while
+    // the F7 search prompt is open, ahead of every other viewer key
+    // (application-shell "Quit request keys and confirmation").
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(ViewerInput::Cmd(Command::RequestQuit));
+    }
     // The F7 search prompt owns the keyboard while it is open, exactly like
     // the command line and quick-search do elsewhere.
     if viewer.search_input.is_some() {
@@ -225,15 +236,18 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let typing = !state.command_line.is_empty();
 
     // The Ctrl+P quick filter, while active on the active panel, claims
-    // plain printables/Backspace/Esc before anything else — but leaves
-    // every other key (movement, Enter, ...) to fall through to the normal
+    // plain printables/Backspace before anything else — but leaves every
+    // other key (movement, Enter, Esc, ...) to fall through to the normal
     // panel handling below, since navigation still applies with the filter
     // narrowing what it can land on (`PanelState::move_cursor` itself
     // restricts to visible entries) (quick-filter "Navigation is restricted
-    // to matching entries").
+    // to matching entries"). Esc no longer exits the filter here — it falls
+    // through to the unconditional panel-level quit request below, and the
+    // activation key (matched further down via `keys.quick_filter`) is what
+    // now toggles the filter off (quick-filter "Clearing the quick filter";
+    // application-shell "Quit request keys and confirmation").
     if state.active_panel().quick_filter.is_some() {
         match key.code {
-            KeyCode::Esc => return Some(Command::QuickFilterEnd),
             KeyCode::Backspace => return Some(Command::QuickFilterBackspace),
             KeyCode::Char(c) if is_plain(&key) => return Some(Command::QuickFilterChar(c)),
             _ => {}
@@ -250,10 +264,27 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         return Some(Command::PasteCursorPath);
     }
     if matches_binding(&key, &keys.quick_filter) {
-        return Some(Command::QuickFilterStart);
+        // The activation key is a toggle: pressed again while a filter is
+        // already active on this panel, it exits and clears the filter
+        // instead of restarting one (quick-filter "Clearing the quick
+        // filter": "the activation key toggles the filter").
+        return Some(if state.active_panel().quick_filter.is_some() {
+            Command::QuickFilterEnd
+        } else {
+            Command::QuickFilterStart
+        });
     }
     if matches_binding(&key, &keys.fuzzy_jump) {
         return Some(Command::FuzzyJumpOpen);
+    }
+    if matches_binding(&key, &keys.split_left) {
+        return Some(Command::SplitShrink);
+    }
+    if matches_binding(&key, &keys.split_right) {
+        return Some(Command::SplitGrow);
+    }
+    if matches_binding(&key, &keys.split_reset) {
+        return Some(Command::SplitReset);
     }
 
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -265,6 +296,14 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     // claimed by any other alt-combination here).
     if ctrl && !alt {
         match key.code {
+            // Ctrl+C requests quit from the panels in any command-line
+            // state (typing, quick filter, or type-ahead) — the universal
+            // terminal interrupt chord, routed through the same
+            // confirmation dialog as every other quit trigger
+            // (application-shell "Quit request keys and confirmation").
+            // Checked ahead of the quick-filter/type-ahead blocks above
+            // implicitly, since neither of those claims Ctrl-modified keys.
+            KeyCode::Char('c') | KeyCode::Char('C') => return Some(Command::RequestQuit),
             KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
             KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
             _ => {}
@@ -320,7 +359,13 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
         KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
-        KeyCode::Esc if typing => Some(Command::CommandLineClear),
+        // Esc is unconditional at panel level: it asks to quit regardless of
+        // command-line content, replacing the old clear-the-buffer meaning
+        // (backspacing to empty is now what hands Up/Down back to the panel
+        // — see the Backspace arms just below) (application-shell "Quit
+        // request keys and confirmation"; command-line "Command history
+        // navigation").
+        KeyCode::Esc => Some(Command::RequestQuit),
         KeyCode::Backspace if typing => Some(Command::CommandLineBackspace),
         KeyCode::Backspace => Some(Command::ParentDir),
 
@@ -355,7 +400,30 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     }
 }
 
+/// The quit-confirmation dialog (`state.quit_confirm`), checked first of
+/// every overlay in `map_key`. Esc keeps its universal dialog-cancel
+/// meaning; Ctrl+C — pressed again, since it is what opened the dialog from
+/// most contexts — confirms instead, the terminal "press Ctrl+C again to
+/// exit" convention (application-shell "Quit request keys and
+/// confirmation"; design D4).
+fn map_quit_confirm_key(key: KeyEvent) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::ConfirmQuit);
+    }
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::ConfirmQuit),
+        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::CancelQuit),
+        _ => None,
+    }
+}
+
 fn map_menu_key(key: KeyEvent) -> Option<Command> {
+    // Ctrl+C requests quit with a pull-down open, ahead of the menu's own
+    // key handling (application-shell "Quit request keys and
+    // confirmation").
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::MenuCollapse),
         KeyCode::F(9) | KeyCode::F(10) => Some(Command::MenuClose),
@@ -371,6 +439,9 @@ fn map_menu_key(key: KeyEvent) -> Option<Command> {
 
 /// Ctrl+J fuzzy-jump dialog (fuzzy-jump "Fuzzy jump dialog invocation").
 fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::FuzzyJumpCancel),
         KeyCode::Enter => Some(Command::FuzzyJumpConfirm),
@@ -388,6 +459,9 @@ fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
 /// confirm a result instead (find-file "Find-file invocation", "Navigate to
 /// a chosen result").
 fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     if dialog.request.is_none() {
         return match key.code {
             KeyCode::Esc => Some(Command::FindFileCancel),
@@ -408,6 +482,9 @@ fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
 
 /// F2 user menu (user-menu "Navigate and dismiss the user menu").
 fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::UserMenuCancel),
         KeyCode::Enter => Some(Command::UserMenuConfirm),
@@ -420,6 +497,9 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
 /// Options → Themes picker (theme-selection "Picker navigation, apply, and
 /// cancel").
 fn map_theme_picker_key(key: KeyEvent) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::ThemePickerCancel),
         KeyCode::Enter => Some(Command::ThemePickerConfirm),
@@ -438,6 +518,9 @@ fn map_theme_picker_key(key: KeyEvent) -> Option<Command> {
 /// and pressing an entry's first letter SHALL activate that entry
 /// directly").
 fn map_file_action_menu_key(key: KeyEvent, _dialog: &FileActionMenuState) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::FileActionMenuCancel),
         KeyCode::Enter => Some(Command::FileActionMenuConfirm),
@@ -454,6 +537,9 @@ fn map_file_action_menu_key(key: KeyEvent, _dialog: &FileActionMenuState) -> Opt
 /// of Enter/Esc/`O` as "go back a level", which `Command::HelpCancel`
 /// already implements uniformly via `HelpState::back`.
 fn map_help_key(key: KeyEvent, dialog: &HelpState) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     if dialog.about_open {
         return match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => Some(Command::HelpCancel),
@@ -485,6 +571,9 @@ fn map_startup_warning_key(_key: KeyEvent) -> Option<Command> {
 }
 
 fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
         KeyCode::Esc => Some(Command::DriveSelectCancel),
         KeyCode::Up => Some(Command::DriveSelectMove(-1)),
@@ -497,17 +586,26 @@ fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
 }
 
 /// While the type-ahead jump owns the keyboard, plain printables extend the
-/// pattern and Esc/Backspace/anything-else it doesn't recognize dismiss it
-/// — so the command line never sees a key quick-search consumed, and vice
-/// versa. A movement key (arrows, Home/End, Page Up/Down) is special: it
-/// exits type-ahead *and* is applied to the panel cursor as a normal
-/// movement, in the same keystroke (type-ahead-jump "A movement key exits
-/// type-ahead and is applied to the panel"; design D5) — `core::update`
-/// clears `quick_search` as a side effect of any `MoveCursor` command while
-/// it is active (see `update::UiPhase::Panels` handling), so simply
-/// emitting the movement command here does both at once.
+/// pattern and Backspace/anything-else it doesn't recognize dismiss it — so
+/// the command line never sees a key quick-search consumed, and vice versa.
+/// A movement key (arrows, Home/End, Page Up/Down) is special: it exits
+/// type-ahead *and* is applied to the panel cursor as a normal movement, in
+/// the same keystroke (type-ahead-jump "A movement key exits type-ahead and
+/// is applied to the panel"; design D5) — `core::update` clears
+/// `quick_search` as a side effect of any `MoveCursor` command while it is
+/// active (see `update::UiPhase::Panels` handling), so simply emitting the
+/// movement command here does both at once. Esc is no longer an exit key:
+/// it requests quit instead, and cancelling that dialog leaves type-ahead
+/// active with its pattern intact (type-ahead-jump "Exiting type-ahead and
+/// restoring command-line routing": "Esc SHALL NOT exit type-ahead ... it
+/// requests application quit"; application-shell "Quit request keys and
+/// confirmation").
 fn map_quick_search_key(key: KeyEvent, page_size: usize) -> Option<Command> {
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match key.code {
+        KeyCode::Esc => Some(Command::RequestQuit),
         KeyCode::Backspace => Some(Command::QuickSearchBackspace),
         KeyCode::Char(c) if is_plain(&key) => Some(Command::QuickSearchChar(c)),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
@@ -556,6 +654,14 @@ pub fn matches_binding(key: &KeyEvent, binding: &KeyBinding) -> bool {
 }
 
 fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> {
+    // Ctrl+C requests quit from every file-op setup dialog, ahead of each
+    // dialog's own key handling — checked with an explicit modifier guard
+    // since `DestinationInput`/`RenameInput` below otherwise claim every
+    // `Char(c)` unconditionally (application-shell "Quit request keys and
+    // confirmation").
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match setup {
         FileOpSetup::DeleteConfirm { .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::FileOpConfirm),
@@ -576,6 +682,15 @@ fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> 
 }
 
 fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Command> {
+    // Ctrl+C requests quit from every running-job dialog — including the
+    // Progress dialog, whose own plain `c`/`C` already means "cancel job"
+    // (matched below with no modifier guard), so the Ctrl+C case must be
+    // intercepted here first. Confirming the quit dialog this opens aborts
+    // the job via the same cancel path before quitting (design D3;
+    // application-shell "Quit request keys and confirmation").
+    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        return Some(Command::RequestQuit);
+    }
     match dialog {
         RunningDialog::Progress { .. } => match key.code {
             KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => Some(Command::FileOpCancelJob),

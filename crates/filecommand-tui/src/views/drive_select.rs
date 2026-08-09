@@ -4,8 +4,9 @@
 //! each label column stays blank until its worker fetch resolves, then
 //! fills in place without moving any other row.
 
+use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::drives::DriveSelect;
-use filecommand_core::listing::pad_to_width;
+use filecommand_core::listing::{pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -17,6 +18,7 @@ const TITLE: &str = " Drive ";
 const LETTER_W: usize = 4;
 /// Widest volume label the column shows before truncating.
 const LABEL_W: usize = 12;
+const MIN_INNER_W: usize = 10;
 
 fn inner_width() -> usize {
     LETTER_W + LABEL_W + 1
@@ -26,16 +28,16 @@ pub fn render_drive_select(buf: &mut Buffer, area: Rect, theme: &Theme, depth: C
     let body_style = role_style(theme, Role::MenuBody, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);
 
-    let inner_w = inner_width();
-    let box_w = inner_w as u16 + 2;
+    let preferred_inner_w = inner_width();
     // Two frame rows plus one row per drive; an empty list still draws the
     // (empty) box rather than nothing at all.
-    let box_h = dialog.drives.len() as u16 + 2;
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let preferred_h = dialog.drives.len() as u16 + 2;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, preferred_h), (MIN_INNER_W as u16, 3), (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let visible_rows = box_h.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     let mut top = format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_w));
     // Set the title into the top border, NC-style.
@@ -45,14 +47,15 @@ pub fn render_drive_select(buf: &mut Buffer, area: Rect, theme: &Theme, depth: C
     }
     buf.set_string(x, y, &top, body_style);
 
-    for (i, drive) in dialog.drives.iter().enumerate() {
+    for (i, drive) in dialog.drives.iter().take(visible_rows).enumerate() {
         let ry = y + 1 + i as u16;
         let letter = format!(" {}: ", drive.letter.to_ascii_uppercase());
         // `None` is "still fetching" and renders blank — an unlabelled
         // volume resolves to an empty string and also renders blank, which
         // is the same thing to the eye and correct either way.
         let label = drive.label.clone().unwrap_or_default();
-        let row = format!("{}{}", pad_to_width(&letter, LETTER_W), pad_to_width(&label, inner_w - LETTER_W));
+        let label_w = inner_w.saturating_sub(LETTER_W);
+        let row = format!("{}{}", pad_to_width(&letter, LETTER_W.min(inner_w)), pad_to_width(&truncate_with_ellipsis(&label, label_w), label_w));
         let style = if i == dialog.selected { highlight_style } else { body_style };
         buf.set_string(x, ry, "\u{2502}", body_style);
         buf.set_string(x + 1, ry, pad_to_width(&row, inner_w), style);
@@ -144,12 +147,17 @@ mod tests {
     }
 
     #[test]
-    fn a_screen_too_small_for_the_box_draws_nothing() {
+    fn a_screen_too_small_for_the_preferred_box_clamps_and_still_draws() {
+        // Under the unified overlay-geometry rule a too-small screen no
+        // longer suppresses the dialog entirely — it clamps to fit and
+        // stays fully on-screen (responsive-layout "Unified overlay
+        // geometry"), inverting the old "draws nothing" premise.
         let area = Rect { x: 0, y: 0, width: 8, height: 3 };
         let mut buf = Buffer::empty(area);
         let dialog = DriveSelect::new(PanelSide::Left, vec!['C'], None);
         render_drive_select(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &dialog);
         let text: String = (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y))).map(|(x, y)| buf[(x, y)].symbol()).collect();
-        assert!(text.trim().is_empty());
+        assert!(!text.trim().is_empty(), "the clamped dialog must still draw something");
+        assert!(text.contains('\u{250C}') && text.contains('\u{2518}'), "the frame stays fully on-screen: `{text}`");
     }
 }

@@ -9,6 +9,7 @@ pub mod error_dialog;
 pub mod file_action_menu;
 pub mod find_file;
 pub mod fuzzy_jump;
+pub mod header;
 pub mod help;
 pub mod info_panel;
 pub mod keybar;
@@ -26,6 +27,8 @@ pub mod user_menu;
 pub mod viewer;
 
 use filecommand_core::fs_ops::dialog::RunningDialog;
+use filecommand_core::listing::display_width;
+use filecommand_core::panel::PanelState;
 use filecommand_core::theme::ColorDepth;
 use filecommand_core::viewer::ByteSource;
 use filecommand_core::{PanelSide, State, UiPhase};
@@ -58,6 +61,14 @@ pub fn render(
     viewer_source: Option<&ByteSource>,
 ) -> Option<(u16, u16)> {
     let cursor = render_phase(buf, area, state, depth, identity_lines, clock_text, viewer_source);
+    // The quit-confirmation dialog is drawn above whatever the current phase
+    // painted — panels, the viewer, an open menu, or any other modal
+    // dialog/overlay — since it lives beside the phase rather than inside
+    // it and can open over any of them (application-shell "Quit request
+    // keys and confirmation"; design D5).
+    if state.quit_confirm {
+        quit_dialog::render_quit_dialog(buf, area, &state.theme, depth);
+    }
     // The startup-warning modal is drawn last, over whatever the current
     // phase already painted — it can only ever be raised at the very start
     // of a session (currently: a malformed `usermenu.toml`), so it must stay
@@ -94,11 +105,10 @@ fn render_phase(
         }
         UiPhase::Editor(e) => editor::render_editor(buf, area, e, &state.theme, depth),
         UiPhase::Panels
-        | UiPhase::QuitConfirm
         | UiPhase::FileOpSetup(_)
         | UiPhase::FileOpRunning { .. }
         | UiPhase::FileOpSummary(_) => {
-            let l = layout::compute((area.width, area.height));
+            let l = layout::compute((area.width, area.height), state.split_percent);
             let left_type_ahead = (state.active == PanelSide::Left).then_some(state.quick_search.as_deref()).flatten();
             let right_type_ahead = (state.active == PanelSide::Right).then_some(state.quick_search.as_deref()).flatten();
             panel::render_panel(
@@ -126,8 +136,13 @@ fn render_phase(
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
             // which is what "hides" it; closing the bar simply stops that
-            // overwrite from happening on the next frame.
-            clock::render_clock(buf, l.right, &state.theme, depth, clock_text);
+            // overwrite from happening on the next frame. The clock itself
+            // is skipped entirely (never partially drawn) when it would
+            // collide with the right panel's centered path title
+            // (responsive-layout "Chrome degradation").
+            if clock_fits_without_colliding(l.right, &state.right, state.active == PanelSide::Right, clock_text) {
+                clock::render_clock(buf, l.right, &state.theme, depth, clock_text);
+            }
             command_line::render_command_line(buf, l.cmdline, &state.theme, depth, &state.prompt(), &state.command_line);
             keybar::render_keybar(buf, l.keybar, &state.theme, depth);
 
@@ -159,7 +174,6 @@ fn render_phase(
             }
 
             match &state.phase {
-                UiPhase::QuitConfirm => quit_dialog::render_quit_dialog(buf, area, &state.theme, depth),
                 UiPhase::FileOpSetup(setup) => {
                     destination_input::render_destination_input(buf, area, &state.theme, depth, setup);
                     delete_confirm::render_delete_confirm(buf, area, &state.theme, depth, setup);
@@ -183,4 +197,26 @@ fn render_phase(
             None
         }
     }
+}
+
+/// Whether the clock can render over `right_area`'s top border without
+/// touching the right panel's centered path title — computed against the
+/// same title string and centering math `panel::render_panel` uses
+/// (`panel::panel_title`), so the two never disagree. `false` whenever the
+/// clock wouldn't fit at all, matching `clock::render_clock`'s own no-op
+/// (responsive-layout "Chrome degradation": "the clock is not drawn at all
+/// and the path title renders normally").
+fn clock_fits_without_colliding(right_area: Rect, right_panel: &PanelState, active: bool, clock_text: &str) -> bool {
+    let clock_w = display_width(clock_text);
+    if clock_w == 0 || clock_w > right_area.width as usize {
+        return false;
+    }
+    let title = panel::panel_title(right_panel, active);
+    let title_w = display_width(&title);
+    let inner_w = (right_area.width as usize).saturating_sub(2);
+    let title_x = right_area.x + 1 + (inner_w.saturating_sub(title_w) / 2) as u16;
+    let title_end = title_x + title_w as u16;
+    let clock_start = right_area.x + right_area.width - clock_w as u16;
+    let clock_end = right_area.x + right_area.width;
+    !(title_x < clock_end && clock_start < title_end)
 }

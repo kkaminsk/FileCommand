@@ -100,22 +100,143 @@ fn parent_nav_at_root_is_no_op() {
 }
 
 #[test]
-fn f10_raises_quit_confirm_and_confirm_quits() {
+fn f10_raises_the_quit_confirm_overlay_and_confirm_quits() {
+    // Post-quit-keys: the dialog is an overlay beside the phase
+    // (`State::quit_confirm: bool`), not a `UiPhase::QuitConfirm` variant —
+    // `RequestQuit` must not disturb `state.phase` at all (application-shell
+    // "Quit request keys and confirmation"; design D5).
     let state = test_state(UiPhase::Panels);
     let (state, effects) = update(state, Command::RequestQuit);
-    assert_eq!(state.phase, UiPhase::QuitConfirm);
+    assert!(state.quit_confirm, "RequestQuit must raise the overlay");
+    assert_eq!(state.phase, UiPhase::Panels, "the overlay lives beside the phase, not inside it");
     assert!(effects.is_empty());
     let (state, effects) = update(state, Command::ConfirmQuit);
     assert_eq!(effects, vec![Effect::Quit]);
-    let _ = state;
+    assert!(!state.quit_confirm);
 }
 
 #[test]
-fn quit_confirm_cancel_returns_to_panels() {
-    let state = test_state(UiPhase::QuitConfirm);
+fn quit_confirm_cancel_clears_only_the_overlay_flag() {
+    let mut state = test_state(UiPhase::Panels);
+    state.quit_confirm = true;
     let (state, effects) = update(state, Command::CancelQuit);
+    assert!(!state.quit_confirm);
     assert_eq!(state.phase, UiPhase::Panels);
     assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// quit-keys: the quit-confirmation overlay opens from every context and
+// cancelling restores that context bit-for-bit (application-shell "Quit
+// request keys and confirmation"; design D5; tasks 19.1/19.2/19.3)
+// ---------------------------------------------------------------------
+
+#[test]
+fn request_quit_opens_over_idle_panels_and_cancel_restores_them_exactly() {
+    let before = test_state(UiPhase::Panels);
+    let (state, effects) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert!(effects.is_empty());
+    let (state, effects) = update(state, Command::CancelQuit);
+    assert!(!state.quit_confirm);
+    assert!(effects.is_empty());
+    assert_eq!(state, before, "cancel must restore idle panels bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_mid_command_line_and_cancel_restores_the_buffer() {
+    let before = type_line(test_state(UiPhase::Panels), "dir");
+    let (state, _) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.command_line, "dir", "the typed buffer must survive RequestQuit untouched");
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must restore the typed command line bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_under_an_active_quick_filter_and_cancel_restores_it() {
+    let mut before = test_state(UiPhase::Panels);
+    before.left.quick_filter = Some("rep".to_string());
+    let (state, _) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.left.quick_filter.as_deref(), Some("rep"));
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must restore the active quick filter bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_during_type_ahead_and_cancel_restores_it() {
+    let mut before = test_state(UiPhase::Panels);
+    before.quick_search = Some("re".to_string());
+    let (state, _) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.quick_search.as_deref(), Some("re"));
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must restore type-ahead bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_above_the_viewer_and_cancel_restores_it() {
+    let (before, _) =
+        update(test_state(UiPhase::Panels), Command::ViewerOpened { path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
+    assert!(matches!(before.phase, UiPhase::Viewer(_)), "precondition: viewer must be open");
+    let (state, effects) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm, "Ctrl+C/RequestQuit must open the overlay while the viewer is open");
+    assert!(matches!(state.phase, UiPhase::Viewer(_)), "the overlay must not replace the viewer underneath it");
+    assert!(effects.is_empty());
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must leave the viewer open, untouched, bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_with_a_pull_down_menu_open_and_cancel_restores_it() {
+    let (before, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
+    assert!(before.menu.is_some(), "precondition: the menu must be open");
+    let (state, effects) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.menu, before.menu, "the open menu must not be disturbed by RequestQuit");
+    assert!(effects.is_empty());
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must leave the menu open, untouched, bit-for-bit");
+}
+
+#[test]
+fn request_quit_opens_with_a_modal_dialog_open_and_cancel_restores_it() {
+    let (before, _) = update(test_state(UiPhase::Panels), Command::FuzzyJumpOpen);
+    assert!(before.fuzzy_jump.is_some(), "precondition: the fuzzy-jump dialog must be open");
+    let (state, effects) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.fuzzy_jump, before.fuzzy_jump, "the open dialog must not be disturbed by RequestQuit");
+    assert!(effects.is_empty());
+    let (state, _) = update(state, Command::CancelQuit);
+    assert_eq!(state, before, "cancel must leave the modal dialog open, untouched, bit-for-bit");
+}
+
+#[test]
+fn confirming_quit_while_a_job_is_running_aborts_it_before_quitting() {
+    // Confirming quit while a file operation is running must abort the job
+    // through the existing cancel path (`Effect::CancelJob`, the same one
+    // the Progress dialog's own Cancel key uses) before `Effect::Quit` —
+    // order matters, since the caller must stop the worker before tearing
+    // the app down (application-shell "Quit request keys and
+    // confirmation"; design D3; task 19.3).
+    let mut state = running_progress_state(JobKind::Copy, "/left", "/right");
+    state.quit_confirm = true;
+    let (state, effects) = update(state, Command::ConfirmQuit);
+    assert_eq!(effects, vec![Effect::CancelJob, Effect::Quit], "the job must be cancelled before the app quits");
+    assert!(!state.quit_confirm);
+}
+
+#[test]
+fn request_quit_while_a_job_is_running_does_not_touch_the_job_until_confirmed() {
+    let before = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (state, effects) = update(before.clone(), Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert!(effects.is_empty(), "merely opening the dialog must not cancel the running job");
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
+    let (state, effects) = update(state, Command::CancelQuit);
+    assert!(effects.is_empty(), "cancelling the quit dialog must not touch the job either");
+    assert_eq!(state, before, "cancel must leave the running job untouched, bit-for-bit");
 }
 
 #[test]
@@ -145,6 +266,112 @@ fn placeholder_below_min_and_grows_back_to_panels_never_splash() {
     assert_eq!(state.phase, UiPhase::Placeholder);
     let (state, _) = update(state, Command::Resize(80, 24));
     assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn too_small_boundary_at_59x16_is_placeholder() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(59, 16));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn too_small_boundary_at_60x15_is_placeholder() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(60, 15));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn too_small_boundary_at_60x16_is_panels() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(60, 16));
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+#[test]
+fn splash_skipped_when_starting_below_60x16_floor() {
+    let (state, _) = State::initial(Theme::classic(), (59, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    assert_eq!(state.phase, UiPhase::Placeholder);
+}
+
+#[test]
+fn splash_starts_normally_at_exactly_60x16() {
+    let (state, _) = State::initial(Theme::classic(), (60, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
+}
+
+#[test]
+fn placeholder_replaces_splash_when_resized_below_new_floor_mid_splash() {
+    let state = test_state(UiPhase::Splash { started_at_ms: 0 });
+    let (state, _) = update(state, Command::Resize(59, 16));
+    assert_eq!(state.phase, UiPhase::Placeholder);
+    // Enlarging back never returns to Splash, only Panels.
+    let (state, _) = update(state, Command::Resize(60, 16));
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+// ---------------------------------------------------------------------
+// Adjustable panel split (panel-split)
+// ---------------------------------------------------------------------
+
+#[test]
+fn split_grow_moves_divider_two_columns_right() {
+    // panel-split "Divider moves in 2-column steps": 50/50 at 100 columns,
+    // Ctrl+Right widens the left panel to 52.
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (state, effects) = update(state, Command::SplitGrow);
+    assert_eq!(state.split_percent, 52);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(52)]);
+}
+
+#[test]
+fn split_shrink_moves_divider_two_columns_left() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (state, effects) = update(state, Command::SplitShrink);
+    assert_eq!(state.split_percent, 48);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(48)]);
+}
+
+#[test]
+fn split_shrink_is_a_no_op_at_the_minimum() {
+    // panel-split "Adjustment at the limit is a no-op": the right panel is
+    // already at its 20-column minimum (left = 80 of 100).
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    state.split_percent = 80;
+    let (state, effects) = update(state, Command::SplitGrow);
+    assert_eq!(state.split_percent, 80, "no change at the limit");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn split_reset_restores_fifty_fifty() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    state.split_percent = 66;
+    let (state, effects) = update(state, Command::SplitReset);
+    assert_eq!(state.split_percent, 50);
+    assert_eq!(effects, vec![Effect::PersistPanelSplit(50)]);
+}
+
+#[test]
+fn split_reset_is_a_no_op_when_already_at_default() {
+    let state = test_state(UiPhase::Panels);
+    assert_eq!(state.split_percent, 50);
+    let (state, effects) = update(state, Command::SplitReset);
+    assert_eq!(state.split_percent, 50);
+    assert!(effects.is_empty(), "no redundant persist when already at the default");
+}
+
+#[test]
+fn split_change_persists_via_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (100, 24);
+    let (_, effects) = update(state, Command::SplitGrow);
+    assert!(matches!(effects.as_slice(), [Effect::PersistPanelSplit(_)]));
 }
 
 #[test]
@@ -533,7 +760,13 @@ fn backspace_edits_the_buffer_and_clears_the_history_cursor() {
 }
 
 #[test]
-fn esc_clears_the_buffer() {
+fn command_line_clear_command_still_clears_the_buffer() {
+    // `Command::CommandLineClear` still exists and still behaves as a plain
+    // "clear the buffer" reducer action — only its trigger changed: Esc no
+    // longer dispatches it (`input::map_panel_key` maps panel-level Esc to
+    // `RequestQuit` unconditionally instead), so nothing in the shipped
+    // key-mapping layer emits this command anymore (command-line "Command
+    // history navigation": "Esc SHALL NOT clear the buffer").
     let state = type_line(test_state(UiPhase::Panels), "dir");
     let (state, _) = update(state, Command::CommandLineClear);
     assert!(state.command_line.is_empty());
@@ -567,9 +800,10 @@ fn leaving_quick_search_hands_printables_back_to_the_command_line() {
 #[test]
 fn quick_search_backspace_shrinks_and_stays_active_when_emptied() {
     // type-ahead-jump "Backspace on a single-character pattern": the
-    // pattern becomes empty but type-ahead mode itself stays active (only
-    // Esc or a movement key exits it) and the cursor holds its position
-    // rather than re-jumping against an empty pattern.
+    // pattern becomes empty but type-ahead mode itself stays active (only a
+    // movement key exits it now — Esc no longer does; it requests quit
+    // instead) and the cursor holds its position rather than re-jumping
+    // against an empty pattern.
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("alpha", 1)];
     let (state, _) = update(state, Command::QuickSearchStart('a'));
@@ -582,7 +816,7 @@ fn quick_search_backspace_shrinks_and_stays_active_when_emptied() {
     assert_eq!(state.quick_search.as_deref(), Some(""), "type-ahead must remain active with an empty pattern");
     assert_eq!(state.left.cursor, cursor_before, "the cursor must hold position rather than jump on an empty pattern");
     let (state, _) = update(state, Command::QuickSearchEnd);
-    assert_eq!(state.quick_search, None, "Esc is still the way to actually exit type-ahead");
+    assert_eq!(state.quick_search, None, "QuickSearchEnd (now dispatched by a movement key, not Esc) still exits type-ahead");
 }
 
 // ---------------------------------------------------------------------
