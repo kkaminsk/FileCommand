@@ -82,6 +82,36 @@ fn full_panel_active_and_inactive_nc_classic() {
     insta::assert_snapshot!("full_panel_active_inactive_nc_classic", render(&state, (80, 24)));
 }
 
+/// A second, independent guard against the same regression `insta`
+/// snapshots protect against — a plain `assert_eq!` against a literal
+/// golden string, which (unlike an `insta` snapshot) cannot be
+/// silently re-accepted with `cargo insta review`/`--accept` without a
+/// deliberate source edit. Pins the exact 80x24 nominal-size rendering
+/// the column-ladder (D3) and Brief-formula (D4) anchors both promise is
+/// byte-identical to the pre-responsive-layout output (panel-navigation
+/// "Full display mode layout"; additional-panel-modes "Brief display
+/// mode"; responsive-layout task 6.3).
+#[test]
+fn full_panel_at_80x24_matches_the_pinned_golden_string() {
+    let state = sample_state(Theme::classic());
+    let text = render(&state, (80, 24));
+
+    let header_row = text.lines().nth(1).unwrap();
+    assert_eq!(
+        header_row,
+        "\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}",
+        "the Full-mode column header at the 80x24 nominal size changed (panel-navigation \"Full display mode layout\", D3 anchor)"
+    );
+    let first_entry_row = text.lines().nth(2).unwrap();
+    assert_eq!(
+        first_entry_row,
+        "\u{2551}..           \u{2502} \u{25B6}UP--DI                \u{2551}\u{2551}                                      \u{2551}",
+        "the Full-mode entry row at the 80x24 nominal size changed"
+    );
+    let last_line = text.lines().last().unwrap().trim_end();
+    assert_eq!(last_line, "1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit", "the full F-key bar form changed at 80 columns");
+}
+
 #[test]
 fn streaming_ministatus_shows_reading_count() {
     let state = sample_state(Theme::classic());
@@ -105,6 +135,24 @@ fn splash_nc_mono() {
 fn terminal_too_small_placeholder() {
     let state = State { phase: UiPhase::Placeholder, term_size: (40, 10), ..State::empty(Theme::classic()) };
     insta::assert_snapshot!("terminal_too_small_placeholder", render(&state, (40, 10)));
+}
+
+#[test]
+fn splash_renders_at_60x16() {
+    // startup-splash "Splash renders in the degraded band": the 48x9 box
+    // fits at every supported size down to the 60x16 floor.
+    let state = State { phase: UiPhase::Splash { started_at_ms: 0 }, ..State::empty(Theme::classic()) };
+    insta::assert_snapshot!("splash_at_60x16_floor", render(&state, (60, 16)));
+}
+
+#[test]
+fn placeholder_below_the_floor() {
+    // application-shell "Placeholder below the floor": one column below
+    // the new 60x16 floor still shows the placeholder, naming 60x16.
+    let state = State { phase: UiPhase::Placeholder, term_size: (59, 16), ..State::empty(Theme::classic()) };
+    let text = render(&state, (59, 16));
+    assert!(text.contains("60x16"), "expected the placeholder to name the 60x16 floor:\n{text}");
+    insta::assert_snapshot!("placeholder_below_the_60x16_floor", text);
 }
 
 #[test]

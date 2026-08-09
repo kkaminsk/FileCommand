@@ -18,12 +18,18 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use crate::style::role_style;
+use crate::views::header::fit_header;
+use crate::views::keybar;
 
-/// The viewer F-key bar's fixed slots; slot 4's label swaps `Hex`/`ASCII` by
-/// mode (viewer: Frame-less full-screen chrome — "Viewer F-key bar
-/// contents"; Text and hex modes — "F4 toggles mode and label").
+/// The viewer F-key bar's fixed slots; slot index 2 (F4) swaps its label to
+/// `Hex`/`ASCII` by mode at render time (viewer: Frame-less full-screen
+/// chrome — "Viewer F-key bar contents"; Text and hex modes — "F4 toggles
+/// mode and label"). Full and short forms follow the same widest-form-
+/// that-fits rule as the main panel bar (responsive-layout "F-key bar
+/// degradation forms").
 const KEY_NUMBERS: [&str; 5] = ["1", "2", "4", "7", "10"];
-const KEY_LABELS_STATIC: [&str; 5] = ["Help", "Unwrap", "", "Search", "Quit"];
+const FULL_LABELS_STATIC: [&str; 5] = ["Help", "Unwrap", "", "Search", "Quit"];
+const SHORT_LABELS_STATIC: [&str; 5] = ["Hlp", "Unwr", "", "Sch", "Qit"];
 
 /// Rows available for the viewer body at a given terminal height: the
 /// header and the F-key bar each reserve one row. Exposed so the TUI's
@@ -63,6 +69,10 @@ pub fn render_viewer(buf: &mut Buffer, area: Rect, viewer: &ViewerState, theme: 
     render_viewer_keybar(buf, keybar_area, viewer, theme, depth);
 }
 
+/// The header row's indicators drop right-to-left as width runs out — the
+/// size/percent indicator first, then the position indicator — keeping
+/// the file name visible last, left-truncated with `…` if even that alone
+/// does not fit (responsive-layout "Full-screen surface degradation").
 fn render_header(buf: &mut Buffer, x: u16, y: u16, w: usize, viewer: &ViewerState, style: Style) {
     let filename = viewer
         .path
@@ -74,46 +84,27 @@ fn render_header(buf: &mut Buffer, x: u16, y: u16, w: usize, viewer: &ViewerStat
         ViewMode::Text => format!("Col {}", viewer.h_scroll),
         ViewMode::Hex => format!("Offset {:08X}", viewer.top_offset),
     };
-    let right = format!("{pos}   Size {}   {pct}%", format_count(viewer.file_len as usize));
-    let left = format!(" {filename}");
-    let gap = w.saturating_sub(display_width(&left) + display_width(&right) + 1);
-    let line = format!("{left}{}{right} ", " ".repeat(gap));
+    let size_and_pct = format!("Size {}   {pct}%", format_count(viewer.file_len as usize));
+    let line = fit_header(&filename, &[pos, size_and_pct], w);
     buf.set_string(x, y, pad_to_width(&line, w), style);
 }
 
-/// The viewer F-key bar: `1Help 2Unwrap 4Hex 7Search 10Quit`, with slot 4's
-/// label swapping to `ASCII` while in hex mode.
+/// The viewer F-key bar: `1Help 2Unwrap 4Hex 7Search 10Quit` at full width,
+/// degrading through a short form and a numbers-only form as `area`
+/// narrows (responsive-layout "F-key bar degradation forms"), with slot
+/// index 2 (F4) swapping to `ASCII` while in hex mode in every form.
 pub fn render_viewer_keybar(buf: &mut Buffer, area: Rect, viewer: &ViewerState, theme: &Theme, depth: ColorDepth) {
-    if area.height == 0 {
-        return;
-    }
-    let number_style = role_style(theme, Role::KeybarNumber, depth);
-    let label_style = role_style(theme, Role::KeybarLabel, depth);
-    buf.set_string(area.x, area.y, " ".repeat(area.width as usize), label_style);
+    let mut full_labels = FULL_LABELS_STATIC;
+    full_labels[2] = viewer.mode.toggle_label();
+    let mut short_labels = SHORT_LABELS_STATIC;
+    short_labels[2] = viewer.mode.toggle_label();
 
-    let mut labels = KEY_LABELS_STATIC;
-    labels[2] = viewer.mode.toggle_label();
+    let full: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().zip(full_labels.iter().copied()).collect();
+    let short: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().zip(short_labels.iter().copied()).collect();
+    let numbers_only: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().map(|n| (n, "")).collect();
 
-    let mut x = area.x;
-    let right_edge = area.x + area.width;
-    for (i, (num, label)) in KEY_NUMBERS.iter().zip(labels.iter()).enumerate() {
-        if i > 0 {
-            if x >= right_edge {
-                break;
-            }
-            x += 1;
-        }
-        if x >= right_edge {
-            break;
-        }
-        buf.set_string(x, area.y, num, number_style);
-        x += num.chars().count() as u16;
-        if x >= right_edge {
-            break;
-        }
-        buf.set_string(x, area.y, label, label_style);
-        x += label.chars().count() as u16;
-    }
+    let form = keybar::choose_form(area.width, &[&full, &short, &numbers_only]);
+    keybar::render_bar(buf, area, theme, depth, form);
 }
 
 // ---------------------------------------------------------------------
@@ -527,6 +518,42 @@ mod tests {
         viewer.top_offset = split_at;
         let text = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 40, height: 6 });
         assert!(!text.contains('\u{fffd}'), "spurious replacement character at the render window boundary:\n{text}");
+    }
+
+    #[test]
+    fn a_narrow_header_drops_the_size_and_pct_indicator_before_position() {
+        // responsive-layout "Full-screen surface degradation": the size/pct
+        // indicator drops before the position indicator, keeping the path
+        // visible last.
+        let src = temp_source("narrow-header", b"hello world");
+        let viewer = ViewerState::new(PathBuf::from("C:\\a\\deeply\\nested\\notes.txt"), src.len());
+        let wide = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 80, height: 5 });
+        let wide_header = wide.lines().next().unwrap();
+        assert!(wide_header.contains("Col") && wide_header.contains("Size") && wide_header.contains("notes.txt"));
+
+        let mid = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 25, height: 5 });
+        let mid_header = mid.lines().next().unwrap();
+        assert!(!mid_header.contains("Size"), "`{mid_header}`");
+        assert!(mid_header.contains("Col"), "`{mid_header}`");
+        assert!(mid_header.contains("notes.txt"), "`{mid_header}`");
+
+        let narrow = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 12, height: 5 });
+        let narrow_header = narrow.lines().next().unwrap();
+        assert!(!narrow_header.contains("Col"), "`{narrow_header}`");
+        assert!(narrow_header.contains("notes.txt"), "`{narrow_header}`");
+    }
+
+    #[test]
+    fn viewer_stays_functional_at_the_60x16_floor() {
+        // responsive-layout "Full-screen surface degradation": "the
+        // content body reflows to the available area and the viewer key
+        // bar renders a complete canonical form."
+        let src = temp_source("floor-size", b"hello world\nsecond line\n");
+        let viewer = ViewerState::new(PathBuf::from("f.txt"), src.len());
+        let text = render(&viewer, Some(&src), Rect { x: 0, y: 0, width: 60, height: 16 });
+        assert!(text.contains("hello world"), "the body reflows and renders content:\n{text}");
+        let last = text.lines().last().unwrap();
+        assert!(!last.trim().is_empty(), "the key bar renders a complete form:\n{text}");
     }
 
     #[test]

@@ -1,9 +1,11 @@
 //! Minimal `config.toml` reader plus the on-disk persistence helpers.
 //!
 //! Recognized keys: `splash` (bool), `theme` (string), `shell` (string),
-//! `editor` (string, the F4 external-editor command), and the overridable
+//! `editor` (string, the F4 external-editor command), `panel_split`
+//! (integer left-panel percentage; panel-split), and the overridable
 //! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
-//! `key.fuzzy_jump`. Missing files and unrecognized or malformed lines are
+//! `key.fuzzy_jump` / `key.split_left` / `key.split_right` /
+//! `key.split_reset`. Missing files and unrecognized or malformed lines are
 //! tolerated; unrecognized keys are ignored.
 //!
 //! Command history persists to `history.json` next to the config, written
@@ -72,6 +74,17 @@ pub struct Keys {
     /// same reason as `quick_filter` (fuzzy-jump "Overridden binding still
     /// opens the dialog"; design D6).
     pub fuzzy_jump: KeyBinding,
+    /// Shrinks the left panel (moves the divider left) by
+    /// `panel_split::SPLIT_STEP` columns. Default Ctrl+Left; overridable
+    /// per the existing keymap convention (panel-split "Adjust and reset
+    /// the panel split"; design D8).
+    pub split_left: KeyBinding,
+    /// Grows the left panel (moves the divider right). Default Ctrl+Right.
+    pub split_right: KeyBinding,
+    /// Resets the split to 50/50. Default Ctrl+=, the one binding in this
+    /// table flagged as potentially undeliverable in some terminal hosts
+    /// (design D8) — hence overridable here.
+    pub split_reset: KeyBinding,
 }
 
 impl Default for Keys {
@@ -81,6 +94,9 @@ impl Default for Keys {
             paste_path: KeyBinding::new(true, false, false, "]"),
             quick_filter: KeyBinding::new(true, false, false, "p"),
             fuzzy_jump: KeyBinding::new(true, false, false, "j"),
+            split_left: KeyBinding::new(true, false, false, "left"),
+            split_right: KeyBinding::new(true, false, false, "right"),
+            split_reset: KeyBinding::new(true, false, false, "="),
         }
     }
 }
@@ -97,12 +113,24 @@ pub struct Config {
     /// configured" message instead of spawning anything (external-editor:
     /// Config-driven external editor command — "Editor command unset").
     pub editor: Option<String>,
+    /// The persisted vertical panel split, as a left-panel percentage
+    /// (panel-split "Split persistence to configuration"). An unset,
+    /// non-integer, or out-of-`[MIN_PANEL_PERCENT, MAX_PANEL_PERCENT]`
+    /// value falls back to `panel_split::DEFAULT_SPLIT_PERCENT`.
+    pub panel_split: u16,
     pub keys: Keys,
 }
 
 impl Default for Config {
     fn default() -> Self {
-        Config { splash: true, theme: DEFAULT_THEME_NAME.to_string(), shell: None, editor: None, keys: Keys::default() }
+        Config {
+            splash: true,
+            theme: DEFAULT_THEME_NAME.to_string(),
+            shell: None,
+            editor: None,
+            panel_split: crate::panel_split::DEFAULT_SPLIT_PERCENT,
+            keys: Keys::default(),
+        }
     }
 }
 
@@ -188,6 +216,32 @@ pub fn parse(input: &str) -> Config {
                     config.keys.fuzzy_jump = b;
                 }
             }
+            "key.split_left" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.split_left = b;
+                }
+            }
+            "key.split_right" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.split_right = b;
+                }
+            }
+            "key.split_reset" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.split_reset = b;
+                }
+            }
+            "panel_split" => {
+                // Tolerant: a non-integer or out-of-range value is treated
+                // as though the key were unset — the default (50) is
+                // already in `config.panel_split` from `Config::default`
+                // (panel-split "Invalid configured value falls back").
+                if let Ok(percent) = value.parse::<u16>() {
+                    if percent <= 100 {
+                        config.panel_split = percent;
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -271,6 +325,65 @@ pub fn set_theme_line(input: &str, theme_name: &str) -> String {
 pub fn save_theme_atomic(path: &Path, theme_name: &str) -> io::Result<()> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
     let updated = set_theme_line(&existing, theme_name);
+    let tmp = temp_sibling(path);
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::write(&tmp, updated)?;
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
+// config.toml panel-split persistence (panel-split)
+// ---------------------------------------------------------------------
+
+/// Rewrite `input`'s `panel_split = <percent>` line to `percent`, replacing
+/// the first top-level (non-comment, non-blank) `panel_split =` line if one
+/// exists, or appending a fresh one otherwise — every other line is left
+/// byte-for-byte untouched, mirroring [`set_theme_line`] exactly (panel-
+/// split "Split persistence to configuration").
+pub fn set_panel_split_line(input: &str, percent: u16) -> String {
+    let new_line = format!("panel_split = {percent}");
+    let mut found = false;
+    let mut out = String::with_capacity(input.len() + new_line.len() + 1);
+    for line in input.lines() {
+        let trimmed = line.trim();
+        let is_split_key = !found
+            && !trimmed.is_empty()
+            && !trimmed.starts_with('#')
+            && trimmed.split_once('=').map(|(k, _)| k.trim() == "panel_split").unwrap_or(false);
+        if is_split_key {
+            out.push_str(&new_line);
+            found = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !found {
+        out.push_str(&new_line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Write the updated `panel_split =` key to `config.toml` at `path`
+/// atomically — same temp-file-then-rename discipline as
+/// [`save_theme_atomic`], reusing the same write-back path per design's
+/// "whichever change builds second reuses the same atomic write-back path
+/// rather than adding a parallel one" (panel-split "Config write is
+/// atomic").
+pub fn save_panel_split_atomic(path: &Path, percent: u16) -> io::Result<()> {
+    let existing = std::fs::read_to_string(path).unwrap_or_default();
+    let updated = set_panel_split_line(&existing, percent);
     let tmp = temp_sibling(path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -947,6 +1060,19 @@ mod tests {
         assert_eq!(keys.paste_path, KeyBinding::new(true, false, false, "]"));
         assert_eq!(keys.quick_filter, KeyBinding::new(true, false, false, "p"));
         assert_eq!(keys.fuzzy_jump, KeyBinding::new(true, false, false, "j"));
+        assert_eq!(keys.split_left, KeyBinding::new(true, false, false, "left"));
+        assert_eq!(keys.split_right, KeyBinding::new(true, false, false, "right"));
+        assert_eq!(keys.split_reset, KeyBinding::new(true, false, false, "="));
+    }
+
+    #[test]
+    fn parses_overridable_split_bindings() {
+        // panel-split "Adjust and reset the panel split": "All three
+        // bindings SHALL be overridable in config.toml".
+        let config = parse("key.split_left = \"alt+left\"\nkey.split_right = \"alt+right\"\nkey.split_reset = \"ctrl+shift+equal\"\n");
+        assert_eq!(config.keys.split_left, KeyBinding::new(false, true, false, "left"));
+        assert_eq!(config.keys.split_right, KeyBinding::new(false, true, false, "right"));
+        assert_eq!(config.keys.split_reset, KeyBinding::new(true, false, true, "equal"));
     }
 
     #[test]
@@ -1014,6 +1140,64 @@ mod tests {
 
         save_theme_atomic(&path, "inverted").expect("write theme to a fresh file");
         assert_eq!(load(&path).theme, "inverted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_panel_split() {
+        let config = parse("panel_split = 66\n");
+        assert_eq!(config.panel_split, 66);
+    }
+
+    #[test]
+    fn invalid_panel_split_falls_back_to_fifty() {
+        // panel-split "Invalid configured value falls back".
+        assert_eq!(parse("panel_split = \"wide\"\n").panel_split, 50);
+        assert_eq!(parse("panel_split = 150\n").panel_split, 50);
+        assert_eq!(parse("splash = true\n").panel_split, 50, "unset falls back too");
+    }
+
+    #[test]
+    fn set_panel_split_line_replaces_an_existing_key_leaving_other_lines_untouched() {
+        let input = "splash = true\npanel_split = 50\nshell = \"cmd.exe /C\"\n";
+        let updated = set_panel_split_line(input, 66);
+        assert_eq!(updated, "splash = true\npanel_split = 66\nshell = \"cmd.exe /C\"\n");
+    }
+
+    #[test]
+    fn set_panel_split_line_appends_when_no_key_is_present() {
+        let input = "splash = true\n";
+        let updated = set_panel_split_line(input, 40);
+        assert_eq!(updated, "splash = true\npanel_split = 40\n");
+    }
+
+    #[test]
+    fn save_panel_split_atomic_writes_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!("filecommand-config-panel-split-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "splash = false\npanel_split = 50\n").unwrap();
+
+        save_panel_split_atomic(&path, 66).expect("write panel_split");
+        let contents = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(contents, "splash = false\npanel_split = 66\n");
+        assert!(!path.with_file_name("config.toml.tmp").exists(), "temp file must be renamed away");
+
+        let loaded = load(&path);
+        assert_eq!(loaded.panel_split, 66);
+        assert!(!loaded.splash, "unrelated keys survive the write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_panel_split_atomic_creates_config_toml_when_missing() {
+        let dir = std::env::temp_dir().join(format!("filecommand-config-panel-split-test-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config.toml");
+
+        save_panel_split_atomic(&path, 40).expect("write panel_split to a fresh file");
+        assert_eq!(load(&path).panel_split, 40);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

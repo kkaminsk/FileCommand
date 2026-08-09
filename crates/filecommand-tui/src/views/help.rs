@@ -4,16 +4,14 @@
 //! secondary-style About dialog it opens for its special first entry
 //! (help-and-about).
 
-use filecommand_core::dialogs::{help_topic_visible_rows, help_window_height, HelpState, HELP_TOPICS};
+use filecommand_core::dialogs::{help_topic_visible_rows, overlay_rect, HelpState, HELP_TOPICS, HELP_WINDOW_MINIMUM, HELP_WINDOW_PREFERRED};
 use filecommand_core::identity;
-use filecommand_core::listing::{display_width, pad_to_width};
+use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use crate::style::role_style;
-
-const WINDOW_WIDTH: usize = 62;
 
 pub fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &HelpState, identity_lines: &[String; 4]) {
     let body = role_style(theme, Role::DialogPrimary, depth);
@@ -21,37 +19,42 @@ pub fn render_help(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
     let button_default = role_style(theme, Role::ButtonFocused, depth);
     let button_normal = role_style(theme, Role::ButtonNormal, depth);
 
-    let inner_w = WINDOW_WIDTH.min(area.width.saturating_sub(4) as usize).max(20);
-    let box_w = inner_w as u16 + 2;
-    let box_h = help_window_height(area.height);
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    // Re-centers on every frame as a pure function of the current area, so
-    // a resize simply redraws at the new center (help-and-about "Help
-    // window re-centers on resize").
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    // Re-derived every frame as a pure function of the current area via the
+    // unified overlay-geometry rule, so a resize simply redraws at the new
+    // clamped, re-centered rectangle (help-and-about "Help window
+    // re-centers on resize"; responsive-layout "Unified overlay geometry").
+    // `crate::update::handle_help`'s scroll math uses the same
+    // `HELP_WINDOW_PREFERRED`/`HELP_WINDOW_MINIMUM` constants via
+    // `dialogs::help_window_height`, so the two never disagree.
+    let r = overlay_rect(HELP_WINDOW_PREFERRED, HELP_WINDOW_MINIMUM, (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     let title = " Help ";
     buf.set_string(x, y, format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(inner_w)), body);
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(title))) / 2) as u16;
-    buf.set_string(title_x, y, title, body);
+    buf.set_string(title_x, y, truncate_with_ellipsis(title, inner_w), body);
 
     // Three centered identity lines — name+version combined on the first
     // line, then copyright, then tribute — byte-for-byte the same strings
     // the splash and Info-panel banner use, per the spec's "header block of
     // three centered lines carrying the identity lines (name + version,
     // copyright, tribute)" (help-and-about "Identity header matches the
-    // shared source of truth").
+    // shared source of truth"). Only truncated with `…` when the clamped
+    // window is too narrow to hold them (responsive-layout "Unified
+    // overlay geometry"): the byte-for-byte match with the splash/Info-
+    // panel banner holds whenever the window is wide enough not to clamp.
     let name_and_version = format!("{} {}", identity_lines[0], identity_lines[1]);
     let header_lines = [name_and_version.as_str(), identity_lines[2].as_str(), identity_lines[3].as_str()];
     for (i, line) in header_lines.iter().enumerate() {
         let ry = y + 1 + i as u16;
         buf.set_string(x, ry, "\u{2551}", body);
-        let lx = x + 1 + (inner_w.saturating_sub(display_width(line)) / 2) as u16;
+        let clipped = truncate_with_ellipsis(line, inner_w);
+        let lx = x + 1 + (inner_w.saturating_sub(display_width(&clipped)) / 2) as u16;
         buf.set_string(x + 1, ry, " ".repeat(inner_w), body);
-        buf.set_string(lx, ry, *line, body);
+        buf.set_string(lx, ry, &clipped, body);
         buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
     }
 
@@ -120,7 +123,7 @@ fn render_topic_list(
             Some(name) => {
                 let text = format!(" {name}");
                 let style = if topic_idx == dialog.cursor { highlight } else { body };
-                buf.set_string(x + 1, ry, pad_to_width(&text, line_w), style);
+                buf.set_string(x + 1, ry, pad_to_width(&truncate_with_ellipsis(&text, line_w), line_w), style);
             }
             None => buf.set_string(x + 1, ry, " ".repeat(line_w), body),
         }
@@ -143,12 +146,15 @@ fn render_topic_page(buf: &mut Buffer, x: u16, list_y0: u16, inner_w: usize, vis
         let ry = list_y0 + row as u16;
         buf.set_string(x, ry, "\u{2551}", body);
         let line = lines.get(row).copied().unwrap_or("");
-        buf.set_string(x + 1, ry, pad_to_width(line, inner_w), body);
+        buf.set_string(x + 1, ry, pad_to_width(&truncate_with_ellipsis(line, inner_w), inner_w), body);
         buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
     }
 }
 
-const ABOUT_WIDTH: usize = 50;
+/// Preferred and minimum About-dialog geometry, nested over the Help window
+/// (responsive-layout "Unified overlay geometry").
+const ABOUT_PREFERRED: (u16, u16) = (52, 10);
+const ABOUT_MINIMUM: (u16, u16) = (30, 8);
 
 /// The secondary-style About dialog, layered over the Help window (help-
 /// and-about "About FileCommand dialog"; §10 license).
@@ -156,19 +162,16 @@ fn render_about(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, 
     let body = role_style(theme, Role::DialogSecondary, depth);
     let button = role_style(theme, Role::ButtonNormal, depth);
 
-    let inner_w = ABOUT_WIDTH.min(area.width.saturating_sub(4) as usize).max(20);
-    let box_w = inner_w as u16 + 2;
-    let box_h = 10u16.min(area.height.saturating_sub(2)).max(8);
-    if area.width < box_w || area.height < box_h {
-        return;
-    }
-    let x = area.x + (area.width - box_w) / 2;
-    let y = area.y + (area.height.saturating_sub(box_h)) / 2;
+    let r = overlay_rect(ABOUT_PREFERRED, ABOUT_MINIMUM, (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
 
     buf.set_string(x, y, format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_w)), body);
     let title = " About FileCommand ";
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(title))) / 2) as u16;
-    buf.set_string(title_x, y, title, body);
+    buf.set_string(title_x, y, truncate_with_ellipsis(title, inner_w), body);
 
     let license_line = format!("License: {}", identity::license());
     let repo_line = identity::repository_url().to_string();
@@ -187,9 +190,10 @@ fn render_about(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, 
             break;
         }
         buf.set_string(x, ry, "\u{2502}", body);
-        let lx = x + 1 + (inner_w.saturating_sub(display_width(line)) / 2) as u16;
+        let clipped = truncate_with_ellipsis(line, inner_w);
+        let lx = x + 1 + (inner_w.saturating_sub(display_width(&clipped)) / 2) as u16;
         buf.set_string(x + 1, ry, " ".repeat(inner_w), body);
-        buf.set_string(lx, ry, *line, body);
+        buf.set_string(lx, ry, &clipped, body);
         buf.set_string(x + 1 + inner_w as u16, ry, "\u{2502}", body);
     }
 

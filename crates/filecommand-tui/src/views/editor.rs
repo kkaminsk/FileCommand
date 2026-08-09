@@ -12,9 +12,15 @@ use ratatui::layout::Rect;
 use ratatui::style::Style;
 
 use crate::style::role_style;
+use crate::views::header::fit_header;
+use crate::views::keybar;
 
 const KEY_NUMBERS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
-const KEY_LABELS: [&str; 10] = ["Help", "Save", "Mark", "Replac", "", "", "Search", "", "", "Quit"];
+/// Full and short label forms follow the same widest-form-that-fits rule
+/// as the main panel bar (responsive-layout "F-key bar degradation
+/// forms").
+const KEY_LABELS_FULL: [&str; 10] = ["Help", "Save", "Mark", "Replac", "", "", "Search", "", "", "Quit"];
+const KEY_LABELS_SHORT: [&str; 10] = ["Hlp", "Sav", "Mrk", "Rep", "", "", "Sch", "", "", "Qit"];
 
 /// Rows available for the editor body at a given terminal height: the
 /// header and the F-key bar each reserve one row — identical to the
@@ -76,66 +82,33 @@ pub fn render_editor(buf: &mut Buffer, area: Rect, editor: &EditorState, theme: 
     Some((area.x + cursor_col as u16, body_y + cursor_row as u16))
 }
 
+/// The header row's indicators drop right-to-left as width runs out — size
+/// and the `Ovr` flag first, then the `Line/Col` indicator — keeping the
+/// file path visible last, left-truncated with `…` if even that alone
+/// does not fit (responsive-layout "Full-screen surface degradation").
 fn render_header(buf: &mut Buffer, x: u16, y: u16, w: usize, editor: &EditorState, style: Style) {
     let modified_marker = if editor.is_modified() { " *" } else { "" };
-    let left = format!(" Edit: {}{modified_marker}", editor.path.display());
-    let center = format!("Line {}/{}   Col {}", editor.caret.line + 1, editor.lines.len().max(1), editor.caret.col + 1);
+    let path_field = format!("Edit: {}{modified_marker}", editor.path.display());
+    let line_col = format!("Line {}/{}   Col {}", editor.caret.line + 1, editor.lines.len().max(1), editor.caret.col + 1);
     let size = format_count(editor.byte_len() as usize);
-    let right = match editor.mode {
-        EntryMode::Overwrite => format!("{size} Ovr "),
-        EntryMode::Insert => format!("{size} "),
+    let size_and_ovr = match editor.mode {
+        EntryMode::Overwrite => format!("{size} Ovr"),
+        EntryMode::Insert => size,
     };
-
-    let mut cells: Vec<char> = vec![' '; w];
-    overlay(&mut cells, 0, &left);
-    overlay(&mut cells, w.saturating_sub(display_width(&center)) / 2, &center);
-    overlay(&mut cells, w.saturating_sub(display_width(&right)), &right);
-    let line: String = cells.into_iter().collect();
-    buf.set_string(x, y, &line, style);
-}
-
-/// Overlay `text` onto `cells` starting at `start`, one `char` per cell —
-/// later overlays win on overlap, which only happens on very narrow
-/// widths.
-fn overlay(cells: &mut [char], start: usize, text: &str) {
-    for (i, ch) in text.chars().enumerate() {
-        if let Some(cell) = cells.get_mut(start + i) {
-            *cell = ch;
-        }
-    }
+    let line = fit_header(&path_field, &[line_col, size_and_ovr], w);
+    buf.set_string(x, y, pad_to_width(&line, w), style);
 }
 
 /// The editor F-key bar: `1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit`,
 /// with unused slots 5/6/8/9 rendered as bare numbers with empty label
 /// blocks (builtin-editor "F-key bar labels").
 pub fn render_editor_keybar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth) {
-    if area.height == 0 {
-        return;
-    }
-    let number_style = role_style(theme, Role::KeybarNumber, depth);
-    let label_style = role_style(theme, Role::KeybarLabel, depth);
-    buf.set_string(area.x, area.y, " ".repeat(area.width as usize), label_style);
+    let full: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().zip(KEY_LABELS_FULL.iter().copied()).collect();
+    let short: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().zip(KEY_LABELS_SHORT.iter().copied()).collect();
+    let numbers_only: Vec<(&str, &str)> = KEY_NUMBERS.iter().copied().map(|n| (n, "")).collect();
 
-    let mut x = area.x;
-    let right_edge = area.x + area.width;
-    for (i, (num, label)) in KEY_NUMBERS.iter().zip(KEY_LABELS.iter()).enumerate() {
-        if i > 0 {
-            if x >= right_edge {
-                break;
-            }
-            x += 1;
-        }
-        if x >= right_edge {
-            break;
-        }
-        buf.set_string(x, area.y, num, number_style);
-        x += num.chars().count() as u16;
-        if x >= right_edge {
-            break;
-        }
-        buf.set_string(x, area.y, label, label_style);
-        x += label.chars().count() as u16;
-    }
+    let form = keybar::choose_form(area.width, &[&full, &short, &numbers_only]);
+    keybar::render_bar(buf, area, theme, depth, form);
 }
 
 fn render_save_on_exit_confirm(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, editor: &EditorState) {
@@ -208,6 +181,45 @@ mod tests {
         let header = text.lines().next().unwrap();
         assert!(header.trim_end().ends_with("Ovr"), "`{header}`");
         assert!(header.contains("4 Ovr") || header.contains("4  Ovr"), "byte size precedes Ovr: `{header}`");
+    }
+
+    #[test]
+    fn a_narrow_header_drops_size_and_ovr_before_line_col_and_keeps_the_path() {
+        // responsive-layout "Full-screen surface degradation": size/Ovr
+        // drop first, then Line/Col, keeping the path visible last.
+        let mut e = editor_from("C:\\a\\deeply\\nested\\notes.txt", "abc\n");
+        e.toggle_mode(); // Overwrite, so the header would show "N Ovr"
+        let wide_area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let (wide_text, _) = render(&e, wide_area);
+        let wide_header = wide_text.lines().next().unwrap();
+        assert!(wide_header.contains("Ovr") && wide_header.contains("Line") && wide_header.contains("notes.txt"));
+
+        // Narrow enough that size/Ovr no longer fits alongside everything
+        // else, but the path and Line/Col still do.
+        let mid_area = Rect { x: 0, y: 0, width: 55, height: 24 };
+        let (mid_text, _) = render(&e, mid_area);
+        let mid_header = mid_text.lines().next().unwrap();
+        assert!(!mid_header.contains("Ovr"), "`{mid_header}`");
+        assert!(mid_header.contains("Line 1/2"), "`{mid_header}`");
+        assert!(mid_header.contains("notes.txt"), "`{mid_header}`");
+
+        // Narrower still: Line/Col drops too, only the path remains.
+        let narrow_area = Rect { x: 0, y: 0, width: 40, height: 24 };
+        let (narrow_text, _) = render(&e, narrow_area);
+        let narrow_header = narrow_text.lines().next().unwrap();
+        assert!(!narrow_header.contains("Line"), "`{narrow_header}`");
+        assert!(narrow_header.contains("notes.txt"), "`{narrow_header}`");
+    }
+
+    #[test]
+    fn a_very_narrow_header_left_truncates_the_path_with_ellipsis() {
+        let e = editor_from("C:\\a\\very\\deeply\\nested\\path\\notes.txt", "abc\n");
+        let area = Rect { x: 0, y: 0, width: 20, height: 24 };
+        let (text, _) = render(&e, area);
+        let header = text.lines().next().unwrap();
+        assert!(header.contains('\u{2026}'), "`{header}`");
+        assert!(header.contains("notes.txt"), "the filename tail survives: `{header}`");
+        assert_eq!(display_width(header), 20);
     }
 
     #[test]
