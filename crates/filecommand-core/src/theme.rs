@@ -568,7 +568,7 @@ impl Theme {
         set(Role::PanelTitleActive, A(Black), A(BrightMagenta));
         set(Role::PanelTitleInactive, A(BrightMagenta), A(Magenta));
         set(Role::PanelHeader, A(BrightYellow), A(Magenta));
-        set(Role::PanelFile, A(BrightMagenta), A(Magenta));
+        set(Role::PanelFile, A(BrightBlack), A(Magenta));
         set(Role::PanelDirectory, A(BrightWhite), A(Magenta));
         set(Role::PanelCursor, A(Black), A(BrightMagenta));
         set(Role::PanelSelected, A(BrightYellow), A(Magenta));
@@ -610,7 +610,7 @@ impl Theme {
             .with_truecolor_overrides(&[
                 (Role::ScreenBackdrop, None, Some(Rgb(48, 0, 64))),
                 (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
-                (Role::PanelFile, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+                (Role::PanelFile, Some(Rgb(169, 169, 169)), Some(Rgb(48, 0, 64))),
                 (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
             ])
     }
@@ -1015,6 +1015,12 @@ mod tests {
         let frame = theme.get(Role::PanelFrame);
         assert_eq!(frame.fg, ColorValue::Ansi16(Ansi16::BrightMagenta));
         assert_eq!(frame.bg, ColorValue::Ansi16(Ansi16::Magenta));
+
+        let file = theme.get(Role::PanelFile);
+        assert_eq!(file.fg, ColorValue::Ansi16(Ansi16::BrightBlack));
+        assert_eq!(file.bg, ColorValue::Ansi16(Ansi16::Magenta));
+        assert_eq!(file.fg_truecolor, Some(Rgb(169, 169, 169)));
+        assert_eq!(file.bg_truecolor, Some(Rgb(48, 0, 64)));
 
         let dir = theme.get(Role::PanelDirectory);
         assert_eq!(dir.fg, ColorValue::Ansi16(Ansi16::BrightWhite));
