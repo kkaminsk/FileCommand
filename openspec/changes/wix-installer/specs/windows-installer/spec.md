@@ -4,7 +4,7 @@
 
 ### Requirement: Dual-scope MSI package
 
-The system SHALL ship a WiX-built MSI that installs FileCommand per-user by default **without any elevation prompt**, placing files in `%LOCALAPPDATA%\Programs\BigHatGroup\FileCommand`, and SHALL support an explicit per-machine mode that elevates and installs to `%ProgramFiles%\BigHatGroup\FileCommand`. Both install paths SHALL end in `BigHatGroup\FileCommand`. Each scope SHALL register standard Apps-list (ARP) metadata — Publisher `BigHatGroup`, product name `FileCommand`, the package version — and provide a Start Menu shortcut at the matching scope. Uninstalling SHALL remove the installed files and shortcut but SHALL NOT delete user-created runtime files.
+The system SHALL ship WiX-built MSI packaging that installs FileCommand per-user by default **without any elevation prompt**, placing files in `%LOCALAPPDATA%\Programs\BigHatGroup\FileCommand`, and SHALL support an explicit per-machine mode that elevates and installs to `%ProgramFiles%\BigHatGroup\FileCommand`. The two scopes MAY be delivered as two single-scope MSI packages behind one bundle — the no-elevation guarantee for the default scope takes precedence over single-package economy. Both install paths SHALL end in `BigHatGroup\FileCommand`. Each scope SHALL register standard Apps-list (ARP) metadata — Publisher `BigHatGroup`, product name `FileCommand`, the package version — and provide a Start Menu shortcut at the matching scope. Uninstalling SHALL remove the installed files and shortcut but SHALL NOT delete user-created runtime files.
 
 #### Scenario: Per-user install needs no elevation
 
@@ -43,7 +43,7 @@ Installing SHALL append the install directory to the PATH environment variable a
 
 ### Requirement: Burn bootstrapper
 
-The system SHALL ship a Burn bundle `FileCommandSetup.exe` that embeds the MSI compressed, so a single executable performs the entire install. The bundle SHALL present the WiX standard bootstrapper UI for interactive installs (per-user default), and SHALL support unattended operation via Burn's standard switches — quiet, passive, no-restart, and uninstall — with a documented command-line control selecting per-machine scope for silent installs.
+The system SHALL ship a Burn bundle `FileCommandSetup.exe` that embeds the MSI package(s) compressed, so a single executable performs the entire install; when the scopes are separate MSIs, exactly one SHALL be planned for install per run, selected by the scope control. The bundle SHALL present the WiX standard bootstrapper UI for interactive installs (per-user default), and SHALL support unattended operation via Burn's standard switches — quiet, passive, no-restart, and uninstall — with a documented command-line control selecting per-machine scope for silent installs.
 
 #### Scenario: One self-contained executable
 
@@ -95,7 +95,7 @@ The MSI and bundle versions SHALL derive from the Cargo workspace version, and i
 
 ### Requirement: Reproducible installer build
 
-The repository SHALL contain the complete installer source and a build script that produces the MSI and bundle from a clean checkout: verifying prerequisites (WiX toolset v4/v5, .NET SDK), building the release binary, stamping the workspace version, and compiling both packages. Documentation SHALL cover prerequisites, usage, scope semantics, the PATH-refresh caveat for already-open shells, and the production code-signing steps for the Burn engine and final bundle.
+The repository SHALL contain the complete installer source and a build script that produces the MSI and bundle from a clean checkout: verifying prerequisites (WiX toolset v4/v5, .NET SDK), building the release binary, stamping the workspace version, and compiling every MSI package and the bundle. Documentation SHALL cover prerequisites, usage, scope semantics, the PATH-refresh caveat for already-open shells, and the production code-signing steps for the Burn engine and final bundle.
 
 #### Scenario: Clean-checkout build
 

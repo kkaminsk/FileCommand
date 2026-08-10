@@ -4,12 +4,18 @@ This directory contains the WiX (v4/v5) sources that package FileCommand
 into a single bootstrapper executable, `FileCommandSetup.exe`, plus the
 winget manifest template used to distribute it.
 
-- `Package.wxs` — the MSI: dual-scope install (per-user by default,
-  per-machine on request), PATH integration, Start Menu shortcut,
-  versioned upgrades.
-- `Bundle.wxs` — the Burn bundle that embeds the MSI behind the WiX
+- `PackagePerUser.wxs` — the per-user MSI (`Scope="perUser"`): installs
+  with **no elevation**, user PATH integration, Start Menu shortcut,
+  versioned upgrades. This is the default scope.
+- `PackagePerMachine.wxs` — the per-machine MSI (`Scope="perMachine"`):
+  elevated install to Program Files, machine PATH, its own UpgradeCode
+  (scope switches are uninstall-then-reinstall, never upgrades).
+- `Bundle.wxs` — the Burn bundle that embeds **both** MSIs behind the WiX
   Standard Bootstrapper Application (WixStdBA) UI, producing
-  `FileCommandSetup.exe`.
+  `FileCommandSetup.exe`; exactly one MSI is planned per run, selected by
+  the `InstallScope` variable. (Two single-scope MSIs replaced the
+  original dual-scope design after testing showed WiX v5's Burn always
+  elevates a dual-scope package — see design.md D1.)
 - `License.rtf` — license text shown by the bootstrapper UI (FileCommand
   is dual-licensed MIT / Apache-2.0; see `LICENSE-MIT` / `LICENSE-APACHE`
   at the repo root).
@@ -45,9 +51,10 @@ From the repo root, or from this directory:
 
 This runs `cargo build --release`, reads the current version from the
 workspace `Cargo.toml` (`[workspace.package].version`), stamps it into
-both the MSI's `ProductVersion` and the bundle's `Version`, and produces:
+both MSIs' `ProductVersion` and the bundle's `Version`, and produces:
 
-- `installer\out\Package.msi`
+- `installer\out\PackagePerUser.msi`
+- `installer\out\PackagePerMachine.msi`
 - `installer\out\FileCommandSetup.exe`
 
 Pass `-SkipCargoBuild` to repackage the existing
@@ -93,8 +100,10 @@ is FileCommand-specific.
 Installing a newer bundle upgrades in place **at the same scope** the
 existing install used (matched by `UpgradeCode`; see design.md decision
 D5). Switching scope — e.g. going from a per-user install to a
-per-machine one — is **not** an upgrade path. To change scope: uninstall
-the existing install, then install fresh at the new scope.
+per-machine one — is **not** an upgrade path: the two scopes are separate
+MSIs with different UpgradeCodes, so installing at the other scope will
+**coexist** with (not replace) the first install. To change scope:
+uninstall the existing install, then install fresh at the new scope.
 
 ### PATH refresh in open shells
 
@@ -111,12 +120,12 @@ after installing.
 Development builds produced by `build.ps1` are unsigned. Before shipping
 a release:
 
-1. **Sign the MSI** (`installer\out\Package.msi`) with `signtool sign` (or
-   your organization's signing pipeline) using an Authenticode
-   certificate, *before* building the bundle — the bundle embeds the MSI
-   as-is.
+1. **Sign both MSIs** (`installer\out\PackagePerUser.msi` and
+   `installer\out\PackagePerMachine.msi`) with `signtool sign` (or your
+   organization's signing pipeline) using an Authenticode certificate,
+   *before* building the bundle — the bundle embeds the MSIs as-is.
 2. **Rebuild the bundle** (`wix build Bundle.wxs ...`) so it embeds the
-   now-signed MSI.
+   now-signed MSIs.
 3. **Sign the Burn engine and the final bundle.** Burn bundles require
    two signing passes: the stub engine is signed once WiX extracts it,
    then the final `FileCommandSetup.exe` is signed again. See the WiX

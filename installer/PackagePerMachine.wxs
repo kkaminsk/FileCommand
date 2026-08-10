@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileCommand per-machine MSI package (WiX v4/v5).
+
+  One of two single-scope packages (see PackagePerUser.wxs and
+  openspec/changes/wix-installer/design.md, revised decision D1). This is
+  the elevated path: Scope="perMachine",
+  %ProgramFiles%\BigHatGroup\FileCommand (64-bit Program Files — the
+  binary is x64), machine PATH, HKLM registration. Selected by the
+  bundle's InstallScope=perMachine control; never installed by default.
+
+  Deliberately different UpgradeCode from the per-user package: switching
+  scope must be uninstall-then-reinstall, never a cross-scope upgrade.
+
+  Build-time variables (see installer/build.ps1):
+    ProductVersion  - stamped from the Cargo workspace version, e.g. 0.1.0
+    SourceDir       - directory containing the built filecommand.exe
+                       (target/release)
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="FileCommand"
+    Manufacturer="BigHatGroup"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="4E088CA3-DA52-42AB-8620-DF5E41B57C7A"
+    Language="1033"
+    Codepage="1252"
+    Scope="perMachine"
+    InstallerVersion="500">
+
+    <SummaryInformation Description="FileCommand Setup (per-machine)" Manufacturer="BigHatGroup" />
+
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/example/filecommand" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- 64-bit Program Files: the packaged binary is x64 (build.ps1 passes -arch x64). -->
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="ManufacturerFolder" Name="BigHatGroup">
+        <Directory Id="APPLICATIONFOLDER" Name="FileCommand" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="BigHatGroup" />
+    </StandardDirectory>
+
+    <!-- Application binary -->
+    <Component Id="ApplicationExecutable" Directory="APPLICATIONFOLDER" Guid="*">
+      <File Id="FileCommandExe" Source="$(var.SourceDir)\filecommand.exe" KeyPath="yes" />
+      <RemoveFolder Id="RemoveApplicationFolder" Directory="APPLICATIONFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveManufacturerFolder" Directory="ManufacturerFolder" On="uninstall" />
+    </Component>
+
+    <!-- Start Menu shortcut; HKLM keypath matches this package's per-machine scope. -->
+    <Component Id="ApplicationShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+        Id="ApplicationStartMenuShortcut"
+        Name="FileCommand"
+        Description="Keyboard-driven dual-panel file manager"
+        Target="[APPLICATIONFOLDER]filecommand.exe"
+        WorkingDirectory="APPLICATIONFOLDER" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKLM" Key="Software\BigHatGroup\FileCommand" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      PATH integration (design D3): append the install directory to the
+      MACHINE PATH, removed automatically on uninstall via the Environment
+      table. Single-scope package, so no runtime condition is needed.
+    -->
+    <Component Id="PathEnvMachine" Directory="APPLICATIONFOLDER" Guid="*">
+      <Environment Id="PATH_MACHINE" Name="PATH" Value="[APPLICATIONFOLDER]" Permanent="no" Part="last" Action="set" System="yes" />
+      <RegistryValue Root="HKLM" Key="Software\BigHatGroup\FileCommand" Name="PathEnvMachine" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainApplication" Title="FileCommand" Level="1" AllowAbsent="no">
+      <ComponentRef Id="ApplicationExecutable" />
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="PathEnvMachine" />
+    </Feature>
+
+  </Package>
+</Wix>

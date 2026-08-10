@@ -9,16 +9,17 @@
         1. Checks prerequisites: .NET SDK and the WiX v4/v5 CLI tool.
         2. Runs `cargo build --release`.
         3. Reads the version from the workspace Cargo.toml and stamps it
-           into the MSI (ProductVersion) and the bundle (Version).
-        4. Runs `wix build` for Package.wxs, then for Bundle.wxs.
+           into both MSIs (ProductVersion) and the bundle (Version).
+        4. Runs `wix build` for PackagePerUser.wxs and
+           PackagePerMachine.wxs, then for Bundle.wxs.
 
     This script AUTHORS the build steps; it does not itself require the
     WiX toolset to be present to exist correctly, but running it does
     require WiX v4/v5 and the .NET SDK to be installed (see README.md).
 
 .PARAMETER OutDir
-    Output directory for Package.msi and FileCommandSetup.exe. Defaults to
-    installer\out next to this script.
+    Output directory for the two MSIs and FileCommandSetup.exe. Defaults
+    to installer\out next to this script.
 
 .PARAMETER SkipCargoBuild
     Skip `cargo build --release` and package whatever is already at
@@ -27,7 +28,7 @@
 
 .EXAMPLE
     .\build.ps1
-    Full build: cargo build --release, then Package.msi, then
+    Full build: cargo build --release, then both MSIs, then
     FileCommandSetup.exe.
 #>
 [CmdletBinding()]
@@ -38,13 +39,15 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$RepoRoot     = Split-Path -Parent $PSScriptRoot
-$InstallerDir = $PSScriptRoot
-$ReleaseDir   = Join-Path $RepoRoot 'target\release'
-$PackageWxs   = Join-Path $InstallerDir 'Package.wxs'
-$BundleWxs    = Join-Path $InstallerDir 'Bundle.wxs'
-$PackageMsi   = Join-Path $OutDir 'Package.msi'
-$BundleExe    = Join-Path $OutDir 'FileCommandSetup.exe'
+$RepoRoot      = Split-Path -Parent $PSScriptRoot
+$InstallerDir  = $PSScriptRoot
+$ReleaseDir    = Join-Path $RepoRoot 'target\release'
+$PerUserWxs    = Join-Path $InstallerDir 'PackagePerUser.wxs'
+$PerMachineWxs = Join-Path $InstallerDir 'PackagePerMachine.wxs'
+$BundleWxs     = Join-Path $InstallerDir 'Bundle.wxs'
+$PerUserMsi    = Join-Path $OutDir 'PackagePerUser.msi'
+$PerMachineMsi = Join-Path $OutDir 'PackagePerMachine.msi'
+$BundleExe     = Join-Path $OutDir 'FileCommandSetup.exe'
 
 function Write-Step {
     param([string]$Message)
@@ -147,20 +150,31 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 Push-Location $InstallerDir
 try {
-    Write-Step "wix build Package.wxs -> $PackageMsi"
-    & wix build $PackageWxs `
+    Write-Step "wix build PackagePerUser.wxs -> $PerUserMsi"
+    & wix build $PerUserWxs `
         -d "ProductVersion=$Version" `
         -d "SourceDir=$ReleaseDir" `
         -arch x64 `
-        -o $PackageMsi
+        -o $PerUserMsi
     if ($LASTEXITCODE -ne 0) {
-        throw "wix build failed for Package.wxs with exit code $LASTEXITCODE"
+        throw "wix build failed for PackagePerUser.wxs with exit code $LASTEXITCODE"
+    }
+
+    Write-Step "wix build PackagePerMachine.wxs -> $PerMachineMsi"
+    & wix build $PerMachineWxs `
+        -d "ProductVersion=$Version" `
+        -d "SourceDir=$ReleaseDir" `
+        -arch x64 `
+        -o $PerMachineMsi
+    if ($LASTEXITCODE -ne 0) {
+        throw "wix build failed for PackagePerMachine.wxs with exit code $LASTEXITCODE"
     }
 
     Write-Step "wix build Bundle.wxs -> $BundleExe"
     & wix build $BundleWxs `
         -d "ProductVersion=$Version" `
-        -d "PackageMsiPath=$PackageMsi" `
+        -d "PerUserMsiPath=$PerUserMsi" `
+        -d "PerMachineMsiPath=$PerMachineMsi" `
         -ext WixToolset.BootstrapperApplications.wixext `
         -arch x64 `
         -o $BundleExe
@@ -173,7 +187,8 @@ try {
 
 Write-Host ""
 Write-Host "Build complete:" -ForegroundColor Green
-Write-Host "  MSI:    $PackageMsi"
-Write-Host "  Bundle: $BundleExe"
+Write-Host "  Per-user MSI:    $PerUserMsi"
+Write-Host "  Per-machine MSI: $PerMachineMsi"
+Write-Host "  Bundle:          $BundleExe"
 Write-Host ""
 Write-Host "These are UNSIGNED development builds. See README.md for the production signing steps." -ForegroundColor Yellow
