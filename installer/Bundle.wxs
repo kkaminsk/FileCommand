@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileCommand Burn bootstrapper bundle (WiX v4/v5).
+
+  Produces FileCommandSetup.exe: a single, self-contained executable that
+  embeds Package.msi (compressed) behind the WiX Standard Bootstrapper
+  Application (WixStdBA). This is the artifact end users double-click and
+  the artifact winget drives silently. See design.md decision D4.
+
+  Build-time variables (see installer/build.ps1):
+    ProductVersion   - stamped from the Cargo workspace version, e.g. 0.1.0
+    PackageMsiPath   - path to the built Package.msi
+
+  Requires the WixToolset.BootstrapperApplications.wixext extension
+  (installer/build.ps1 passes -ext for this).
+
+  Scope control for silent/automated installs (design D4, winget mapping):
+    FileCommandSetup.exe                          -> per-user, no elevation
+    FileCommandSetup.exe /quiet                    -> per-user, silent
+    FileCommandSetup.exe /quiet InstallScope=perMachine
+                                                     -> per-machine, silent, elevates once
+    FileCommandSetup.exe /uninstall /quiet          -> silent uninstall (same scope as the
+                                                        installed bundle)
+  Burn's standard /quiet, /passive, /norestart, /uninstall switches are
+  provided by the engine; no custom wiring is needed for those.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+    Name="FileCommand"
+    Manufacturer="BigHatGroup"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="83A047C2-CBA3-4DA9-96EF-1481CD2D0A6A">
+
+    <!--
+      Burn automatically detects other bundles sharing this UpgradeCode at
+      a lower version and performs an in-place major upgrade (removes the
+      old bundle's MSI, installs the new one) at the SAME scope the older
+      bundle was installed at (design D5).
+    -->
+
+    <!--
+      Bundle-level variable selecting install scope for the chained MSI.
+      Overridable on the command line without a leading slash, e.g.
+      "FileCommandSetup.exe /quiet InstallScope=perMachine". Defaults to
+      per-user so the plain double-click / no-argument silent path never
+      elevates.
+    -->
+    <Variable Name="InstallScope" Type="string" Value="perUser" bal:Overridable="yes" Persisted="yes" />
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        LicenseFile="License.rtf"
+        Theme="rtfLicense"
+        SuppressOptionsUI="yes"
+        ShowVersion="yes" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <MsiPackage
+        Id="FileCommandMsi"
+        SourceFile="$(var.PackageMsiPath)"
+        Compressed="yes"
+        Vital="yes">
+        <!--
+          Forward the bundle's InstallScope variable to the MSI's
+          dual-scope property (Package.wxs). Only MSIINSTALLPERUSER is
+          forwarded: ALLUSERS is a Burn-controlled property and cannot be
+          authored here (WIX0365). Leaving MSIINSTALLPERUSER unset for the
+          perMachine case falls through to the package's own
+          Scope="perUserOrMachine" default. The default ("perUser" or
+          unset/empty) leaves the MSI in its no-elevation per-user default.
+        -->
+        <MsiProperty Name="MSIINSTALLPERUSER" Value="1" Condition="InstallScope = &quot;perUser&quot; OR InstallScope = &quot;&quot;" />
+      </MsiPackage>
+    </Chain>
+
+  </Bundle>
+</Wix>
