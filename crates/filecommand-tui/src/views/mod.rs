@@ -60,14 +60,21 @@ pub fn render(
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
 ) -> Option<(u16, u16)> {
-    let cursor = render_phase(buf, area, state, depth, identity_lines, clock_text, viewer_source);
+    // Resolved once per frame: the highlighted built-in theme while the
+    // theme picker is open, else the applied theme (theme-selection "Live
+    // theme preview while the picker is open"). Every renderer below —
+    // panels, key bar, the picker dialog itself, and any overlay drawn
+    // above it — styles itself from this single value so the whole screen
+    // repaints consistently as the highlight moves.
+    let render_theme = state.render_theme();
+    let cursor = render_phase(buf, area, state, &render_theme, depth, identity_lines, clock_text, viewer_source);
     // The quit-confirmation dialog is drawn above whatever the current phase
     // painted — panels, the viewer, an open menu, or any other modal
     // dialog/overlay — since it lives beside the phase rather than inside
     // it and can open over any of them (application-shell "Quit request
     // keys and confirmation"; design D5).
     if state.quit_confirm {
-        quit_dialog::render_quit_dialog(buf, area, &state.theme, depth);
+        quit_dialog::render_quit_dialog(buf, area, &render_theme, depth);
     }
     // The startup-warning modal is drawn last, over whatever the current
     // phase already painted — it can only ever be raised at the very start
@@ -76,7 +83,7 @@ pub fn render(
     // be on screen underneath it (user-menu "Malformed file warns and falls
     // back without overwriting").
     if let Some(message) = &state.startup_warning {
-        startup_warning::render_startup_warning(buf, area, &state.theme, depth, message);
+        startup_warning::render_startup_warning(buf, area, &render_theme, depth, message);
     }
     cursor
 }
@@ -85,6 +92,7 @@ fn render_phase(
     buf: &mut Buffer,
     area: Rect,
     state: &State,
+    theme: &filecommand_core::theme::Theme,
     depth: ColorDepth,
     identity_lines: &[String; 4],
     clock_text: &str,
@@ -92,18 +100,18 @@ fn render_phase(
 ) -> Option<(u16, u16)> {
     match &state.phase {
         UiPhase::Splash { .. } => {
-            splash::render_splash(buf, area, &state.theme, depth, identity_lines);
+            splash::render_splash(buf, area, theme, depth, identity_lines);
             None
         }
         UiPhase::Placeholder => {
-            placeholder::render_placeholder(buf, area, &state.theme, depth);
+            placeholder::render_placeholder(buf, area, theme, depth);
             None
         }
         UiPhase::Viewer(v) => {
-            viewer::render_viewer(buf, area, v, &state.theme, depth, viewer_source);
+            viewer::render_viewer(buf, area, v, theme, depth, viewer_source);
             None
         }
-        UiPhase::Editor(e) => editor::render_editor(buf, area, e, &state.theme, depth),
+        UiPhase::Editor(e) => editor::render_editor(buf, area, e, theme, depth),
         UiPhase::Panels
         | UiPhase::FileOpSetup(_)
         | UiPhase::FileOpRunning { .. }
@@ -115,7 +123,7 @@ fn render_phase(
                 buf,
                 l.left,
                 &state.left,
-                &state.theme,
+                theme,
                 depth,
                 state.active == PanelSide::Left,
                 identity_lines,
@@ -126,7 +134,7 @@ fn render_phase(
                 buf,
                 l.right,
                 &state.right,
-                &state.theme,
+                theme,
                 depth,
                 state.active == PanelSide::Right,
                 identity_lines,
@@ -141,56 +149,61 @@ fn render_phase(
             // collide with the right panel's centered path title
             // (responsive-layout "Chrome degradation").
             if clock_fits_without_colliding(l.right, &state.right, state.active == PanelSide::Right, clock_text) {
-                clock::render_clock(buf, l.right, &state.theme, depth, clock_text);
+                clock::render_clock(buf, l.right, theme, depth, clock_text);
             }
-            command_line::render_command_line(buf, l.cmdline, &state.theme, depth, &state.prompt(), &state.command_line);
-            keybar::render_keybar(buf, l.keybar, &state.theme, depth);
+            command_line::render_command_line(buf, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
+            keybar::render_keybar(buf, l.keybar, theme, depth);
 
             // The F9 bar overlays the panels' top borders (and the clock)
             // rather than reserving a row of its own.
             if let Some(menu) = &state.menu {
-                menubar::render_menu_bar(buf, area, &state.theme, depth, menu);
+                menubar::render_menu_bar(buf, area, theme, depth, menu);
             }
             if let Some(dialog) = &state.drive_select {
-                drive_select::render_drive_select(buf, area, &state.theme, depth, dialog);
+                drive_select::render_drive_select(buf, area, theme, depth, dialog);
             }
             if let Some(dialog) = &state.fuzzy_jump {
-                fuzzy_jump::render_fuzzy_jump(buf, area, &state.theme, depth, dialog, &state.dir_history, state.clock_ms);
+                fuzzy_jump::render_fuzzy_jump(buf, area, theme, depth, dialog, &state.dir_history, state.clock_ms);
             }
             if let Some(dialog) = &state.find_file {
-                find_file::render_find_file(buf, area, &state.theme, depth, dialog);
+                find_file::render_find_file(buf, area, theme, depth, dialog);
             }
             if let Some(dialog) = &state.user_menu {
-                user_menu::render_user_menu(buf, area, &state.theme, depth, dialog, &state.user_menu_entries);
+                user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries);
             }
             if let Some(dialog) = &state.theme_picker {
-                theme_picker::render_theme_picker(buf, area, &state.theme, depth, dialog, &state.theme.name);
+                // The dialog itself styles from the previewed `theme`, but
+                // its active-theme marker stays bound to `state.theme.name`
+                // — the applied theme — even while a different theme is
+                // being previewed (design D2; theme-selection "Live theme
+                // preview while the picker is open").
+                theme_picker::render_theme_picker(buf, area, theme, depth, dialog, &state.theme.name);
             }
             if let Some(dialog) = &state.help {
-                help::render_help(buf, area, &state.theme, depth, dialog, identity_lines);
+                help::render_help(buf, area, theme, depth, dialog, identity_lines);
             }
             if let Some(dialog) = &state.file_action_menu {
-                file_action_menu::render_file_action_menu(buf, area, &state.theme, depth, dialog);
+                file_action_menu::render_file_action_menu(buf, area, theme, depth, dialog);
             }
 
             match &state.phase {
                 UiPhase::FileOpSetup(setup) => {
-                    destination_input::render_destination_input(buf, area, &state.theme, depth, setup);
-                    delete_confirm::render_delete_confirm(buf, area, &state.theme, depth, setup);
+                    destination_input::render_destination_input(buf, area, theme, depth, setup);
+                    delete_confirm::render_delete_confirm(buf, area, theme, depth, setup);
                 }
                 UiPhase::FileOpRunning { dialog, .. } => match dialog {
                     RunningDialog::Progress { kind, progress } => {
-                        progress_dialog::render_progress(buf, area, &state.theme, depth, *kind, progress);
+                        progress_dialog::render_progress(buf, area, theme, depth, *kind, progress);
                     }
                     RunningDialog::Conflict { info, rename_input, .. } => {
-                        conflict_dialog::render_conflict(buf, area, &state.theme, depth, info, rename_input);
+                        conflict_dialog::render_conflict(buf, area, theme, depth, info, rename_input);
                     }
                     RunningDialog::Error { info, .. } => {
-                        error_dialog::render_error(buf, area, &state.theme, depth, info);
+                        error_dialog::render_error(buf, area, theme, depth, info);
                     }
                 },
                 UiPhase::FileOpSummary(skipped) => {
-                    skipped_summary::render_skipped_summary(buf, area, &state.theme, depth, skipped);
+                    skipped_summary::render_skipped_summary(buf, area, theme, depth, skipped);
                 }
                 _ => {}
             }

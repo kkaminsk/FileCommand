@@ -1044,6 +1044,109 @@ fn snapshot_theme_picker_dialog_with_active_theme_marked() {
 }
 
 // ---------------------------------------------------------------------
+// theme-picker-live-preview: live whole-screen preview while the picker
+// is open (theme-selection "Live theme preview while the picker is open").
+// ---------------------------------------------------------------------
+
+/// Full-frame render through a real `TestBackend`, returning both the
+/// plain-text glyph grid and the backing [`Buffer`] so callers can also
+/// spot-check styling — needed here because a theme change never changes
+/// glyphs, only colors, so the text grid alone can't tell two themes apart.
+fn render_to_buffer(width: u16, height: u16, state: &State, depth: ColorDepth) -> Buffer {
+    let identity_lines = pinned_identity_lines();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            views::render(frame.buffer_mut(), area, state, depth, &identity_lines, FIXED_CLOCK_TEXT, None);
+        })
+        .expect("draw into TestBackend");
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn snapshot_theme_picker_dialog_previews_a_non_active_highlighted_theme() {
+    // task 3.1: the active theme is `nc-classic`, but the highlight sits on
+    // `purple-lights`. Every surface — not just the picker dialog — must
+    // render through `purple-lights`'s role table, while the marker stays
+    // on the applied theme's (`nc-classic`) row (theme-selection scenario
+    // "Moving the highlight previews the theme").
+    use filecommand_core::theme::{BUILTIN_THEME_NAMES, Role};
+    use filecommand_tui::style::role_style;
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    let highlight = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
+    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState { highlight });
+
+    let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+    let text = buffer_to_text(&buf);
+
+    // The marker stays on the applied theme's row, not the previewed one
+    // (design D2).
+    let active_row = text.lines().find(|l| l.contains("nc-classic")).expect("nc-classic row present");
+    assert!(active_row.contains('*'), "the marker stays on the applied theme's row: `{active_row}`");
+    let previewed_row = text.lines().find(|l| l.contains("purple-lights")).expect("purple-lights row present");
+    assert!(!previewed_row.contains('*'), "the previewed (non-applied) row carries no marker: `{previewed_row}`");
+
+    // A theme swap changes colors, not glyphs, so prove the *whole frame*
+    // previews `purple-lights` by checking styling directly: the left
+    // panel's top-left frame cell (outside the picker dialog entirely)
+    // must use `purple-lights`'s `PanelFrame` role, not `nc-classic`'s.
+    let purple = Theme::purple_lights();
+    let classic = Theme::classic();
+    let purple_frame = role_style(&purple, Role::PanelFrame, ColorDepth::Ansi16);
+    let classic_frame = role_style(&classic, Role::PanelFrame, ColorDepth::Ansi16);
+    assert_ne!(purple_frame, classic_frame, "sanity: the two themes actually differ on PanelFrame");
+    assert_eq!(buf[(0, 0)].style().fg, purple_frame.fg, "the panel border previews the highlighted theme, not the applied one");
+    assert_eq!(buf[(0, 0)].style().bg, purple_frame.bg, "the panel border previews the highlighted theme, not the applied one");
+
+    insta::assert_snapshot!("theme_picker_dialog_previews_purple_lights", text);
+}
+
+#[test]
+fn theme_picker_open_with_the_active_theme_highlighted_is_byte_identical_to_the_frame_before_it_opened() {
+    // task 3.2 / theme-selection scenario "Opening the picker changes
+    // nothing visually": since the highlight starts on the active theme,
+    // opening the picker must not repaint anything outside the dialog's
+    // own footprint.
+    let state = base_state(UiPhase::Panels, Theme::classic());
+    let before = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+
+    let mut opened = state;
+    opened.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("nc-classic"));
+    let after = render_to_buffer(80, 24, &opened, ColorDepth::Ansi16);
+
+    // Derive the dialog's exact footprint from its own box-drawing corners
+    // rather than hardcoding coordinates, so this stays correct however the
+    // picker sizes itself. Row 0 is skipped because it's the panels' own
+    // top border, which reuses the same corner glyph as the dialog's.
+    let after_text = buffer_to_text(&after);
+    let lines: Vec<&str> = after_text.lines().collect();
+    let y_top = lines.iter().enumerate().skip(1).find(|(_, l)| l.contains('\u{2554}')).map(|(i, _)| i).expect("picker top border present");
+    let y_bottom = lines.iter().position(|l| l.contains('\u{255A}')).expect("picker bottom border present");
+    let x_left = lines[y_top].chars().position(|c| c == '\u{2554}').expect("picker top-left corner present");
+    let x_right = lines[y_top].chars().position(|c| c == '\u{2557}').expect("picker top-right corner present");
+
+    let area = before.area;
+    for y in 0..area.height {
+        for x in 0..area.width {
+            let before_cell = &before[(x, y)];
+            let after_cell = &after[(x, y)];
+            if before_cell != after_cell {
+                // Every diff must fall inside the picker dialog's own
+                // footprint — nothing else may repaint.
+                let (xu, yu) = (x as usize, y as usize);
+                assert!(
+                    xu >= x_left && xu <= x_right && yu >= y_top && yu <= y_bottom,
+                    "cell ({x},{y}) changed outside the picker dialog's footprint: {before_cell:?} -> {after_cell:?}"
+                );
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // visual-themes: representative screens (panels, a dialog, key bar) under
 // each of the four new built-in themes (theme-system "New themes satisfy
 // validation and swap semantics" — task 4.3).
