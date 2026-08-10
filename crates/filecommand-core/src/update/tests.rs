@@ -3269,6 +3269,57 @@ fn theme_picker_esc_changes_nothing() {
 }
 
 // ---------------------------------------------------------------------
+// theme-picker-live-preview: State::render_theme()
+// ---------------------------------------------------------------------
+
+#[test]
+fn render_theme_before_opening_the_picker_equals_the_active_theme() {
+    let mut state = test_state(UiPhase::Panels);
+    state.theme = Theme::terminal_green();
+    assert_eq!(state.render_theme(), state.theme, "no picker open: render theme is the active theme");
+}
+
+#[test]
+fn render_theme_while_open_tracks_the_highlighted_theme_as_it_moves() {
+    let mut state = test_state(UiPhase::Panels); // active theme is nc-classic (index 0)
+    state.theme = Theme::classic();
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    // Opening is visually a no-op: highlight starts on the active theme.
+    assert_eq!(state.render_theme(), state.theme, "opening previews the active theme first");
+
+    let target = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
+    let (state, _) = update(state, Command::ThemePickerMove(target as isize));
+    assert_eq!(
+        state.render_theme().name,
+        "purple-lights",
+        "moving the highlight previews the newly highlighted theme"
+    );
+    assert_eq!(state.theme.name, "nc-classic", "the applied theme is untouched by moving the highlight");
+}
+
+#[test]
+fn render_theme_after_cancel_reverts_to_the_active_theme() {
+    let state = test_state(UiPhase::Panels); // active theme is nc-classic
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    let (state, _) = update(state, Command::ThemePickerMove(3)); // preview some other theme
+    assert_ne!(state.render_theme().name, "nc-classic", "sanity: a non-active theme is previewed");
+    let (state, _) = update(state, Command::ThemePickerCancel);
+    assert_eq!(state.render_theme(), state.theme, "after cancel, render theme is the (unchanged) active theme");
+    assert_eq!(state.theme.name, "nc-classic", "cancel never touched the active theme");
+}
+
+#[test]
+fn render_theme_after_confirm_equals_the_newly_applied_theme() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::ThemePickerOpen);
+    let target = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "yellow-storm").unwrap();
+    let (state, _) = update(state, Command::ThemePickerMove(target as isize));
+    let (state, _) = update(state, Command::ThemePickerConfirm);
+    assert_eq!(state.render_theme(), state.theme, "after confirm, render theme is the applied theme");
+    assert_eq!(state.render_theme().name, "yellow-storm");
+}
+
+// ---------------------------------------------------------------------
 // M5: F1 Help window + About dialog
 // ---------------------------------------------------------------------
 

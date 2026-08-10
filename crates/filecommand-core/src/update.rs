@@ -193,6 +193,25 @@ impl State {
         format!("{}>", self.active_panel().cwd.display())
     }
 
+    /// The theme every renderer should draw with this frame: while the
+    /// theme picker is open, the currently *highlighted* built-in theme
+    /// (falling back to the active theme on a lookup miss, which never
+    /// happens in practice since the highlight is always clamped within
+    /// `BUILTIN_THEME_NAMES`); otherwise the applied `state.theme`. This is
+    /// a pure, render-only derivation — it never mutates `state.theme` or
+    /// touches persistence (theme-selection: "Live theme preview while the
+    /// picker is open").
+    pub fn render_theme(&self) -> Theme {
+        if let Some(picker) = &self.theme_picker {
+            if let Some(name) = crate::theme::BUILTIN_THEME_NAMES.get(picker.highlight) {
+                if let Some(theme) = Theme::by_name(name) {
+                    return theme;
+                }
+            }
+        }
+        self.theme.clone()
+    }
+
     /// A bare state with empty panels — the base every test builds on, and
     /// the shape `initial` fills in.
     pub fn empty(theme: Theme) -> State {
