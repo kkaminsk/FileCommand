@@ -443,7 +443,11 @@ const CONFIGURATION: &str = "\
 config.toml (next to the executable) sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
 and can remap the quick-filter, fuzzy-jump, and panel-split keys.
-usermenu.toml defines the F2 user menu's entries.";
+usermenu.toml defines the F2 user menu's entries. --nosplash skips
+the startup splash. --theme <name> (or --theme=<name>) starts the
+session in a built-in theme instead of the configured one, for this
+launch only: it never writes config.toml, so applying a theme from
+a picker during such a session still persists normally.";
 
 #[cfg(test)]
 mod tests {

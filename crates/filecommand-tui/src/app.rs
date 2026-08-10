@@ -16,7 +16,7 @@ use filecommand_core::editor::{EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
-use filecommand_core::theme::{ColorDepth, Theme};
+use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
 use filecommand_core::{config, drives, identity, update, Command, Effect, State, UiPhase};
@@ -48,15 +48,59 @@ struct Runtime {
     viewer_source: Option<(PathBuf, ByteSource)>,
 }
 
-pub fn run(no_splash_flag: bool) -> io::Result<()> {
+/// Launch-time command-line switches, parsed once by [`parse_launch_args`]
+/// and threaded through to [`run`]. Kept as a small struct rather than a
+/// growing list of `bool`/`Option` parameters on `run` itself (design D2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LaunchOptions {
+    /// `--nosplash`: skip the startup splash screen regardless of
+    /// `config.toml`'s `splash` key (startup-splash).
+    pub no_splash: bool,
+    /// `--theme <name>` or `--theme=<name>`: `None` when the switch was not
+    /// passed at all; `Some(String::new())` when it was passed with no
+    /// following value (e.g. as the final argument); `Some(name)` otherwise,
+    /// where `name` may or may not resolve to a built-in theme — that
+    /// resolution happens in `resolve_startup_theme`, not here
+    /// (theme-selection "Launch-time theme override via --theme").
+    pub theme: Option<String>,
+}
+
+/// Parse launch switches from an argument iterator (excluding the program
+/// name). Pure and independent of `std::env` so it is testable without a
+/// real process; `main.rs` calls this with `std::env::args().skip(1)` and
+/// forwards the result to [`run`] (design D2: "`main.rs` stays a thin
+/// parse-and-forward layer; parsing moves to a small pure helper").
+///
+/// Both `--theme <name>` and `--theme=<name>` are accepted (design D1).
+/// Switches may appear in either order and alongside `--nosplash`.
+pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptions {
+    let mut opts = LaunchOptions::default();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--nosplash" {
+            opts.no_splash = true;
+        } else if arg == "--theme" {
+            // A missing value (switch is the final argument) is recorded as
+            // an empty string rather than `None`, so `resolve_startup_theme`
+            // can tell "switch not passed" (no warning) apart from "switch
+            // passed with nothing after it" (warns: missing value).
+            opts.theme = Some(iter.next().unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--theme=") {
+            opts.theme = Some(value.to_string());
+        }
+    }
+    opts
+}
+
+pub fn run(launch: LaunchOptions) -> io::Result<()> {
     crate::terminal::install_panic_hook();
     let mut guard = TerminalGuard::new()?;
 
     let clock = RealClock::new();
     let wall_clock = RealWallClock;
     let config = config::load(Path::new(CONFIG_FILE));
-    let theme = resolve_startup_theme(&config);
-    let show_splash = config.splash && !no_splash_flag;
+    let (theme, theme_warning) = resolve_startup_theme(&config, launch.theme.as_deref());
+    let show_splash = config.splash && !launch.no_splash;
     let keys = config.keys.clone();
 
     let size = guard.terminal.size()?;
@@ -67,6 +111,14 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
+    // Session-only: this only ever sets `state.startup_warning` in memory,
+    // never touches `config.toml` (theme-selection "Override is
+    // session-only"; design D4). `apply_user_menu` below may overwrite this
+    // with its own warning if both fire at once — matching the pre-existing
+    // single-`startup_warning`-field behavior, not a new decision here.
+    if let Some(warning) = theme_warning {
+        state.startup_warning = Some(warning);
+    }
     let history_file = config::load_history_file(Path::new(config::HISTORY_FILE));
     state.history = history_file.commands;
     state.dir_history = history_file.directories;
@@ -160,15 +212,43 @@ pub fn run(no_splash_flag: bool) -> io::Result<()> {
     }
 }
 
-/// Resolve the startup theme from `config.theme`: an unset key already
-/// defaults to `nc-classic` in `config::Config::default`, and any name that
-/// isn't one of the six built-ins (renamed/typo'd/hand-edited) falls back to
-/// `nc-classic` here (theme-selection "Unknown configured theme falls back
-/// to default"). Factored out of `run` so this fallback composition —
-/// previously a bare inline expression with no direct regression test — is
-/// testable without a real terminal, matching `apply_config`'s rationale.
-fn resolve_startup_theme(config: &config::Config) -> Theme {
-    Theme::by_name(&config.theme).unwrap_or_else(Theme::classic)
+/// Resolve the startup theme from `config.theme` and an optional `--theme`
+/// launch override, returning the theme to start with plus an optional
+/// warning message for `state.startup_warning`.
+///
+/// `override_name`: `None` when `--theme` was not passed (no warning is
+/// ever produced in that case); `Some("")` when `--theme` was passed with no
+/// value; `Some(name)` otherwise. A valid `name` wins over `config.theme`
+/// with no warning (theme-selection "Valid override wins over
+/// configuration"). An empty or unrecognized `name` produces a warning
+/// naming the problem and listing `BUILTIN_THEME_NAMES`, and falls through
+/// to the existing config-then-default resolution unchanged (theme-selection
+/// "Unknown name warns and falls back" / "Missing value warns and falls
+/// back").
+///
+/// An unset `config.theme` key already defaults to `nc-classic` in
+/// `config::Config::default`, and any configured name that isn't one of the
+/// six built-ins (renamed/typo'd/hand-edited) falls back to `nc-classic`
+/// here (theme-selection "Unknown configured theme falls back to default").
+/// Factored out of `run` so this fallback composition — previously a bare
+/// inline expression with no direct regression test — is testable without a
+/// real terminal, matching `apply_config`'s rationale.
+fn resolve_startup_theme(config: &config::Config, override_name: Option<&str>) -> (Theme, Option<String>) {
+    let configured = || Theme::by_name(&config.theme).unwrap_or_else(Theme::classic);
+    match override_name {
+        None => (configured(), None),
+        Some("") => {
+            let warning = format!("--theme requires a value; valid themes: {}", BUILTIN_THEME_NAMES.join(", "));
+            (configured(), Some(warning))
+        }
+        Some(name) => match Theme::by_name(name) {
+            Some(theme) => (theme, None),
+            None => {
+                let warning = format!("--theme {name} is not a recognized theme; valid themes: {}", BUILTIN_THEME_NAMES.join(", "));
+                (configured(), Some(warning))
+            }
+        },
+    }
 }
 
 /// Snapshot config-driven values into `State` at startup: the configured
@@ -613,8 +693,9 @@ mod tests {
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_for_an_unknown_name() {
         let config = config::parse("theme = \"no-such-theme\"\n");
-        let theme = resolve_startup_theme(&config);
+        let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
+        assert_eq!(warning, None, "no --theme switch was passed, so no warning is raised");
     }
 
     /// Same scenario, unset case: an omitted `theme` key already defaults to
@@ -623,8 +704,9 @@ mod tests {
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_when_theme_is_unset() {
         let config = config::parse("splash = false\n");
-        let theme = resolve_startup_theme(&config);
+        let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
+        assert_eq!(warning, None);
     }
 
     /// Sanity check that a known configured theme round-trips through
@@ -633,8 +715,116 @@ mod tests {
     #[test]
     fn resolve_startup_theme_loads_a_known_configured_theme() {
         let config = config::parse("theme = \"terminal-green\"\n");
-        let theme = resolve_startup_theme(&config);
+        let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::terminal_green().name);
+        assert_eq!(warning, None);
+    }
+
+    // -- theme-selection "Launch-time theme override via --theme" --------
+
+    /// Parser: `--theme <name>` (space-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_theme_with_a_space_separated_value() {
+        let opts = parse_launch_args(["--theme".to_string(), "yellow-storm".to_string()]);
+        assert_eq!(opts.theme.as_deref(), Some("yellow-storm"));
+        assert!(!opts.no_splash);
+    }
+
+    /// Parser: `--theme=<name>` (equals-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_theme_with_an_equals_separated_value() {
+        let opts = parse_launch_args(["--theme=purple-lights".to_string()]);
+        assert_eq!(opts.theme.as_deref(), Some("purple-lights"));
+    }
+
+    /// Parser: `--theme` as the final argument has no value to consume, so
+    /// it is recorded as an empty string rather than panicking or being
+    /// dropped (spec scenario "Missing value warns and falls back").
+    #[test]
+    fn parse_launch_args_records_an_empty_value_when_theme_has_no_following_argument() {
+        let opts = parse_launch_args(["--theme".to_string()]);
+        assert_eq!(opts.theme.as_deref(), Some(""));
+    }
+
+    /// Parser: no `--theme` switch at all leaves the field unset, distinct
+    /// from the missing-value case above.
+    #[test]
+    fn parse_launch_args_leaves_theme_unset_when_the_switch_is_absent() {
+        let opts = parse_launch_args(["--nosplash".to_string()]);
+        assert_eq!(opts.theme, None);
+        assert!(opts.no_splash);
+    }
+
+    /// Parser: `--nosplash` is unaffected by `--theme` parsing, in either
+    /// order, when both switches are present.
+    #[test]
+    fn parse_launch_args_reads_both_switches_regardless_of_order() {
+        let nosplash_first = parse_launch_args(["--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
+        assert!(nosplash_first.no_splash);
+        assert_eq!(nosplash_first.theme.as_deref(), Some("terminal-green"));
+
+        let theme_first = parse_launch_args(["--theme=terminal-green".to_string(), "--nosplash".to_string()]);
+        assert!(theme_first.no_splash);
+        assert_eq!(theme_first.theme.as_deref(), Some("terminal-green"));
+    }
+
+    /// theme-selection "Valid override wins over configuration": a valid
+    /// `--theme` value beats a different `config.theme`, with no warning.
+    #[test]
+    fn resolve_startup_theme_override_wins_over_configuration() {
+        let config = config::parse("theme = \"nc-classic\"\n");
+        let (theme, warning) = resolve_startup_theme(&config, Some("yellow-storm"));
+        assert_eq!(theme.name, Theme::yellow_storm().name);
+        assert_eq!(warning, None, "a valid override produces no warning");
+    }
+
+    /// theme-selection "Unknown name warns and falls back": an unrecognized
+    /// override falls through to the configured theme and produces a
+    /// warning naming the rejected value and listing the valid names.
+    #[test]
+    fn resolve_startup_theme_unknown_override_falls_back_with_a_warning() {
+        let config = config::parse("theme = \"nc-mono\"\n");
+        let (theme, warning) = resolve_startup_theme(&config, Some("no-such-theme"));
+        assert_eq!(theme.name, Theme::mono().name);
+        let warning = warning.expect("an unknown override raises a warning");
+        assert!(warning.contains("no-such-theme"), "warning should name the rejected value: {warning}");
+        for name in BUILTIN_THEME_NAMES {
+            assert!(warning.contains(name), "warning should list every built-in theme name: {warning}");
+        }
+    }
+
+    /// theme-selection "Missing value warns and falls back": `--theme` with
+    /// no value falls through to the configured theme and warns that the
+    /// value was missing (distinct wording from the unknown-name case).
+    #[test]
+    fn resolve_startup_theme_missing_value_falls_back_with_a_warning() {
+        let config = config::parse("theme = \"nc-mono\"\n");
+        let (theme, warning) = resolve_startup_theme(&config, Some(""));
+        assert_eq!(theme.name, Theme::mono().name);
+        let warning = warning.expect("a missing value raises a warning");
+        assert!(warning.to_lowercase().contains("value"), "warning should describe a missing value: {warning}");
+    }
+
+    /// theme-selection "Override is session-only": a picker apply during a
+    /// session that started via `--theme` persists exactly as it would
+    /// without the switch — the override only changes the initial `Theme`
+    /// passed into `State::initial`, so `update`'s own persistence logic is
+    /// untouched (design D4).
+    #[test]
+    fn picker_apply_persists_normally_during_an_overridden_session() {
+        let config = config::parse("theme = \"nc-classic\"\n");
+        let (theme, warning) = resolve_startup_theme(&config, Some("terminal-green"));
+        assert_eq!(theme.name, Theme::terminal_green().name);
+        assert_eq!(warning, None);
+
+        let (state, _) = State::initial(theme, (80, 24), 0, PathBuf::from("."), PathBuf::from("."), false);
+        let (state, _) = update(state, Command::ThemePickerOpen);
+        let target = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
+        let current = state.theme_picker.as_ref().unwrap().highlight;
+        let (state, _) = update(state, Command::ThemePickerMove(target as isize - current as isize));
+        let (state, effects) = update(state, Command::ThemePickerConfirm);
+        assert_eq!(state.theme.name, "purple-lights", "the picker's choice wins, not the launch override");
+        assert_eq!(effects, vec![Effect::PersistTheme("purple-lights".to_string())], "persistence is unaffected by how the session started");
     }
 
     /// Regression test for the M5 review finding: a malformed
