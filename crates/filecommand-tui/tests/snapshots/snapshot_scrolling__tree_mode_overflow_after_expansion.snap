@@ -1,0 +1,26 @@
+---
+source: crates/filecommand-tui/tests/snapshot_scrolling.rs
+expression: text
+---
+╔═════════ C:\Users\demo\left ═════════╗
+║Tree                                  ║
+║├─DIR06                               ░
+║├─DIR07                               ░
+║├─DIR08                               ░
+║├─DIR09                               ░
+║├─DIR10                               ░
+║├─DIR11                               █
+║├─DIR12                               █
+║├─DIR13                               █
+║├─DIR14                               █
+║├─DIR15                               █
+║├─DIR16                               █
+║├─DIR17                               █
+║├─DIR18                               █
+║├─DIR19                               █
+║├─DIR20                               █
+║├─DIR21                               █
+║├─DIR22                               █
+║├─DIR23                               █
+║└─DIR24                               █
+╚══════════════ C:\dir24 ══════════════╝

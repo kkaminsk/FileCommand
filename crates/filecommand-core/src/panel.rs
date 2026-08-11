@@ -69,6 +69,14 @@ pub struct TreeState {
     /// (additional-panel-modes "Enter returns to prior list mode at chosen
     /// directory").
     pub prior_mode: DisplayMode,
+    /// The topmost visible node row, in the same flat `nodes` index space as
+    /// `cursor` — the render-viewport offset for Tree mode's own scrolling
+    /// (additional-panel-modes "Tree mode scrolling"; design D2/D3). Wiring
+    /// the minimal-shift reconciliation that keeps it in sync with `cursor`
+    /// is `additional-panel-modes`' own follow-up group; this field exists
+    /// now so it round-trips through tab snapshot/restore (panel-navigation
+    /// "Scroll offset is core panel state") the same way `PanelState`'s does.
+    pub scroll_offset: usize,
 }
 
 impl TreeState {
@@ -77,7 +85,12 @@ impl TreeState {
     /// itself is the only node until its children are expanded (additional-
     /// panel-modes "No up-front full-drive scan").
     pub fn new(root: PathBuf, prior_mode: DisplayMode) -> TreeState {
-        TreeState { nodes: vec![TreeNode { path: root, depth: 0, expanded: false, prefix: String::new(), continuation: String::new() }], cursor: 0, prior_mode }
+        TreeState {
+            nodes: vec![TreeNode { path: root, depth: 0, expanded: false, prefix: String::new(), continuation: String::new() }],
+            cursor: 0,
+            prior_mode,
+            scroll_offset: 0,
+        }
     }
 
     /// The currently highlighted node, if any.
@@ -99,6 +112,30 @@ impl TreeState {
             CursorMove::Home => 0,
             CursorMove::End => last,
         };
+    }
+
+    /// Scroll the tree's render viewport (`scroll_offset`) by the minimum
+    /// amount needed to keep `cursor` inside a `rows`-tall window over the
+    /// flattened `nodes` list — a no-op if it's already visible. Mirrors
+    /// [`PanelState::ensure_cursor_visible`]'s minimal-shift clamp (design
+    /// D2), operating directly on the flat node-index space since Tree mode
+    /// has no quick-filter narrowing. Called by `core::update` after every
+    /// tree cursor move and after `insert_children` (expansion) changes the
+    /// node list out from under the current offset (additional-panel-modes
+    /// "Tree mode scrolling").
+    pub fn ensure_cursor_visible(&mut self, rows: usize) {
+        let rows = rows.max(1);
+        if self.nodes.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let last = self.nodes.len() - 1;
+        let pos = self.cursor.min(last);
+        if pos < self.scroll_offset {
+            self.scroll_offset = pos;
+        } else if pos >= self.scroll_offset + rows {
+            self.scroll_offset = pos + 1 - rows;
+        }
     }
 
     /// Insert `children` (already-sorted child directories, from
@@ -229,6 +266,15 @@ pub struct PanelState {
     /// settling the cursor there (find-file "Navigate to a chosen result").
     /// `None` for every ordinary navigation.
     pub pending_cursor_target: Option<OsString>,
+    /// The topmost visible position of the panel body's render window, in
+    /// *visible-position* space — an index into `visible_indices()`, not a
+    /// raw `entries` index (panel-navigation "Scroll offset is core panel
+    /// state"; design D3). Kept in sync with `cursor` by
+    /// [`Self::ensure_cursor_visible`], which `core::update` calls after
+    /// every cursor-moving or list-mutating command — the renderer only
+    /// ever reads it (design D2, modeled on `EditorState::top_line`/
+    /// `ensure_caret_visible`).
+    pub scroll_offset: usize,
 }
 
 impl PanelState {
@@ -253,6 +299,7 @@ impl PanelState {
             git_request: None,
             tree: None,
             pending_cursor_target: None,
+            scroll_offset: 0,
         }
     }
 
@@ -285,6 +332,65 @@ impl PanelState {
             CursorMove::End => last,
         };
         self.cursor_user_moved = true;
+    }
+
+    /// Scroll the render viewport (`scroll_offset`) by the minimum amount
+    /// needed to keep the cursor inside a `rows`-tall window — a no-op if
+    /// it's already visible. Operates in *visible-position* space (an index
+    /// into `visible_indices()`), the same space `scroll_offset` is defined
+    /// in, so it re-clamps correctly whether the cursor itself moved or the
+    /// quick-filter-narrowed list changed shape underneath it. Mirrors
+    /// `EditorState::ensure_caret_visible`'s minimal-shift clamp (design
+    /// D2): single-step moves shift the window by one row, `Home` (cursor
+    /// at position 0) pins the window to the top, `End` (cursor at the last
+    /// position) pins it to the bottom, and any other jump just lands the
+    /// cursor inside the window at the minimum distance. Called by
+    /// `core::update` after every cursor-moving or list-mutating command —
+    /// never by the renderer, which only reads `scroll_offset` (panel-
+    /// navigation "Viewport scrolling keeps the cursor visible", "Scroll
+    /// offset is core panel state").
+    pub fn ensure_cursor_visible(&mut self, rows: usize) {
+        let rows = rows.max(1);
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        if pos < self.scroll_offset {
+            self.scroll_offset = pos;
+        } else if pos >= self.scroll_offset + rows {
+            self.scroll_offset = pos + 1 - rows;
+        }
+    }
+
+    /// Brief mode's column-window counterpart to [`Self::ensure_cursor_visible`]:
+    /// the render window is `cols` whole columns of `rows` consecutive
+    /// visible-positions each (column-major, matching the renderer's `pos =
+    /// c * rows + row`), and `scroll_offset` is kept on a `rows`-multiple so
+    /// it always names a column boundary. Scrolls by the minimum number of
+    /// *columns* — never partial columns — that brings the cursor's column
+    /// back inside the window; a no-op when it already is (design D4;
+    /// additional-panel-modes "Brief mode column scrolling"). Called by
+    /// `core::update` instead of `ensure_cursor_visible` whenever the panel
+    /// is in Brief mode.
+    pub fn ensure_cursor_visible_brief(&mut self, rows: usize, cols: usize) {
+        let rows = rows.max(1);
+        let cols = cols.max(1);
+        let visible = self.visible_indices();
+        if visible.is_empty() {
+            self.scroll_offset = 0;
+            return;
+        }
+        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        let pos_col = pos / rows;
+        let mut start_col = self.scroll_offset / rows;
+        if pos_col < start_col {
+            start_col = pos_col;
+        } else if pos_col >= start_col + cols {
+            start_col = pos_col + 1 - cols;
+        }
+        self.scroll_offset = start_col * rows;
     }
 
     /// `move_cursor`, but restricted to entries the active quick filter
@@ -342,6 +448,11 @@ impl PanelState {
         self.entries.clear();
         self.cursor = 0;
         self.cursor_user_moved = false;
+        // A fresh directory has an entirely different entry set, so any
+        // scroll position from the old one is meaningless — reset alongside
+        // the cursor it tracks (panel-navigation "Scroll offset is core
+        // panel state").
+        self.scroll_offset = 0;
         self.progress = ListingProgress::Streaming { count: 0 };
         self.last_error = None;
         self.selected.clear();
@@ -539,6 +650,7 @@ impl PanelState {
             git_request: self.git_request,
             tree: self.tree.clone(),
             pending_cursor_target: self.pending_cursor_target.clone(),
+            scroll_offset: self.scroll_offset,
         }
     }
 
@@ -561,6 +673,14 @@ impl PanelState {
         self.git_request = data.git_request;
         self.tree = data.tree;
         self.pending_cursor_target = data.pending_cursor_target;
+        // Restored as-is; it may no longer fit the current viewport height
+        // (the panel may have been resized, or the split/tab-strip state
+        // differs from when this tab was stashed) — `core::update` re-clamps
+        // via `ensure_cursor_visible` right after calling into tab
+        // switch/open/close, which is where the current row count is known
+        // (panel-navigation "Tab restore re-clamps against the current
+        // viewport").
+        self.scroll_offset = data.scroll_offset;
     }
 
     /// The full ordered tab list, with the active tab's live state
@@ -654,6 +774,7 @@ pub struct TabData {
     pub git_request: Option<u64>,
     pub tree: Option<TreeState>,
     pub pending_cursor_target: Option<OsString>,
+    pub scroll_offset: usize,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single
@@ -1570,6 +1691,421 @@ mod tests {
             tree.insert_children(&PathBuf::from(r"C:\"), vec![dir_child("alpha")]);
             tree.move_cursor(CursorMove::Down(1));
             assert_eq!(tree.selected().unwrap().path, PathBuf::from(r"C:\alpha"));
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Scroll offset / viewport reconciliation (panel-scrolling task 1.5)
+    // -----------------------------------------------------------------
+
+    mod scroll_offset_tests {
+        use super::*;
+
+        /// A panel of `n` plain files named `e0`, `e1`, … in insertion
+        /// order, sorted `Unsorted` so the entry order is exactly the
+        /// creation order — keeps every test's expected positions obvious.
+        fn panel_of(n: usize) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.sort_mode = SortMode::Unsorted;
+            p.entries = (0..n).map(|i| file(&format!("e{i}"))).collect();
+            p
+        }
+
+        #[test]
+        fn fresh_panel_starts_with_a_zero_offset() {
+            let p = panel_of(20);
+            assert_eq!(p.scroll_offset, 0);
+        }
+
+        #[test]
+        fn no_op_while_the_cursor_stays_inside_the_window() {
+            let mut p = panel_of(20);
+            p.cursor = 3;
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 0);
+            p.cursor = 9; // last row of a 10-row window starting at 0
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 0, "the window must not move while the cursor is still inside it");
+        }
+
+        #[test]
+        fn cursor_below_the_bottom_edge_shifts_the_window_by_exactly_one_line() {
+            let mut p = panel_of(20);
+            p.scroll_offset = 0;
+            p.cursor = 9; // last visible row of a 10-row window
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 0);
+            p.cursor = 10; // one step past the bottom edge
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 1, "must shift by exactly one line, not re-center");
+        }
+
+        #[test]
+        fn cursor_above_the_top_edge_shifts_the_window_by_exactly_one_line() {
+            let mut p = panel_of(20);
+            p.scroll_offset = 5;
+            p.cursor = 5; // first visible row of a window starting at 5
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 5);
+            p.cursor = 4; // one step above the top edge
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 4, "must shift by exactly one line, not re-center");
+        }
+
+        #[test]
+        fn home_pins_the_window_to_the_top() {
+            let mut p = panel_of(20);
+            p.scroll_offset = 8;
+            p.cursor = 15;
+            p.move_cursor(CursorMove::Home);
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.cursor, 0);
+            assert_eq!(p.scroll_offset, 0, "Home must pin the window's first row to the list's first position");
+        }
+
+        #[test]
+        fn end_pins_the_window_to_the_bottom() {
+            let mut p = panel_of(20);
+            p.scroll_offset = 0;
+            p.cursor = 0;
+            p.move_cursor(CursorMove::End);
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.cursor, 19);
+            assert_eq!(p.scroll_offset, 10, "End must pin the window's last row to the list's last position (20 - 10 = 10)");
+        }
+
+        #[test]
+        fn a_jump_that_lands_far_outside_the_window_still_lands_the_cursor_in_view() {
+            // Simulates a type-ahead/find-file settle: the cursor is set
+            // directly, far from the current window, in one step.
+            let mut p = panel_of(50);
+            p.scroll_offset = 0;
+            p.cursor = 42;
+            p.ensure_cursor_visible(10);
+            assert!(
+                p.scroll_offset <= p.cursor && p.cursor < p.scroll_offset + 10,
+                "cursor {} must be inside the window [{}, {})",
+                p.cursor,
+                p.scroll_offset,
+                p.scroll_offset + 10
+            );
+            assert_eq!(p.scroll_offset, 33, "minimal-shift lands the cursor exactly on the window's last row: 42 + 1 - 10 = 33");
+        }
+
+        #[test]
+        fn quick_filter_narrowing_re_clamps_the_offset_in_visible_position_space() {
+            let mut p = panel_of(30);
+            p.cursor = 25;
+            p.scroll_offset = 20; // cursor at visible-position 25, well inside [20, 30)
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 20);
+
+            // Narrow to only even-numbered entries: "e25" is filtered out
+            // and the cursor snaps to the nearest still-visible entry.
+            p.quick_filter = Some(String::new());
+            p.activate_quick_filter();
+            for c in "e2".chars() {
+                p.quick_filter_push(c);
+            }
+            // "e2","e20".."e29" all contain "e2"; narrow further to land on
+            // a single, known entry.
+            p.quick_filter = Some("e24".to_string());
+            let visible = p.visible_indices();
+            assert_eq!(visible.len(), 1, "exactly \"e24\" should match");
+            p.cursor = visible[0];
+            // Re-clamp: with only one visible position (position 0), the
+            // stale offset of 20 must be pulled back to 0.
+            p.ensure_cursor_visible(10);
+            assert_eq!(p.scroll_offset, 0, "offset is in visible-position space and must re-clamp when the visible list shrinks");
+        }
+
+        #[test]
+        fn re_sort_keeps_the_cursors_entry_in_view_after_it_moves_far_in_the_list() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.entries = (0..30).map(|i| sized(&format!("e{i}"), i as u64)).collect();
+            p.sort_mode = SortMode::Unsorted;
+            p.cursor = 0; // "e0"
+            p.scroll_offset = 0;
+            p.ensure_cursor_visible(10);
+            // Reverse the order by size: "e0" (size 0) moves to the very
+            // end of the list.
+            p.set_sort_mode(SortMode::Size);
+            p.resort(); // no-op re-affirmation the mode is size-sorted already
+            p.entries.reverse(); // now largest-to-smallest ("e0" last)
+            p.cursor = p.entries.iter().position(|e| e.name == OsString::from("e0")).unwrap();
+            assert_eq!(p.cursor, 29);
+            p.ensure_cursor_visible(10);
+            assert!(p.scroll_offset <= p.cursor && p.cursor < p.scroll_offset + 10);
+            assert_eq!(p.scroll_offset, 20, "\"e0\" is now at position 29: 29 + 1 - 10 = 20");
+        }
+
+        #[test]
+        fn streamed_inserts_keep_the_offset_pinned_to_zero_while_the_cursor_is_unmoved() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.sort_mode = SortMode::Name;
+            for i in 0..15 {
+                p.insert_streamed(file(&format!("e{i:02}")));
+                // Mirrors what `update::apply_listing_event` does after
+                // every `ListingChunk`: re-clamp with a fixed 10-row window.
+                p.ensure_cursor_visible(10);
+            }
+            assert_eq!(p.cursor, 0, "cursor stays pinned to the top while the user hasn't moved it");
+            assert_eq!(p.scroll_offset, 0, "the window stays pinned to the top right along with the cursor");
+        }
+
+        #[test]
+        fn tab_restore_round_trips_the_scroll_offset_and_a_later_reconcile_can_re_clamp_it() {
+            let mut p = panel_of(20);
+            p.cursor = 15;
+            p.scroll_offset = 10;
+            p.open_tab(); // new tab inherits the same state, including scroll_offset
+            p.begin_new_listing(PathBuf::from("/other"));
+            p.entries = (0..3).map(|i| file(&format!("x{i}"))).collect();
+            p.cursor = 0;
+            assert_eq!(p.scroll_offset, 0, "a fresh listing resets the offset alongside the cursor");
+
+            p.switch_tab(1);
+            assert_eq!(p.cursor, 15);
+            assert_eq!(p.scroll_offset, 10, "the stashed tab's offset round-trips through open_tab/switch_tab");
+
+            // Restoring against a shorter viewport than when it was stashed
+            // must re-clamp so the cursor stays visible.
+            p.ensure_cursor_visible(3);
+            assert!(p.scroll_offset <= p.cursor && p.cursor < p.scroll_offset + 3);
+            assert_eq!(p.scroll_offset, 13, "15 + 1 - 3 = 13");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Brief column-window and Tree scrolling (panel-scrolling task 2.3)
+    // -----------------------------------------------------------------
+
+    mod brief_scroll_tests {
+        use super::*;
+
+        /// A panel of `n` plain files, `Unsorted` so creation order is
+        /// preserved and each position is exactly `ei`'s index `i`.
+        fn panel_of(n: usize) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.sort_mode = SortMode::Unsorted;
+            p.entries = (0..n).map(|i| file(&format!("e{i}"))).collect();
+            p
+        }
+
+        #[test]
+        fn fresh_panel_starts_column_offset_at_zero() {
+            let p = panel_of(30);
+            assert_eq!(p.scroll_offset, 0);
+        }
+
+        #[test]
+        fn no_op_while_the_cursor_stays_inside_the_column_window() {
+            // rows = 5, cols = 2 -> a 10-position window [0, 10).
+            let mut p = panel_of(30);
+            p.cursor = 8; // column 1, row 3 -- still inside the window
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 0, "the window must not move while the cursor is already inside it");
+        }
+
+        #[test]
+        fn cursor_past_the_last_visible_column_shifts_the_window_by_exactly_one_column() {
+            let mut p = panel_of(30);
+            p.scroll_offset = 0;
+            p.cursor = 9; // column 1, row 4: the window's last column
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 0);
+            p.cursor = 10; // column 2, row 0: one step past the last column
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 5, "shifts by exactly one column (5 positions), not further");
+            // The leftmost column (positions 0..5, i.e. column 0) has left
+            // the window; the cursor's column (2) is now the window's last.
+            assert!(p.scroll_offset / 5 <= 2 && 2 < p.scroll_offset / 5 + 2);
+        }
+
+        #[test]
+        fn cursor_before_the_first_visible_column_shifts_the_window_by_exactly_one_column() {
+            let mut p = panel_of(30);
+            p.scroll_offset = 10; // window starts at column 2
+            p.cursor = 10; // column 2, row 0: the window's first column
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 10);
+            p.cursor = 9; // column 1, row 4: one step before the first column
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 5, "shifts left by exactly one column");
+        }
+
+        #[test]
+        fn window_start_always_lands_on_a_column_boundary() {
+            let mut p = panel_of(47);
+            let rows = 5;
+            let cols = 2;
+            // Walk the cursor across the whole list; after every step the
+            // offset must be an exact multiple of `rows` (additional-panel-
+            // modes "Window start stays on a column boundary").
+            for pos in 0..47 {
+                p.cursor = pos;
+                p.ensure_cursor_visible_brief(rows, cols);
+                assert_eq!(p.scroll_offset % rows, 0, "offset {} is not a multiple of rows_h {} at cursor {}", p.scroll_offset, rows, pos);
+            }
+        }
+
+        #[test]
+        fn end_lands_the_cursor_in_the_windows_last_column() {
+            // 23 entries, rows = 5 -> columns 0..4 (col 4 has only 3 rows).
+            let mut p = panel_of(23);
+            p.scroll_offset = 0;
+            p.cursor = 0;
+            p.move_cursor(CursorMove::End);
+            assert_eq!(p.cursor, 22);
+            p.ensure_cursor_visible_brief(5, 2);
+            // cursor's column = 22 / 5 = 4; minimal shift lands columns [3,4)
+            // in the window: offset = (4 + 1 - 2) * 5 = 15.
+            assert_eq!(p.scroll_offset, 15);
+            assert_eq!(p.scroll_offset % 5, 0, "offset stays on a column boundary");
+        }
+
+        #[test]
+        fn home_pins_the_window_to_the_first_column() {
+            let mut p = panel_of(30);
+            p.scroll_offset = 15;
+            p.cursor = 20;
+            p.move_cursor(CursorMove::Home);
+            assert_eq!(p.cursor, 0);
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 0, "Home must pin the window to the first column");
+        }
+
+        #[test]
+        fn fitting_list_keeps_the_window_at_the_first_column() {
+            // Every position fits within a single window (cols * rows = 30
+            // exactly covers a 30-entry list): the offset must stay put at 0
+            // wherever the cursor lands.
+            let mut p = panel_of(30);
+            for pos in [0usize, 14, 29] {
+                p.cursor = pos;
+                p.ensure_cursor_visible_brief(10, 3);
+                assert_eq!(p.scroll_offset, 0, "a fully-fitting list never needs to scroll (cursor {pos})");
+            }
+        }
+
+        #[test]
+        fn empty_visible_list_leaves_the_offset_at_zero() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.ensure_cursor_visible_brief(5, 2);
+            assert_eq!(p.scroll_offset, 0);
+        }
+    }
+
+    mod tree_scroll_tests {
+        use super::*;
+        use crate::listing::Entry as ListEntry;
+
+        fn dir_child(name: &str) -> ListEntry {
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+        }
+
+        /// A flattened tree of `n` top-level directories under `C:\`.
+        fn tree_of(n: usize) -> TreeState {
+            let mut t = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            let children: Vec<ListEntry> = (0..n).map(|i| dir_child(&format!("d{i}"))).collect();
+            t.insert_children(&PathBuf::from(r"C:\"), children);
+            t
+        }
+
+        #[test]
+        fn fresh_tree_starts_with_a_zero_offset() {
+            let t = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+            assert_eq!(t.scroll_offset, 0);
+        }
+
+        #[test]
+        fn no_op_while_the_tree_cursor_stays_inside_the_window() {
+            let mut t = tree_of(20); // node 0 is the root, 1..=20 are d0..d19
+            t.cursor = 5;
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0, "cursor is within the first 10-row window");
+        }
+
+        #[test]
+        fn tree_cursor_below_the_bottom_scrolls_the_node_window_by_one_row() {
+            let mut t = tree_of(20);
+            t.scroll_offset = 0;
+            t.cursor = 9; // last visible row of a 10-row window
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0);
+            t.move_cursor(CursorMove::Down(1));
+            assert_eq!(t.cursor, 10);
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 1, "shifts by exactly one row (additional-panel-modes \"Tree cursor below the bottom scrolls the nodes\")");
+        }
+
+        #[test]
+        fn tree_cursor_above_the_top_scrolls_the_node_window_by_one_row() {
+            let mut t = tree_of(20);
+            t.scroll_offset = 5;
+            t.cursor = 5;
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 5);
+            t.cursor = 4;
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 4);
+        }
+
+        #[test]
+        fn tree_home_and_end_pin_the_window() {
+            let mut t = tree_of(20);
+            t.scroll_offset = 8;
+            t.cursor = 15;
+            t.move_cursor(CursorMove::Home);
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0);
+
+            t.move_cursor(CursorMove::End);
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.cursor, 20); // root + 20 children = 21 nodes, last index 20
+            assert_eq!(t.scroll_offset, 11, "21 nodes: 20 + 1 - 10 = 11");
+        }
+
+        #[test]
+        fn expanding_a_directory_that_overflows_the_window_re_clamps_the_offset() {
+            // A small tree that fits entirely in a 10-row window at first.
+            let mut t = tree_of(3); // root + 3 children = 4 nodes
+            t.cursor = 3; // "d2", the last node
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0, "4 nodes fit comfortably inside 10 rows");
+
+            // Expanding "d2" (the node the cursor sits on) splices many more
+            // nodes in beneath it, without moving the cursor itself, growing
+            // the flattened list past the window (additional-panel-modes
+            // "Expanding a directory can overflow and shows the scrollbar").
+            let grandchildren: Vec<ListEntry> = (0..20).map(|i| dir_child(&format!("g{i}"))).collect();
+            let ok = t.insert_children(&PathBuf::from(r"C:\d2"), grandchildren);
+            assert!(ok);
+            assert_eq!(t.nodes.len(), 24, "4 original nodes + 20 newly spliced grandchildren");
+            assert_eq!(t.cursor, 3, "expansion does not move the cursor");
+
+            // The cursor's node is still at flat index 3, well within any
+            // 10-row window starting at 0 -- expansion inserted *after* it,
+            // so no re-clamp is actually needed here, but the call must
+            // remain a correct no-op rather than clamping to something
+            // arbitrary.
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0);
+
+            // Move the cursor down into the newly-overflowing tail and
+            // confirm the window follows it exactly as it would for any
+            // other growth of the node list.
+            t.move_cursor(CursorMove::Down(15)); // index 18
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.cursor, 18);
+            assert_eq!(t.scroll_offset, 9, "18 + 1 - 10 = 9");
+        }
+
+        #[test]
+        fn empty_tree_leaves_the_offset_at_zero() {
+            let mut t = TreeState { nodes: Vec::new(), cursor: 0, prior_mode: DisplayMode::Full, scroll_offset: 7 };
+            t.ensure_cursor_visible(10);
+            assert_eq!(t.scroll_offset, 0);
         }
     }
 }

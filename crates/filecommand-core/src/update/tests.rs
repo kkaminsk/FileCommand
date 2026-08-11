@@ -3449,3 +3449,253 @@ fn dismiss_startup_warning_is_a_no_op_when_nothing_is_warned() {
     assert_eq!(state.startup_warning, None);
     assert!(effects.is_empty());
 }
+
+// ---------------------------------------------------------------------
+// Panel-scrolling: reducer-level viewport reconciliation (task 1.5)
+//
+// `panel::tests::scroll_offset_tests` exercises `ensure_cursor_visible`
+// directly at fixed row counts; these tests instead drive the reducer end
+// to end so each wiring site in `update.rs` (task 1.4) is proven to
+// actually call it, at term sizes chosen so `panel_viewport_rows` produces
+// a known, hand-verifiable row count (visible here via `super::*`, the same
+// private helper `update`'s own reducer arms use).
+// ---------------------------------------------------------------------
+
+#[test]
+fn full_mode_viewport_rows_at_80x24_are_19() {
+    // Every test below is built on this figure: panels_h = 24 - 2 = 22, no
+    // tab strip at 1 tab (reserved = 2), body_h = 20, Full/Tree = body_h -
+    // 1 (header row) = 19.
+    assert_eq!(panel_viewport_rows((80, 24), DisplayMode::Full, 1), 19);
+}
+
+#[test]
+fn quick_filter_narrowing_re_clamps_the_offset_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+    state.left.cursor = 25; // "e25" -- one of only three entries containing "5"
+    state.left.scroll_offset = 15; // a stale offset from before filtering narrowed the list
+
+    let (state, _) = update(state, Command::QuickFilterStart);
+    let (state, _) = update(state, Command::QuickFilterChar('5'));
+
+    let visible: Vec<String> = state.left.visible_indices().into_iter().map(|i| state.left.entries[i].name.to_string_lossy().into_owned()).collect();
+    assert_eq!(visible, vec!["e5", "e15", "e25"], "only entries containing \"5\" remain");
+    assert_eq!(state.left.cursor, 25, "\"e25\" stays selected — it's still visible under the filter");
+    assert_eq!(state.left.scroll_offset, 2, "\"e25\" is now at visible position 2; the stale offset (15) must re-clamp to it (panel-navigation \"Quick-filter narrowing re-clamps the offset\")");
+}
+
+#[test]
+fn re_sort_re_clamps_the_offset_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    // Descending by size, so "e00" (the largest) starts at position 0.
+    state.left.entries = (0..30).map(|i| file_entry(&format!("e{i:02}"), 29 - i as u64)).collect();
+    state.left.cursor = 0; // "e00"
+    state.left.scroll_offset = 0;
+
+    let (state, _) = update(state, Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Size });
+
+    assert_eq!(state.left.entries.last().unwrap().name, OsString::from("e00"), "ascending-by-size moves the largest entry to the very end");
+    assert_eq!(state.left.cursor, 29, "the cursor re-anchors onto \"e00\"'s new position");
+    assert_eq!(state.left.scroll_offset, 11, "29 + 1 - 19 = 11 (panel-navigation \"Re-sort keeps the cursor's entry in view\")");
+}
+
+#[test]
+fn terminal_shrinking_re_clamps_the_offset_on_resize() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+    state.left.cursor = 18;
+    state.left.scroll_offset = 0;
+
+    let (state, _) = update(state, Command::Resize(80, 24));
+    assert_eq!(state.left.scroll_offset, 0, "no shrink yet: the cursor is already inside the 19-row window");
+
+    // 80x14: panels_h = 12, no tab strip, body_h = 10, Full rows = 9.
+    assert_eq!(panel_viewport_rows((80, 14), DisplayMode::Full, 1), 9);
+    let (state, _) = update(state, Command::Resize(80, 14));
+    assert_eq!(state.left.scroll_offset, 10, "18 + 1 - 9 = 10 (panel-navigation \"Terminal resize re-clamps\")");
+}
+
+#[test]
+fn tab_restore_re_clamps_against_the_current_viewport_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+    state.left.cursor = 18;
+    state.left.scroll_offset = 10; // valid at 19 rows: window [10, 29)
+
+    // Stash this as tab 1; the new (now-active) tab inherits the same
+    // cursor/offset and is left untouched from here on.
+    let (state, _) = update(state, Command::OpenTab);
+    assert_eq!(state.left.tab_count(), 2);
+
+    // Shrink drastically enough that the stashed tab's offset (10) will no
+    // longer keep its cursor (18) in view once restored.
+    let (state, _) = update(state, Command::Resize(80, 10));
+    // 80x10, 2 tabs: panels_h = 8, tab strip visible (reserved = 3),
+    // body_h = 5, Full rows = 4.
+    assert_eq!(panel_viewport_rows((80, 10), DisplayMode::Full, 2), 4);
+
+    let (state, _) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "tab 1 is the originally-stashed tab");
+    assert_eq!(state.left.cursor, 18, "the restored cursor position round-trips exactly");
+    assert_eq!(
+        state.left.scroll_offset, 15,
+        "the stashed offset (10) no longer fits a 4-row window around cursor 18; 18 + 1 - 4 = 15 (panel-navigation \"Tab restore re-clamps against the current viewport\")"
+    );
+}
+
+#[test]
+fn streamed_chunk_keeps_the_offset_pinned_to_zero_via_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Name;
+    let entries: Vec<Entry> = (0..30).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
+
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+
+    assert_eq!(state.left.cursor, 0, "the cursor stays pinned to the top while the user hasn't moved it");
+    assert_eq!(state.left.scroll_offset, 0, "the window stays pinned to the top right along with the cursor (panel-navigation \"Streamed listing keeps the top pinned\")");
+}
+
+#[test]
+fn find_file_settle_on_listing_complete_lands_the_cursor_in_view() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.pending_cursor_target = Some(OsString::from("e25"));
+    let entries: Vec<Entry> = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e25"), "find-file's deferred settle lands the cursor on the matched entry");
+    assert_eq!(state.left.cursor, 25);
+    assert_eq!(
+        state.left.scroll_offset, 7,
+        "25 + 1 - 19 = 7: the settled cursor lands inside the window (panel-navigation \"Scroll offset is core panel state\" -- find-file's deferred cursor settle re-clamps)"
+    );
+}
+
+// ---------------------------------------------------------------------
+// Panel-scrolling: Brief column-window and Tree reconciliation (task 2.3)
+//
+// These drive the reducer end to end, proving `reconcile_panel_viewport`'s
+// Brief/Tree branches (task 2.1/2.2) are actually wired into
+// `Command::MoveCursor` and `Command::TreeNodeExpanded`, on top of
+// `panel::tests::brief_scroll_tests`/`tree_scroll_tests`'s pure coverage of
+// the underlying clamp math.
+// ---------------------------------------------------------------------
+
+#[test]
+fn brief_mode_interior_width_and_column_count_at_80x24_default_split() {
+    // split 50/50 at width 80 -> left_w = 40, interior = 38 -> 3 columns
+    // (byte-identical to `filecommand-tui::views::panel::render_brief_body`'s
+    // `(inner_w / 12).max(1)`).
+    let interior = panel_interior_width((80, 24), panel_split::DEFAULT_SPLIT_PERCENT, PanelSide::Left);
+    assert_eq!(interior, 38);
+    assert_eq!(brief_column_count(interior), 3);
+    // Brief rows_h = the full body (no header row): panels_h = 22, no tab
+    // strip at 1 tab, body_h = 20.
+    assert_eq!(panel_viewport_rows((80, 24), DisplayMode::Brief, 1), 20);
+}
+
+#[test]
+fn brief_mode_cursor_past_the_last_column_shifts_the_window_one_column_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Brief-mode: 20 rows_h, 3 columns (60-position window)
+    state.left.display_mode = DisplayMode::Brief;
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = (0..100).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+    state.left.cursor = 59; // column 2 (last of the window), row 19 -- the window's last position
+    state.left.scroll_offset = 0;
+
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+
+    assert_eq!(state.left.cursor, 60, "column 3, row 0: one step past the window's last column");
+    assert_eq!(
+        state.left.scroll_offset, 20,
+        "shifts by exactly one column (20 positions), not further (additional-panel-modes \"Cursor past the last visible column shifts the window one column\")"
+    );
+    assert_eq!(state.left.scroll_offset % 20, 0, "the offset stays on a rows_h-multiple column boundary (additional-panel-modes \"Window start stays on a column boundary\")");
+}
+
+#[test]
+fn brief_mode_quick_filter_re_clamps_the_column_window_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Brief-mode: 20 rows_h, 3 columns
+    state.left.display_mode = DisplayMode::Brief;
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = (0..100).map(|i| file_entry(&format!("e{i}"), 0)).collect();
+    state.left.cursor = 65; // column 3
+    state.left.scroll_offset = 60; // window starts at column 3, matching the cursor
+
+    let (state, _) = update(state, Command::QuickFilterStart);
+    // Only "e6" and "e65"/"e6x" family remain a small handful of matches
+    // near the front of the list, forcing the (now far too large) stale
+    // offset to pull back.
+    let (state, _) = update(state, Command::QuickFilterChar('e'));
+    let (state, _) = update(state, Command::QuickFilterChar('6'));
+
+    let visible = state.left.visible_indices();
+    assert!(!visible.is_empty());
+    let pos = visible.iter().position(|&i| i == state.left.cursor).unwrap();
+    let start_col = state.left.scroll_offset / 20;
+    let pos_col = pos / 20;
+    assert!(
+        start_col <= pos_col && pos_col < start_col + 3,
+        "the cursor's column ({pos_col}) must be inside the re-clamped window starting at column {start_col} (panel-navigation \"Quick-filter narrowing re-clamps the offset\", extended to Brief's column space)"
+    );
+    assert_eq!(state.left.scroll_offset % 20, 0, "offset stays on a column boundary after re-clamping");
+}
+
+#[test]
+fn tree_mode_cursor_below_the_bottom_scrolls_the_node_window_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Tree-mode body: 19 rows (body_h - 1 header)
+    assert_eq!(panel_viewport_rows((80, 24), DisplayMode::Tree, 1), 19);
+    state.left.display_mode = DisplayMode::Tree;
+    let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+    let children: Vec<Entry> = (0..30).map(|i| dir_entry(&format!("d{i}"))).collect();
+    tree.insert_children(&PathBuf::from(r"C:\"), children); // 31 nodes total (root + 30)
+    tree.cursor = 18; // last visible row of a 19-row window starting at 0
+    state.left.tree = Some(tree);
+
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+
+    let tree = state.left.tree.as_ref().unwrap();
+    assert_eq!(tree.cursor, 19);
+    assert_eq!(tree.scroll_offset, 1, "shifts by exactly one row, mirroring Full mode (additional-panel-modes \"Tree cursor below the bottom scrolls the nodes\")");
+}
+
+#[test]
+fn tree_node_expanded_re_clamps_the_tree_offset_through_the_reducer() {
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 12); // a small Tree-mode body forces a small row count
+    let rows = panel_viewport_rows((80, 12), DisplayMode::Tree, 1);
+    state.left.display_mode = DisplayMode::Tree;
+    let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
+    let children: Vec<Entry> = (0..15).map(|i| dir_entry(&format!("d{i}"))).collect();
+    tree.insert_children(&PathBuf::from(r"C:\"), children); // 16 nodes total (root + 15)
+    tree.cursor = 12;
+    tree.scroll_offset = 0; // stale at the current (small) row count: 12 is not in [0, rows)
+    state.left.tree = Some(tree);
+
+    // Expand a *different* node than the cursor's; it must not move the
+    // cursor, but the node-list mutation still funnels through
+    // reconciliation (additional-panel-modes "Tree mode scrolling").
+    let more = vec![dir_entry("extra")];
+    let (state, _) = update(state, Command::TreeNodeExpanded { panel: PanelSide::Left, path: PathBuf::from(r"C:\d0"), children: more });
+
+    let tree = state.left.tree.as_ref().unwrap();
+    assert_eq!(tree.cursor, 12, "expanding a different node doesn't move the cursor");
+    assert_eq!(tree.scroll_offset, 12 + 1 - rows, "the stale offset re-clamps to the minimal-shift window around the cursor once TreeNodeExpanded re-runs reconciliation");
+}

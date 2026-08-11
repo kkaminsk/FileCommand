@@ -1,0 +1,26 @@
+---
+source: crates/filecommand-tui/tests/snapshot_scrolling.rs
+expression: text
+---
+╔═════════ C:\Users\demo\left ═════════╗
+║Name↓        │ Size    Date    Time   ║
+║file05       │ 0                      ░
+║file06       │ 0                      ░
+║file07       │ 0                      ░
+║file08       │ 0                      ░
+║file09       │ 0                      █
+║file10       │ 0                      █
+║file11       │ 0                      █
+║file12       │ 0                      █
+║file13       │ 0                      █
+║file14       │ 0                      █
+║file15       │ 0                      █
+║file16       │ 0                      █
+║file17       │ 0                      █
+║file18       │ 0                      █
+║file19       │ 0                      █
+║file20       │ 0                      ░
+║file21       │ 0                      ░
+║file22       │ 0                      ░
+║file23       │ 0                      ░
+╚═════════════ file23  0 ══════════════╝

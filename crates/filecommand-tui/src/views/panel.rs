@@ -158,6 +158,43 @@ fn quick_filter_or_type_ahead_status(panel: &PanelState, type_ahead: Option<&str
     panel.quick_filter.clone().or_else(|| type_ahead.map(|p| p.to_string()))
 }
 
+/// The overflow-only right-border scrollbar's thumb window within a
+/// `track_rows`-cell vertical track, or `None` when the visible list fits
+/// inside `window_capacity` positions — in which case the border renders as
+/// the unbroken `║` double-line, byte-identical to before this change
+/// (panel-navigation "Scrollbar indicator on overflow"; design D5).
+/// `Some((thumb_start, thumb_len))` otherwise: `thumb_len` is `max(1,
+/// round(track_rows * window_capacity / total))` cells, and `thumb_start`
+/// places the thumb so it touches the track's top exactly when `offset` is 0
+/// and its bottom exactly when the window shows the list's last position.
+/// Full and Tree mode pass `window_capacity == track_rows`, matching D5's
+/// `rows * rows / total` literally; Brief mode passes the larger `columns *
+/// rows_h` capacity so the thumb reflects the cursor window's linear
+/// position through the whole list, not just one column's share of it.
+fn scrollbar_thumb(track_rows: usize, window_capacity: usize, total: usize, offset: usize) -> Option<(usize, usize)> {
+    if track_rows == 0 || total <= window_capacity {
+        return None;
+    }
+    let thumb_len = (((track_rows * window_capacity) as f64 / total as f64).round() as usize).clamp(1, track_rows);
+    let travel = track_rows - thumb_len;
+    let max_offset = total - window_capacity;
+    let start = if travel == 0 { 0 } else { ((offset.min(max_offset) as f64 / max_offset as f64) * travel as f64).round() as usize }.min(travel);
+    Some((start, thumb_len))
+}
+
+/// Paints one right-border cell at track-relative `row`: the unbroken `║`
+/// frame glyph when `thumb` is `None`, else `█` inside the thumb window and
+/// `░` elsewhere in the whole track, both in the `panel.scrollbar` role
+/// (panel-navigation "Scrollbar indicator on overflow"). Shared by Full,
+/// Brief, and Tree bodies so the glyph rules live in exactly one place.
+fn draw_scrollbar_cell(buf: &mut Buffer, x: u16, y: u16, row: usize, thumb: Option<(usize, usize)>, frame_style: Style, scrollbar_style: Style) {
+    match thumb {
+        None => buf.set_string(x, y, "\u{2551}", frame_style),
+        Some((start, len)) if row >= start && row < start + len => buf.set_string(x, y, "\u{2588}", scrollbar_style),
+        Some(_) => buf.set_string(x, y, "\u{2591}", scrollbar_style),
+    }
+}
+
 /// The panel's top-border title string — Quick View's fixed label, or the
 /// current directory path with the M5 git branch-name suffix on the active
 /// panel — exactly as `render_panel` centers and clips it into the top
@@ -256,7 +293,7 @@ pub fn render_panel(
     // modes "Brief display mode").
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
-        render_brief_body(buf, x0, body_y0, w, body_h, panel, theme, depth, active);
+        render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active);
         render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
         return;
     }
@@ -317,11 +354,13 @@ pub fn render_panel(
     let visible = panel.visible_indices();
     let rows_start = body_y0 + 1;
     let rows_h = body_h.saturating_sub(1); // header row
+    let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
+    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, visible.len(), panel.scroll_offset);
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
-        buf.set_string(right_x, y, "\u{2551}", frame_style);
-        if let Some((entry, is_selected)) = visible.get(row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
+        draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
+        if let Some((entry, is_selected)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
             let style = if is_selected {
                 cursor_style
             } else if entry.is_dir_like() {
@@ -378,11 +417,13 @@ fn draw_side_borders(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, body
 /// the standard directory/file/selected/cursor styling and the `..`
 /// up-dir marker (additional-panel-modes "Brief display mode").
 #[allow(clippy::too_many_arguments)]
-fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: u16, panel: &PanelState, theme: &Theme, depth: ColorDepth, active: bool) {
+fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, w: usize, body_h: u16, panel: &PanelState, theme: &Theme, depth: ColorDepth, active: bool) {
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
     let selected_style = role_style(theme, Role::PanelSelected, depth);
+    let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
+    let frame_style = role_style(theme, Role::PanelFrame, depth);
 
     let inner_w = w.saturating_sub(2);
     // `max(1, floor(interior_width / 12))` columns, equal widths with the
@@ -401,12 +442,18 @@ fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: 
     // name-matching entries), exactly like Full mode above (quick-filter
     // "Substring narrowing as the pattern is typed").
     let visible = panel.visible_indices();
+    // The overflow-only scrollbar reflects the cursor window's linear
+    // position through the whole visible list, not one column's share of it
+    // — window_capacity is every position the `n_cols`-wide window shows at
+    // once (additional-panel-modes "Brief mode column scrolling").
+    let thumb = scrollbar_thumb(rows_h, n_cols * rows_h, visible.len(), panel.scroll_offset);
 
     for row in 0..rows_h {
         let y = body_y0 + row as u16;
+        draw_scrollbar_cell(buf, right_x, y, row, thumb, frame_style, scrollbar_style);
         let mut x = x0 + 1;
         for (c, &cw) in col_widths.iter().enumerate() {
-            let pos = c * rows_h + row;
+            let pos = panel.scroll_offset + c * rows_h + row;
             if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
                 let style = if is_cursor {
@@ -455,6 +502,7 @@ fn render_tree_body(
     let header_style = role_style(theme, Role::PanelHeader, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
+    let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
     let inner_w = w.saturating_sub(2);
 
     buf.set_string(x0, body_y0, "\u{2551}", frame_style);
@@ -464,13 +512,16 @@ fn render_tree_body(
     let rows_start = body_y0 + 1;
     let rows_h = body_h.saturating_sub(1);
     let cursor_row = panel.tree.as_ref().map(|t| t.cursor);
+    let tree_offset = panel.tree.as_ref().map(|t| t.scroll_offset).unwrap_or(0);
+    let tree_len = panel.tree.as_ref().map(|t| t.nodes.len()).unwrap_or(0);
+    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, tree_len, tree_offset);
 
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
-        buf.set_string(right_x, y, "\u{2551}", frame_style);
-        let is_cursor = active && cursor_row == Some(row as usize);
-        match panel.tree.as_ref().and_then(|t| t.nodes.get(row as usize)) {
+        draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
+        let is_cursor = active && cursor_row == Some(tree_offset + row as usize);
+        match panel.tree.as_ref().and_then(|t| t.nodes.get(tree_offset + row as usize)) {
             Some(node) if node.depth == 0 => {
                 let text = node.path.display().to_string();
                 buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), if is_cursor { cursor_style } else { dir_style });

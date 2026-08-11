@@ -117,6 +117,11 @@ pub enum Role {
     PanelCursor,
     PanelSelected,
     PanelMinistatus,
+    /// The overflow-only right-border scrollbar's `░` track and `█` thumb
+    /// (panel-scrolling "Scrollbar indicator on overflow"; design D5). One
+    /// role covers both glyphs — they stay visually distinguishable through
+    /// glyph density alone, so no second role is needed.
+    PanelScrollbar,
     /// The M5 git-info status-marker column's `M` (modified) glyph
     /// (git-info "Per-file status marker column").
     PanelGitModified,
@@ -180,6 +185,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::PanelCursor,
     Role::PanelSelected,
     Role::PanelMinistatus,
+    Role::PanelScrollbar,
     Role::PanelGitModified,
     Role::PanelGitUntracked,
     Role::PanelGitStaged,
@@ -230,6 +236,7 @@ impl Role {
             Role::PanelCursor => "panel.cursor",
             Role::PanelSelected => "panel.selected",
             Role::PanelMinistatus => "panel.ministatus",
+            Role::PanelScrollbar => "panel.scrollbar",
             Role::PanelGitModified => "panel.git.modified",
             Role::PanelGitUntracked => "panel.git.untracked",
             Role::PanelGitStaged => "panel.git.staged",
@@ -379,6 +386,9 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(Cyan));
         set(Role::PanelSelected, A(BrightYellow), A(Blue));
         set(Role::PanelMinistatus, A(Cyan), A(Blue));
+        // Matches `PanelFrame`'s hue: the scrollbar overlays the border it
+        // replaces on overflow, so it reads as part of the same frame.
+        set(Role::PanelScrollbar, A(Cyan), A(Blue));
         // Conventional git-status hues: red for a working-tree change,
         // yellow for untracked, green for staged — distinct from every
         // other panel role so the marker column reads at a glance.
@@ -435,6 +445,7 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(White));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(White), A(Black));
+        set(Role::PanelScrollbar, A(White), A(Black));
         // Mono carries no hue meaning (same precedent as `MenuHotkey`
         // above): all three marker glyphs read as ordinary bright text
         // rather than color-coded status.
@@ -508,6 +519,7 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(Green));
         set(Role::PanelSelected, A(BrightGreen), A(Black));
         set(Role::PanelMinistatus, A(Green), A(Black));
+        set(Role::PanelScrollbar, A(Green), A(Black));
         // Monochrome: git status markers carry no hue meaning, same
         // precedent as `nc-mono`'s marker roles.
         set(Role::PanelGitModified, A(BrightGreen), A(Black));
@@ -546,6 +558,7 @@ impl Theme {
             .expect("terminal-green role table is complete")
             .with_truecolor_overrides(&[
                 (Role::PanelFrame, None, Some(Rgb(0, 40, 0))),
+                (Role::PanelScrollbar, None, Some(Rgb(0, 40, 0))),
                 (Role::PanelFile, Some(Rgb(51, 204, 51)), Some(Rgb(0, 40, 0))),
                 (Role::PanelDirectory, Some(Rgb(102, 255, 102)), Some(Rgb(0, 40, 0))),
                 (Role::PanelCursor, None, Some(Rgb(51, 204, 51))),
@@ -573,6 +586,7 @@ impl Theme {
         set(Role::PanelCursor, A(Black), A(BrightMagenta));
         set(Role::PanelSelected, A(BrightYellow), A(Magenta));
         set(Role::PanelMinistatus, A(BrightMagenta), A(Magenta));
+        set(Role::PanelScrollbar, A(BrightMagenta), A(Magenta));
         set(Role::PanelGitModified, A(BrightRed), A(Magenta));
         set(Role::PanelGitUntracked, A(BrightYellow), A(Magenta));
         set(Role::PanelGitStaged, A(BrightGreen), A(Magenta));
@@ -610,6 +624,7 @@ impl Theme {
             .with_truecolor_overrides(&[
                 (Role::ScreenBackdrop, None, Some(Rgb(48, 0, 64))),
                 (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+                (Role::PanelScrollbar, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
                 (Role::PanelFile, Some(Rgb(169, 169, 169)), Some(Rgb(48, 0, 64))),
                 (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
             ])
@@ -638,6 +653,7 @@ impl Theme {
         // yellow (normal files) and bright-yellow (directories).
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(Yellow), A(Black));
+        set(Role::PanelScrollbar, A(Yellow), A(Black));
         set(Role::PanelGitModified, A(BrightYellow), A(Black));
         set(Role::PanelGitUntracked, A(BrightYellow), A(Black));
         set(Role::PanelGitStaged, A(BrightYellow), A(Black));
@@ -678,6 +694,7 @@ impl Theme {
             .expect("yellow-storm role table is complete")
             .with_truecolor_overrides(&[
                 (Role::PanelFrame, Some(Rgb(255, 191, 0)), None),
+                (Role::PanelScrollbar, Some(Rgb(255, 191, 0)), None),
                 (Role::PanelFile, Some(Rgb(255, 191, 0)), None),
                 (Role::PanelDirectory, Some(Rgb(255, 214, 51)), None),
                 (Role::PanelCursor, None, Some(Rgb(255, 191, 0))),
@@ -711,6 +728,7 @@ impl Theme {
         set(Role::PanelCursor, A(BrightWhite), A(Black));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(Black), A(BrightWhite));
+        set(Role::PanelScrollbar, A(Black), A(BrightWhite));
         // No hue anywhere: git status markers read as ordinary bright text.
         set(Role::PanelGitModified, A(Black), A(BrightWhite));
         set(Role::PanelGitUntracked, A(Black), A(BrightWhite));
