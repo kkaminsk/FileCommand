@@ -23,7 +23,6 @@ use filecommand_core::{config, drives, identity, update, Command, Effect, State,
 
 use crate::clock::{RealClock, RealWallClock};
 use crate::input::{self, ViewerInput};
-use crate::layout;
 use crate::terminal::TerminalGuard;
 use crate::views;
 use crate::worker;
@@ -150,7 +149,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                     // (application-shell "Quit request keys and
                     // confirmation"; design D5).
                     let cmd = if state.quit_confirm {
-                        let page_size = layout::compute(state.term_size, state.split_percent).entries_visible;
+                        let page_size = active_panel_page_size(&state);
                         input::map_key(key, &state, page_size, &keys)
                     } else {
                         match &state.phase {
@@ -165,7 +164,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                                 input::map_editor_key(key, editor, rows_visible)
                             }
                             _ => {
-                                let page_size = layout::compute(state.term_size, state.split_percent).entries_visible;
+                                let page_size = active_panel_page_size(&state);
                                 input::map_key(key, &state, page_size, &keys)
                             }
                         }
@@ -277,6 +276,18 @@ fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
     if user_menu.malformed {
         state.startup_warning = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
     }
+}
+
+/// The PgUp/PgDn paging step for `map_key`'s active-panel commands: the
+/// active panel's own body entry-row count, from the same per-mode
+/// derivation `core::update` uses to reconcile the scroll viewport
+/// (`filecommand_core::update::panel_viewport_rows`) rather than the
+/// layout-level `Layout::entries_visible`, which over-counts by one with a
+/// visible tab strip and mismatches Brief mode's row count (panel-scrolling
+/// design D2; panel-navigation "Scroll offset is core panel state").
+fn active_panel_page_size(state: &State) -> usize {
+    let panel = state.active_panel();
+    filecommand_core::update::panel_viewport_rows(state.term_size, panel.display_mode, panel.tab_count())
 }
 
 /// Resolve a viewer key's meaning into a core `Command`. Simple toggles pass

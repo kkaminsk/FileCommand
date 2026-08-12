@@ -1,0 +1,16 @@
+---
+source: crates/filecommand-tui/tests/snapshot_scrolling.rs
+expression: text
+---
+╔═══════════ C:\Users\demo\left ═══════════╗
+║file09        file19        file29        ░
+║file10        file20        file30        ░
+║file11        file21        file31        █
+║file12        file22        file32        █
+║file13        file23        file33        █
+║file14        file24        file34        █
+║file15        file25                      █
+║file16        file26                      █
+║file17        file27                      █
+║file18        file28                      █
+╚═══════════════ file34  0 ════════════════╝

@@ -781,6 +781,11 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             (_, true) => UiPhase::Placeholder,
             (other, false) => other.clone(),
         };
+        // A shrinking terminal can leave either panel's cursor below its new,
+        // shorter window; re-clamp both sides unconditionally (panel-
+        // navigation "Terminal resize re-clamps").
+        reconcile_panel_viewport(&mut state, PanelSide::Left);
+        reconcile_panel_viewport(&mut state, PanelSide::Right);
         return (state, effects);
     }
 
@@ -827,6 +832,12 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             if let Some(tree) = state.panel_mut(panel).tree.as_mut() {
                 tree.insert_children(&path, children);
             }
+            // Expansion can grow the flattened node list arbitrarily; the
+            // cursor itself doesn't move, but a growing list can overflow
+            // the window it previously fit in, so re-clamp (additional-
+            // panel-modes "Expanding a directory can overflow and shows the
+            // scrollbar").
+            reconcile_panel_viewport(&mut state, panel);
             return (state, effects);
         }
         _ => {}
@@ -977,6 +988,7 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                     effects.extend(handle_tree_cursor_move(&mut state, side, m));
                 } else {
                     state.panel_mut(side).move_cursor(m);
+                    reconcile_panel_viewport(&mut state, side);
                 }
             }
             Command::ToggleActivePanel => state.active = state.active.toggle(),
@@ -991,7 +1003,11 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 let path = state.panel(side).cwd.clone();
                 effects.extend(begin_listing(&mut state, side, path));
             }
-            Command::ToggleSelectAtCursor => state.panel_mut(state.active).toggle_selection_and_advance(),
+            Command::ToggleSelectAtCursor => {
+                let side = state.active;
+                state.panel_mut(side).toggle_selection_and_advance();
+                reconcile_panel_viewport(&mut state, side);
+            }
             Command::GroupSelectAll => state.panel_mut(state.active).select_matching("*"),
             Command::GroupDeselectAll => state.panel_mut(state.active).deselect_matching("*"),
             Command::InvertSelection => state.panel_mut(state.active).invert_selection(),
@@ -1046,16 +1062,43 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             Command::QuickSearchEnd => state.quick_search = None,
 
-            Command::SetSortMode { side, mode } => state.panel_mut(side).set_sort_mode(mode),
+            Command::SetSortMode { side, mode } => {
+                state.panel_mut(side).set_sort_mode(mode);
+                reconcile_panel_viewport(&mut state, side);
+            }
 
             Command::QuickFilterStart => state.panel_mut(state.active).activate_quick_filter(),
-            Command::QuickFilterChar(c) => state.panel_mut(state.active).quick_filter_push(c),
-            Command::QuickFilterBackspace => state.panel_mut(state.active).quick_filter_backspace(),
-            Command::QuickFilterEnd => state.panel_mut(state.active).clear_quick_filter(),
+            Command::QuickFilterChar(c) => {
+                let side = state.active;
+                state.panel_mut(side).quick_filter_push(c);
+                reconcile_panel_viewport(&mut state, side);
+            }
+            Command::QuickFilterBackspace => {
+                let side = state.active;
+                state.panel_mut(side).quick_filter_backspace();
+                reconcile_panel_viewport(&mut state, side);
+            }
+            Command::QuickFilterEnd => {
+                let side = state.active;
+                state.panel_mut(side).clear_quick_filter();
+                reconcile_panel_viewport(&mut state, side);
+            }
 
-            Command::OpenTab => state.panel_mut(state.active).open_tab(),
-            Command::CloseTab => state.panel_mut(state.active).close_tab(),
-            Command::SwitchTab(n) => state.panel_mut(state.active).switch_tab(n),
+            Command::OpenTab => {
+                let side = state.active;
+                state.panel_mut(side).open_tab();
+                reconcile_panel_viewport(&mut state, side);
+            }
+            Command::CloseTab => {
+                let side = state.active;
+                state.panel_mut(side).close_tab();
+                reconcile_panel_viewport(&mut state, side);
+            }
+            Command::SwitchTab(n) => {
+                let side = state.active;
+                state.panel_mut(side).switch_tab(n);
+                reconcile_panel_viewport(&mut state, side);
+            }
 
             Command::EnterTreeMode(side) => effects.extend(enter_tree_mode(&mut state, side)),
             Command::SetDisplayMode { side, mode } => {
@@ -1289,6 +1332,7 @@ fn jump_to_prefix(state: &mut State, pattern: &str) {
         panel.cursor = index;
         panel.cursor_user_moved = true;
     }
+    reconcile_panel_viewport(state, side);
 }
 
 // ---------------------------------------------------------------------
@@ -1493,6 +1537,93 @@ fn handle_request_editor(state: &mut State) -> Vec<Effect> {
 /// cannot depend on `filecommand-tui`).
 fn editor_viewport(term_size: (u16, u16)) -> (usize, usize) {
     (term_size.1.saturating_sub(2).max(1) as usize, term_size.0.max(1) as usize)
+}
+
+/// A panel's body entry-row count for a given terminal height, display mode,
+/// and tab count — the same shape as [`editor_viewport`], kept as a
+/// duplicate of `filecommand-tui`'s `layout::compute` +
+/// `views::panel::render` geometry rather than a cross-crate dependency, so
+/// `core::update` can call [`PanelState::ensure_cursor_visible`] without
+/// depending on `filecommand-tui` (design D2). Only the terminal height
+/// matters here — the command-line and F-key bar rows are shared by both
+/// panels regardless of the panel split, and `split_percent` only ever
+/// changes each panel's *width*, which entry-row counting doesn't depend on
+/// (Brief mode's column count, a width-derived quantity, is the
+/// `additional-panel-modes` follow-up group's concern, not this one's).
+///
+/// Mirrors, in order: `layout::compute`'s `panels_h` (terminal height minus
+/// the one-row command line and one-row F-key bar), `views::panel::render`'s
+/// `has_strip`/`reserved` (a tab strip, shown at 2+ tabs, costs a row beyond
+/// the top+bottom border), and its `rows_h` per display mode — Full and Tree
+/// both reserve a header row on top of the body, Brief does not.
+///
+/// `pub` so `filecommand-tui` can also derive the PgUp/PgDn paging step from
+/// it directly, in place of the layout-level `entries_visible` (which
+/// over-counts by one when the tab strip is visible and mismatches Brief) —
+/// one source of truth for both the viewport clamp and the paging step
+/// (design D2's risk note).
+pub fn panel_viewport_rows(term_size: (u16, u16), display_mode: DisplayMode, tab_count: usize) -> usize {
+    let panels_h = term_size.1.saturating_sub(2);
+    let has_strip = panels_h >= 4 && tab_count >= 2;
+    let reserved: u16 = if has_strip { 3 } else { 2 };
+    let body_h = panels_h.saturating_sub(reserved);
+    let rows = match display_mode {
+        DisplayMode::Full | DisplayMode::Tree => body_h.saturating_sub(1),
+        _ => body_h,
+    };
+    rows.max(1) as usize
+}
+
+/// `side`'s panel interior width (the panel's rendered width, border
+/// columns subtracted) for the current terminal width and split — mirrors
+/// `layout::compute`'s `left_w`/`right_w` (via
+/// `panel_split::effective_left_width`) and `views::panel::render`'s
+/// `w.saturating_sub(2)`, kept as a duplicate here for the same reason
+/// [`panel_viewport_rows`] is: `core::update` needs it (for Brief mode's
+/// column count) without a cross-crate dependency on `filecommand-tui`.
+fn panel_interior_width(term_size: (u16, u16), split_percent: u16, side: PanelSide) -> u16 {
+    let left_w = panel_split::effective_left_width(split_percent, term_size.0);
+    let panel_w = match side {
+        PanelSide::Left => left_w,
+        PanelSide::Right => term_size.0.saturating_sub(left_w),
+    };
+    panel_w.saturating_sub(2)
+}
+
+/// Brief mode's column count for a given interior width: `max(1,
+/// floor(interior_w / 12))`, byte-identical to `filecommand-tui`'s
+/// `brief_column_widths`/`render_brief_body` formula (design D4;
+/// additional-panel-modes "Brief mode column scrolling").
+fn brief_column_count(interior_w: u16) -> usize {
+    ((interior_w / 12).max(1)) as usize
+}
+
+/// Re-clamp `side`'s scroll offset against its current viewport — the one
+/// call site every cursor-moving or list-mutating path funnels through
+/// (design D6), so the renderer never has to reason about scrolling itself.
+/// Dispatches to the mode-appropriate clamp: Brief's column-window
+/// reconciliation, Tree's over its own `TreeState::scroll_offset` (a no-op
+/// if Tree mode was already left before this ran), or Full/Info/QuickView's
+/// line-wise `PanelState::ensure_cursor_visible`.
+fn reconcile_panel_viewport(state: &mut State, side: PanelSide) {
+    let panel = state.panel(side);
+    let display_mode = panel.display_mode;
+    let rows = panel_viewport_rows(state.term_size, display_mode, panel.tab_count());
+    match display_mode {
+        DisplayMode::Brief => {
+            let interior_w = panel_interior_width(state.term_size, state.split_percent, side);
+            let cols = brief_column_count(interior_w);
+            state.panel_mut(side).ensure_cursor_visible_brief(rows, cols);
+        }
+        DisplayMode::Tree => {
+            if let Some(tree) = state.panel_mut(side).tree.as_mut() {
+                tree.ensure_cursor_visible(rows);
+            }
+        }
+        _ => {
+            state.panel_mut(side).ensure_cursor_visible(rows);
+        }
+    }
 }
 
 /// Drive every command while the editor is open (gated in [`update`] by
@@ -2241,6 +2372,11 @@ fn enter_tree_mode(state: &mut State, side: PanelSide) -> Vec<Effect> {
     // invisibly (quick-filter "Substring narrowing as the pattern is
     // typed").
     p.clear_quick_filter();
+    // A brand-new tree is a single root node, so this is a no-op today, but
+    // it keeps the freshly entered tree's viewport state consistent with
+    // every other tree-mutating path rather than relying on it happening to
+    // already be zeroed.
+    reconcile_panel_viewport(state, side);
     vec![Effect::ExpandTreeNode { panel: side, path: root }]
 }
 
@@ -2255,6 +2391,10 @@ fn handle_tree_cursor_move(state: &mut State, side: PanelSide, m: CursorMove) ->
         let Some(node) = tree.selected() else { return vec![] };
         (node.path.clone(), !node.expanded)
     };
+    // Keep the tree cursor inside its own scrolled window (additional-
+    // panel-modes "Tree mode scrolling") before the opposite panel's
+    // re-listing kicks off below.
+    reconcile_panel_viewport(state, side);
     let mut effects = begin_listing_inner(state, side.toggle(), target.clone());
     if needs_expand {
         effects.push(Effect::ExpandTreeNode { panel: side, path: target });
@@ -2554,6 +2694,12 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             if let crate::panel::ListingProgress::Streaming { count } = &mut p.progress {
                 *count = p.entries.len();
             }
+            // Keeps the pinned-to-top offset (0) while the user hasn't moved
+            // the cursor, exactly as `insert_streamed` already pins the
+            // cursor itself; re-clamps if the user had already moved it
+            // (panel-navigation "Streamed listing keeps the top pinned until
+            // the user moves").
+            reconcile_panel_viewport(state, panel);
         }
         Command::ListingComplete { panel, total } => {
             let p = state.panel_mut(panel);
@@ -2571,6 +2717,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
                     p.cursor_user_moved = true;
                 }
             }
+            reconcile_panel_viewport(state, panel);
         }
         Command::ListingFailed { panel, message } => {
             let p = state.panel_mut(panel);
