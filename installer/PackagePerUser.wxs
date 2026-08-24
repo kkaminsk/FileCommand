@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileCommand per-user MSI package (WiX v4/v5).
+
+  One of two single-scope packages (see PackagePerMachine.wxs and
+  openspec/changes/wix-installer/design.md, revised decision D1): a single
+  dual-scope MSI was falsified by testing — WiX v5's Burn statically plans
+  a Scope="perUserOrMachine" package as per-machine and launches an
+  elevated engine on every run. This package is the no-elevation default
+  path: Scope="perUser", %LocalAppData%\Programs\BigHatGroup\FileCommand,
+  user PATH, HKCU registration.
+
+  This MSI is designed to be driven by the Burn bootstrapper in
+  Bundle.wxs, which supplies the setup UI and selects between the two
+  scope packages via the InstallScope bundle variable.
+
+  Build-time variables (see installer/build.ps1):
+    ProductVersion  - stamped from the Cargo workspace version, e.g. 0.1.0
+    SourceDir       - directory containing the built filecommand.exe
+                       (target/release)
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="FileCommand"
+    Manufacturer="BigHatGroup"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="E4FA877A-C5DE-4BB5-A56E-530939D32718"
+    Language="1033"
+    Codepage="1252"
+    Scope="perUser"
+    InstallerVersion="500">
+
+    <SummaryInformation Description="FileCommand Setup (per-user)" Manufacturer="BigHatGroup" />
+
+    <!--
+      Same-scope, in-place upgrades only (design D5): a newer MSI with
+      this UpgradeCode replaces an older per-user install. The per-machine
+      package has a different UpgradeCode on purpose — switching scope is
+      uninstall-then-reinstall, documented in README.md, never an upgrade.
+    -->
+    <MajorUpgrade
+      DowngradeErrorMessage="A newer version of [ProductName] is already installed. Setup will now exit." />
+
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/example/filecommand" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalAppDataProgramsFolder" Name="Programs">
+        <Directory Id="ManufacturerFolder" Name="BigHatGroup">
+          <Directory Id="APPLICATIONFOLDER" Name="FileCommand" />
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="ApplicationProgramsFolder" Name="BigHatGroup" />
+    </StandardDirectory>
+
+    <!-- Application binary -->
+    <Component Id="ApplicationExecutable" Directory="APPLICATIONFOLDER" Guid="*">
+      <File Id="FileCommandExe" Source="$(var.SourceDir)\filecommand.exe" KeyPath="yes" />
+      <RemoveFolder Id="RemoveApplicationFolder" Directory="APPLICATIONFOLDER" On="uninstall" />
+      <RemoveFolder Id="RemoveManufacturerFolder" Directory="ManufacturerFolder" On="uninstall" />
+    </Component>
+
+    <!-- Start Menu shortcut; HKCU keypath matches this package's per-user scope. -->
+    <Component Id="ApplicationShortcut" Directory="ApplicationProgramsFolder" Guid="*">
+      <Shortcut
+        Id="ApplicationStartMenuShortcut"
+        Name="FileCommand"
+        Description="Keyboard-driven dual-panel file manager"
+        Target="[APPLICATIONFOLDER]filecommand.exe"
+        WorkingDirectory="APPLICATIONFOLDER" />
+      <RemoveFolder Id="RemoveApplicationProgramsFolder" On="uninstall" />
+      <RegistryValue Root="HKCU" Key="Software\BigHatGroup\FileCommand" Name="StartMenuShortcut" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <!--
+      PATH integration (design D3): append the install directory to the
+      USER PATH, removed automatically on uninstall via the Environment
+      table. Single-scope package, so no runtime condition is needed.
+    -->
+    <Component Id="PathEnvUser" Directory="APPLICATIONFOLDER" Guid="*">
+      <Environment Id="PATH_USER" Name="PATH" Value="[APPLICATIONFOLDER]" Permanent="no" Part="last" Action="set" System="no" />
+      <RegistryValue Root="HKCU" Key="Software\BigHatGroup\FileCommand" Name="PathEnvUser" Type="integer" Value="1" KeyPath="yes" />
+    </Component>
+
+    <Feature Id="MainApplication" Title="FileCommand" Level="1" AllowAbsent="no">
+      <ComponentRef Id="ApplicationExecutable" />
+      <ComponentRef Id="ApplicationShortcut" />
+      <ComponentRef Id="PathEnvUser" />
+    </Feature>
+
+  </Package>
+</Wix>

@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileCommand Burn bootstrapper bundle (WiX v4/v5).
+
+  Produces FileCommandSetup.exe: a single, self-contained executable that
+  embeds BOTH single-scope MSIs compressed (design.md revised D1/D4)
+  behind the WiX Standard Bootstrapper Application (WixStdBA). Exactly one
+  MSI is planned per run, selected by the InstallScope variable's
+  InstallCondition gates below. This is the artifact end users
+  double-click and the artifact winget drives silently.
+
+  Build-time variables (see installer/build.ps1):
+    ProductVersion       - stamped from the Cargo workspace version
+    PerUserMsiPath       - path to the built PackagePerUser.msi
+    PerMachineMsiPath    - path to the built PackagePerMachine.msi
+
+  Requires the WixToolset.BootstrapperApplications.wixext extension
+  (installer/build.ps1 passes -ext for this).
+
+  Scope control for silent/automated installs (design D4, winget mapping):
+    FileCommandSetup.exe                           -> per-user, no elevation
+    FileCommandSetup.exe /quiet                    -> per-user, silent
+    FileCommandSetup.exe /quiet InstallScope=perMachine
+                                                   -> per-machine, silent, elevates once
+    FileCommandSetup.exe /uninstall /quiet         -> silent uninstall (InstallScope is
+                                                      persisted, so the scope installed
+                                                      is the scope removed)
+  Burn's standard /quiet, /passive, /norestart, /uninstall switches are
+  provided by the engine; no custom wiring is needed for those.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <Bundle
+    Name="FileCommand"
+    Manufacturer="BigHatGroup"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="83A047C2-CBA3-4DA9-96EF-1481CD2D0A6A">
+
+    <!--
+      Burn automatically detects other bundles sharing this UpgradeCode at
+      a lower version and performs an in-place major upgrade at the same
+      scope the older bundle chose (design D5); InstallScope is Persisted
+      so upgrades and uninstalls replan the same package that was
+      originally installed.
+    -->
+    <Variable Name="InstallScope" Type="string" Value="perUser" bal:Overridable="yes" Persisted="yes" />
+
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+        LicenseFile="License.rtf"
+        Theme="rtfLicense"
+        SuppressOptionsUI="yes"
+        ShowVersion="yes" />
+    </BootstrapperApplication>
+
+    <Chain>
+      <!--
+        Exactly one of these InstallConditions is true for any InstallScope
+        value; the default ("perUser", or unset/empty) plans only the
+        per-user package, which is a Scope="perUser" MSI — so the default
+        path never elevates (the falsified dual-scope design's core bug).
+      -->
+      <MsiPackage
+        Id="FileCommandMsiPerUser"
+        SourceFile="$(var.PerUserMsiPath)"
+        Compressed="yes"
+        Vital="yes"
+        InstallCondition="InstallScope &lt;&gt; &quot;perMachine&quot;" />
+      <MsiPackage
+        Id="FileCommandMsiPerMachine"
+        SourceFile="$(var.PerMachineMsiPath)"
+        Compressed="yes"
+        Vital="yes"
+        InstallCondition="InstallScope = &quot;perMachine&quot;" />
+    </Chain>
+
+  </Bundle>
+</Wix>

@@ -2,3 +2,5 @@
 /history.json
 /usermenu.toml
 /config.toml
+/installer/out
+/installer/.wix
