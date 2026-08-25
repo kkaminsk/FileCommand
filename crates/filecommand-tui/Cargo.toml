@@ -17,6 +17,16 @@ ratatui = { workspace = true }
 crossterm = { workspace = true }
 unicode-width = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Windows clipboard: CF_HDROP file objects + "Preferred DropEffect" for the
+# clipboard-export Files action (design D3).
+clipboard-win = "5.4"
+
+[target.'cfg(not(windows))'.dependencies]
+# Non-Windows fallback: text-only clipboard (Paths/Names; Files falls back
+# to Paths text) (design D5).
+arboard = "3.6"
+
 [dev-dependencies]
 insta = { workspace = true }
 proptest = { workspace = true }

@@ -130,7 +130,9 @@ impl ThemePickerState {
 
 /// One entry in the file-action menu, in menu order. `Run` is included only
 /// when the target is executable, and always sorts first (file-action-menu
-/// "Menu contents, ordering, and navigation").
+/// "Menu contents, ordering, and navigation"). `SendToClipboard` is always
+/// last and never mutates the filesystem (file-action-menu "No mutation
+/// without an intervening dialog").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileActionMenuEntry {
     Run,
@@ -140,6 +142,7 @@ pub enum FileActionMenuEntry {
     Rename,
     Move,
     Delete,
+    SendToClipboard,
 }
 
 impl FileActionMenuEntry {
@@ -155,6 +158,7 @@ impl FileActionMenuEntry {
             FileActionMenuEntry::Rename => "Rename",
             FileActionMenuEntry::Move => "Move",
             FileActionMenuEntry::Delete => "Delete",
+            FileActionMenuEntry::SendToClipboard => "Send to clipboard",
         }
     }
 }
@@ -187,6 +191,7 @@ impl FileActionMenuState {
             FileActionMenuEntry::Rename,
             FileActionMenuEntry::Move,
             FileActionMenuEntry::Delete,
+            FileActionMenuEntry::SendToClipboard,
         ]);
         FileActionMenuState { target_name, entries, cursor: 0 }
     }
@@ -437,12 +442,20 @@ Esc clears it. Ctrl+J opens a fuzzy, frecency-ranked jump list of
 previously visited directories. Ctrl+T/Ctrl+W/Alt+1..9 manage panel
 tabs. Alt+F7 searches the active panel's subtree by name. Ctrl+Left/
 Ctrl+Right adjusts the vertical panel split 2 columns at a time;
-Ctrl+= resets it to 50/50. The split persists across restarts.";
+Ctrl+= resets it to 50/50. The split persists across restarts.
+
+Ctrl+C (or Ctrl+Ins) copies the selected files (or the file under
+the cursor) to the clipboard as file objects, ready to paste into
+Explorer, Outlook, or any other Windows application. Ctrl+Shift+Ins
+copies their absolute paths as text, one per line; the Files menu
+also offers copying just their names. All three act on the same
+selection scope as F5 Copy.";
 
 const CONFIGURATION: &str = "\
 config.toml (next to the executable) sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
-and can remap the quick-filter, fuzzy-jump, and panel-split keys.
+and can remap the quick-filter, fuzzy-jump, panel-split, and
+clipboard (key.clipboard_files, key.clipboard_paths) keys.
 usermenu.toml defines the F2 user menu's entries. --nosplash skips
 the startup splash. --theme <name> (or --theme=<name>) starts the
 session in a built-in theme instead of the configured one, for this
@@ -510,6 +523,7 @@ mod tests {
                 FileActionMenuEntry::Rename,
                 FileActionMenuEntry::Move,
                 FileActionMenuEntry::Delete,
+                FileActionMenuEntry::SendToClipboard,
             ]
         );
     }

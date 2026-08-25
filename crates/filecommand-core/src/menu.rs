@@ -86,6 +86,13 @@ pub enum MenuAction {
     Move,
     Mkdir,
     Delete,
+    /// Files pull-down "Copy to clipboard" (Ctrl+C) — clipboard-export
+    /// "Clipboard actions in menus".
+    ClipboardFiles,
+    /// Files pull-down "Copy path(s)" (Ctrl+Shift+Ins).
+    ClipboardPaths,
+    /// Files pull-down "Copy name(s)" — menu-only, no key binding.
+    ClipboardNames,
     SelectGroup,
     DeselectGroup,
     InvertSelection,
@@ -169,6 +176,11 @@ const FILES_MENU: &[MenuEntry] = &[
     item("Rename/Move", 0, "F6", MenuAction::Move),
     item("Make directory", 0, "F7", MenuAction::Mkdir),
     item("Delete", 0, "F8", MenuAction::Delete),
+    MenuEntry::Separator,
+    item("Copy to clipboard", 0, "Ctrl-C", MenuAction::ClipboardFiles),
+    item("Copy path(s)", 0, "Ctrl-Sh-Ins", MenuAction::ClipboardPaths),
+    item("Copy name(s)", 0, "", MenuAction::ClipboardNames),
+    MenuEntry::Separator,
     item("Attributes", 0, "", MenuAction::Unimplemented),
     MenuEntry::Separator,
     item("Select group", 0, "+", MenuAction::SelectGroup),
@@ -326,13 +338,13 @@ mod tests {
     #[test]
     fn vertical_selection_skips_separators_and_disabled_items() {
         let mut menu = MenuState::for_menu(MenuId::Files);
-        // "Attributes" is disabled and directly precedes a separator, so
-        // stepping past "Delete" must land on "Select group".
-        let delete = entries(MenuId::Files)
+        // "Attributes" is disabled and bounded by separators on both sides,
+        // so stepping past "Copy name(s)" must land on "Select group".
+        let copy_names = entries(MenuId::Files)
             .iter()
-            .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Delete"))
+            .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy name(s)"))
             .unwrap();
-        menu.selected = delete;
+        menu.selected = copy_names;
         menu.move_selection(1);
         assert_eq!(menu.selected_item().map(|i| i.label), Some("Select group"));
     }
@@ -416,6 +428,9 @@ mod tests {
                 "Rename/Move",
                 "Make directory",
                 "Delete",
+                "Copy to clipboard",
+                "Copy path(s)",
+                "Copy name(s)",
                 "Attributes",
                 "Select group",
                 "Deselect group",
@@ -423,6 +438,24 @@ mod tests {
                 "Quit",
             ]
         );
+    }
+
+    #[test]
+    fn files_menu_clipboard_group_has_hyphenated_shortcut_hints() {
+        // clipboard-export "Clipboard actions in menus": right-aligned
+        // shortcut hints in the existing hyphenated style.
+        let by_label = |label: &str| -> &'static MenuItem {
+            entries(MenuId::Files)
+                .iter()
+                .find_map(|e| match e {
+                    MenuEntry::Item(i) if i.label == label => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("`{label}` missing from the Files menu"))
+        };
+        assert_eq!(by_label("Copy to clipboard").shortcut, "Ctrl-C");
+        assert_eq!(by_label("Copy path(s)").shortcut, "Ctrl-Sh-Ins");
+        assert_eq!(by_label("Copy name(s)").shortcut, "", "Names is menu-only: no key binding to hint");
     }
 
     #[test]

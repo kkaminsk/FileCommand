@@ -1095,13 +1095,14 @@ fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
 #[test]
 fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    // Non-executable: View, Edit, Copy, Rename, Move, Delete (6 entries).
+    // Non-executable: View, Edit, Copy, Rename, Move, Delete, Send to
+    // clipboard (7 entries).
     let (state, _) = update(state, Command::FileActionMenuMove(-5));
     assert_eq!(state.file_action_menu.as_ref().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
     let (state, _) = update(state, Command::FileActionMenuMove(100));
     let menu = state.file_action_menu.as_ref().unwrap();
     assert_eq!(menu.cursor, menu.entries.len() - 1, "Down past the last entry clamps, it does not wrap");
-    assert_eq!(menu.selected(), FileActionMenuEntry::Delete);
+    assert_eq!(menu.selected(), FileActionMenuEntry::SendToClipboard);
 }
 
 #[test]
@@ -3698,4 +3699,219 @@ fn tree_node_expanded_re_clamps_the_tree_offset_through_the_reducer() {
     let tree = state.left.tree.as_ref().unwrap();
     assert_eq!(tree.cursor, 12, "expanding a different node doesn't move the cursor");
     assert_eq!(tree.scroll_offset, 12 + 1 - rows, "the stale offset re-clamps to the minimal-shift window around the cursor once TreeNodeExpanded re-runs reconciliation");
+}
+
+// ---------------------------------------------------------------------
+// Clipboard export (clipboard-export)
+// ---------------------------------------------------------------------
+
+#[test]
+fn copy_to_clipboard_uses_cursor_entry_when_nothing_explicitly_selected() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("README.md", 10)];
+    let (state, effects) = update(state, Command::CopyToClipboard(ClipboardPayloadKind::Paths));
+    assert_eq!(
+        effects,
+        vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Paths, items: vec![PathBuf::from(r"C:\NORTON\README.md")] })]
+    );
+    assert!(state.left.clipboard_feedback.is_none(), "feedback waits for the ClipboardResult reply");
+}
+
+#[test]
+fn copy_to_clipboard_uses_explicit_selection_over_cursor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2), file_entry("c.txt", 3)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    state.left.selected.insert(OsString::from("c.txt"));
+    state.left.cursor = 1; // b.txt: not selected, must not be used
+
+    let (_, effects) = update(state, Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    let Some(Effect::SetClipboard(payload)) = effects.into_iter().next() else { panic!("expected a SetClipboard effect") };
+    assert_eq!(payload.kind, ClipboardPayloadKind::Files);
+    let mut items = payload.items;
+    items.sort();
+    assert_eq!(items, vec![PathBuf::from(r"C:\NORTON\a.txt"), PathBuf::from(r"C:\NORTON\c.txt")]);
+}
+
+#[test]
+fn copy_to_clipboard_on_parent_dir_with_no_selection_reports_nothing_to_copy() {
+    // The parent-directory pseudo-entry is never a valid clipboard source
+    // (clipboard-export "Parent entry is never copied"), exactly like F5.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry::parent_dir(), file_entry("a.txt", 1)];
+    state.left.cursor = 0; // ".."
+    let (state, effects) = update(state, Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    assert!(effects.is_empty(), "nothing is written to the clipboard");
+    let feedback = state.left.clipboard_feedback.expect("the mini-status reports there is nothing to copy");
+    assert_eq!(feedback.message, "Nothing to copy");
+    assert!(!feedback.is_error);
+}
+
+#[test]
+fn copy_to_clipboard_with_empty_panel_reports_nothing_to_copy() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::CopyToClipboard(ClipboardPayloadKind::Names));
+    assert!(effects.is_empty());
+    assert_eq!(state.left.clipboard_feedback.unwrap().message, "Nothing to copy");
+}
+
+#[test]
+fn clipboard_result_ok_files_reports_the_plural_template_even_for_one() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\a.txt")] };
+    let (state, effects) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert!(effects.is_empty());
+    let feedback = state.left.clipboard_feedback.expect("success sets feedback");
+    assert_eq!(feedback.message, "1 files copied to clipboard");
+    assert!(!feedback.is_error);
+}
+
+#[test]
+fn clipboard_result_ok_paths_singular_names_the_path() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Paths, items: vec![PathBuf::from(r"C:\NORTON\README.md")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert_eq!(state.left.clipboard_feedback.unwrap().message, r"Path copied: C:\NORTON\README.md");
+}
+
+#[test]
+fn clipboard_result_ok_paths_plural_counts() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload {
+        kind: ClipboardPayloadKind::Paths,
+        items: vec![PathBuf::from(r"C:\NORTON\a.txt"), PathBuf::from(r"C:\NORTON\b.txt")],
+    };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert_eq!(state.left.clipboard_feedback.unwrap().message, "2 paths copied");
+}
+
+#[test]
+fn clipboard_result_ok_names_counts() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Names, items: vec![PathBuf::from("a.txt"), PathBuf::from("b.txt")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert_eq!(state.left.clipboard_feedback.unwrap().message, "2 names copied");
+}
+
+#[test]
+fn clipboard_result_fallback_to_paths_names_the_platform_limitation() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\a.txt")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: true, result: Ok(()) });
+    let feedback = state.left.clipboard_feedback.unwrap();
+    assert_eq!(feedback.message, "Paths copied (file objects unsupported here)");
+    assert!(!feedback.is_error);
+}
+
+#[test]
+fn clipboard_result_err_shows_the_message_in_the_error_role() {
+    let state = test_state(UiPhase::Panels);
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\a.txt")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Err("Clipboard busy — try again".to_string()) });
+    let feedback = state.left.clipboard_feedback.unwrap();
+    assert_eq!(feedback.message, "Clipboard busy — try again");
+    assert!(feedback.is_error);
+}
+
+#[test]
+fn clipboard_feedback_expires_via_tick_once_the_deadline_passes() {
+    let mut state = test_state(UiPhase::Panels);
+    state.clock_ms = 0;
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from("a.txt")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert!(state.left.clipboard_feedback.is_some());
+
+    // Not yet at the deadline: still showing.
+    let (state, _) = update(state, Command::Tick(CLIPBOARD_FEEDBACK_MS - 1));
+    assert!(state.left.clipboard_feedback.is_some(), "feedback holds until the deadline is reached");
+
+    // At the deadline: expired.
+    let (state, _) = update(state, Command::Tick(CLIPBOARD_FEEDBACK_MS));
+    assert!(state.left.clipboard_feedback.is_none(), "feedback expires once the clock reaches expires_at_ms");
+}
+
+#[test]
+fn clipboard_feedback_clears_on_the_next_key_before_the_deadline() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
+    state.clock_ms = 0;
+    let payload = ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from("a.txt")] };
+    let (state, _) = update(state, Command::ClipboardResult { payload, fell_back_to_paths: false, result: Ok(()) });
+    assert!(state.left.clipboard_feedback.is_some());
+
+    // Any other command — e.g. Down — counts as "the next key press" and
+    // clears the feedback immediately, well before the ~3s deadline.
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert_eq!(state.left.cursor, 1, "the movement itself still applies");
+    assert!(state.left.clipboard_feedback.is_none(), "the mini-status shows the normal display again");
+}
+
+#[test]
+fn files_menu_clipboard_group_dispatches_copy_to_clipboard() {
+    assert_eq!(
+        menu_action_command(MenuAction::ClipboardFiles, PanelSide::Left),
+        Some(Command::CopyToClipboard(ClipboardPayloadKind::Files))
+    );
+    assert_eq!(
+        menu_action_command(MenuAction::ClipboardPaths, PanelSide::Left),
+        Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths))
+    );
+    assert_eq!(
+        menu_action_command(MenuAction::ClipboardNames, PanelSide::Left),
+        Some(Command::CopyToClipboard(ClipboardPayloadKind::Names))
+    );
+}
+
+#[test]
+fn files_menu_activate_on_copy_to_clipboard_runs_the_files_action() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::MenuOpen);
+    let (mut state, _) = update(state, Command::MenuHotkey('f')); // Files
+    let target = crate::menu::entries(crate::menu::MenuId::Files)
+        .iter()
+        .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy to clipboard"))
+        .unwrap();
+    state.menu.as_mut().unwrap().selected = target;
+    let (state, effects) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none(), "activating the item closes the whole menu overlay");
+    assert_eq!(
+        effects,
+        vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\a.txt")] })]
+    );
+}
+
+#[test]
+fn send_to_clipboard_action_menu_entry_targets_only_the_menus_entry() {
+    // The menu's target (`notes.txt`) is copied even though a different
+    // entry is selected and the cursor sits on a third one — the action
+    // menu always scopes to the entry it was opened on, never the panel's
+    // live selection or cursor (design D3 of `file-action-menu`).
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("notes.txt", 1), file_entry("other.txt", 2)];
+    state.left.selected.insert(OsString::from("other.txt"));
+    let state = opened_menu_state_from(state, "notes.txt");
+
+    let (state, effects) = update(state, Command::FileActionMenuHotkey('S'));
+    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    assert_eq!(
+        effects,
+        vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\notes.txt")] })]
+    );
+    assert_eq!(state.left.selected.len(), 1, "the panel's selection is untouched");
+}
+
+/// Like `opened_menu_state`, but starting from a caller-built `state`
+/// (entries/selection already set up) instead of building a fresh one —
+/// needed by tests that must control the panel's selection independently
+/// of the menu's target entry.
+fn opened_menu_state_from(mut state: State, cursor_on: &str) -> State {
+    state.left.cursor = state.left.entries.iter().position(|e| e.name == cursor_on).unwrap();
+    let (state, _) = update(state, Command::Enter);
+    assert!(state.file_action_menu.is_some(), "setup precondition: the menu must be open");
+    state
 }

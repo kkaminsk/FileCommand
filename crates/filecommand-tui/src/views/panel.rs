@@ -231,7 +231,13 @@ pub fn render_panel(
     let file_style = role_style(theme, Role::PanelFile, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
-    let ministatus_style = role_style(theme, Role::PanelMinistatus, depth);
+    // A clipboard action's feedback (clipboard-export "Clipboard feedback")
+    // takes over the mini-status role's color when it reports failure — the
+    // same error role dialogs use — otherwise the normal mini-status role.
+    let ministatus_style = match &panel.clipboard_feedback {
+        Some(feedback) if feedback.is_error => role_style(theme, Role::DialogError, depth),
+        _ => role_style(theme, Role::PanelMinistatus, depth),
+    };
 
     let w = area.width as usize;
     let x0 = area.x;
@@ -277,6 +283,13 @@ pub fn render_panel(
     // (the highlighted path / previewed file) below, which takes
     // precedence when present.
     let input_override = quick_filter_or_type_ahead_status(panel, type_ahead);
+    // Clipboard feedback (clipboard-export "Clipboard feedback") wins over
+    // the quick-filter/type-ahead pattern and every mode-specific override
+    // below — it is the most recent thing the user asked for, is always
+    // transient (cleared by `crate::update` on the very next command or
+    // after ~3s), and Ctrl+C/Ctrl+Ins/Ctrl+Shift+Ins work over the panels
+    // regardless of the active display mode.
+    let clipboard_override = panel.clipboard_feedback.as_ref().map(|f| f.message.clone());
 
     // Info mode replaces the whole body — header row included — with the
     // stacked info boxes, keeping only the panel's own double-line border
@@ -285,7 +298,7 @@ pub fn render_panel(
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, clipboard_override.clone().or_else(|| input_override.clone()));
         return;
     }
 
@@ -294,7 +307,7 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, clipboard_override.clone().or_else(|| input_override.clone()));
         return;
     }
 
@@ -303,7 +316,7 @@ pub fn render_panel(
     // modes "Tree display mode structure and rendering").
     if panel.display_mode == DisplayMode::Tree {
         let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, clipboard_override.clone().or(mini_status).or_else(|| input_override.clone()));
         return;
     }
 
@@ -313,7 +326,7 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::QuickView {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let mini_status = render_quick_view_body(buf, x0, body_y0, w, body_h, opposite, theme, depth);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, clipboard_override.clone().or(mini_status).or_else(|| input_override.clone()));
         return;
     }
 
@@ -398,7 +411,7 @@ pub fn render_panel(
         }
     }
 
-    render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+    render_bottom_border(buf, area, panel, frame_style, ministatus_style, clipboard_override.or(input_override));
 }
 
 /// The `\u{2551}` left/right frame verticals for every row of a body region

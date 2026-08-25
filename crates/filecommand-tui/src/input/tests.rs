@@ -61,13 +61,16 @@ fn quit_dialog_maps_y_and_n() {
 }
 
 #[test]
-fn quit_dialog_ctrl_c_confirms() {
-    // Ctrl+C confirms inside the dialog — the "press Ctrl+C again to exit"
-    // convention, satisfying Ctrl+C-Ctrl+C-quits end to end (application-shell
-    // "Quit request keys and confirmation": "Ctrl+C SHALL confirm"; task 2.3).
+fn quit_dialog_ignores_ctrl_c() {
+    // BREAKING (clipboard-file-export): Ctrl+C no longer confirms inside the
+    // dialog — the `quit-keys` "press Ctrl+C again to exit" convention is
+    // reversed per the user's decision. The dialog stays open and nothing
+    // happens (application-shell "Quit request keys and confirmation":
+    // "Ctrl+C SHALL have no effect there").
     let mut state = panels();
     state.quit_confirm = true;
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), Some(Command::ConfirmQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
+    assert_eq!(map(key(KeyCode::Char('C'), KeyModifiers::CONTROL), &state), None);
 }
 
 #[test]
@@ -171,6 +174,18 @@ fn progress_state() -> State {
 #[test]
 fn progress_dialog_cancel_key_maps_to_cancel_job() {
     assert_eq!(map(plain(KeyCode::Esc), &progress_state()), Some(Command::FileOpCancelJob));
+}
+
+#[test]
+fn progress_dialog_plain_c_still_cancels_but_ctrl_c_is_ignored() {
+    // No-modifier guard added to the `c`/`C` -> FileOpCancelJob arm
+    // (clipboard-export "Clipboard key bindings"; design D1) — see
+    // `ctrl_c_no_longer_requests_quit_from_modal_dialogs_and_overlays` for
+    // the Ctrl+C-is-ignored half.
+    let state = progress_state();
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::FileOpCancelJob));
+    assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::FileOpCancelJob));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
 }
 
 fn conflict_state(rename_input: Option<String>) -> State {
@@ -763,35 +778,69 @@ fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
 }
 
 // ---------------------------------------------------------------------
-// quit-keys: Ctrl+C requests quit everywhere except the built-in editor
+// clipboard-file-export: Ctrl+C is the Files clipboard action, not quit,
+// anywhere (BREAKING relative to quit-keys); Ctrl+Ins/Ctrl+Shift+Ins are the
+// other two clipboard chords.
 // ---------------------------------------------------------------------
 
 #[test]
-fn ctrl_c_requests_quit_from_panels_in_any_command_line_state() {
-    // Idle panel, mid-typing, under an active quick filter, and during
-    // type-ahead all route Ctrl+C to `RequestQuit` (application-shell
-    // "Quit request keys and confirmation": "Ctrl+C SHALL request quit ...
-    // panels in any state").
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &panels()), Some(Command::RequestQuit));
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &typing("dir")), Some(Command::RequestQuit));
+fn ctrl_c_copies_files_from_panels_in_any_command_line_state() {
+    // Idle panel, mid-typing, and under an active quick filter all route
+    // Ctrl+C to the Files clipboard action rather than `RequestQuit`
+    // (clipboard-export "Clipboard key bindings": "Ctrl+C copies files over
+    // the panels").
+    let files = Some(Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &panels()), files);
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &typing("dir")), files);
 
     let mut filtering = panels();
     filtering.left.quick_filter = Some("re".to_string());
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &filtering), Some(Command::RequestQuit));
-
-    let mut searching = panels();
-    searching.quick_search = Some("r".to_string());
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &searching), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &filtering), files);
 }
 
 #[test]
-fn ctrl_c_requests_quit_from_the_viewer() {
+fn ctrl_ins_is_a_fixed_alias_for_files_and_ctrl_shift_ins_is_paths() {
+    // clipboard-export "Clipboard key bindings": "Ctrl+Ins alias" and the
+    // default `clipboard_paths` binding.
+    let files = Some(Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    let paths = Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths));
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::CONTROL), &panels()), files);
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::CONTROL | KeyModifiers::SHIFT), &panels()), paths);
+}
+
+#[test]
+fn ctrl_ins_no_longer_toggles_selection() {
+    // Regression for the breaking key-map change: Ctrl+Ins used to fall
+    // through to the unguarded `Insert -> ToggleSelectAtCursor` arm; the
+    // clipboard Files chord must win instead (clipboard-export "Clipboard
+    // key bindings"; plain Insert is untouched — see
+    // `selection_keys_map_while_the_command_line_is_empty`).
+    assert_ne!(map(key(KeyCode::Insert, KeyModifiers::CONTROL), &panels()), Some(Command::ToggleSelectAtCursor));
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::CONTROL), &panels()), Some(Command::CopyToClipboard(ClipboardPayloadKind::Files)));
+}
+
+#[test]
+fn rebinding_the_files_chord_leaves_ctrl_ins_working() {
+    // clipboard-export "Clipboard key bindings": "Rebinding the files
+    // chord" — `key.clipboard_files = "ctrl+k"` moves the rebindable chord
+    // and Ctrl+C stops doing anything over the panels, while the fixed
+    // Ctrl+Ins alias still runs Files.
+    let keys = Keys { clipboard_files: filecommand_core::config::KeyBinding::new(true, false, false, "k"), ..Keys::default() };
+    let state = panels();
+    let files = Some(Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    assert_eq!(map_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL), &state, 5, &keys), files);
+    assert_eq!(map_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state, 5, &keys), None);
+    assert_eq!(map_key(key(KeyCode::Insert, KeyModifiers::CONTROL), &state, 5, &keys), files);
+}
+
+#[test]
+fn ctrl_c_no_longer_requests_quit_from_the_viewer() {
     let v = open_viewer(filecommand_core::viewer::ViewMode::Text);
-    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), Some(ViewerInput::Cmd(Command::RequestQuit)));
+    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), None);
     // Still true while the F7 search prompt is open.
     let mut v = v;
     v.search_input = Some(String::new());
-    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), Some(ViewerInput::Cmd(Command::RequestQuit)));
+    assert_eq!(map_viewer_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &v, 20), None);
 }
 
 #[test]
@@ -804,38 +853,60 @@ fn ctrl_c_in_the_built_in_editor_still_copies() {
 }
 
 #[test]
-fn ctrl_c_requests_quit_with_a_pull_down_menu_open() {
+fn ctrl_c_no_longer_requests_quit_with_a_pull_down_menu_open() {
     let mut state = panels();
     state.menu = Some(MenuState::for_menu(MenuId::Files));
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
 }
 
 #[test]
-fn ctrl_c_requests_quit_from_modal_dialogs_and_overlays() {
+fn ctrl_c_no_longer_requests_quit_from_modal_dialogs_and_overlays() {
     // A representative sample of the modal dialogs/overlays beside the
-    // phase: fuzzy jump, find file, user menu, theme picker, file action
-    // menu, help, drive select, and the file-op setup/running dialogs.
+    // phase: fuzzy jump, find file, user menu, drive select, and the
+    // file-op running dialog all now ignore Ctrl+C outright.
     let mut fuzzy = panels();
     fuzzy.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &fuzzy), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &fuzzy), None);
 
     let mut find = panels();
     find.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &find), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &find), None);
 
     let mut user_menu = panels();
     user_menu.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &user_menu), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &user_menu), None);
 
     let mut drive = panels();
     drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec![], None));
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &drive), Some(Command::RequestQuit));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &drive), None);
 
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &progress_state()), None);
+}
+
+#[test]
+fn ctrl_c_types_a_literal_c_in_a_file_op_text_input() {
+    // `DestinationInput`/`RenameInput`'s `Char(c) => FileOpInputChar(c)` arm
+    // has never filtered by modifier (every other Ctrl-letter already types
+    // its base character there), so removing the old Ctrl+C intercept makes
+    // Ctrl+C consistent with that existing behavior rather than a new
+    // special case — it is not treated as "over the panels" for clipboard
+    // purposes (clipboard-export "Clipboard key bindings": "over the
+    // panels").
     assert_eq!(
         map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()),
-        Some(Command::RequestQuit)
+        Some(Command::FileOpInputChar('c'))
     );
-    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &progress_state()), Some(Command::RequestQuit));
+}
+
+#[test]
+fn quick_search_treats_ctrl_c_as_an_unrecognized_key_and_ends_type_ahead() {
+    // Type-ahead is a distinct keyboard-owning mode (`map_quick_search_key`,
+    // not `map_panel_key`), so it never sees the clipboard chords; Ctrl+C
+    // now falls to its existing "any other key ends type-ahead" catch-all,
+    // same as any other key the mode doesn't recognize.
+    let mut searching = panels();
+    searching.quick_search = Some("r".to_string());
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &searching), Some(Command::QuickSearchEnd));
 }
 
 #[test]
@@ -922,6 +993,20 @@ fn help_dialog_precedence_list_then_page_then_about() {
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::HelpCancel));
+}
+
+#[test]
+fn help_ignores_ctrl_c_but_plain_c_still_cancels() {
+    // No-modifier guard added to the top-level list's `c`/`C` -> HelpCancel
+    // arm (clipboard-export "Clipboard key bindings"; design D1): Ctrl+C
+    // must fall through to `_ => None` rather than closing Help, while the
+    // plain key is untouched.
+    let mut state = panels();
+    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
+    assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::HelpCancel));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
+    assert_eq!(map(key(KeyCode::Char('C'), KeyModifiers::CONTROL), &state), None);
 }
 
 #[test]
