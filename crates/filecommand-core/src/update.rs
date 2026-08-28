@@ -20,7 +20,7 @@ use crate::git_info::GitInfo;
 use crate::info::InfoValues;
 use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuId, MenuState};
-use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
+use crate::panel::{ClipboardFeedback, CursorMove, DisplayMode, PanelState, TreeState};
 use crate::panel_split;
 use crate::quicksearch::{self, FrecencyEntry, FuzzyJumpState};
 use crate::shell::{self, ShellConfig};
@@ -30,6 +30,10 @@ use crate::viewer::ViewerState;
 pub const MIN_COLS: u16 = 60;
 pub const MIN_ROWS: u16 = 16;
 pub const SPLASH_MIN_HOLD_MS: u64 = 800;
+/// How long a clipboard action's mini-status feedback stays up before a
+/// `Tick` expires it, absent an intervening key press (clipboard-export
+/// "Clipboard feedback").
+pub const CLIPBOARD_FEEDBACK_MS: u64 = 3000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSide {
@@ -663,6 +667,53 @@ pub enum Command {
     /// as if it had been highlighted and confirmed (file-action-menu
     /// "First-letter hotkey activates directly").
     FileActionMenuHotkey(char),
+
+    // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
+    // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
+    // group, and the file-action menu's `Send to clipboard` (which always
+    // requests `Files`, scoped to its single target entry rather than
+    // `active_selection_sources` — see `activate_file_action`).
+    /// Places the F5-scope entries (`active_selection_sources`) on the OS
+    /// clipboard per `kind` (clipboard-export "Clipboard payloads and
+    /// scope"). A no-op, reported in the mini-status, when the scope is
+    /// empty (nothing selected and the cursor is on `..` or off the list).
+    CopyToClipboard(ClipboardPayloadKind),
+    /// Reply to `Effect::SetClipboard` once the TUI's `Clipboard` trait has
+    /// run. `payload` echoes back the request (the resolved paths are
+    /// needed to render the singular "Path copied: <path>" message without
+    /// re-deriving scope); `fell_back_to_paths` is set only when a `Files`
+    /// request was carried out as a plain-text `Paths` write because file
+    /// objects aren't supported on this platform (clipboard-export
+    /// "Non-Windows fallback"). `Ok(())` shows the per-kind success
+    /// message; `Err(message)` shows `message` verbatim in the error role
+    /// (clipboard-export "Clipboard busy retry" — the TUI retries before
+    /// giving up, so by the time this arrives the failure is final).
+    ClipboardResult { payload: ClipboardPayload, fell_back_to_paths: bool, result: Result<(), String> },
+}
+
+/// Which of the three clipboard actions a `Command::CopyToClipboard` /
+/// `Effect::SetClipboard` targets (clipboard-export "Clipboard payloads and
+/// scope"). `Names` is menu-only — reachable only through the Files
+/// pull-down, never a key binding (design D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardPayloadKind {
+    /// `CF_HDROP` file objects on Windows; falls back to `Paths`-as-text
+    /// elsewhere (clipboard-export "Windows file-object payload",
+    /// "Non-Windows fallback").
+    Files,
+    /// One absolute path per line, plain text.
+    Paths,
+    /// One file name per line, plain text.
+    Names,
+}
+
+/// The resolved payload for an `Effect::SetClipboard`: the action kind and
+/// the absolute, `..`-excluded paths of the F5-scope entries
+/// (`active_selection_sources`/`named_entry_source`) it was built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardPayload {
+    pub kind: ClipboardPayloadKind,
+    pub items: Vec<PathBuf>,
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -764,6 +815,13 @@ pub enum Effect {
     /// stale/abandoned search's results are dropped once the dialog has
     /// moved on.
     FindInSubtree { root: PathBuf, pattern: String, request: u64 },
+    /// Write `payload` to the OS clipboard via the TUI's `Clipboard` trait
+    /// and report the outcome back via `Command::ClipboardResult`. Executed
+    /// synchronously, like `EnumerateDrives` — `OpenClipboard` binds to the
+    /// calling thread and set-and-close is sub-millisecond, so no worker
+    /// thread is needed (design D3; clipboard-export "Clipboard payloads
+    /// and scope").
+    SetClipboard(ClipboardPayload),
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -791,9 +849,22 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
     // Every `Tick` updates the clock reading `begin_listing` timestamps
     // frecency visits with, regardless of phase — mirrored generically here
-    // rather than duplicated in every phase arm that might navigate.
+    // rather than duplicated in every phase arm that might navigate. A tick
+    // also expires any clipboard feedback whose ~3s has elapsed
+    // (clipboard-export "Clipboard feedback"); every other command counts
+    // as "the next key press" and clears it immediately instead of waiting
+    // out the timer — except the two commands that manage the feedback
+    // themselves, whose own handling below sets it fresh.
     if let Command::Tick(now) = cmd {
         state.clock_ms = now;
+        for side in [PanelSide::Left, PanelSide::Right] {
+            if matches!(&state.panel(side).clipboard_feedback, Some(f) if now >= f.expires_at_ms) {
+                state.panel_mut(side).clipboard_feedback = None;
+            }
+        }
+    } else if !matches!(cmd, Command::CopyToClipboard(_) | Command::ClipboardResult { .. }) {
+        state.left.clipboard_feedback = None;
+        state.right.clipboard_feedback = None;
     }
 
     // Listing events fold in identically regardless of phase — a background
@@ -1015,6 +1086,10 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::RequestMove => enter_file_op_setup(&mut state, JobKind::Move),
             Command::RequestMkdir => enter_file_op_setup(&mut state, JobKind::Mkdir),
             Command::RequestDelete => enter_delete_confirm(&mut state),
+            Command::CopyToClipboard(kind) => effects.extend(handle_copy_to_clipboard(&mut state, kind)),
+            Command::ClipboardResult { payload, fell_back_to_paths, result } => {
+                apply_clipboard_result(&mut state, payload, fell_back_to_paths, result)
+            }
 
             Command::CommandLineChar(c) => {
                 state.command_line.push(c);
@@ -1871,6 +1946,9 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::Move => Some(Command::RequestMove),
         MenuAction::Mkdir => Some(Command::RequestMkdir),
         MenuAction::Delete => Some(Command::RequestDelete),
+        MenuAction::ClipboardFiles => Some(Command::CopyToClipboard(ClipboardPayloadKind::Files)),
+        MenuAction::ClipboardPaths => Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths)),
+        MenuAction::ClipboardNames => Some(Command::CopyToClipboard(ClipboardPayloadKind::Names)),
         MenuAction::SelectGroup => Some(Command::GroupSelectAll),
         MenuAction::DeselectGroup => Some(Command::GroupDeselectAll),
         MenuAction::InvertSelection => Some(Command::InvertSelection),
@@ -1881,6 +1959,75 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::OpenThemes => Some(Command::ThemePickerOpen),
         MenuAction::Unimplemented => None,
     }
+}
+
+// ---------------------------------------------------------------------
+// Clipboard export (clipboard-export)
+// ---------------------------------------------------------------------
+
+/// Ctrl+C/Ctrl+Ins, Ctrl+Shift+Ins, and the Files pull-down's clipboard
+/// group: resolve the F5 scope and either request the write (leaving
+/// feedback to `apply_clipboard_result` once `Effect::SetClipboard`
+/// replies) or, when the scope is empty, report that directly — the parent
+/// pseudo-entry is never included, since `active_selection_sources` already
+/// excludes it (clipboard-export "Clipboard payloads and scope": "Parent
+/// entry is never copied").
+fn handle_copy_to_clipboard(state: &mut State, kind: ClipboardPayloadKind) -> Vec<Effect> {
+    let sources = active_selection_sources(state);
+    if sources.is_empty() {
+        set_clipboard_feedback(state, "Nothing to copy".to_string(), false);
+        return vec![];
+    }
+    let items = sources.into_iter().map(|s| s.path).collect();
+    vec![Effect::SetClipboard(ClipboardPayload { kind, items })]
+}
+
+/// The file-action menu's `Send to clipboard`: always `Files`, scoped to
+/// the menu's single target entry rather than the panel's selection (design
+/// D3 of `file-action-menu`, mirrored here from `activate_file_action`'s
+/// existing Copy/Move/Delete handling).
+fn handle_send_target_to_clipboard(source: SourceItem) -> Vec<Effect> {
+    vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![source.path] })]
+}
+
+/// Reply to `Effect::SetClipboard`: render the outcome into the active
+/// panel's mini-status feedback (clipboard-export "Clipboard feedback",
+/// "Non-Windows fallback").
+fn apply_clipboard_result(state: &mut State, payload: ClipboardPayload, fell_back_to_paths: bool, result: Result<(), String>) {
+    let (message, is_error) = match result {
+        Err(message) => (message, true),
+        Ok(()) => (clipboard_success_message(&payload, fell_back_to_paths), false),
+    };
+    set_clipboard_feedback(state, message, is_error);
+}
+
+/// The success feedback template for a completed `ClipboardPayload`
+/// (clipboard-export "Clipboard feedback"). `Paths` gets a singular
+/// variant naming the one path copied; `Files`/`Names` always use the
+/// plural template, matching the literal message set the requirement
+/// enumerates. A `Files` request downgraded to a `Paths` text write on a
+/// non-Windows host reports that explicitly instead (clipboard-export
+/// "Non-Windows fallback").
+fn clipboard_success_message(payload: &ClipboardPayload, fell_back_to_paths: bool) -> String {
+    if fell_back_to_paths {
+        return "Paths copied (file objects unsupported here)".to_string();
+    }
+    let n = payload.items.len();
+    match payload.kind {
+        ClipboardPayloadKind::Files => format!("{n} files copied to clipboard"),
+        ClipboardPayloadKind::Paths if n == 1 => format!("Path copied: {}", payload.items[0].display()),
+        ClipboardPayloadKind::Paths => format!("{n} paths copied"),
+        ClipboardPayloadKind::Names => format!("{n} names copied"),
+    }
+}
+
+/// Show `message` in the active panel's mini-status until the next key
+/// press or `CLIPBOARD_FEEDBACK_MS` elapses, whichever comes first
+/// (clipboard-export "Clipboard feedback").
+fn set_clipboard_feedback(state: &mut State, message: String, is_error: bool) {
+    let side = state.active;
+    let expires_at_ms = state.clock_ms.saturating_add(CLIPBOARD_FEEDBACK_MS);
+    state.panel_mut(side).clipboard_feedback = Some(ClipboardFeedback { message, is_error, expires_at_ms });
 }
 
 // ---------------------------------------------------------------------
@@ -2064,6 +2211,14 @@ fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_n
             }
             vec![]
         }
+        // Send to clipboard: the `clipboard-export` Files action, scoped to
+        // the menu's single target entry — never mutates the filesystem
+        // (file-action-menu "Menu actions route to existing flows", "No
+        // mutation without an intervening dialog").
+        FileActionMenuEntry::SendToClipboard => match named_entry_source(state, side, &target_name) {
+            Some(source) => handle_send_target_to_clipboard(source),
+            None => vec![],
+        },
     }
 }
 

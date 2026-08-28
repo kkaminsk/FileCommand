@@ -16,7 +16,7 @@ use filecommand_core::git_info::{FileStatus, GitInfo};
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
 use filecommand_core::menu::{MenuId, MenuState};
-use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
+use filecommand_core::panel::{ClipboardFeedback, DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
 use filecommand_core::{PanelSide, State, UiPhase};
@@ -950,6 +950,58 @@ fn type_ahead_mini_status_only_affects_the_active_panel() {
     let right_half: String = chars[mid..].iter().collect();
     assert!(left_half.contains("zz"));
     assert!(!right_half.contains("zz"));
+}
+
+// ---------------------------------------------------------------------
+// clipboard-file-export: mini-status clipboard feedback (clipboard-export
+// "Clipboard feedback")
+// ---------------------------------------------------------------------
+
+#[test]
+fn snapshot_clipboard_feedback_mini_status_success() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.clipboard_feedback =
+        Some(ClipboardFeedback { message: "3 files copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("3 files copied to clipboard"), "`{row}`");
+    insta::assert_snapshot!("clipboard_feedback_mini_status_success", row);
+}
+
+#[test]
+fn snapshot_clipboard_feedback_mini_status_error() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.clipboard_feedback =
+        Some(ClipboardFeedback { message: "Clipboard busy — try again".to_string(), is_error: true, expires_at_ms: 3_000 });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("Clipboard busy"), "`{row}`");
+    insta::assert_snapshot!("clipboard_feedback_mini_status_error", row);
+}
+
+#[test]
+fn clipboard_feedback_takes_precedence_over_the_quick_filter_mini_status() {
+    // Ctrl+C is matched over the panels ahead of the quick-filter's
+    // plain-char capture (`input::map_panel_key`), so both can be live in
+    // the same frame; the feedback must win (clipboard-export "Clipboard
+    // feedback").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.quick_filter = Some("rep".to_string());
+    state.left.clipboard_feedback =
+        Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("1 file copied to clipboard"), "`{row}`");
+    assert!(!row.contains("rep"), "`{row}`");
+}
+
+#[test]
+fn clipboard_feedback_error_uses_a_different_style_than_success() {
+    use filecommand_tui::style::role_style;
+    let theme = Theme::classic();
+    let success_style = role_style(&theme, filecommand_core::theme::Role::PanelMinistatus, ColorDepth::Ansi16);
+    let error_style = role_style(&theme, filecommand_core::theme::Role::DialogError, ColorDepth::Ansi16);
+    assert_ne!(success_style, error_style);
 }
 
 #[test]

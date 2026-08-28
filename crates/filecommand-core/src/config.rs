@@ -5,8 +5,9 @@
 //! (integer left-panel percentage; panel-split), and the overridable
 //! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
 //! `key.fuzzy_jump` / `key.split_left` / `key.split_right` /
-//! `key.split_reset`. Missing files and unrecognized or malformed lines are
-//! tolerated; unrecognized keys are ignored.
+//! `key.split_reset` / `key.clipboard_files` / `key.clipboard_paths`.
+//! Missing files and unrecognized or malformed lines are tolerated;
+//! unrecognized keys are ignored.
 //!
 //! Command history persists to `history.json` next to the config, written
 //! atomically (temp file + rename) so a crash mid-write can never leave a
@@ -85,6 +86,13 @@ pub struct Keys {
     /// table flagged as potentially undeliverable in some terminal hosts
     /// (design D8) — hence overridable here.
     pub split_reset: KeyBinding,
+    /// Copies the F5-scope entries to the clipboard as file objects.
+    /// Default Ctrl+C (clipboard-export "Clipboard key bindings"). Ctrl+Ins
+    /// is a fixed alias, not rebindable through this key.
+    pub clipboard_files: KeyBinding,
+    /// Copies the F5-scope entries' absolute paths to the clipboard as
+    /// text. Default Ctrl+Shift+Ins.
+    pub clipboard_paths: KeyBinding,
 }
 
 impl Default for Keys {
@@ -97,6 +105,8 @@ impl Default for Keys {
             split_left: KeyBinding::new(true, false, false, "left"),
             split_right: KeyBinding::new(true, false, false, "right"),
             split_reset: KeyBinding::new(true, false, false, "="),
+            clipboard_files: KeyBinding::new(true, false, false, "c"),
+            clipboard_paths: KeyBinding::new(true, false, true, "insert"),
         }
     }
 }
@@ -229,6 +239,16 @@ pub fn parse(input: &str) -> Config {
             "key.split_reset" => {
                 if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
                     config.keys.split_reset = b;
+                }
+            }
+            "key.clipboard_files" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.clipboard_files = b;
+                }
+            }
+            "key.clipboard_paths" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.clipboard_paths = b;
                 }
             }
             "panel_split" => {
@@ -1063,6 +1083,19 @@ mod tests {
         assert_eq!(keys.split_left, KeyBinding::new(true, false, false, "left"));
         assert_eq!(keys.split_right, KeyBinding::new(true, false, false, "right"));
         assert_eq!(keys.split_reset, KeyBinding::new(true, false, false, "="));
+        // clipboard-export "Clipboard key bindings": Ctrl+C for Files,
+        // Ctrl+Shift+Ins for Paths.
+        assert_eq!(keys.clipboard_files, KeyBinding::new(true, false, false, "c"));
+        assert_eq!(keys.clipboard_paths, KeyBinding::new(true, false, true, "insert"));
+    }
+
+    #[test]
+    fn parses_overridable_clipboard_bindings() {
+        // clipboard-export "Rebinding the files chord": `key.clipboard_files
+        // = "ctrl+k"` rebinds Files; Paths is independently overridable too.
+        let config = parse("key.clipboard_files = \"ctrl+k\"\nkey.clipboard_paths = \"alt+shift+c\"\n");
+        assert_eq!(config.keys.clipboard_files, KeyBinding::new(true, false, false, "k"));
+        assert_eq!(config.keys.clipboard_paths, KeyBinding::new(false, true, true, "c"));
     }
 
     #[test]

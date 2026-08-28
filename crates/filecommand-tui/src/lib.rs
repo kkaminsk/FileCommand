@@ -3,6 +3,7 @@
 //! adds the ratatui/crossterm-backed shell around it.
 
 pub mod app;
+pub mod clipboard;
 pub mod clock;
 pub mod input;
 pub mod layout;

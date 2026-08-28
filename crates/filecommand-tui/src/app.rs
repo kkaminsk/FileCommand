@@ -17,10 +17,12 @@ use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
 use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
+use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
 use filecommand_core::{config, drives, identity, update, Command, Effect, State, UiPhase};
 
+use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
 use crate::input::{self, ViewerInput};
 use crate::terminal::TerminalGuard;
@@ -45,6 +47,10 @@ struct Runtime {
     /// state (design D1). Set on `Effect::OpenViewer`, cleared on
     /// `Command::ViewerClose` — the only path out of `UiPhase::Viewer`.
     viewer_source: Option<(PathBuf, ByteSource)>,
+    /// The OS clipboard behind `Effect::SetClipboard` — `Box<dyn Clipboard>`
+    /// rather than a concrete type so tests can swap in
+    /// `clipboard::RecordingClipboard` (clipboard-export; design D3).
+    clipboard: Box<dyn Clipboard>,
 }
 
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
@@ -125,8 +131,14 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     apply_user_menu(&mut state, user_menu);
 
     let (tx, rx) = mpsc::channel::<Command>();
-    let mut rt =
-        Runtime { tx, active_job: None, history_path: PathBuf::from(config::HISTORY_FILE), config_path: PathBuf::from(CONFIG_FILE), viewer_source: None };
+    let mut rt = Runtime {
+        tx,
+        active_job: None,
+        history_path: PathBuf::from(config::HISTORY_FILE),
+        config_path: PathBuf::from(CONFIG_FILE),
+        viewer_source: None,
+        clipboard: Box::new(PlatformClipboard::default()),
+    };
 
     if run_effects(effects, &mut guard, &mut rt)? {
         return Ok(());
@@ -518,6 +530,25 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                         let _ = rt.tx.send(Command::EditorSaveFailed { message: e.to_string() });
                     }
                 }
+            }
+            Effect::SetClipboard(payload) => {
+                // Path normalisation (clipboard-export "Windows file-object
+                // payload"; design D4) happens once here, up front, so the
+                // same normalized items back the actual clipboard write and
+                // the `ClipboardResult` reply core renders into feedback
+                // (e.g. the singular "Path copied: <path>" message) —
+                // neither ever shows the internal `\\?\` form.
+                let items: Vec<PathBuf> = payload.items.iter().map(|p| clipboard::normalize_path(p)).collect();
+                let (result, fell_back_to_paths) = match payload.kind {
+                    ClipboardPayloadKind::Files => match rt.clipboard.set_files(&items) {
+                        Ok(fell_back) => (Ok(()), fell_back),
+                        Err(message) => (Err(message), false),
+                    },
+                    ClipboardPayloadKind::Paths => (rt.clipboard.set_text(&clipboard::paths_text(&items)), false),
+                    ClipboardPayloadKind::Names => (rt.clipboard.set_text(&clipboard::names_text(&items)), false),
+                };
+                let normalized_payload = update::ClipboardPayload { kind: payload.kind, items };
+                let _ = rt.tx.send(Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
             }
         }
     }
