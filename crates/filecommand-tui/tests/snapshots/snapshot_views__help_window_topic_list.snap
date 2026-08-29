@@ -1,6 +1,5 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 1094
 expression: text
 ---
 ╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
@@ -12,6 +11,7 @@ expression: text
 ║        ╠────────────────────────────────────────────────────────────╣        ║
 ║        ║ About FileCommand                                          ║        ║
 ║        ║ Keyboard reference                                         ║        ║
+║        ║ Mouse                                                      ║        ║
 ║        ║ Panels and display modes                                   ║        ║
 ║        ║ File operations                                            ║        ║
 ║        ║ Menus                                                      ║        ║
@@ -20,7 +20,6 @@ expression: text
 ║        ║ Command line                                               ║        ║
 ║        ║ Modern extras                                              ║        ║
 ║        ║ Configuration                                              ║        ║
-║        ║                                                            ║        ║
 ║        ╠────────────────────────────────────────────────────────────╣        ║
 ║        ║                      Help     Cancel                       ║        ║
 ║        ╚════════════════════════════════════════════════════════════╝        ║

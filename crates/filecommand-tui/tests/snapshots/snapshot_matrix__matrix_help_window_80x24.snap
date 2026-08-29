@@ -11,6 +11,7 @@ expression: text
          ╠────────────────────────────────────────────────────────────╣         
          ║ About FileCommand                                          ║         
          ║ Keyboard reference                                         ║         
+         ║ Mouse                                                      ║         
          ║ Panels and display modes                                   ║         
          ║ File operations                                            ║         
          ║ Menus                                                      ║         
@@ -19,7 +20,6 @@ expression: text
          ║ Command line                                               ║         
          ║ Modern extras                                              ║         
          ║ Configuration                                              ║         
-         ║                                                            ║         
          ╠────────────────────────────────────────────────────────────╣         
          ║                      Help     Cancel                       ║         
          ╚════════════════════════════════════════════════════════════╝

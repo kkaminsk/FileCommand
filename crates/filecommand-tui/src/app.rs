@@ -8,11 +8,11 @@ use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{self, Event, KeyEventKind};
+use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
-use filecommand_core::editor::{EditorState, LoadResult as EditorLoadResult};
+use filecommand_core::editor::{EditorMove, EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
@@ -20,11 +20,12 @@ use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
-use filecommand_core::{config, drives, identity, update, Command, Effect, State, UiPhase};
+use filecommand_core::{config, drives, identity, update, Command, Effect, PanelSide, State, UiPhase};
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
-use crate::input::{self, ViewerInput};
+use crate::hitmap::HitMap;
+use crate::input::{self, MouseTracker, ViewerInput};
 use crate::terminal::TerminalGuard;
 use crate::views;
 use crate::worker;
@@ -51,6 +52,12 @@ struct Runtime {
     /// rather than a concrete type so tests can swap in
     /// `clipboard::RecordingClipboard` (clipboard-export; design D3).
     clipboard: Box<dyn Clipboard>,
+    /// Press/double-click bookkeeping for `input::map_mouse`, kept here
+    /// (rather than a local in `run`'s loop) so it's reachable from
+    /// `run_effects`, which resets it at every `guard.resume()` call site —
+    /// crossterm may otherwise believe a button is still held after a
+    /// suspended shell/editor/scrollback run (design D1 risk).
+    mouse_tracker: MouseTracker,
 }
 
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
@@ -61,6 +68,10 @@ pub struct LaunchOptions {
     /// `--nosplash`: skip the startup splash screen regardless of
     /// `config.toml`'s `splash` key (startup-splash).
     pub no_splash: bool,
+    /// `--nomouse`: disable mouse capture regardless of `config.toml`'s
+    /// `[mouse] enabled` key, mirroring `--nosplash` (mouse-input "Mouse
+    /// capture configuration").
+    pub no_mouse: bool,
     /// `--theme <name>` or `--theme=<name>`: `None` when the switch was not
     /// passed at all; `Some(String::new())` when it was passed with no
     /// following value (e.g. as the final argument); `Some(name)` otherwise,
@@ -84,6 +95,8 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
     while let Some(arg) = iter.next() {
         if arg == "--nosplash" {
             opts.no_splash = true;
+        } else if arg == "--nomouse" {
+            opts.no_mouse = true;
         } else if arg == "--theme" {
             // A missing value (switch is the final argument) is recorded as
             // an empty string rather than `None`, so `resolve_startup_theme`
@@ -99,11 +112,18 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
 
 pub fn run(launch: LaunchOptions) -> io::Result<()> {
     crate::terminal::install_panic_hook();
-    let mut guard = TerminalGuard::new()?;
+    // Loaded before the guard so the guard can enable mouse capture (or not)
+    // on its very first frame rather than flipping it on a moment later
+    // (application-shell "Terminal acquired on startup"; mouse-input "Mouse
+    // capture configuration") — `config::load` is pure file I/O with no
+    // terminal dependency, so this reorder ahead of `TerminalGuard::new` is
+    // safe.
+    let config = config::load(Path::new(CONFIG_FILE));
+    let mouse_enabled = config.mouse_enabled && !launch.no_mouse;
+    let mut guard = TerminalGuard::new(mouse_enabled)?;
 
     let clock = RealClock::new();
     let wall_clock = RealWallClock;
-    let config = config::load(Path::new(CONFIG_FILE));
     let (theme, theme_warning) = resolve_startup_theme(&config, launch.theme.as_deref());
     let show_splash = config.splash && !launch.no_splash;
     let keys = config.keys.clone();
@@ -138,78 +158,113 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         config_path: PathBuf::from(CONFIG_FILE),
         viewer_source: None,
         clipboard: Box::new(PlatformClipboard::default()),
+        mouse_tracker: MouseTracker::new(),
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
         return Ok(());
     }
     let (mut state, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
-    draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+    let mut hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+
+    // A non-mouse event read while draining a burst of mouse events (design
+    // D7) is stashed here rather than lost — crossterm has no way to push an
+    // event back onto its queue, so the next loop iteration consumes this
+    // instead of polling again.
+    let mut pending_event: Option<Event> = None;
 
     loop {
         let (s, mut dirty) = drain_events(state, &rx, &mut guard, &mut rt)?;
         state = s;
 
-        if event::poll(POLL_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    // The quit-confirmation dialog outranks the viewer/editor's
-                    // own direct-dispatch key routing: once it is up, every key
-                    // goes through `map_key` (which checks `quit_confirm`
-                    // first), regardless of `state.phase` — the same way it
-                    // outranks every other overlay inside `map_key` itself
-                    // (application-shell "Quit request keys and
-                    // confirmation"; design D5).
-                    let cmd = if state.quit_confirm {
-                        let page_size = active_panel_page_size(&state);
-                        input::map_key(key, &state, page_size, &keys)
-                    } else {
-                        match &state.phase {
-                            UiPhase::Viewer(viewer) => {
-                                let rows_visible = views::viewer::body_rows(state.term_size.1);
-                                let source = rt.viewer_source.as_ref().map(|(_, s)| s);
-                                input::map_viewer_key(key, viewer, rows_visible)
-                                    .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
-                            }
-                            UiPhase::Editor(editor) => {
-                                let rows_visible = views::editor::body_rows(state.term_size.1);
-                                input::map_editor_key(key, editor, rows_visible)
-                            }
-                            _ => {
-                                let page_size = active_panel_page_size(&state);
-                                input::map_key(key, &state, page_size, &keys)
-                            }
+        let next_event = match pending_event.take() {
+            Some(e) => Some(e),
+            None if event::poll(POLL_INTERVAL)? => Some(event::read()?),
+            None => None,
+        };
+
+        match next_event {
+            Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                // The quit-confirmation dialog outranks the viewer/editor's
+                // own direct-dispatch key routing: once it is up, every key
+                // goes through `map_key` (which checks `quit_confirm`
+                // first), regardless of `state.phase` — the same way it
+                // outranks every other overlay inside `map_key` itself
+                // (application-shell "Quit request keys and
+                // confirmation"; design D5).
+                let cmd = if state.quit_confirm {
+                    let page_size = active_panel_page_size(&state);
+                    input::map_key(key, &state, page_size, &keys)
+                } else {
+                    match &state.phase {
+                        UiPhase::Viewer(viewer) => {
+                            let rows_visible = views::viewer::body_rows(state.term_size.1);
+                            let source = rt.viewer_source.as_ref().map(|(_, s)| s);
+                            input::map_viewer_key(key, viewer, rows_visible)
+                                .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
                         }
-                    };
-                    match cmd {
-                        Some(cmd) => {
-                            let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
-                            if quit {
-                                return Ok(());
-                            }
-                            state = s;
-                            dirty = true;
+                        UiPhase::Editor(editor) => {
+                            let rows_visible = views::editor::body_rows(state.term_size.1);
+                            input::map_editor_key(key, editor, rows_visible)
                         }
-                        None => continue,
+                        _ => {
+                            let page_size = active_panel_page_size(&state);
+                            input::map_key(key, &state, page_size, &keys)
+                        }
+                    }
+                };
+                match cmd {
+                    Some(cmd) => {
+                        let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
+                        if quit {
+                            return Ok(());
+                        }
+                        state = s;
+                        dirty = true;
+                    }
+                    None => continue,
+                }
+            }
+            Some(Event::Resize(w, h)) => {
+                let (s, quit) = apply(state, Command::Resize(w, h), &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
+                }
+                state = s;
+                dirty = true;
+            }
+            Some(Event::Mouse(first)) => {
+                // Drain every mouse event already queued this frame after
+                // the first, so a burst of wheel/drag events causes at most
+                // one redraw (mouse-input "Mouse events are coalesced";
+                // design D7). A non-mouse event read mid-drain is stashed in
+                // `pending_event` rather than lost.
+                let mut batch = vec![first];
+                while event::poll(Duration::ZERO)? {
+                    match event::read()? {
+                        Event::Mouse(m) => batch.push(m),
+                        other => {
+                            pending_event = Some(other);
+                            break;
+                        }
                     }
                 }
-                Event::Resize(w, h) => {
-                    let (s, quit) = apply(state, Command::Resize(w, h), &mut guard, &mut rt)?;
-                    if quit {
-                        return Ok(());
-                    }
-                    state = s;
-                    dirty = true;
+                let (s, quit, batch_dirty) = apply_mouse_batch(state, batch, &hitmap, &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
                 }
-                _ => {}
+                state = s;
+                dirty = dirty || batch_dirty;
             }
-        } else {
-            let (s, quit) = apply(state, Command::Tick(clock.now_ms()), &mut guard, &mut rt)?;
-            if quit {
-                return Ok(());
+            Some(_) => {}
+            None => {
+                let (s, quit) = apply(state, Command::Tick(clock.now_ms()), &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
+                }
+                state = s;
+                dirty = true;
             }
-            state = s;
-            dirty = true;
         }
 
         if dirty {
@@ -218,9 +273,168 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             // its very first appearance rather than a frame later.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
-            draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+            hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
         }
     }
+}
+
+/// A wheel/scroll command not yet applied, accumulated across consecutive
+/// same-target events in the current drained batch (design D7: "SHALL sum
+/// consecutive wheel notches"). Kept as running totals rather than replaying
+/// each notch through `apply` individually: repeated single-notch
+/// `move_cursor` calls happen to land on the same final position for a
+/// simple clamped cursor, but a batch that reverses direction near a list's
+/// end would not — `clamp(clamp(x + d1) + d2) != clamp(x + d1 + d2)` in
+/// general — so only a true running sum matches "sum" literally. It also
+/// spares the viewer a backward/forward scan per notch: one scan for the
+/// whole batch's net delta instead of N.
+enum PendingScroll {
+    None,
+    /// Net notches (positive down) while `state.phase` has stayed
+    /// `UiPhase::Viewer` for the whole streak.
+    Viewer(i64),
+    /// Net notches while `state.phase` has stayed `UiPhase::Editor`.
+    Editor(i64),
+    /// Net `ScrollPanel` delta for one panel side.
+    Panel(PanelSide, isize),
+}
+
+/// Apply whatever `pending` has accumulated so far, exactly once, via the
+/// normal `apply` path (so its effects run and history/frecency/etc. see
+/// one command, not N). A net delta of zero — equal ups and downs canceling
+/// out — applies nothing at all, matching "no redraw storm" (design D7).
+fn flush_pending_scroll(pending: PendingScroll, mut state: State, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool, bool)> {
+    let mut dirty = false;
+    match pending {
+        PendingScroll::None => {}
+        PendingScroll::Viewer(net) if net != 0 => {
+            if let UiPhase::Viewer(viewer) = &state.phase {
+                let rows_visible = views::viewer::body_rows(state.term_size.1);
+                let source = rt.viewer_source.as_ref().map(|(_, s)| s);
+                if let Some(cmd) = resolve_viewer_navigation(viewer, source, ViewerInput::ScrollLines(net * 3), rows_visible) {
+                    let (s, quit) = apply(state, cmd, guard, rt)?;
+                    if quit {
+                        return Ok((s, true, true));
+                    }
+                    state = s;
+                    dirty = true;
+                }
+            }
+        }
+        PendingScroll::Editor(net) if net != 0 => {
+            // The editor has no caret-independent viewport scroll, so the
+            // net delta is still applied as individual `EditorMove` steps
+            // (three per notch) rather than a single jump command
+            // (builtin-editor).
+            let step = if net > 0 { EditorMove::Down } else { EditorMove::Up };
+            for _ in 0..(net.unsigned_abs() * 3) {
+                let (s, quit) = apply(state, Command::EditorMove(step), guard, rt)?;
+                if quit {
+                    return Ok((s, true, dirty));
+                }
+                state = s;
+                dirty = true;
+            }
+        }
+        PendingScroll::Panel(side, delta) if delta != 0 => {
+            let (s, quit) = apply(state, Command::ScrollPanel { side, delta }, guard, rt)?;
+            if quit {
+                return Ok((s, true, true));
+            }
+            state = s;
+            dirty = true;
+        }
+        PendingScroll::Viewer(_) | PendingScroll::Editor(_) | PendingScroll::Panel(..) => {} // net == 0
+    }
+    Ok((state, false, dirty))
+}
+
+/// Apply a frame's worth of already-drained mouse events (design D7):
+/// `Moved` is discarded (no hover feature), the viewer/editor accept wheel
+/// only — dispatched directly from `state.phase`, mirroring how the key path
+/// calls `map_viewer_key`/`map_editor_key` directly rather than through
+/// `map_key` — and every other phase goes through `input::map_mouse`, gated
+/// by its own mode-gating table (design D5). Consecutive wheel notches
+/// (ScrollUp/ScrollDown) targeting the same viewer/editor/panel accumulate
+/// in `PendingScroll` rather than being applied one at a time; a click or a
+/// switch of target flushes whatever was pending first, so ordering is
+/// preserved.
+fn apply_mouse_batch(
+    mut state: State,
+    batch: Vec<crossterm::event::MouseEvent>,
+    hitmap: &HitMap,
+    guard: &mut TerminalGuard,
+    rt: &mut Runtime,
+) -> io::Result<(State, bool, bool)> {
+    let mut dirty = false;
+    let mut pending = PendingScroll::None;
+    macro_rules! flush {
+        () => {{
+            let (s, quit, d) = flush_pending_scroll(std::mem::replace(&mut pending, PendingScroll::None), state, guard, rt)?;
+            state = s;
+            dirty |= d;
+            if quit {
+                return Ok((state, true, dirty));
+            }
+        }};
+    }
+
+    for m in batch {
+        if matches!(m.kind, MouseEventKind::Moved) {
+            continue;
+        }
+        match &state.phase {
+            UiPhase::Viewer(_) => match m.kind {
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                    pending = match pending {
+                        PendingScroll::Viewer(n) => PendingScroll::Viewer(n + notch),
+                        _ => {
+                            flush!();
+                            PendingScroll::Viewer(notch)
+                        }
+                    };
+                }
+                _ => flush!(),
+            },
+            UiPhase::Editor(_) => match m.kind {
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                    pending = match pending {
+                        PendingScroll::Editor(n) => PendingScroll::Editor(n + notch),
+                        _ => {
+                            flush!();
+                            PendingScroll::Editor(notch)
+                        }
+                    };
+                }
+                _ => flush!(),
+            },
+            _ => {
+                if let Some(cmd) = input::map_mouse(m, hitmap, &mut rt.mouse_tracker, &state) {
+                    if let Command::ScrollPanel { side, delta } = cmd {
+                        pending = match pending {
+                            PendingScroll::Panel(s, d) if s == side => PendingScroll::Panel(s, d + delta),
+                            _ => {
+                                flush!();
+                                PendingScroll::Panel(side, delta)
+                            }
+                        };
+                    } else {
+                        flush!();
+                        let (s, quit) = apply(state, cmd, guard, rt)?;
+                        if quit {
+                            return Ok((s, true, true));
+                        }
+                        state = s;
+                        dirty = true;
+                    }
+                }
+            }
+        }
+    }
+    flush!();
+    Ok((state, false, dirty))
 }
 
 /// Resolve the startup theme from `config.theme` and an optional `--theme`
@@ -441,12 +655,21 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::RunShellCommand(invocation, side) => {
                 run_shell_command(guard, &invocation)?;
+                // Mirrors `TerminalGuard::resume`'s own reasoning (design
+                // D1): a button held when the TUI suspended may never
+                // deliver its `Up` back through crossterm once resumed, so
+                // any in-progress press/double-click bookkeeping is
+                // discarded rather than trusted.
+                rt.mouse_tracker.reset();
                 // Fed straight back, same as drive enumeration: the panel
                 // that owned the command must show whatever the command did
                 // to its directory the moment the TUI repaints.
                 let _ = rt.tx.send(Command::RereadPanel(side));
             }
-            Effect::ShowScrollback => show_scrollback(guard)?,
+            Effect::ShowScrollback => {
+                show_scrollback(guard)?;
+                rt.mouse_tracker.reset();
+            }
             Effect::PersistHistory(file) => {
                 // A history write failing (read-only directory, full disk)
                 // must never take the session down with it.
@@ -490,18 +713,22 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
                 worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
             }
-            Effect::RunExternalEditor(invocation, side) => match run_external_editor(guard, &invocation)? {
-                Ok(()) => {
-                    // The editor may have written to the file; re-read the
-                    // panel that owned the cursor entry, mirroring
-                    // `RunShellCommand` (external-editor: Synchronous wait
-                    // and panel re-read — "Panel refreshed after edit").
-                    let _ = rt.tx.send(Command::RereadPanel(side));
+            Effect::RunExternalEditor(invocation, side) => {
+                let result = run_external_editor(guard, &invocation)?;
+                rt.mouse_tracker.reset();
+                match result {
+                    Ok(()) => {
+                        // The editor may have written to the file; re-read the
+                        // panel that owned the cursor entry, mirroring
+                        // `RunShellCommand` (external-editor: Synchronous wait
+                        // and panel re-read — "Panel refreshed after edit").
+                        let _ = rt.tx.send(Command::RereadPanel(side));
+                    }
+                    Err(message) => {
+                        let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
+                    }
                 }
-                Err(message) => {
-                    let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
-                }
-            },
+            }
             Effect::OpenEditor { path } => match EditorState::open(&path) {
                 // Synchronous, like `Effect::OpenViewer`: the whole read is
                 // bounded by the 10 MB cap, so this is cheap enough for the
@@ -649,15 +876,19 @@ fn wait_for_key() -> io::Result<()> {
     Ok(())
 }
 
+/// Draws one frame and returns the [`HitMap`] it recorded, which the caller
+/// keeps around to feed `input::map_mouse` for whatever mouse events arrive
+/// before the next draw (design D2).
 fn draw(
     guard: &mut TerminalGuard,
     state: &State,
     identity_lines: &[String; 4],
     wall_clock: &dyn WallClock,
     viewer_source: Option<&ByteSource>,
-) -> io::Result<()> {
+) -> io::Result<HitMap> {
     let (hour, minute) = wall_clock.now_local();
     let clock_text = format_clock(hour, minute);
+    let mut hitmap = HitMap::default();
     guard.terminal.draw(|frame| {
         let area = frame.area();
         let depth = ColorDepth::Ansi16;
@@ -667,12 +898,13 @@ fn draw(
         // back as a return value instead of being set from inside `render`
         // itself (builtin-editor "Full-screen editor chrome" — caret as the
         // terminal cursor).
-        let cursor = views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
-        if let Some((x, y)) = cursor {
+        let output = views::render(frame.buffer_mut(), area, state, depth, identity_lines, &clock_text, viewer_source);
+        if let Some((x, y)) = output.cursor {
             frame.set_cursor_position((x, y));
         }
+        hitmap = output.hitmap;
     })?;
-    Ok(())
+    Ok(hitmap)
 }
 
 #[cfg(test)]
@@ -808,6 +1040,41 @@ mod tests {
         let theme_first = parse_launch_args(["--theme=terminal-green".to_string(), "--nosplash".to_string()]);
         assert!(theme_first.no_splash);
         assert_eq!(theme_first.theme.as_deref(), Some("terminal-green"));
+    }
+
+    // -- mouse-input "Mouse capture configuration" ------------------------
+
+    /// Parser: `--nomouse` sets `no_mouse`, mirroring `--nosplash` exactly,
+    /// and leaves the other switches unaffected.
+    #[test]
+    fn parse_launch_args_reads_nomouse() {
+        let opts = parse_launch_args(["--nomouse".to_string()]);
+        assert!(opts.no_mouse);
+        assert!(!opts.no_splash);
+        assert_eq!(opts.theme, None);
+    }
+
+    /// Parser: no `--nomouse` switch at all leaves it unset (mouse capture
+    /// stays governed by `config.toml` alone).
+    #[test]
+    fn parse_launch_args_leaves_nomouse_unset_when_the_switch_is_absent() {
+        let opts = parse_launch_args(["--nosplash".to_string()]);
+        assert!(!opts.no_mouse);
+    }
+
+    /// Parser: `--nomouse` composes with `--nosplash` and `--theme`
+    /// regardless of order, just like any two independent switches.
+    #[test]
+    fn parse_launch_args_reads_nomouse_alongside_other_switches_regardless_of_order() {
+        let nomouse_first = parse_launch_args(["--nomouse".to_string(), "--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
+        assert!(nomouse_first.no_mouse);
+        assert!(nomouse_first.no_splash);
+        assert_eq!(nomouse_first.theme.as_deref(), Some("terminal-green"));
+
+        let nomouse_last = parse_launch_args(["--theme=terminal-green".to_string(), "--nosplash".to_string(), "--nomouse".to_string()]);
+        assert!(nomouse_last.no_mouse);
+        assert!(nomouse_last.no_splash);
+        assert_eq!(nomouse_last.theme.as_deref(), Some("terminal-green"));
     }
 
     /// theme-selection "Valid override wins over configuration": a valid

@@ -21,6 +21,9 @@ use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::ViewerState;
 use filecommand_core::{Command, PanelSide, State, UiPhase};
 
+mod mouse;
+pub use mouse::{map_mouse, MouseTracker};
+
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
     // The quit-confirmation dialog is the topmost modal overlay of all: it
     // can open above panels, the viewer, an open menu, or any other modal

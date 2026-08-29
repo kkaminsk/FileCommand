@@ -210,6 +210,48 @@ pub fn panel_title(panel: &PanelState, active: bool) -> String {
     }
 }
 
+/// The clickable regions `render_panel` currently draws for `panel` at
+/// `area` (mouse-input "Hit-testing stays in the TUI"): the whole rect, the
+/// title row, and — in Full mode only — each drawn entry row keyed by name.
+/// Mirrors `render_panel`'s own `has_strip`/`reserved`/`body_y0`/`rows_h`
+/// geometry exactly, rather than re-deriving it independently, so this can
+/// never describe a row that isn't actually where `render_panel` painted
+/// it. Brief/Tree/Info/QuickView modes record `area`/`title` only — no
+/// discrete per-file row exists in those layouts the way it does in Full
+/// mode.
+pub fn hit_test(area: Rect, panel: &PanelState) -> crate::hitmap::PanelHits {
+    let mut hits = crate::hitmap::PanelHits { area, ..Default::default() };
+    if area.width < 4 || area.height < 3 {
+        return hits;
+    }
+    let x0 = area.x;
+    let y0 = area.y;
+    let right_x = x0 + area.width - 1;
+    hits.title = Rect { x: x0, y: y0, width: area.width, height: 1 };
+
+    let has_strip = area.height >= 4 && tab_strip::is_visible(panel);
+    let reserved = if has_strip { 3 } else { 2 };
+    if area.height < reserved {
+        return hits;
+    }
+    let body_y0 = y0 + if has_strip { 2 } else { 1 };
+    let body_h = area.height - reserved;
+
+    if panel.display_mode != DisplayMode::Full {
+        return hits;
+    }
+    let rows_start = body_y0 + 1;
+    let rows_h = body_h.saturating_sub(1);
+    let visible = panel.visible_indices();
+    for row in 0..rows_h {
+        let y = rows_start + row;
+        let Some(entry) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i)) else { continue };
+        let rect = Rect { x: x0 + 1, y, width: right_x.saturating_sub(x0 + 1), height: 1 };
+        hits.rows.push((rect, entry.name.clone()));
+    }
+    hits
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     buf: &mut Buffer,

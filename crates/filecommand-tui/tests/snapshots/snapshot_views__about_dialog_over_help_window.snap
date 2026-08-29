@@ -1,6 +1,5 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 1118
 expression: text
 ---
 ╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
@@ -12,15 +11,15 @@ expression: text
 ║        ╠────────────────────────────────────────────────────────────╣        ║
 ║        ║ Abo┌─────────────── About FileCommand ────────────────┐    ║        ║
 ║        ║ Key│                   FileCommand                    │    ║        ║
-║        ║ Pan│                  Version 0.1.0                   │    ║        ║
-║        ║ Fil│    Copyright (C) 2026 The FileCommand Authors    │    ║        ║
-║        ║ Men│   Inspired by the Norton Commander, 1986-1998    │    ║        ║
-║        ║ Vie│                                                  │    ║        ║
-║        ║ Edi│            License: MIT OR Apache-2.0            │    ║        ║
-║        ║ Com│      https://github.com/example/filecommand      │    ║        ║
-║        ║ Mod│                        OK                        │    ║        ║
-║        ║ Con└──────────────────────────────────────────────────┘    ║        ║
-║        ║                                                            ║        ║
+║        ║ Mou│                  Version 0.1.0                   │    ║        ║
+║        ║ Pan│    Copyright (C) 2026 The FileCommand Authors    │    ║        ║
+║        ║ Fil│   Inspired by the Norton Commander, 1986-1998    │    ║        ║
+║        ║ Men│                                                  │    ║        ║
+║        ║ Vie│            License: MIT OR Apache-2.0            │    ║        ║
+║        ║ Edi│      https://github.com/example/filecommand      │    ║        ║
+║        ║ Com│                        OK                        │    ║        ║
+║        ║ Mod└──────────────────────────────────────────────────┘    ║        ║
+║        ║ Configuration                                              ║        ║
 ║        ╠────────────────────────────────────────────────────────────╣        ║
 ║        ║                      Help     Cancel                       ║        ║
 ║        ╚════════════════════════════════════════════════════════════╝        ║
