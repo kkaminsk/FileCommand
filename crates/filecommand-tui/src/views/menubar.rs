@@ -179,6 +179,66 @@ fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
     buf.set_string(x, y + 1 + visible as u16, format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_w)), body_style);
 }
 
+/// The clickable menu-title rects `render_menu_bar` currently draws across
+/// the top row of `area` (mouse-input "Key bar, menu bar, pull-down items,
+/// and dialog buttons are clickable"). Mirrors `title_positions`' exact
+/// placement, same as the renderer itself does.
+pub fn hit_titles(area: Rect) -> Vec<(Rect, MenuId)> {
+    if area.height == 0 || area.width == 0 {
+        return vec![];
+    }
+    let mut out = Vec::with_capacity(ALL_MENUS.len());
+    for (id, x) in title_positions() {
+        let x = area.x + x;
+        if x >= area.x + area.width {
+            break;
+        }
+        let w = (id.title().chars().count() as u16).min(area.x + area.width - x);
+        out.push((Rect { x, y: area.y, width: w, height: 1 }, id));
+    }
+    out
+}
+
+/// The open pull-down's clickable item rects at `area` (the same full-
+/// screen `area` `render_menu_bar`/`render_pulldown` are given), indexed by
+/// position in `menu::entries(menu.active)` so the index matches exactly
+/// what `MenuState::selected` would land on — separators simply have no
+/// entry here. Mirrors `render_pulldown`'s box-geometry math (`box_w`,
+/// `box_h`, `x`, `y`, `visible`) so an item rect can never land somewhere
+/// the box isn't actually drawn. Empty when the pull-down is closed.
+pub fn hit_items(area: Rect, menu: &MenuState) -> Vec<(Rect, usize)> {
+    if !menu.pulldown_open {
+        return vec![];
+    }
+    let id = menu.active;
+    let content_rows = entries(id).len() as u16;
+    let avail_h = area.height.saturating_sub(1);
+    let box_w = clamp_overlay_dim(pulldown_inner_width(id) as u16 + 2, MIN_INNER_W + 2, area.width);
+    let box_h = clamp_overlay_dim(content_rows + 2, MIN_BOX_H, avail_h);
+    if box_h < 2 {
+        return vec![];
+    }
+    let inner_w = box_w.saturating_sub(2);
+    let visible = box_h.saturating_sub(2) as usize;
+
+    let title_x = title_positions().iter().find(|(m, _)| *m == id).map(|(_, x)| *x).unwrap_or(LEAD);
+    let mut x = area.x + title_x.saturating_sub(1);
+    let right_edge = area.x + area.width;
+    if x + box_w > right_edge {
+        x = right_edge.saturating_sub(box_w);
+    }
+    let y = area.y + 1;
+
+    let mut out = Vec::new();
+    for (i, entry) in entries(id).iter().take(visible).enumerate() {
+        if matches!(entry, MenuEntry::Item(_)) {
+            let ry = y + 1 + i as u16;
+            out.push((Rect { x: x + 1, y: ry, width: inner_w, height: 1 }, i));
+        }
+    }
+    out
+}
+
 fn clip(s: &str, max_w: usize) -> String {
     let mut out = String::new();
     let mut acc = 0usize;

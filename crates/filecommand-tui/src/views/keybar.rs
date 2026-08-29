@@ -131,6 +131,33 @@ pub fn render_keybar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDe
     render_bar(buf, area, theme, depth, form);
 }
 
+/// The clickable slot rects `render_keybar` currently draws at `area`, each
+/// paired with its F-key number (1..=10, `10` for F10 — mouse-input "Key
+/// bar, menu bar, pull-down items, and dialog buttons are clickable").
+/// Mirrors `choose_form`/`render_bar`'s exact placement (same form choice,
+/// same running `x`) so a click can never land on a slot that isn't
+/// actually drawn there.
+pub fn hit_slots(area: Rect) -> Vec<(Rect, u8)> {
+    let form = choose_form(area.width, &[KEYS_FULL, KEYS_SHORT, KEYS_NUMBERS_ONLY]);
+    let mut out = Vec::with_capacity(form.len());
+    let mut x = area.x;
+    let right_edge = area.x + area.width;
+    for (i, (num, label)) in form.iter().enumerate() {
+        if i > 0 {
+            x += 1;
+        }
+        let slot_w = (display_width(num) + display_width(label)) as u16;
+        if x + slot_w > right_edge {
+            break;
+        }
+        if let Ok(n) = num.parse::<u8>() {
+            out.push((Rect { x, y: area.y, width: slot_w, height: 1 }, n));
+        }
+        x += slot_w;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

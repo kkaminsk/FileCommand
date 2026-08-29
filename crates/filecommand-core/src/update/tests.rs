@@ -3915,3 +3915,333 @@ fn opened_menu_state_from(mut state: State, cursor_on: &str) -> State {
     assert!(state.file_action_menu.is_some(), "setup precondition: the menu must be open");
     state
 }
+
+// ---------------------------------------------------------------------
+// Mouse (mouse-basics, design D2)
+// ---------------------------------------------------------------------
+
+/// mouse-input "Click focuses and places the cursor" — "Click on the
+/// inactive panel".
+#[test]
+fn click_entry_focuses_the_clicked_panel_and_moves_its_cursor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.right.entries = vec![file_entry("notes.txt", 1), file_entry("other.txt", 2)];
+    let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Right, name: OsString::from("notes.txt"), mods: ClickMods::Plain });
+    assert_eq!(state.active, PanelSide::Right);
+    assert_eq!(state.right.cursor, 0);
+}
+
+/// mouse-input "Click on a selected entry keeps it selected" — a plain
+/// click never touches the selection set, only the cursor.
+#[test]
+fn click_entry_plain_never_changes_selection() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from("b.txt"), mods: ClickMods::Plain });
+    assert_eq!(state.left.cursor, 1);
+    assert!(state.left.selected.contains(&OsString::from("a.txt")), "the existing selection survives an unrelated plain click");
+    assert!(!state.left.selected.contains(&OsString::from("b.txt")), "a plain click never selects the clicked entry either");
+}
+
+/// mouse-input "Ctrl+click toggles selection" — "Toggle on".
+#[test]
+fn ctrl_click_toggles_selection_and_moves_the_cursor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from("a.txt"), mods: ClickMods::Ctrl });
+    assert!(state.left.selected.contains(&OsString::from("a.txt")));
+    assert_eq!(state.left.cursor, 0);
+
+    let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from("a.txt"), mods: ClickMods::Ctrl });
+    assert!(!state.left.selected.contains(&OsString::from("a.txt")), "a second Ctrl+click toggles it back off");
+}
+
+/// mouse-input "Ctrl+click toggles selection" — "Parent entry ignored".
+#[test]
+fn ctrl_click_on_parent_entry_never_selects_it() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None }];
+    let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from(".."), mods: ClickMods::Ctrl });
+    assert!(state.left.selected.is_empty());
+    assert_eq!(state.left.cursor, 0, "the cursor still moves to `..`");
+}
+
+/// A name the panel no longer lists is a silent no-op, not a panic — the
+/// hit map can go briefly stale between a frame being drawn and the click
+/// landing (e.g. a re-read completing in between).
+#[test]
+fn click_entry_on_a_vanished_name_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.right.entries = vec![file_entry("a.txt", 1)];
+    let before_cursor = state.right.cursor;
+    let (state, effects) = update(state, Command::ClickEntry { side: PanelSide::Right, name: OsString::from("gone.txt"), mods: ClickMods::Plain });
+    assert!(effects.is_empty());
+    assert_eq!(state.right.cursor, before_cursor);
+    assert_eq!(state.active, PanelSide::Right, "focus still moves to the clicked side even though the name missed");
+}
+
+/// mouse-input "Click focuses and places the cursor" — clicking blank body
+/// area or the title focuses without moving the cursor.
+#[test]
+fn focus_panel_switches_active_without_touching_the_cursor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.right.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
+    state.right.cursor = 1;
+    let (state, effects) = update(state, Command::FocusPanel(PanelSide::Right));
+    assert!(effects.is_empty());
+    assert_eq!(state.active, PanelSide::Right);
+    assert_eq!(state.right.cursor, 1, "the cursor is untouched");
+}
+
+/// mouse-input "Wheel moves the cursor of the panel under the pointer" —
+/// "Wheel over the inactive panel": the cursor of the scrolled panel moves,
+/// the active panel does not change.
+#[test]
+fn scroll_panel_moves_the_cursor_of_the_named_side_without_changing_focus() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.right.entries = (0..10).map(|i| file_entry(&format!("f{i}.txt"), 1)).collect();
+    let (state, _) = update(state, Command::ScrollPanel { side: PanelSide::Right, delta: 3 });
+    assert_eq!(state.active, PanelSide::Left, "the active panel never changes");
+    assert_eq!(state.right.cursor, 3, "three rows per notch");
+}
+
+#[test]
+fn scroll_panel_upward_never_underflows_past_the_first_row() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = (0..10).map(|i| file_entry(&format!("f{i}.txt"), 1)).collect();
+    state.left.cursor = 1;
+    let (state, _) = update(state, Command::ScrollPanel { side: PanelSide::Left, delta: -3 });
+    assert_eq!(state.left.cursor, 0);
+}
+
+/// mouse-input "Key bar, menu bar, pull-down items, and dialog buttons are
+/// clickable" — "Key bar Copy".
+#[test]
+fn keybar_press_five_opens_the_copy_setup_dialog() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::KeybarPress(5));
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind: JobKind::Copy, .. })));
+}
+
+#[test]
+fn keybar_press_ten_requests_quit_exactly_like_f10() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::KeybarPress(10));
+    assert!(state.quit_confirm);
+}
+
+#[test]
+fn keybar_press_out_of_range_is_a_no_op() {
+    let state = test_state(UiPhase::Panels);
+    let before = state.clone();
+    let (state, effects) = update(state, Command::KeybarPress(0));
+    assert!(effects.is_empty());
+    assert_eq!(state, before);
+}
+
+/// mouse-input "Key bar, menu bar, pull-down items, and dialog buttons are
+/// clickable" — a menu-title click opens that pull-down.
+#[test]
+fn menu_title_click_opens_the_named_pulldown() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::MenuTitleClick(MenuId::Files));
+    let menu = state.menu.expect("the bar opens");
+    assert_eq!(menu.active, MenuId::Files);
+    assert!(menu.pulldown_open);
+}
+
+/// A menu-title click while a different pull-down is already open switches
+/// to the clicked one instead of stacking overlays.
+#[test]
+fn menu_title_click_switches_from_an_already_open_menu() {
+    let mut state = test_state(UiPhase::Panels);
+    state.menu = Some(MenuState::for_menu(MenuId::Left));
+    let (state, _) = update(state, Command::MenuTitleClick(MenuId::Options));
+    assert_eq!(state.menu.unwrap().active, MenuId::Options);
+}
+
+/// mouse-input "Menu item activation" — clicking `Files` then `Delete`
+/// starts the delete-confirmation flow exactly as F8 would.
+#[test]
+fn menu_item_click_activates_the_item_exactly_like_menu_activate() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    let delete_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Delete")).unwrap();
+    let (state, _) = update(state, Command::MenuItemClick(delete_index));
+    assert!(state.menu.is_none(), "activating an item closes the bar");
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })));
+}
+
+#[test]
+fn menu_item_click_on_a_disabled_item_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    let disabled_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "View")).unwrap();
+    let (state, effects) = update(state, Command::MenuItemClick(disabled_index));
+    assert!(state.menu.is_some(), "a disabled item never closes the bar");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn menu_item_click_with_no_menu_open_is_a_no_op() {
+    let state = test_state(UiPhase::Panels);
+    let before = state.clone();
+    let (state, effects) = update(state, Command::MenuItemClick(0));
+    assert!(effects.is_empty());
+    assert_eq!(state, before);
+}
+
+/// mouse-input "Dialog button" — clicking `Skip All` on the conflict dialog
+/// applies the choice exactly as if selected by keyboard.
+#[test]
+fn dialog_button_click_conflict_skip_all_sends_the_same_effect_as_the_key() {
+    let progress_state = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (state, _) = update(progress_state, Command::JobConflict(sample_conflict()));
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }), "setup precondition");
+
+    let (_, effects) = update(state.clone(), Command::FileOpConflictChoice(ConflictChoice::SkipAll));
+    let (_, click_effects) = update(state, Command::DialogButtonClick(ButtonId::ConflictSkipAll));
+    assert_eq!(effects, click_effects);
+}
+
+/// mouse-input "Running job accepts Cancel only" — the Cancel button click
+/// signals the same cancellation the keyboard path does.
+#[test]
+fn dialog_button_click_progress_cancel_cancels_the_job() {
+    let state = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (_, effects) = update(state, Command::DialogButtonClick(ButtonId::ProgressCancel));
+    assert_eq!(effects, vec![Effect::CancelJob]);
+}
+
+/// Quit-dialog buttons reach the same global `quit_confirm` handling the
+/// keyboard's Y/N does, regardless of what phase is underneath.
+#[test]
+fn dialog_button_click_quit_yes_confirms_quit() {
+    let mut state = test_state(UiPhase::Panels);
+    state.quit_confirm = true;
+    let (state, effects) = update(state, Command::DialogButtonClick(ButtonId::QuitYes));
+    assert!(effects.contains(&Effect::Quit));
+    assert!(!state.quit_confirm);
+}
+
+#[test]
+fn dialog_button_click_quit_no_cancels_the_quit_dialog_and_restores_context() {
+    let mut state = test_state(UiPhase::Viewer(crate::viewer::ViewerState::new(PathBuf::from("f.txt"), 0)));
+    state.quit_confirm = true;
+    let (state, effects) = update(state, Command::DialogButtonClick(ButtonId::QuitNo));
+    assert!(effects.is_empty());
+    assert!(!state.quit_confirm);
+    assert!(matches!(state.phase, UiPhase::Viewer(_)), "cancelling only clears the flag, restoring whatever was underneath");
+}
+
+/// `Command::OpenActionMenuAt`: files get the same single-target menu
+/// `handle_enter` builds; directories get the same menu minus View, Edit,
+/// and Run (file-action-menu "Directory targets and selection-scoped
+/// invocation").
+#[test]
+fn open_action_menu_at_opens_the_menu_for_a_file() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.entries = vec![file_entry("notes.txt", 1)];
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Right, name: OsString::from("notes.txt") });
+    assert_eq!(state.active, PanelSide::Right);
+    assert_eq!(state.right.cursor, 0);
+    let menu = state.file_action_menu.expect("the menu opens for a file target");
+    assert_eq!(menu.target_name, OsString::from("notes.txt"));
+    assert!(!menu.selection_scoped, "not a member of any selection");
+}
+
+/// file-action-menu "Directory targets and selection-scoped invocation" —
+/// "Directory menu contents".
+#[test]
+fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("src")];
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("src") });
+    assert_eq!(state.left.cursor, 0, "the cursor moves to the target");
+    let menu = state.file_action_menu.expect("the menu opens for a directory target too");
+    assert_eq!(
+        menu.entries,
+        vec![
+            FileActionMenuEntry::Copy,
+            FileActionMenuEntry::Rename,
+            FileActionMenuEntry::Move,
+            FileActionMenuEntry::Delete,
+            FileActionMenuEntry::SendToClipboard,
+        ]
+    );
+}
+
+#[test]
+fn open_action_menu_at_on_the_parent_entry_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None }];
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("..") });
+    assert!(state.file_action_menu.is_none(), "`..` is never a valid action-menu target");
+}
+
+/// file-action-menu "Directory targets and selection-scoped invocation" —
+/// "Selection-scoped delete": right-clicking a member of a multi-entry
+/// selection scopes Delete to the whole selection, not just the clicked
+/// entry.
+#[test]
+fn open_action_menu_at_on_a_selected_entry_scopes_delete_to_the_whole_selection() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2), file_entry("c.txt", 3), file_entry("d.txt", 4)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    state.left.selected.insert(OsString::from("b.txt"));
+    state.left.selected.insert(OsString::from("c.txt"));
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert!(menu.selection_scoped);
+
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, .. }) => {
+            assert_eq!(sources.len(), 3, "the dialog is scoped to the whole selection, naming the count");
+        }
+        other => panic!("expected DeleteConfirm scoped to the selection, got {other:?}"),
+    }
+}
+
+/// Right-clicking an entry that is *not* selected stays scoped to that one
+/// entry, exactly like the pre-existing Enter behavior.
+#[test]
+fn open_action_menu_at_on_an_unselected_entry_stays_single_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert!(!menu.selection_scoped);
+
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("b.txt"));
+        }
+        other => panic!("expected DeleteConfirm scoped to b.txt alone, got {other:?}"),
+    }
+}
+
+/// file-action-menu "Enter stays single-target": the keyboard path never
+/// scopes to the selection even when the cursor entry is itself selected.
+#[test]
+fn enter_on_a_selected_entry_still_opens_a_single_target_menu() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2), file_entry("c.txt", 3)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    state.left.selected.insert(OsString::from("b.txt"));
+    state.left.selected.insert(OsString::from("c.txt"));
+    state.left.cursor = 1; // b.txt, itself selected
+    let (state, _) = update(state, Command::Enter);
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert!(!menu.selection_scoped, "Enter-key invocation SHALL remain single-target and file-only");
+}

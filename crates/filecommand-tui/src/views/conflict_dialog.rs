@@ -5,6 +5,7 @@ use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::ConflictInfo;
 use filecommand_core::listing::{display_width, format_date, format_size, format_time, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::ButtonId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -58,4 +59,39 @@ pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
     buf.set_string(x + 1, y + 6, " ".repeat(inner_w), body);
     buf.set_string(x + 1 + inner_w as u16, y + 6, "\u{2551}", body);
     buf.set_string(x, y + box_h - 1, &bottom, body);
+}
+
+/// The hotkey-text button spans `render_conflict` currently draws at `area`
+/// for the `(O)verwrite  (S)kip  (R)ename  Over(w)rite All  Skip (A)ll` row
+/// — this dialog has no framed buttons, so each hotkey span itself is
+/// recorded as a button (design D2). Empty while the in-place rename input
+/// is showing instead of that row, mirroring the renderer exactly. Mirrors
+/// `render_conflict`'s own `overlay_rect` geometry so the rects can never
+/// drift from what's actually on screen.
+pub fn hit_buttons(area: Rect, rename_input: &Option<String>) -> Vec<(Rect, ButtonId)> {
+    if rename_input.is_some() {
+        return vec![];
+    }
+    let r = overlay_rect((BOX_INNER_W as u16 + 2, 8), (MIN_INNER_W as u16 + 2, 8), (area.width, area.height));
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+    let text = truncate_with_ellipsis("(O)verwrite  (S)kip  (R)ename  Over(w)rite All  Skip (A)ll", inner_w);
+    let base_x = x + 1;
+    let row_y = y + 5;
+
+    let mut out = Vec::new();
+    for (label, id) in [
+        ("(O)verwrite", ButtonId::ConflictOverwrite),
+        ("(S)kip", ButtonId::ConflictSkip),
+        ("(R)ename", ButtonId::ConflictRename),
+        ("Over(w)rite All", ButtonId::ConflictOverwriteAll),
+        ("Skip (A)ll", ButtonId::ConflictSkipAll),
+    ] {
+        if let Some(byte_idx) = text.find(label) {
+            let col = text[..byte_idx].chars().count() as u16;
+            out.push((Rect { x: base_x + col, y: row_y, width: display_width(label) as u16, height: 1 }, id));
+        }
+    }
+    out
 }

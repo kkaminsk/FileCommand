@@ -3,6 +3,7 @@
 use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::ButtonId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -32,4 +33,28 @@ pub fn render_quit_dialog(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Co
     buf.set_string(x, y, &top, style);
     buf.set_string(x, y + 1, &mid, style);
     buf.set_string(x, y + box_h - 1, &bottom, style);
+}
+
+/// The `Y`/`N` character spans inside `render_quit_dialog`'s message at
+/// `area`, recorded as button hits (design D2: a buttonless dialog's hotkey
+/// spans count as buttons). Mirrors the renderer's own `overlay_rect`
+/// geometry exactly.
+pub fn hit_buttons(area: Rect) -> Vec<(Rect, ButtonId)> {
+    let preferred_w = display_width(MESSAGE) as u16 + 2;
+    let r = overlay_rect((preferred_w, 3), (preferred_w, 3), (area.width, area.height));
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+    let message = pad_to_width(&truncate_with_ellipsis(MESSAGE, inner_w), inner_w);
+    let base_x = x + 1;
+    let row_y = y + 1;
+
+    let mut out = Vec::new();
+    for (ch, id) in [('Y', ButtonId::QuitYes), ('N', ButtonId::QuitNo)] {
+        if let Some(byte_idx) = message.find(ch) {
+            let col = message[..byte_idx].chars().count() as u16;
+            out.push((Rect { x: base_x + col, y: row_y, width: 1, height: 1 }, id));
+        }
+    }
+    out
 }

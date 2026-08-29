@@ -5,6 +5,7 @@ use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::{JobKind, ProgressInfo};
 use filecommand_core::listing::{display_width, format_count, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::ButtonId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -72,4 +73,17 @@ pub fn render_progress(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
     buf.set_string(x + 1 + inner_w as u16, y + 5, "\u{2551}", body);
 
     buf.set_string(x, y + box_h - 1, &bottom, body);
+}
+
+/// The `[ Cancel ]` button rect `render_progress` currently draws at
+/// `area` — the only mouse target a running job's progress dialog offers
+/// (mouse-input "Running job accepts Cancel only"). Mirrors the renderer's
+/// own `overlay_rect` geometry exactly.
+pub fn hit_buttons(area: Rect) -> Vec<(Rect, ButtonId)> {
+    let preferred = (BOX_INNER_W as u16 + 2, 7);
+    let r = overlay_rect(preferred, preferred, (area.width, area.height));
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+    let label = "[ Cancel ]";
+    vec![(Rect { x: x + 1, y: y + 5, width: display_width(label) as u16, height: 1 }, ButtonId::ProgressCancel)]
 }
