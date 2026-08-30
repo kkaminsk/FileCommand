@@ -4245,3 +4245,491 @@ fn enter_on_a_selected_entry_still_opens_a_single_target_menu() {
     let menu = state.file_action_menu.as_ref().unwrap();
     assert!(!menu.selection_scoped, "Enter-key invocation SHALL remain single-target and file-only");
 }
+
+// ---------------------------------------------------------------------
+// Mouse drag-and-drop (mouse-panel-drag)
+// ---------------------------------------------------------------------
+
+#[test]
+fn drag_begin_on_a_selected_entry_scopes_to_the_whole_selection() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2), file_entry("c.txt", 3)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    state.left.selected.insert(OsString::from("c.txt"));
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let drag = state.drag.as_ref().expect("drag should have begun");
+    let mut names: Vec<_> = drag.items.iter().map(|s| s.original_name.clone()).collect();
+    names.sort();
+    assert_eq!(names, vec![OsString::from("a.txt"), OsString::from("c.txt")]);
+    assert_eq!(drag.source, PanelSide::Left);
+    assert_eq!(drag.source_dir, PathBuf::from("/left"));
+    assert_eq!(drag.op, JobKind::Copy);
+    assert_eq!(drag.target, None);
+}
+
+#[test]
+fn drag_begin_on_an_unselected_entry_drags_only_that_entry_and_leaves_selection_unchanged() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
+    state.left.selected.insert(OsString::from("a.txt"));
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("b.txt"), op: JobKind::Copy });
+    let drag = state.drag.as_ref().expect("drag should have begun");
+    assert_eq!(drag.items.len(), 1);
+    assert_eq!(drag.items[0].original_name, OsString::from("b.txt"));
+    assert!(state.left.selected.contains(&OsString::from("a.txt")), "selection must be unchanged");
+    assert!(!state.left.selected.contains(&OsString::from("b.txt")));
+}
+
+#[test]
+fn drag_begin_never_drags_the_parent_pseudo_entry() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry::parent_dir(), file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from(".."), op: JobKind::Copy });
+    assert!(state.drag.is_none(), "the parent-directory pseudo-entry SHALL never be dragged");
+}
+
+#[test]
+fn drag_begin_on_an_entry_that_no_longer_exists_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("gone.txt"), op: JobKind::Copy });
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn drag_over_stores_a_valid_target_and_the_recomputed_verb() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Move, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    let drag = state.drag.as_ref().expect("drag must still be in progress");
+    assert_eq!(drag.op, JobKind::Move, "the verb is recomputed on every DragOver (design D2)");
+    assert_eq!(drag.target, Some(DropTarget::PanelDir(PanelSide::Right)));
+}
+
+#[test]
+fn drag_over_rejects_the_items_own_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Left)) });
+    assert_eq!(state.drag.as_ref().unwrap().target, None, "the items' own directory is never a valid target");
+}
+
+#[test]
+fn drag_over_rejects_a_dragged_directory_onto_itself_or_its_own_descendant() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("sub"), op: JobKind::Copy });
+
+    // Onto itself: the `sub` row of the very panel it was dragged from.
+    let (state, _) = update(
+        state,
+        Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("sub") }) },
+    );
+    assert_eq!(state.drag.as_ref().unwrap().target, None, "a directory dropped onto itself must be invalid");
+
+    // Into a listing inside itself: the other panel has since navigated
+    // into a descendant of the dragged directory.
+    let mut state = state;
+    state.right.cwd = PathBuf::from("/left/sub/nested");
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    assert_eq!(state.drag.as_ref().unwrap().target, None, "a descendant of the dragged directory must be invalid");
+}
+
+#[test]
+fn drag_over_rejects_info_and_quick_view_panels() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.display_mode = DisplayMode::Info;
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    assert_eq!(state.drag.as_ref().unwrap().target, None, "Info-mode panels are never valid targets");
+}
+
+#[test]
+fn drag_drop_opens_the_drop_dialog_prefilled_with_the_exact_target_path() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry::parent_dir(), file_entry("a.txt", 1)];
+    state.right.entries = vec![Entry::parent_dir(), dir_entry("OLD")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(
+        state,
+        Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Right, name: OsString::from("OLD") }) },
+    );
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(state.drag.is_none(), "the drag ends the moment the dialog opens");
+    assert!(effects.is_empty(), "opening the dialog is not itself an effect");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, input, buttons, .. }) => {
+            assert_eq!(kind, JobKind::Copy);
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("a.txt"));
+            assert_eq!(input, PathBuf::from("/right").join("OLD").display().to_string());
+            assert_eq!(buttons, Some(DropButtons { focused: JobKind::Copy }));
+        }
+        other => panic!("expected a drop-initiated DestinationInput dialog, got {other:?}"),
+    }
+}
+
+#[test]
+fn drag_drop_on_an_invalid_target_does_nothing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    // No DragOver ever validated a target — `target` stays `None`.
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::Panels), "no dialog opens over an invalid drop");
+    assert!(effects.is_empty());
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn drag_drop_is_cancelled_when_the_source_panel_navigated_away() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    // The source panel navigates elsewhere mid-drag.
+    let mut state = state;
+    state.left.cwd = PathBuf::from("/left/elsewhere");
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::Panels), "the drop is cancelled, not just retargeted");
+    assert!(effects.is_empty());
+    assert!(state.drag.is_none());
+}
+
+/// mouse-drag "Valid drop targets" scenario "Same-panel subdirectory": a
+/// subdirectory row in the *same* panel the drag started from is a valid
+/// target (only the items' own directory and self/descendant drops are
+/// rejected — a different sibling subdirectory of the same panel is fine).
+#[test]
+fn drag_over_accepts_a_subdirectory_row_in_the_same_panel_as_the_source() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![Entry::parent_dir(), file_entry("notes.txt", 1), dir_entry("src")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("notes.txt"), op: JobKind::Copy });
+    let (state, _) = update(
+        state,
+        Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("src") }) },
+    );
+    assert_eq!(
+        state.drag.as_ref().unwrap().target,
+        Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("src") }),
+        "a sibling subdirectory in the source's own panel must be a valid target"
+    );
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
+            assert_eq!(input, PathBuf::from("/left").join("src").display().to_string());
+        }
+        other => panic!("expected the same-panel subdirectory drop dialog, got {other:?}"),
+    }
+    assert!(effects.is_empty());
+}
+
+/// mouse-drag "Robust against listing changes": "the target row no longer
+/// resolves to a directory" — a `SubDir` target validated by an earlier
+/// `DragOver` must be re-checked at `DragDrop` time, since the entry it named
+/// can have changed kind (or vanished) in between.
+#[test]
+fn drag_drop_is_cancelled_when_the_target_row_no_longer_resolves_to_a_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.entries = vec![dir_entry("OLD")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(
+        state,
+        Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Right, name: OsString::from("OLD") }) },
+    );
+    assert!(state.drag.as_ref().unwrap().target.is_some(), "OLD is a directory, so the target should validate");
+
+    // Between the last `DragOver` and the button-up, `OLD` stops being a
+    // directory (e.g. a concurrent re-read replaced it with a same-named
+    // file).
+    let mut state = state;
+    state.right.entries = vec![file_entry("OLD", 4)];
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::Panels), "the drop is cancelled when the target no longer resolves to a directory");
+    assert!(effects.is_empty());
+    assert!(state.drag.is_none());
+}
+
+/// mouse-drag "Robust against listing changes": the same re-validation also
+/// cancels the drop outright when the target row disappears entirely rather
+/// than merely changing kind.
+#[test]
+fn drag_drop_is_cancelled_when_the_target_row_has_vanished() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.entries = vec![dir_entry("OLD")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(
+        state,
+        Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Right, name: OsString::from("OLD") }) },
+    );
+    let mut state = state;
+    state.right.entries = vec![]; // OLD is gone by the time the button comes up.
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::Panels), "the drop is cancelled when the target row no longer exists");
+    assert!(effects.is_empty());
+    assert!(state.drag.is_none());
+}
+
+/// mouse-drag + operation-dialogs: a Move-proposing drag never runs the job
+/// directly on drop — it only ever opens the drop dialog with `[ Move ]`
+/// focused, and the job starts strictly from an explicit
+/// `FileOpConfirmAs`/`FileOpConfirm` on that dialog (a button click, or Enter
+/// while it's focused). This is the named-test complement to the
+/// `drag_proptests` invariant that no drag-lifecycle command ever emits
+/// `Effect::RunJob` directly.
+#[test]
+fn a_move_drag_drop_opens_the_dialog_and_never_runs_the_job_directly() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    // Right-button drag (design D1): proposes Move.
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Move });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Move, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    let (state, drop_effects) = update(state, Command::DragDrop { op: JobKind::Move });
+    assert!(drop_effects.is_empty(), "DragDrop must never itself emit an effect, let alone RunJob");
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, buttons, .. }) => {
+            assert_eq!(*kind, JobKind::Move);
+            assert_eq!(*buttons, Some(DropButtons { focused: JobKind::Move }), "the dialog must open with [ Move ] focused, not run yet");
+        }
+        other => panic!("expected the drop dialog with Move focused, got {other:?}"),
+    }
+    // Only now, via the dialog's own confirm, does the job actually start.
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.kind, JobKind::Move),
+        other => panic!("expected exactly one RunJob(Move) from the dialog confirm, got {other:?}"),
+    }
+}
+
+#[test]
+fn drag_cancel_clears_the_drag_with_no_effect() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    assert!(state.drag.is_some());
+    let (state, effects) = update(state, Command::DragCancel);
+    assert!(state.drag.is_none());
+    assert!(effects.is_empty());
+    assert!(matches!(state.phase, UiPhase::Panels));
+}
+
+/// mouse-drag "Cancel and phase-change clear the drag": "Pressing Esc during
+/// a drag SHALL cancel it" (tasks.md 2.4). `input::map_panel_key` maps Esc to
+/// `Command::DragCancel` while `state.drag` is `Some` (see
+/// `filecommand-tui/src/input/mod.rs::map_panel_key`'s own test coverage) —
+/// this closes the loop from the core side: a `DragDrop` that arrives *after*
+/// the cancel (exactly what `MouseTracker` sends on the button-up that
+/// follows a cancelled drag, since it only learns the drag ended once this
+/// event lands) finds `state.drag` already `None` and is a pure no-op, so
+/// "no dialog opens and nothing changes" holds end to end.
+#[test]
+fn a_drag_drop_that_arrives_after_esc_cancelled_the_drag_is_a_no_op() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    let (state, _) = update(state, Command::DragCancel);
+    assert!(state.drag.is_none(), "Esc must clear the drag immediately");
+
+    // The button-up event the TUI's `MouseTracker` still has queued arrives
+    // after the cancel — `resolve_drag_release` cannot know the drag was
+    // cancelled and sends `DragDrop` regardless (mouse-panel-drag input
+    // stage); core must not resurrect a dialog from it.
+    let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::Panels), "no dialog opens from a drop after Esc cancelled the drag");
+    assert!(effects.is_empty());
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn keyboard_copy_dialog_still_has_no_button_row() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestCopy);
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { buttons, .. }) => {
+            assert_eq!(buttons, None, "the keyboard F5 dialog has no button row");
+        }
+        other => panic!("expected DestinationInput, got {other:?}"),
+    }
+}
+
+/// operation-dialogs "Switching the verb in the dialog": clicking `[ Move ]`
+/// on a dialog that opened proposing Copy starts a Move job, without first
+/// needing to change which button is focused.
+#[test]
+fn file_op_confirm_as_overrides_the_dialogs_opened_verb() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) });
+    let (state, _) = update(state, Command::DragDrop { op: JobKind::Copy });
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, buttons, .. }) => {
+            assert_eq!(*kind, JobKind::Copy);
+            assert_eq!(*buttons, Some(DropButtons { focused: JobKind::Copy }));
+        }
+        other => panic!("expected drop dialog, got {other:?}"),
+    }
+    let (state, effects) = update(state, Command::FileOpConfirmAs(JobKind::Move));
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.kind, JobKind::Move),
+        other => panic!("expected exactly one RunJob(Move), got {other:?}"),
+    }
+}
+
+/// `ButtonId::DropDialogCopy`/`DropDialogMove`/`DropDialogCancel` route
+/// exactly like their keyboard equivalents via `button_command`.
+#[test]
+fn drop_dialog_button_ids_route_through_button_command() {
+    assert_eq!(button_command(ButtonId::DropDialogCopy), Some(Command::FileOpConfirmAs(JobKind::Copy)));
+    assert_eq!(button_command(ButtonId::DropDialogMove), Some(Command::FileOpConfirmAs(JobKind::Move)));
+    assert_eq!(button_command(ButtonId::DropDialogCancel), Some(Command::FileOpCancel));
+}
+
+#[test]
+fn drag_clears_when_the_f9_menu_opens() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    assert!(state.drag.is_some());
+    let (state, _) = update(state, Command::MenuOpen);
+    assert!(state.drag.is_none(), "opening an overlay must clear an in-progress drag");
+}
+
+#[test]
+fn drag_clears_on_quit_request() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::RequestQuit);
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn drag_clears_on_listing_failure() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Right, message: "boom".to_string() });
+    assert!(state.drag.is_none());
+}
+
+#[test]
+fn drag_clears_on_resize_below_the_minimum() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::Resize(10, 5));
+    assert!(matches!(state.phase, UiPhase::Placeholder));
+    assert!(state.drag.is_none());
+}
+
+mod drag_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn arb_side() -> impl Strategy<Value = PanelSide> {
+        prop_oneof![Just(PanelSide::Left), Just(PanelSide::Right)]
+    }
+
+    fn arb_verb() -> impl Strategy<Value = JobKind> {
+        prop_oneof![Just(JobKind::Copy), Just(JobKind::Move)]
+    }
+
+    fn arb_name() -> impl Strategy<Value = OsString> {
+        prop_oneof![Just(OsString::from("a.txt")), Just(OsString::from("sub")), Just(OsString::from(".."))].prop_map(|n| n)
+    }
+
+    fn arb_drop_target() -> impl Strategy<Value = DropTarget> {
+        prop_oneof![
+            arb_side().prop_map(DropTarget::PanelDir),
+            (arb_side(), arb_name()).prop_map(|(side, name)| DropTarget::SubDir { side, name }),
+            (arb_side(), arb_name()).prop_map(|(side, name)| DropTarget::TreeNode { side, path: PathBuf::from(name) }),
+            (arb_side(), 0usize..3).prop_map(|(side, index)| DropTarget::Tab { side, index }),
+        ]
+    }
+
+    fn arb_command() -> impl Strategy<Value = Command> {
+        prop_oneof![
+            (arb_side(), arb_name(), arb_verb()).prop_map(|(side, name, op)| Command::DragBegin { side, name, op }),
+            (arb_verb(), prop::option::of(arb_drop_target())).prop_map(|(op, target)| Command::DragOver { op, target }),
+            arb_verb().prop_map(|op| Command::DragDrop { op }),
+            Just(Command::DragCancel),
+            (arb_side(), arb_name()).prop_map(|(side, name)| Command::ClickEntry { side, name, mods: ClickMods::Plain }),
+            Just(Command::ToggleSelectAtCursor),
+            Just(Command::RequestCopy),
+            Just(Command::RequestMove),
+            // `ConfirmQuit`/`CancelQuit` are deliberately excluded: core
+            // assumes (via the TUI's mode-gating table, not enforced here)
+            // that they only ever arrive while `state.quit_confirm` is
+            // already `true` — `RequestQuit` alone already exercises the
+            // relevant drag-clearing path (see `drag_clears_on_quit_request`
+            // above).
+            Just(Command::RequestQuit),
+            Just(Command::MenuOpen),
+            Just(Command::MenuClose),
+            Just(Command::FileOpConfirm),
+            arb_verb().prop_map(Command::FileOpConfirmAs),
+            Just(Command::FileOpCancel),
+            arb_side().prop_map(|panel| Command::ListingFailed { panel, message: "boom".to_string() }),
+            (10u16..200, 4u16..80).prop_map(|(w, h)| Command::Resize(w, h)),
+        ]
+    }
+
+    fn seeded_state() -> State {
+        let mut state = test_state(UiPhase::Panels);
+        state.left.entries = vec![Entry::parent_dir(), dir_entry("sub"), file_entry("a.txt", 1)];
+        state.right.entries = vec![Entry::parent_dir(), dir_entry("sub"), file_entry("a.txt", 1)];
+        state
+    }
+
+    fn any_overlay_open(state: &State) -> bool {
+        state.menu.is_some()
+            || state.drive_select.is_some()
+            || state.fuzzy_jump.is_some()
+            || state.find_file.is_some()
+            || state.user_menu.is_some()
+            || state.theme_picker.is_some()
+            || state.file_action_menu.is_some()
+            || state.help.is_some()
+            || state.startup_warning.is_some()
+            || state.quit_confirm
+    }
+
+    proptest! {
+        /// mouse-drag "Cancel and phase-change clear the drag", property-
+        /// tested over random command interleavings (design D5): `drag` is
+        /// never `Some` outside `UiPhase::Panels` with no overlay open, and
+        /// none of `DragBegin`/`DragOver`/`DragDrop`/`DragCancel` ever
+        /// directly emits `Effect::RunJob` — a job only ever starts through
+        /// the dialog's own `FileOpConfirm`/`FileOpConfirmAs`.
+        #[test]
+        fn drag_invariants_hold_over_random_command_interleavings(cmds in prop::collection::vec(arb_command(), 0..25)) {
+            let mut state = seeded_state();
+            for cmd in cmds {
+                let is_drag_lifecycle_cmd =
+                    matches!(cmd, Command::DragBegin { .. } | Command::DragOver { .. } | Command::DragDrop { .. } | Command::DragCancel);
+                let (next_state, effects) = update(state, cmd);
+                state = next_state;
+                if is_drag_lifecycle_cmd {
+                    prop_assert!(
+                        !effects.iter().any(|e| matches!(e, Effect::RunJob(_))),
+                        "DragBegin/DragOver/DragDrop/DragCancel must never directly emit RunJob"
+                    );
+                }
+                if state.drag.is_some() {
+                    prop_assert!(matches!(state.phase, UiPhase::Panels), "drag survived outside UiPhase::Panels");
+                    prop_assert!(!any_overlay_open(&state), "drag survived with an overlay open");
+                }
+            }
+        }
+    }
+}

@@ -12,6 +12,8 @@ use ratatui::Terminal;
 
 use filecommand_core::drives::DriveSelect;
 use filecommand_core::editor::EditorState;
+use filecommand_core::fs_ops::dialog::{DropButtons, FileOpSetup};
+use filecommand_core::fs_ops::{JobKind, SourceItem};
 use filecommand_core::git_info::{FileStatus, GitInfo};
 use filecommand_core::info::InfoValues;
 use filecommand_core::listing::{DateTime, Entry, EntryKind, SortMode};
@@ -19,7 +21,7 @@ use filecommand_core::menu::{MenuId, MenuState};
 use filecommand_core::panel::{ClipboardFeedback, DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
-use filecommand_core::{PanelSide, State, UiPhase};
+use filecommand_core::{DragState, DropTarget, PanelSide, State, UiPhase};
 
 use filecommand_tui::views;
 
@@ -134,6 +136,75 @@ fn snapshot_full_panels_active_right_inactive_left() {
     state.active = PanelSide::Right;
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("full_panels_active_right", text);
+}
+
+// -----------------------------------------------------------------
+// mouse-panel-drag: drag-in-progress feedback and the drop-initiated
+// dialog (tasks.md 3.2).
+// -----------------------------------------------------------------
+
+#[test]
+fn snapshot_drag_in_progress_shows_target_feedback_on_the_right_panel() {
+    // Left is the active source panel, dragging `readme.txt` onto the
+    // right panel's `docs` row — a valid same-op Copy target.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.drag = Some(DragState {
+        source: PanelSide::Left,
+        source_dir: state.left.cwd.clone(),
+        items: vec![SourceItem { original_name: "readme.txt".into(), path: state.left.cwd.join("readme.txt"), is_dir: false }],
+        op: JobKind::Copy,
+        target: Some(DropTarget::SubDir { side: PanelSide::Right, name: "docs".into() }),
+    });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Copy 1 file \u{25BA} docs\\"), "target mini-status must name the verb, count, and directory:\n{text}");
+    assert!(text.contains("Drop=Copy  Shift/RightBtn=Move  Esc=Cancel"), "key bar must relabel for the drag's duration:\n{text}");
+    insta::assert_snapshot!("drag_in_progress_target_feedback", text);
+}
+
+#[test]
+fn snapshot_drag_in_progress_over_an_invalid_target_shows_cant_drop_here() {
+    // Dragging `docs` (a directory) and hovering the source panel itself —
+    // its own directory is always invalid (mouse-drag "Same directory is
+    // invalid").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.drag = Some(DragState {
+        source: PanelSide::Left,
+        source_dir: state.left.cwd.clone(),
+        items: vec![SourceItem { original_name: "docs".into(), path: state.left.cwd.join("docs"), is_dir: true }],
+        op: JobKind::Copy,
+        target: None,
+    });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Can't drop here"), "the drag's own source panel shows the invalid-target status:\n{text}");
+    insta::assert_snapshot!("drag_in_progress_invalid_target", text);
+}
+
+fn drop_dialog_state(focused: JobKind) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+        kind: focused,
+        sources: vec![SourceItem { original_name: "readme.txt".into(), path: PathBuf::from(r"C:\Users\demo\left\readme.txt"), is_dir: false }],
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        input: r"C:\Users\demo\right".to_string(),
+        buttons: Some(DropButtons { focused }),
+    });
+    state
+}
+
+#[test]
+fn snapshot_drop_dialog_with_copy_focused() {
+    let text = render_to_text(80, 24, &drop_dialog_state(JobKind::Copy), ColorDepth::Ansi16);
+    assert!(text.contains("Copy 1 file"));
+    assert!(text.contains("[ Copy ]") && text.contains("[ Move ]") && text.contains("[ Cancel ]"));
+    insta::assert_snapshot!("drop_dialog_copy_focused", text);
+}
+
+#[test]
+fn snapshot_drop_dialog_with_move_focused() {
+    let text = render_to_text(80, 24, &drop_dialog_state(JobKind::Move), ColorDepth::Ansi16);
+    assert!(text.contains("Move 1 file"));
+    assert!(text.contains("[ Copy ]") && text.contains("[ Move ]") && text.contains("[ Cancel ]"));
+    insta::assert_snapshot!("drop_dialog_move_focused", text);
 }
 
 #[test]

@@ -9,6 +9,7 @@
 //! frame.
 
 use std::ffi::OsString;
+use std::path::PathBuf;
 
 use filecommand_core::menu::MenuId;
 use filecommand_core::update::ButtonId;
@@ -30,9 +31,25 @@ pub struct PanelHits {
     /// Each currently-drawn entry row, keyed by the entry's *original* name
     /// — never a row index — so identity survives scrolling, sorting, and a
     /// quick filter narrowing what's visible (mouse-input "Row identity
-    /// survives scrolling"). Populated for `DisplayMode::Full` today; the
-    /// other display modes record `area`/`title` only.
+    /// survives scrolling"). Populated for `DisplayMode::Full` only — the
+    /// other display modes record `area`/`title` only, except `Tree`, which
+    /// records [`Self::tree_nodes`] instead.
     pub rows: Vec<(Rect, OsString)>,
+    /// Each currently-drawn Tree-mode node row, keyed by the node's own
+    /// path rather than its position in the flattened, lazily-expanded node
+    /// list — a row index would go stale the instant a sibling node
+    /// expands/collapses or the tree re-flattens, exactly the "keying items
+    /// by row index is rejected" reasoning design D4 already applies to
+    /// dragged items themselves (mouse-panel-drag; additional-panel-modes
+    /// "Tree display mode structure and rendering"). Populated only in
+    /// `DisplayMode::Tree`; empty otherwise.
+    pub tree_nodes: Vec<(Rect, PathBuf)>,
+    /// This panel's currently-drawn tab-strip cells, keyed by position in
+    /// `PanelState::tab_dirs()` (design D7: "a tab in the strip stands for
+    /// its directory") — the same index `DropTarget::Tab` carries. Empty
+    /// when the strip isn't shown (fewer than two tabs, or too little
+    /// vertical room for it).
+    pub tabs: Vec<(Rect, usize)>,
 }
 
 /// Every clickable region drawn this frame. `views::render` returns one of

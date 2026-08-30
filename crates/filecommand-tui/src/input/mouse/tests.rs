@@ -7,10 +7,11 @@ use filecommand_core::dialogs::{FileActionMenuState, ThemePickerState, UserMenuS
 use filecommand_core::drives::DriveSelect;
 use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::FileOpSetup;
+use filecommand_core::fs_ops::JobKind;
 use filecommand_core::menu::{MenuId, MenuState};
 use filecommand_core::quicksearch::FuzzyJumpState;
 use filecommand_core::theme::Theme;
-use filecommand_core::update::{ButtonId, ClickMods};
+use filecommand_core::update::{ButtonId, ClickMods, DropTarget};
 use filecommand_core::{Command, PanelSide, State, UiPhase};
 
 use super::*;
@@ -38,11 +39,13 @@ fn sample_hitmap() -> HitMap {
         area: Rect { x: 0, y: 0, width: 20, height: 10 },
         title: Rect { x: 0, y: 0, width: 20, height: 1 },
         rows: vec![(Rect { x: 2, y: 3, width: 10, height: 1 }, OsString::from("a.txt"))],
+        ..Default::default()
     };
     *hm.panel_mut(PanelSide::Right) = PanelHits {
         area: Rect { x: 20, y: 0, width: 20, height: 10 },
         title: Rect { x: 20, y: 0, width: 20, height: 1 },
         rows: vec![],
+        ..Default::default()
     };
     hm.keybar = vec![(Rect { x: 10, y: 20, width: 5, height: 1 }, 5)];
     hm.menu_titles = vec![(Rect { x: 5, y: 0, width: 5, height: 1 }, MenuId::Files)];
@@ -125,16 +128,120 @@ fn ctrl_click_does_not_arm_a_double_click() {
     assert_eq!(cmd, Some(Command::ClickEntry { side: PanelSide::Left, name: OsString::from("a.txt"), mods: ClickMods::Plain }));
 }
 
-/// A press that drags to a different cell before release is not a click.
+/// A press that drags to a different cell before release is not a click —
+/// mouse-panel-drag's territory: a press on an entry row that moves begins
+/// and then completes a drag instead (mouse-drag "Drag lifecycle").
 #[test]
-fn a_drag_before_release_is_not_a_click() {
+fn a_drag_before_release_begins_and_completes_a_drag_not_a_click() {
     let hitmap = sample_hitmap();
     let state = test_state();
     let mut tracker = MouseTracker::new();
     map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
-    map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 4, 3), &hitmap, &mut tracker, &state);
+    let begin = map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 4, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(begin, Some(Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy }));
     let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 4, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::DragDrop { op: JobKind::Copy }), "not a click; a completed drag instead");
+}
+
+// ---------------------------------------------------------------------
+// mouse-panel-drag: drag lifecycle, verb selection, and de-duplication
+// (tasks.md 2.1).
+// ---------------------------------------------------------------------
+
+/// A press that never moves is untouched by any of this — still a plain
+/// click, exactly as mouse-basics pinned it.
+#[test]
+fn a_press_that_never_moves_is_still_a_plain_click() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::ClickEntry { side: PanelSide::Left, name: OsString::from("a.txt"), mods: ClickMods::Plain }));
+}
+
+/// A press that starts on blank panel area and then moves never begins a
+/// drag (mouse-drag "Drag lifecycle": only "a press on an entry row"
+/// qualifies) — and releasing it is a no-op, exactly like the old
+/// (pre-drag) "moved press" behaviour.
+#[test]
+fn a_press_on_blank_area_that_moves_never_begins_a_drag() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 15, 8), &hitmap, &mut tracker, &state);
+    let drag_event = map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 16, 8), &hitmap, &mut tracker, &state);
+    assert_eq!(drag_event, None);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 16, 8), &hitmap, &mut tracker, &state);
     assert_eq!(cmd, None);
+}
+
+/// mouse-drag "Drag lifecycle": dragging the pressed entry over the other
+/// panel's blank area resolves that panel as a `PanelDir` target once the
+/// pointer actually gets there.
+#[test]
+fn dragging_over_the_other_panel_resolves_a_panel_dir_target() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 4, 3), &hitmap, &mut tracker, &state); // crosses the threshold: DragBegin
+    let cmd = map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 25, 5), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Right)) }));
+}
+
+/// An unchanged target/verb across successive `Drag` events is
+/// de-duplicated — no repeated `DragOver` (mouse-drag "de-duplicated so an
+/// unchanged target doesn't re-emit every event").
+#[test]
+fn an_unchanged_drag_target_does_not_re_emit_drag_over() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 4, 3), &hitmap, &mut tracker, &state); // DragBegin
+    let first = map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 25, 5), &hitmap, &mut tracker, &state);
+    assert!(matches!(first, Some(Command::DragOver { .. })));
+    let second = map_mouse(ev(MouseEventKind::Drag(MouseButton::Left), 26, 6), &hitmap, &mut tracker, &state); // still over the right panel's blank area
+    assert_eq!(second, None, "the target didn't change, so nothing re-emits");
+}
+
+/// mouse-drag "Verb selection": Shift+left-button drag proposes Move.
+#[test]
+fn shift_drag_proposes_move() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev_mods(MouseEventKind::Down(MouseButton::Left), 3, 3, KeyModifiers::SHIFT), &hitmap, &mut tracker, &state);
+    let begin = map_mouse(ev_mods(MouseEventKind::Drag(MouseButton::Left), 4, 3, KeyModifiers::SHIFT), &hitmap, &mut tracker, &state);
+    assert_eq!(begin, Some(Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Move }));
+}
+
+/// mouse-drag "Verb selection": Ctrl+left-button drag still proposes Copy —
+/// Ctrl never proposes Move.
+#[test]
+fn ctrl_drag_still_proposes_copy() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev_mods(MouseEventKind::Down(MouseButton::Left), 3, 3, KeyModifiers::CONTROL), &hitmap, &mut tracker, &state);
+    let begin = map_mouse(ev_mods(MouseEventKind::Drag(MouseButton::Left), 4, 3, KeyModifiers::CONTROL), &hitmap, &mut tracker, &state);
+    assert_eq!(begin, Some(Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy }));
+}
+
+/// mouse-drag "Verb selection" / "Right-button drag proposes Move": a
+/// right-button press that moves before release begins a Move-proposing
+/// drag instead of opening the action menu.
+#[test]
+fn right_button_press_that_moves_begins_a_move_drag_instead_of_the_action_menu() {
+    let hitmap = sample_hitmap();
+    let state = test_state();
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Right), 3, 3), &hitmap, &mut tracker, &state);
+    let begin = map_mouse(ev(MouseEventKind::Drag(MouseButton::Right), 4, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(begin, Some(Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Move }));
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Right), 4, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::DragDrop { op: JobKind::Move }));
 }
 
 #[test]
@@ -167,15 +274,19 @@ fn click_on_a_menu_title_opens_the_pulldown() {
     assert_eq!(cmd, Some(Command::MenuTitleClick(MenuId::Files)));
 }
 
-/// mouse-input "Right-click opens the action menu": a right-click `Down` on
-/// a panel row dispatches `OpenActionMenuAt` straight away — no matching
-/// `Up` needed, unlike a left-click.
+/// mouse-input "Right-click opens the action menu" / mouse-panel-drag: a
+/// right-button press that never moves before release still opens the
+/// action menu, now resolved on `Up` rather than `Down` — deferred so a
+/// right-button press that *does* move first can become a drag instead
+/// (mouse-drag "Verb selection": "a right-button drag ... SHALL propose
+/// Move").
 #[test]
 fn right_click_on_an_entry_row_opens_the_action_menu() {
     let hitmap = sample_hitmap();
     let state = test_state();
     let mut tracker = MouseTracker::new();
-    let cmd = map_mouse(ev(MouseEventKind::Down(MouseButton::Right), 3, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(map_mouse(ev(MouseEventKind::Down(MouseButton::Right), 3, 3), &hitmap, &mut tracker, &state), None, "Down alone dispatches nothing");
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Right), 3, 3), &hitmap, &mut tracker, &state);
     assert_eq!(cmd, Some(Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("a.txt") }));
 }
 
@@ -184,11 +295,14 @@ fn right_click_off_any_row_does_nothing() {
     let hitmap = sample_hitmap();
     let state = test_state();
     let mut tracker = MouseTracker::new();
-    let cmd = map_mouse(ev(MouseEventKind::Down(MouseButton::Right), 15, 8), &hitmap, &mut tracker, &state);
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Right), 15, 8), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Right), 15, 8), &hitmap, &mut tracker, &state);
     assert_eq!(cmd, None);
 }
 
-/// A right-click breaks any in-progress left-click double-click chain.
+/// A right-button press breaks any in-progress left-click double-click
+/// chain immediately on `Down`, even though opening the action menu itself
+/// is now deferred to `Up`.
 #[test]
 fn right_click_clears_the_double_click_chain() {
     let hitmap = sample_hitmap();

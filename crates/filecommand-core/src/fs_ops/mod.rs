@@ -11,7 +11,7 @@ pub mod path;
 pub mod worker;
 
 pub use conflict::{ConflictChoice, ConflictInfo, ConflictPolicy, ConflictResolution};
-pub use dialog::{FileOpSetup, RunningDialog};
+pub use dialog::{DropButtons, FileOpSetup, RunningDialog};
 pub use error::{ErrorChoice, ErrorInfo, ErrorPolicy, ErrorResolution, SkippedItem};
 pub use fs::{ChunkControl, FakeFs, FileId, FileSystem, FsMetadata, RawEntry, RealFs, ReparseKind};
 pub use job::{CancelFlag, Job, JobKind, JobOutcome, JobSink, ProgressInfo, SourceItem};

@@ -109,6 +109,10 @@ pub enum Role {
     ScreenBackdrop,
     ScreenPlaceholder,
     PanelFrame,
+    /// The target panel's frame+title while a mouse drag (mouse-panel-drag)
+    /// hovers a valid drop target — additive to `PanelFrame`, drawn only for
+    /// the duration of the drag (mouse-drag "Drag feedback").
+    PanelFrameDrop,
     PanelTitleActive,
     PanelTitleInactive,
     PanelHeader,
@@ -177,6 +181,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::ScreenBackdrop,
     Role::ScreenPlaceholder,
     Role::PanelFrame,
+    Role::PanelFrameDrop,
     Role::PanelTitleActive,
     Role::PanelTitleInactive,
     Role::PanelHeader,
@@ -228,6 +233,7 @@ impl Role {
             Role::ScreenBackdrop => "screen.backdrop",
             Role::ScreenPlaceholder => "screen.placeholder",
             Role::PanelFrame => "panel.frame",
+            Role::PanelFrameDrop => "panel.frame.drop",
             Role::PanelTitleActive => "panel.title.active",
             Role::PanelTitleInactive => "panel.title.inactive",
             Role::PanelHeader => "panel.header",
@@ -378,6 +384,10 @@ impl Theme {
         set(Role::ScreenBackdrop, Inherit, A(Blue));
         set(Role::ScreenPlaceholder, A(White), A(Blue));
         set(Role::PanelFrame, A(Cyan), A(Blue));
+        // A brighter foreground on the same panel background — a drag
+        // hovering this panel reads as "hot" without changing its hue
+        // (design D6: nc-classic bright-white on blue).
+        set(Role::PanelFrameDrop, A(BrightWhite), A(Blue));
         set(Role::PanelTitleActive, A(Black), A(Cyan));
         set(Role::PanelTitleInactive, A(Cyan), A(Blue));
         set(Role::PanelHeader, A(BrightYellow), A(Blue));
@@ -437,6 +447,12 @@ impl Theme {
         set(Role::ScreenBackdrop, ColorValue::Inherit, A(Black));
         set(Role::ScreenPlaceholder, A(White), A(Black));
         set(Role::PanelFrame, A(White), A(Black));
+        // Mono's frame is already white, so `PanelFrame` itself has no
+        // brighter foreground to lend the drop role (theme-system's
+        // every-role rule forbids a colorless no-op here) — the only
+        // meaningful cue left is a full inversion (design D6: "inverted —
+        // black on white").
+        set(Role::PanelFrameDrop, A(Black), A(White));
         set(Role::PanelTitleActive, A(Black), A(White));
         set(Role::PanelTitleInactive, A(White), A(Black));
         set(Role::PanelHeader, A(White), A(Black));
@@ -511,6 +527,10 @@ impl Theme {
         set(Role::ScreenBackdrop, ColorValue::Inherit, A(Black));
         set(Role::ScreenPlaceholder, A(Green), A(Black));
         set(Role::PanelFrame, A(Green), A(Black));
+        // `PanelFrame`'s own fg/bg swapped — the same "invert your own
+        // frame" move `nc-mono` makes, kept within this theme's single hue
+        // (design D6).
+        set(Role::PanelFrameDrop, A(Black), A(Green));
         set(Role::PanelTitleActive, A(Black), A(Green));
         set(Role::PanelTitleInactive, A(Green), A(Black));
         set(Role::PanelHeader, A(Green), A(Black));
@@ -578,6 +598,9 @@ impl Theme {
         set(Role::ScreenBackdrop, ColorValue::Inherit, A(Magenta));
         set(Role::ScreenPlaceholder, A(White), A(Magenta));
         set(Role::PanelFrame, A(BrightMagenta), A(Magenta));
+        // `PanelFrame`'s fg/bg swapped, mirroring `terminal-green`'s own
+        // choice (design D6).
+        set(Role::PanelFrameDrop, A(Magenta), A(BrightMagenta));
         set(Role::PanelTitleActive, A(Black), A(BrightMagenta));
         set(Role::PanelTitleInactive, A(BrightMagenta), A(Magenta));
         set(Role::PanelHeader, A(BrightYellow), A(Magenta));
@@ -643,6 +666,9 @@ impl Theme {
         set(Role::ScreenBackdrop, ColorValue::Inherit, A(Black));
         set(Role::ScreenPlaceholder, A(Yellow), A(Black));
         set(Role::PanelFrame, A(Yellow), A(Black));
+        // `PanelFrame`'s fg/bg swapped, staying within this theme's own hue
+        // family (design D6; theme-system "single-hue constraint").
+        set(Role::PanelFrameDrop, A(Black), A(Yellow));
         set(Role::PanelTitleActive, A(Black), A(Yellow));
         set(Role::PanelTitleInactive, A(Yellow), A(Black));
         set(Role::PanelHeader, A(Yellow), A(Black));
@@ -715,6 +741,9 @@ impl Theme {
         set(Role::ScreenBackdrop, ColorValue::Inherit, A(BrightWhite));
         set(Role::ScreenPlaceholder, A(Black), A(BrightWhite));
         set(Role::PanelFrame, A(Black), A(BrightWhite));
+        // `PanelFrame`'s fg/bg swapped — no hue anywhere, matching this
+        // theme's own no-hue constraint (design D6).
+        set(Role::PanelFrameDrop, A(BrightWhite), A(Black));
         set(Role::PanelTitleActive, A(BrightWhite), A(Black));
         set(Role::PanelTitleInactive, A(Black), A(BrightWhite));
         set(Role::PanelHeader, A(Black), A(BrightWhite));

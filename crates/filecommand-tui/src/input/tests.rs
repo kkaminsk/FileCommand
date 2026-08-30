@@ -136,6 +136,7 @@ fn destination_input_state() -> State {
         sources: vec![],
         source_dir: PathBuf::from("/left"),
         input: String::new(),
+        buttons: None,
     }))
 }
 
@@ -276,6 +277,22 @@ fn esc_requests_quit_unconditionally_and_does_not_touch_the_buffer() {
     // shell "Quit request keys and confirmation").
     assert_eq!(map(plain(KeyCode::Esc), &typing("dir")), Some(Command::RequestQuit));
     assert_eq!(map(plain(KeyCode::Esc), &panels()), Some(Command::RequestQuit), "Esc requests quit even with nothing typed");
+}
+
+/// mouse-drag "Cancel and phase-change clear the drag": "Pressing Esc during
+/// a drag SHALL cancel it" — overriding the otherwise-unconditional
+/// Esc-requests-quit mapping just above.
+#[test]
+fn esc_cancels_an_in_progress_drag_instead_of_requesting_quit() {
+    let mut state = panels();
+    state.drag = Some(filecommand_core::update::DragState {
+        source: PanelSide::Left,
+        source_dir: PathBuf::from("/left"),
+        items: vec![filecommand_core::fs_ops::SourceItem { original_name: "a.txt".into(), path: PathBuf::from("/left/a.txt"), is_dir: false }],
+        op: filecommand_core::fs_ops::JobKind::Copy,
+        target: None,
+    });
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DragCancel));
 }
 
 #[test]
