@@ -35,8 +35,13 @@ Burn scope switch, and versioning).
 
   ```powershell
   dotnet tool install --global wix
-  wix extension add WixToolset.BootstrapperApplications.wixext
+  wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
   ```
+
+  Pin the extension to `5.0.2` explicitly — `wix extension add` without a
+  version resolves the latest release (currently 7.0.0), which is not
+  compatible with the WiX v5 CLI and fails the bundle build with
+  `WIX0144: The extension ... could not be found`.
 
 `build.ps1` checks for `dotnet`, `wix`, and `cargo` on `PATH` up front and
 fails fast with an install hint if any are missing.
