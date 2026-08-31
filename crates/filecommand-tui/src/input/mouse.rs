@@ -16,7 +16,8 @@
 use std::ffi::OsString;
 
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
-use filecommand_core::update::ClickMods;
+use filecommand_core::fs_ops::JobKind;
+use filecommand_core::update::{ClickMods, DropTarget};
 use filecommand_core::{Command, PanelSide, State, UiPhase};
 
 use crate::hitmap::{self, HitMap};
@@ -41,19 +42,38 @@ pub struct MouseTracker {
     /// double-click (design D3: "second Down on the same row within ~400
     /// ms"). Cleared on a Ctrl+click, a non-entry click, or once consumed.
     last_click: Option<(PanelSide, OsString, u64)>,
+    /// The verb/target last sent via `DragBegin`/`DragOver` for the
+    /// in-progress drag (mouse-panel-drag "Drag lifecycle"; design D4): also
+    /// doubles as "is a drag actually under way right now", since it is
+    /// `Some` only between a real `DragBegin` and the drag ending (drop,
+    /// cancel, or `reset()`) — a moved press that never started on an entry
+    /// row (so no `DragBegin` was ever sent) leaves this `None` for the
+    /// whole gesture. Comparing against it before each `DragOver` is what
+    /// keeps an unchanged target from re-emitting every event (mouse-drag:
+    /// "de-duplicated so an unchanged target doesn't re-emit every event").
+    drag_sent: Option<(JobKind, Option<DropTarget>)>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PressState {
     x: u16,
     y: u16,
     button: MouseButton,
     ctrl: bool,
     /// Set once `Drag` reports the pointer over a different cell than where
-    /// it went down — a moved press resolves as a drag gesture on `Up`
-    /// (mouse-panel-drag's territory, a non-goal here), never a click or a
-    /// Ctrl-toggle (design D3: "Ctrl-click-without-movement detection").
+    /// it went down — mouse-panel-drag's ≥ 1 cell threshold (design D2)
+    /// reuses this verbatim rather than adding a coarser one. A moved press
+    /// resolves as a drag gesture on `Up` (or, if it started on an entry
+    /// row, already mid-drag by then via `DragBegin`/`DragOver`), never a
+    /// click or a Ctrl-toggle (design D3: "Ctrl-click-without-movement
+    /// detection").
     moved: bool,
+    /// The entry (if any) the press landed on, resolved once at press time
+    /// against the same hit map a drag beginning later needs — a drag can
+    /// only ever begin "on an entry row" (mouse-drag "Drag lifecycle"), so a
+    /// press on blank panel area, a title, or a tab/tree-node hit never
+    /// starts one, however far it moves.
+    origin_entry: Option<(PanelSide, OsString)>,
 }
 
 impl MouseTracker {
@@ -61,23 +81,33 @@ impl MouseTracker {
         Self::default()
     }
 
-    /// Discard all in-progress press/double-click state. Called at every
-    /// `TerminalGuard::resume()` call site (design D1).
+    /// Discard all in-progress press/double-click/drag state. Called at
+    /// every `TerminalGuard::resume()` call site (design D1).
     pub fn reset(&mut self) {
         self.press = None;
         self.last_click = None;
+        self.drag_sent = None;
     }
 
-    fn begin_press(&mut self, x: u16, y: u16, button: MouseButton, ctrl: bool) {
-        self.press = Some(PressState { x, y, button, ctrl, moved: false });
+    fn begin_press(&mut self, x: u16, y: u16, button: MouseButton, ctrl: bool, origin_entry: Option<(PanelSide, OsString)>) {
+        self.press = Some(PressState { x, y, button, ctrl, moved: false, origin_entry });
     }
 
-    fn note_drag(&mut self, x: u16, y: u16, button: MouseButton) {
+    /// Marks the current press as moved once its cell differs from where it
+    /// went down, returning whether *this* call is the one that made that
+    /// transition (`false` -> `true`) — the exact event mouse-panel-drag's
+    /// "moved at least one cell" threshold is crossed on, and so the one
+    /// `resolve_panels_drag` must answer with `DragBegin` rather than
+    /// `DragOver`.
+    fn note_drag(&mut self, x: u16, y: u16, button: MouseButton) -> bool {
         if let Some(p) = &mut self.press {
             if p.button == button && (p.x != x || p.y != y) {
+                let just_crossed = !p.moved;
                 p.moved = true;
+                return just_crossed;
             }
         }
+        false
     }
 
     /// Take the current press iff it was for `button`; `None` both when
@@ -176,7 +206,7 @@ pub fn map_mouse(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker,
 fn map_dialog_buttons(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker) -> Option<Command> {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            tracker.begin_press(event.column, event.row, MouseButton::Left, false);
+            tracker.begin_press(event.column, event.row, MouseButton::Left, false, None);
             None
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -197,7 +227,7 @@ fn map_dialog_buttons(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTra
 fn map_pulldown(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker) -> Option<Command> {
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            tracker.begin_press(event.column, event.row, MouseButton::Left, false);
+            tracker.begin_press(event.column, event.row, MouseButton::Left, false, None);
             None
         }
         MouseEventKind::Drag(MouseButton::Left) => {
@@ -229,39 +259,162 @@ fn map_panels(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker, st
     match event.kind {
         MouseEventKind::Down(MouseButton::Left) => {
             let ctrl = event.modifiers.contains(KeyModifiers::CONTROL);
-            tracker.begin_press(event.column, event.row, MouseButton::Left, ctrl);
+            let origin = press_origin(event.column, event.row, hitmap);
+            tracker.begin_press(event.column, event.row, MouseButton::Left, ctrl, origin);
             None
         }
-        MouseEventKind::Drag(MouseButton::Left) => {
-            tracker.note_drag(event.column, event.row, MouseButton::Left);
-            None
-        }
+        MouseEventKind::Drag(MouseButton::Left) => resolve_panels_drag(event, hitmap, tracker, state, MouseButton::Left),
         MouseEventKind::Up(MouseButton::Left) => {
             let press = tracker.take_press(MouseButton::Left)?;
+            if press.moved {
+                return resolve_drag_release(event, tracker, MouseButton::Left);
+            }
             resolve_panels_click(event.column, event.row, press, hitmap, tracker, state)
         }
-        // Right-click opens the action menu straight on `Down` — unlike the
-        // left button it has no drag or double-click meaning to
-        // disambiguate, so there is nothing to wait for a matching `Up` to
-        // resolve (mouse-input "Right-click opens the action menu"; design
-        // D2/D4). Any in-progress left-button double-click chain is broken,
-        // matching every other panels-context click resolution below.
-        MouseEventKind::Down(MouseButton::Right) => resolve_right_click(event.column, event.row, hitmap, tracker),
+        // A right-button press is deferred exactly like a left-button one
+        // now: only an `Up` that never moved resolves as opening the action
+        // menu (mouse-input "Right-click opens the action menu"); movement
+        // before release turns it into a Move-proposing drag instead
+        // (mouse-drag "Verb selection": "a right-button drag ... SHALL
+        // propose Move") — there is no way to know which of the two a press
+        // will become until it either releases or moves. Any in-progress
+        // left-button double-click chain is broken immediately on `Down`,
+        // matching the immediate-on-`Down` behaviour this replaces.
+        MouseEventKind::Down(MouseButton::Right) => {
+            tracker.last_click = None;
+            let origin = press_origin(event.column, event.row, hitmap);
+            tracker.begin_press(event.column, event.row, MouseButton::Right, false, origin);
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Right) => resolve_panels_drag(event, hitmap, tracker, state, MouseButton::Right),
+        MouseEventKind::Up(MouseButton::Right) => {
+            let press = tracker.take_press(MouseButton::Right)?;
+            if press.moved {
+                return resolve_drag_release(event, tracker, MouseButton::Right);
+            }
+            resolve_right_click(event.column, event.row, hitmap, tracker)
+        }
         MouseEventKind::ScrollDown => resolve_wheel(event.column, event.row, 3, hitmap),
         MouseEventKind::ScrollUp => resolve_wheel(event.column, event.row, -3, hitmap),
         _ => None,
     }
 }
 
-fn resolve_panels_click(x: u16, y: u16, press: PressState, hitmap: &HitMap, tracker: &mut MouseTracker, state: &State) -> Option<Command> {
-    if press.moved {
-        // A drag that ends somewhere is `mouse-panel-drag`'s territory
-        // (Non-Goal here) — never a click, so it doesn't chain into a
-        // double-click either.
-        tracker.last_click = None;
+/// The entry (if any) under `(x, y)` in either panel's currently-drawn rows,
+/// resolved once at press time so a drag beginning later already knows
+/// which side/entry to freeze (mouse-drag "Drag lifecycle": items are
+/// "the pressed entry", named here before any movement has happened).
+fn press_origin(x: u16, y: u16, hitmap: &HitMap) -> Option<(PanelSide, OsString)> {
+    for side in [PanelSide::Left, PanelSide::Right] {
+        if let Some(name) = find_hit(&hitmap.panel(side).rows, x, y) {
+            return Some((side, name));
+        }
+    }
+    None
+}
+
+/// A `Drag` event over the panels (design D2/D4): the first one to cross
+/// the ≥ 1 cell threshold begins the drag (`Command::DragBegin`), scoped to
+/// the entry the press landed on — a no-op if the press didn't start on an
+/// entry row, since mouse-drag's "Drag lifecycle" only ever begins "on an
+/// entry row". Every later `Drag` event recomputes the proposed verb and a
+/// fresh geometric target and, if either changed since the last one sent,
+/// re-emits `Command::DragOver`, de-duplicated via `tracker.drag_sent`
+/// (mouse-drag: "de-duplicated so an unchanged target doesn't re-emit every
+/// event").
+fn resolve_panels_drag(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker, state: &State, button: MouseButton) -> Option<Command> {
+    let just_crossed = tracker.note_drag(event.column, event.row, button);
+    let press = tracker.press.as_ref()?;
+    if press.button != button {
         return None;
     }
+    let (side, name) = press.origin_entry.clone()?;
+    let op = propose_verb(event.modifiers, button);
+    if just_crossed {
+        tracker.drag_sent = Some((op, None));
+        return Some(Command::DragBegin { side, name, op });
+    }
+    let target = resolve_drop_target(event.column, event.row, hitmap, state);
+    let candidate = (op, target);
+    if tracker.drag_sent.as_ref() == Some(&candidate) {
+        return None;
+    }
+    tracker.drag_sent = Some(candidate.clone());
+    Some(Command::DragOver { op: candidate.0, target: candidate.1 })
+}
 
+/// The button released after the press had moved: ends the drag with
+/// `Command::DragDrop` if one had actually begun — `tracker.drag_sent` is
+/// `Some` only for the life of a real drag (see its own doc comment) — or
+/// does nothing if the moved press never started on an entry row in the
+/// first place (mouse-drag "Release on an invalid spot" only applies to a
+/// real drag; a moved press with no drag is simply not a click, exactly as
+/// before mouse-panel-drag). The verb is recomputed fresh from this release
+/// event's own modifiers/button, never reused from the last `DragOver`
+/// (mouse-drag "Verb selection": "recomputed ... of each drag and release
+/// event").
+fn resolve_drag_release(event: MouseEvent, tracker: &mut MouseTracker, button: MouseButton) -> Option<Command> {
+    tracker.last_click = None;
+    tracker.drag_sent.take()?;
+    let op = propose_verb(event.modifiers, button);
+    Some(Command::DragDrop { op })
+}
+
+/// mouse-drag "Verb selection" / design D1/D2: a plain or Ctrl-modified
+/// left-button drag proposes Copy; a Shift-modified left-button drag or any
+/// right-button drag proposes Move — Ctrl never proposes Move. Recomputed
+/// fresh from this event's own modifiers/button every time it's called,
+/// never cached across events, since no key event exists for a bare
+/// modifier press or release (design D2).
+fn propose_verb(modifiers: KeyModifiers, button: MouseButton) -> JobKind {
+    if button == MouseButton::Right || modifiers.contains(KeyModifiers::SHIFT) {
+        JobKind::Move
+    } else {
+        JobKind::Copy
+    }
+}
+
+/// The raw geometric hit at `(x, y)` translated into core's `DropTarget`
+/// vocabulary — never validated here (mouse-drag "Valid drop targets" is
+/// entirely `core::update`'s job by design; this only reports what's
+/// physically under the pointer this frame). Checked per side in the same
+/// rows-then-tree-nodes-then-tabs-then-area/title order every side offers,
+/// mirroring `resolve_panels_click`'s own per-side loop below.
+fn resolve_drop_target(x: u16, y: u16, hitmap: &HitMap, state: &State) -> Option<DropTarget> {
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let panel_hits = hitmap.panel(side);
+        if let Some(name) = find_hit(&panel_hits.rows, x, y) {
+            return Some(resolve_row_target(state, side, name));
+        }
+        if let Some(path) = find_hit(&panel_hits.tree_nodes, x, y) {
+            return Some(DropTarget::TreeNode { side, path });
+        }
+        if let Some(index) = find_hit(&panel_hits.tabs, x, y) {
+            return Some(DropTarget::Tab { side, index });
+        }
+        if hitmap::hit(panel_hits.area, x, y) || hitmap::hit(panel_hits.title, x, y) {
+            return Some(DropTarget::PanelDir(side));
+        }
+    }
+    None
+}
+
+/// A row hit resolves to `SubDir` (a subdirectory or the `..` row) or
+/// `PanelDir` (any non-directory row — per `DropTarget::PanelDir`'s own doc
+/// comment, "its title, blank body area, or any non-directory row all
+/// resolve to this same variant") depending on what the panel's own,
+/// already-loaded listing says about that name right now — the hit map
+/// itself carries no entry-kind information, only the name.
+fn resolve_row_target(state: &State, side: PanelSide, name: OsString) -> DropTarget {
+    let is_dir_like = state.panel(side).entries.iter().find(|e| e.name == name).map(|e| e.is_dir_like()).unwrap_or(false);
+    if is_dir_like {
+        DropTarget::SubDir { side, name }
+    } else {
+        DropTarget::PanelDir(side)
+    }
+}
+
+fn resolve_panels_click(x: u16, y: u16, press: PressState, hitmap: &HitMap, tracker: &mut MouseTracker, state: &State) -> Option<Command> {
     if let Some(id) = find_hit(&hitmap.menu_titles, x, y) {
         tracker.last_click = None;
         return Some(Command::MenuTitleClick(id));

@@ -128,7 +128,16 @@ fn build_hitmap(area: Rect, state: &State) -> HitMap {
                 hm.menu_items = menubar::hit_items(area, menu);
             }
             match &state.phase {
-                UiPhase::FileOpSetup(setup) => hm.dialog_buttons = delete_confirm::hit_buttons(area, setup),
+                UiPhase::FileOpSetup(setup) => {
+                    // Exactly one of these is ever non-empty for a given
+                    // `setup` — `delete_confirm::hit_buttons` no-ops outside
+                    // `DeleteConfirm`, `destination_input::hit_buttons`
+                    // outside a drop-initiated `DestinationInput` — so
+                    // concatenating both is simply "whichever dialog is
+                    // actually showing its buttons this frame."
+                    hm.dialog_buttons = delete_confirm::hit_buttons(area, setup);
+                    hm.dialog_buttons.extend(destination_input::hit_buttons(area, setup));
+                }
                 UiPhase::FileOpRunning { dialog, .. } => {
                     hm.dialog_buttons = match dialog {
                         RunningDialog::Progress { .. } => progress_dialog::hit_buttons(area),
@@ -197,6 +206,8 @@ fn render_phase(
                 identity_lines,
                 &state.right,
                 left_type_ahead,
+                PanelSide::Left,
+                state.drag.as_ref(),
             );
             panel::render_panel(
                 buf,
@@ -208,6 +219,8 @@ fn render_phase(
                 identity_lines,
                 &state.left,
                 right_type_ahead,
+                PanelSide::Right,
+                state.drag.as_ref(),
             );
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
@@ -220,7 +233,7 @@ fn render_phase(
                 clock::render_clock(buf, l.right, theme, depth, clock_text);
             }
             command_line::render_command_line(buf, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
-            keybar::render_keybar(buf, l.keybar, theme, depth);
+            keybar::render_keybar(buf, l.keybar, theme, depth, state.drag.is_some());
 
             // The F9 bar overlays the panels' top borders (and the clock)
             // rather than reserving a row of its own.

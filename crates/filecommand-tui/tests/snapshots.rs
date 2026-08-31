@@ -160,6 +160,6 @@ fn f_key_bar_static_labels() {
     let theme = Theme::classic();
     let area = Rect { x: 0, y: 0, width: 80, height: 1 };
     let mut buf = Buffer::empty(area);
-    views::keybar::render_keybar(&mut buf, area, &theme, ColorDepth::Ansi16);
+    views::keybar::render_keybar(&mut buf, area, &theme, ColorDepth::Ansi16, false);
     insta::assert_snapshot!("f_key_bar", buffer_to_text(&buf, area));
 }

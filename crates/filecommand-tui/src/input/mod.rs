@@ -239,6 +239,17 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let active = state.active;
     let typing = !state.command_line.is_empty();
 
+    // A drag in progress claims Esc unconditionally, cancelling it rather
+    // than reaching the unconditional-quit-request arm below (mouse-drag
+    // "Cancel and phase-change clear the drag": "Pressing Esc during a drag
+    // SHALL cancel it"). `state.drag` is `Some` only in `UiPhase::Panels`
+    // with no overlay open (core's `drag_allowed`), which this function is
+    // already gated on by `map_key`'s own dispatch, so this can never
+    // shadow a dialog's own Esc handling.
+    if state.drag.is_some() && key.code == KeyCode::Esc {
+        return Some(Command::DragCancel);
+    }
+
     // The Ctrl+P quick filter, while active on the active panel, claims
     // plain printables/Backspace before anything else — but leaves every
     // other key (movement, Enter, Esc, ...) to fall through to the normal

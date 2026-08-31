@@ -37,6 +37,13 @@ enum LabelForm {
 pub struct StripCell {
     pub text: String,
     pub active: bool,
+    /// This cell's position in `PanelState::tab_dirs()` — the same index
+    /// `DropTarget::Tab` carries (mouse-panel-drag). Not used by
+    /// `render_tab_strip`'s own drawing, only by [`hit_test`], but recorded
+    /// on every cell `layout` produces (rather than re-deriving it
+    /// separately in the hit-test) so the two can never disagree about
+    /// which tab a given cell stands for.
+    pub index: usize,
 }
 
 fn truncate_name(name: &str, max_w: usize) -> String {
@@ -140,7 +147,7 @@ pub fn layout(basenames: &[String], active: usize, width: usize) -> (Vec<StripCe
         let labels: Vec<String> = basenames.iter().enumerate().map(|(i, n)| label_text(i, n, form)).collect();
         let total: usize = labels.iter().map(|l| display_width(l)).sum();
         if total <= width {
-            let cells = labels.into_iter().enumerate().map(|(i, text)| StripCell { text, active: i == active }).collect();
+            let cells = labels.into_iter().enumerate().map(|(i, text)| StripCell { text, active: i == active, index: i }).collect();
             return (cells, false, false);
         }
     }
@@ -152,7 +159,7 @@ pub fn layout(basenames: &[String], active: usize, width: usize) -> (Vec<StripCe
     let (lo, hi) = scroll_window(&widths, active, width);
     let left_marker = lo > 0;
     let right_marker = hi + 1 < labels.len();
-    let cells = (lo..=hi).map(|i| StripCell { text: labels[i].clone(), active: i == active }).collect();
+    let cells = (lo..=hi).map(|i| StripCell { text: labels[i].clone(), active: i == active, index: i }).collect();
     (cells, left_marker, right_marker)
 }
 
@@ -178,13 +185,20 @@ fn clip(s: &str, max_w: usize) -> String {
 /// Render `panel`'s tab strip into `area` (expected to be exactly one row
 /// tall, spanning the panel's full width). A no-op if the panel has fewer
 /// than 2 tabs — callers should check [`is_visible`] before reserving the
-/// row in the first place.
-pub fn render_tab_strip(buf: &mut Buffer, area: Rect, panel: &PanelState, theme: &Theme, depth: ColorDepth) {
+/// row in the first place. `target_tab`, when `Some`, is the
+/// [`StripCell::index`] of an in-progress drag's current validated tab
+/// target (mouse-panel-drag "Drag feedback"): that cell renders in
+/// `Role::ButtonFocused` instead of its ordinary active/inactive style,
+/// exactly like a target row/node elsewhere in the panel. `None` for every
+/// ordinary frame (no drag, or this strip isn't the drag's target), which
+/// renders byte-identical to before this parameter existed.
+pub fn render_tab_strip(buf: &mut Buffer, area: Rect, panel: &PanelState, theme: &Theme, depth: ColorDepth, target_tab: Option<usize>) {
     if area.height == 0 || area.width == 0 || !is_visible(panel) {
         return;
     }
     let active_style = role_style(theme, Role::TabActive, depth);
     let inactive_style = role_style(theme, Role::TabInactive, depth);
+    let target_style = role_style(theme, Role::ButtonFocused, depth);
     buf.set_string(area.x, area.y, " ".repeat(area.width as usize), inactive_style);
 
     let basenames: Vec<String> = panel.tab_dirs().iter().map(|p| tab_basename(p)).collect();
@@ -201,7 +215,13 @@ pub fn render_tab_strip(buf: &mut Buffer, area: Rect, panel: &PanelState, theme:
         if x >= label_right_edge {
             break;
         }
-        let style = if cell.active { active_style } else { inactive_style };
+        let style = if Some(cell.index) == target_tab {
+            target_style
+        } else if cell.active {
+            active_style
+        } else {
+            inactive_style
+        };
         let budget = (label_right_edge - x) as usize;
         let text = clip(&cell.text, budget);
         buf.set_string(x, area.y, &text, style);
@@ -212,12 +232,131 @@ pub fn render_tab_strip(buf: &mut Buffer, area: Rect, panel: &PanelState, theme:
     }
 }
 
+/// The clickable rect for each currently-drawn tab, keyed by
+/// [`StripCell::index`] — the same index [`filecommand_core::update::DropTarget::Tab`]
+/// carries (mouse-panel-drag; design D7: "a tab in the strip stands for its
+/// directory"). Mirrors `render_tab_strip`'s own geometry exactly — the same
+/// `layout()` call, the same left-marker offset, the same per-cell `clip`
+/// budget — so a hit rect can never describe a cell that isn't actually
+/// where the renderer painted it. A no-op (empty) under the same conditions
+/// `render_tab_strip` itself no-ops on.
+pub fn hit_test(area: Rect, panel: &PanelState) -> Vec<(Rect, usize)> {
+    if area.height == 0 || area.width == 0 || !is_visible(panel) {
+        return Vec::new();
+    }
+    let basenames: Vec<String> = panel.tab_dirs().iter().map(|p| tab_basename(p)).collect();
+    let (cells, left_marker, right_marker) = layout(&basenames, panel.active_tab_index, area.width as usize);
+
+    let right_edge = area.x + area.width;
+    let mut x = area.x;
+    if left_marker {
+        x += 1;
+    }
+    let label_right_edge = if right_marker { right_edge.saturating_sub(1) } else { right_edge };
+    let mut hits = Vec::new();
+    for cell in &cells {
+        if x >= label_right_edge {
+            break;
+        }
+        let budget = (label_right_edge - x) as usize;
+        let text = clip(&cell.text, budget);
+        let w = display_width(&text) as u16;
+        if w > 0 {
+            hits.push((Rect { x, y: area.y, width: w, height: 1 }, cell.index));
+        }
+        x += w;
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
+    use filecommand_core::panel::PanelState;
+
     use super::*;
 
     fn names(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("TAB{i}")).collect()
+    }
+
+    // -----------------------------------------------------------------
+    // mouse-panel-drag: drag-target tab highlighting (tasks.md 2.2).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn render_tab_strip_with_no_target_matches_the_pre_drag_rendering() {
+        let mut panel = PanelState::new(PathBuf::from(r"C:\left"));
+        panel.open_tab();
+        let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+        let theme = Theme::classic();
+
+        let mut with_none = Buffer::empty(area);
+        render_tab_strip(&mut with_none, area, &panel, &theme, ColorDepth::Ansi16, None);
+        let mut baseline = Buffer::empty(area);
+        render_tab_strip(&mut baseline, area, &panel, &theme, ColorDepth::Ansi16, Some(99)); // out-of-range target: no cell has index 99
+        assert_eq!(with_none, baseline, "an out-of-range/absent target must never change any cell's style");
+    }
+
+    #[test]
+    fn render_tab_strip_paints_the_target_tab_in_the_button_focused_role() {
+        let mut panel = PanelState::new(PathBuf::from(r"C:\left"));
+        panel.open_tab();
+        let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+        let theme = Theme::classic();
+        let expected = role_style(&theme, Role::ButtonFocused, ColorDepth::Ansi16);
+
+        let mut buf = Buffer::empty(area);
+        render_tab_strip(&mut buf, area, &panel, &theme, ColorDepth::Ansi16, Some(1));
+        let hits = hit_test(area, &panel);
+        let (rect, _) = hits.iter().find(|(_, i)| *i == 1).expect("tab 1 is drawn at this width");
+        assert_eq!(buf[(rect.x, rect.y)].style().fg, expected.fg, "the target tab's own cell must use button.focused");
+        assert_eq!(buf[(rect.x, rect.y)].style().bg, expected.bg, "the target tab's own cell must use button.focused");
+    }
+
+    // -----------------------------------------------------------------
+    // mouse-panel-drag: `hit_test` (tasks.md 2.1).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hit_test_returns_one_rect_per_visible_cell_in_left_to_right_order() {
+        let mut panel = PanelState::new(PathBuf::from(r"C:\left"));
+        panel.open_tab(); // 2 tabs now, both at the same inherited cwd
+        let area = Rect { x: 5, y: 0, width: 40, height: 1 };
+        let hits = hit_test(area, &panel);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].1, 0);
+        assert_eq!(hits[1].1, 1);
+        // Left-to-right, non-overlapping, and nested inside `area`.
+        assert!(hits[0].0.x >= area.x);
+        assert!(hits[1].0.x >= hits[0].0.x + hits[0].0.width);
+        assert!(hits[1].0.x + hits[1].0.width <= area.x + area.width);
+    }
+
+    #[test]
+    fn hit_test_is_empty_with_a_single_tab() {
+        let panel = PanelState::new(PathBuf::from(r"C:\left"));
+        let area = Rect { x: 0, y: 0, width: 40, height: 1 };
+        assert!(hit_test(area, &panel).is_empty());
+    }
+
+    #[test]
+    fn hit_test_indices_match_scrolled_layout_when_the_strip_overflows() {
+        // 20 tabs, active tab far from the start: the strip scrolls, so the
+        // visible cells' indices must still name the true tab positions, not
+        // their position within the visible window.
+        let mut panel = PanelState::new(PathBuf::from(r"C:\left"));
+        for _ in 0..19 {
+            panel.open_tab();
+        }
+        panel.switch_tab(11); // one-based; activates tab index 10
+        let area = Rect { x: 0, y: 0, width: 12, height: 1 };
+        let hits = hit_test(area, &panel);
+        assert!(hits.iter().any(|(_, i)| *i == 10), "the active tab's own cell must be among the hits");
+        for w in hits.windows(2) {
+            assert!(w[1].1 > w[0].1, "indices must stay in ascending tab order");
+        }
     }
 
     #[test]
