@@ -186,17 +186,17 @@ atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
 
 ### Screen layout
 
-```
-┌──────────────────────┬──────────────────────┐   ← panel top borders + clock
-│  LEFT PANEL           │  RIGHT PANEL          │
-│  (Brief/Full/Info/     │  (independent mode,    │
-│   Tree/Quick View)     │   sort, filter, tabs)  │
-├──────────────────────┴──────────────────────┤
-│ C:\NORTON>_                                   │   ← command line
-├────────────────────────────────────────────────┤
-│ 1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir ...│   ← F-key bar
-└────────────────────────────────────────────────┘
-```
+![FileCommand screen layout](Screen/intro.png)
+
+1. **Left navigation pane** — its own directory, cursor, selection, sort
+   mode, filter, and display mode; the path renders inverse in the top
+   border when this panel is active.
+2. **Right navigation pane** — independent of the left: its own mode, sort,
+   filter, and tabs, so the two panels can browse entirely different
+   locations at once.
+3. **F-key menu** — the function-key command bar (`1Help 2Menu 3View 4Edit
+   5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit`); clickable with the mouse,
+   and relabels under Ctrl/Alt for their key-bar variants.
 
 - Two independent panels, each with its own directory, cursor, selection,
   sort mode, filter, and display mode.
