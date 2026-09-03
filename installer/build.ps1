@@ -26,15 +26,45 @@
     target\release\filecommand.exe. Useful for iterating on WiX authoring
     without rebuilding Rust every time.
 
+.PARAMETER Sign
+    Sign filecommand.exe, both MSIs, and the Burn bundle using Azure
+    Trusted Signing (see the Big Hat Group CodeSigning tooling). Requires
+    an authenticated `az login` session with the Code Signing Certificate
+    Profile Signer role on the BHGPublic/private-mcp profile, plus a local
+    checkout of the CodeSigning repo (for the signing dlib + metadata).
+
+.PARAMETER CodeSigningDlib
+    Path to Azure.CodeSigning.Dlib.dll. Defaults to the CodeSigning repo
+    checkout at C:\GitHub\CodeSigning. Only used with -Sign.
+
+.PARAMETER CodeSigningMetadata
+    Path to the Trusted Signing metadata JSON (endpoint, account, cert
+    profile). Defaults to metadata-packager-mcp-cli.json in the
+    CodeSigning repo checkout. Only used with -Sign.
+
+.PARAMETER SignToolPath
+    Path to signtool.exe. Defaults to auto-detecting the newest Windows
+    SDK signtool on the machine. Only used with -Sign.
+
 .EXAMPLE
     .\build.ps1
     Full build: cargo build --release, then both MSIs, then
-    FileCommandSetup.exe.
+    FileCommandSetup.exe. Unsigned.
+
+.EXAMPLE
+    .\build.ps1 -Sign
+    Full build, signing filecommand.exe, both MSIs, and the bundle with
+    Azure Trusted Signing along the way.
 #>
 [CmdletBinding()]
 param(
     [string]$OutDir = (Join-Path $PSScriptRoot 'out'),
-    [switch]$SkipCargoBuild
+    [switch]$SkipCargoBuild,
+    [switch]$Sign,
+    [string]$CodeSigningDlib = 'C:\GitHub\CodeSigning\Microsoft.Trusted.Signing.Client.1.0.95\bin\x64\Azure.CodeSigning.Dlib.dll',
+    [string]$CodeSigningMetadata = 'C:\GitHub\CodeSigning\metadata-packager-mcp-cli.json',
+    [string]$SignToolPath,
+    [string]$TimestampServer = 'http://timestamp.acs.microsoft.com'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -88,6 +118,36 @@ function Get-WorkspaceVersion {
     return $Matches[1]
 }
 
+function Find-SignTool {
+    $candidates = Get-ChildItem -Path "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+        Sort-Object { try { [version]$_.Directory.Parent.Name } catch { [version]'0.0' } } -Descending
+    if ($candidates) {
+        return $candidates[0].FullName
+    }
+    return $null
+}
+
+function Invoke-FileSigning {
+    param([string]$Path)
+
+    if (-not (Test-Path $Path)) {
+        throw "Cannot sign missing file: $Path"
+    }
+
+    Write-Step "Signing: $Path"
+    & $script:SignToolPath sign /fd SHA256 /tr $TimestampServer /td SHA256 `
+        /dlib $CodeSigningDlib /dmdf $CodeSigningMetadata $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool sign failed for $Path with exit code $LASTEXITCODE"
+    }
+
+    & $script:SignToolPath verify /pa $Path
+    if ($LASTEXITCODE -ne 0) {
+        throw "signtool verify failed for $Path with exit code $LASTEXITCODE"
+    }
+    Write-Host "  Signed and verified: $Path" -ForegroundColor Green
+}
+
 # ---------------------------------------------------------------------------
 # 1. Prerequisite checks
 # ---------------------------------------------------------------------------
@@ -106,6 +166,29 @@ Assert-Prerequisite -Name 'cargo' -Check {
     $null = & cargo --version 2>$null
     $LASTEXITCODE -eq 0
 } -InstallHint 'Install the Rust toolchain from https://rustup.rs'
+
+if ($Sign) {
+    if (-not $SignToolPath) {
+        $SignToolPath = Find-SignTool
+    }
+    Assert-Prerequisite -Name 'signtool.exe (Windows SDK)' -Check {
+        $SignToolPath -and (Test-Path $SignToolPath)
+    } -InstallHint 'Install a Windows SDK (10.0.26100.0+) or pass -SignToolPath explicitly'
+    $script:SignToolPath = $SignToolPath
+
+    Assert-Prerequisite -Name 'Azure.CodeSigning.Dlib.dll' -Check {
+        Test-Path $CodeSigningDlib
+    } -InstallHint "Expected at $CodeSigningDlib -- checkout the CodeSigning repo or pass -CodeSigningDlib"
+
+    Assert-Prerequisite -Name 'Trusted Signing metadata' -Check {
+        Test-Path $CodeSigningMetadata
+    } -InstallHint "Expected at $CodeSigningMetadata -- checkout the CodeSigning repo or pass -CodeSigningMetadata"
+
+    Assert-Prerequisite -Name 'Azure CLI authentication' -Check {
+        $null = & az account show 2>$null
+        $LASTEXITCODE -eq 0
+    } -InstallHint 'Run: az login (needs Code Signing Certificate Profile Signer role on BHGPublic/private-mcp)'
+}
 
 # ---------------------------------------------------------------------------
 # 2. Build the release binary
@@ -129,6 +212,10 @@ if ($SkipCargoBuild) {
 $ExePath = Join-Path $ReleaseDir 'filecommand.exe'
 if (-not (Test-Path $ExePath)) {
     throw "Expected release binary not found at $ExePath. Run without -SkipCargoBuild first."
+}
+
+if ($Sign) {
+    Invoke-FileSigning -Path $ExePath
 }
 
 # ---------------------------------------------------------------------------
@@ -170,6 +257,13 @@ try {
         throw "wix build failed for PackagePerMachine.wxs with exit code $LASTEXITCODE"
     }
 
+    if ($Sign) {
+        # Sign both MSIs *before* the bundle build so it embeds the signed
+        # copies as-is.
+        Invoke-FileSigning -Path $PerUserMsi
+        Invoke-FileSigning -Path $PerMachineMsi
+    }
+
     Write-Step "wix build Bundle.wxs -> $BundleExe"
     & wix build $BundleWxs `
         -d "ProductVersion=$Version" `
@@ -181,6 +275,31 @@ try {
     if ($LASTEXITCODE -ne 0) {
         throw "wix build failed for Bundle.wxs with exit code $LASTEXITCODE"
     }
+
+    if ($Sign) {
+        # Burn bundles need a two-pass sign: detach the stub engine, sign
+        # it, reattach it, then sign the whole bundle. `wix burn
+        # detach`/`reattach` are the WiX v4/v5 replacements for the old
+        # `insignia` tool. This must run from $InstallerDir too, same as
+        # the builds above.
+        $EnginePath = Join-Path $OutDir 'engine.exe'
+        Write-Step "wix burn detach -> $EnginePath"
+        & wix burn detach $BundleExe -engine $EnginePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "wix burn detach failed with exit code $LASTEXITCODE"
+        }
+
+        Invoke-FileSigning -Path $EnginePath
+
+        Write-Step "wix burn reattach -> $BundleExe"
+        & wix burn reattach $BundleExe -engine $EnginePath -o $BundleExe
+        if ($LASTEXITCODE -ne 0) {
+            throw "wix burn reattach failed with exit code $LASTEXITCODE"
+        }
+        Remove-Item -Path $EnginePath -Force -ErrorAction SilentlyContinue
+
+        Invoke-FileSigning -Path $BundleExe
+    }
 } finally {
     Pop-Location
 }
@@ -191,4 +310,8 @@ Write-Host "  Per-user MSI:    $PerUserMsi"
 Write-Host "  Per-machine MSI: $PerMachineMsi"
 Write-Host "  Bundle:          $BundleExe"
 Write-Host ""
-Write-Host "These are UNSIGNED development builds. See README.md for the production signing steps." -ForegroundColor Yellow
+if ($Sign) {
+    Write-Host "All artifacts signed and verified with Azure Trusted Signing." -ForegroundColor Green
+} else {
+    Write-Host "These are UNSIGNED development builds. Pass -Sign to sign with Azure Trusted Signing, or see README.md for manual production signing steps." -ForegroundColor Yellow
+}

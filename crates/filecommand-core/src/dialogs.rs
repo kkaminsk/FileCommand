@@ -130,7 +130,9 @@ impl ThemePickerState {
 
 /// One entry in the file-action menu, in menu order. `Run` is included only
 /// when the target is executable, and always sorts first (file-action-menu
-/// "Menu contents, ordering, and navigation").
+/// "Menu contents, ordering, and navigation"). `SendToClipboard` is always
+/// last and never mutates the filesystem (file-action-menu "No mutation
+/// without an intervening dialog").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileActionMenuEntry {
     Run,
@@ -140,6 +142,7 @@ pub enum FileActionMenuEntry {
     Rename,
     Move,
     Delete,
+    SendToClipboard,
 }
 
 impl FileActionMenuEntry {
@@ -155,40 +158,68 @@ impl FileActionMenuEntry {
             FileActionMenuEntry::Rename => "Rename",
             FileActionMenuEntry::Move => "Move",
             FileActionMenuEntry::Delete => "Delete",
+            FileActionMenuEntry::SendToClipboard => "Send to clipboard",
         }
     }
 }
 
-/// The open Enter-on-file action menu: the name of the cursor entry it
-/// targets (captured at open time, independent of the panel's
-/// multi-selection — file-action-menu "Enter on a file opens the action
-/// menu": "SHALL NOT consume or alter the multi-entry selection"), its
-/// ordered entry list, and the highlighted row.
+/// The open file-action menu: the name of the cursor entry it targets
+/// (captured at open time, independent of the panel's multi-selection —
+/// file-action-menu "Enter on a file opens the action menu": "SHALL NOT
+/// consume or alter the multi-entry selection"), its ordered entry list,
+/// and the highlighted row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileActionMenuState {
     pub target_name: OsString,
     pub entries: Vec<FileActionMenuEntry>,
     pub cursor: usize,
+    /// Whether this menu was opened on an entry that was already a member
+    /// of the panel's selection set, captured at open time exactly like
+    /// `target_name` — when true, `crate::update::activate_file_action`
+    /// scopes Copy, Move, Delete, and Send to clipboard to the whole
+    /// selection set instead of `target_name` alone, and names the
+    /// resulting dialog with the count (mouse-basics design D4;
+    /// file-action-menu "Directory targets and selection-scoped
+    /// invocation"). Always `false` via [`FileActionMenuState::new`], the
+    /// keyboard Enter path, which stays single-target per that same
+    /// requirement ("Enter-key invocation SHALL remain single-target and
+    /// file-only").
+    pub selection_scoped: bool,
 }
 
 impl FileActionMenuState {
-    /// Opens with the first entry highlighted — `Run` when `executable`,
-    /// else `View` (file-action-menu "Menu contents, ordering, and
-    /// navigation").
+    /// The keyboard Enter path: file-only, never selection-scoped
+    /// (file-action-menu "Enter stays single-target"). Opens with the
+    /// first entry highlighted — `Run` when `executable`, else `View`
+    /// (file-action-menu "Menu contents, ordering, and navigation").
     pub fn new(target_name: OsString, executable: bool) -> FileActionMenuState {
+        Self::open(target_name, false, executable, false)
+    }
+
+    /// The general constructor `new` delegates to, and mouse right-click
+    /// uses directly (mouse-input "Right-click opens the action menu").
+    /// `is_dir` omits View, Edit, and Run from the menu — they have no
+    /// meaning for a directory (file-action-menu "Directory targets and
+    /// selection-scoped invocation": "Directory menu contents").
+    /// `selection_scoped` is recorded for `activate_file_action` to read
+    /// later; it does not change which entries are listed.
+    pub fn open(target_name: OsString, is_dir: bool, executable: bool, selection_scoped: bool) -> FileActionMenuState {
         let mut entries = Vec::with_capacity(7);
-        if executable {
-            entries.push(FileActionMenuEntry::Run);
+        if !is_dir {
+            if executable {
+                entries.push(FileActionMenuEntry::Run);
+            }
+            entries.push(FileActionMenuEntry::View);
+            entries.push(FileActionMenuEntry::Edit);
         }
         entries.extend([
-            FileActionMenuEntry::View,
-            FileActionMenuEntry::Edit,
             FileActionMenuEntry::Copy,
             FileActionMenuEntry::Rename,
             FileActionMenuEntry::Move,
             FileActionMenuEntry::Delete,
+            FileActionMenuEntry::SendToClipboard,
         ]);
-        FileActionMenuState { target_name, entries, cursor: 0 }
+        FileActionMenuState { target_name, entries, cursor: 0, selection_scoped }
     }
 
     /// Move the highlight by `delta`, clamped within the entry list — same
@@ -226,9 +257,10 @@ impl FileActionMenuState {
 /// always first and is special-cased (it opens the About dialog rather than
 /// a topic page) — see [`HelpState::activate`] (help-and-about "Help topic
 /// list").
-pub const HELP_TOPICS: [&str; 10] = [
+pub const HELP_TOPICS: [&str; 11] = [
     "About FileCommand",
     "Keyboard reference",
+    "Mouse",
     "Panels and display modes",
     "File operations",
     "Menus",
@@ -357,14 +389,15 @@ pub fn help_topic_visible_rows(window_height: u16) -> usize {
 pub fn topic_page_text(topic_index: usize) -> &'static str {
     match topic_index {
         1 => KEYBOARD_REFERENCE,
-        2 => PANELS_AND_DISPLAY_MODES,
-        3 => FILE_OPERATIONS,
-        4 => MENUS,
-        5 => VIEWER,
-        6 => EDITOR,
-        7 => COMMAND_LINE,
-        8 => MODERN_EXTRAS,
-        9 => CONFIGURATION,
+        2 => MOUSE,
+        3 => PANELS_AND_DISPLAY_MODES,
+        4 => FILE_OPERATIONS,
+        5 => MENUS,
+        6 => VIEWER,
+        7 => EDITOR,
+        8 => COMMAND_LINE,
+        9 => MODERN_EXTRAS,
+        10 => CONFIGURATION,
         _ => "",
     }
 }
@@ -393,6 +426,25 @@ Other bindings:
   Alt+letter   Type-ahead jump to entry
   Ctrl+Left/Right  Adjust the panel split
   Ctrl+=       Reset the panel split to 50/50";
+
+const MOUSE: &str = "\
+Mouse capture is on by default. Click an entry to focus its panel
+and move the cursor there without changing the selection; Ctrl+click
+toggles that entry's selection in place. Double-click acts as Enter.
+The wheel moves the cursor of the panel under the pointer three rows
+per notch; in the viewer it scrolls three lines, in the editor it
+moves the caret three lines. Clicking a function-key-bar slot, a
+menu-bar title, a pull-down item, or a dialog button does exactly
+what the key would; a click outside an open pull-down closes it.
+
+Right-click opens the file-action menu for the clicked entry: on a
+directory it omits View, Edit, and Run, and on an already-selected
+entry it scopes Copy, Move, Delete, and Send to clipboard to the
+whole selection instead of just the one entry. Shift+drag still
+selects text natively in the terminal emulator.
+
+config.toml's [mouse] enabled = false, or the --nomouse launch flag,
+turns capture off entirely.";
 
 const PANELS_AND_DISPLAY_MODES: &str = "\
 Each panel shows a directory listing and can be switched between
@@ -437,12 +489,20 @@ Esc clears it. Ctrl+J opens a fuzzy, frecency-ranked jump list of
 previously visited directories. Ctrl+T/Ctrl+W/Alt+1..9 manage panel
 tabs. Alt+F7 searches the active panel's subtree by name. Ctrl+Left/
 Ctrl+Right adjusts the vertical panel split 2 columns at a time;
-Ctrl+= resets it to 50/50. The split persists across restarts.";
+Ctrl+= resets it to 50/50. The split persists across restarts.
+
+Ctrl+C (or Ctrl+Ins) copies the selected files (or the file under
+the cursor) to the clipboard as file objects, ready to paste into
+Explorer, Outlook, or any other Windows application. Ctrl+Shift+Ins
+copies their absolute paths as text, one per line; the Files menu
+also offers copying just their names. All three act on the same
+selection scope as F5 Copy.";
 
 const CONFIGURATION: &str = "\
 config.toml (next to the executable) sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
-and can remap the quick-filter, fuzzy-jump, and panel-split keys.
+and can remap the quick-filter, fuzzy-jump, panel-split, and
+clipboard (key.clipboard_files, key.clipboard_paths) keys.
 usermenu.toml defines the F2 user menu's entries. --nosplash skips
 the startup splash. --theme <name> (or --theme=<name>) starts the
 session in a built-in theme instead of the configured one, for this
@@ -510,6 +570,7 @@ mod tests {
                 FileActionMenuEntry::Rename,
                 FileActionMenuEntry::Move,
                 FileActionMenuEntry::Delete,
+                FileActionMenuEntry::SendToClipboard,
             ]
         );
     }

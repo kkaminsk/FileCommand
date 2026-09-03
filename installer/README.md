@@ -35,8 +35,13 @@ Burn scope switch, and versioning).
 
   ```powershell
   dotnet tool install --global wix
-  wix extension add WixToolset.BootstrapperApplications.wixext
+  wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
   ```
+
+  Pin the extension to `5.0.2` explicitly — `wix extension add` without a
+  version resolves the latest release (currently 7.0.0), which is not
+  compatible with the WiX v5 CLI and fails the bundle build with
+  `WIX0144: The extension ... could not be found`.
 
 `build.ps1` checks for `dotnet`, `wix`, and `cargo` on `PATH` up front and
 fails fast with an install hint if any are missing.
@@ -117,26 +122,41 @@ after installing.
 
 ## Production signing
 
-Development builds produced by `build.ps1` are unsigned. Before shipping
-a release:
+Plain `build.ps1` produces **unsigned** development builds. Pass `-Sign`
+to sign everything with Azure Trusted Signing (Big Hat Group Inc.'s
+`BHGPublic/private-mcp` certificate profile, from the
+[CodeSigning](https://github.com/kkaminsk/CodeSigning) tooling):
 
-1. **Sign both MSIs** (`installer\out\PackagePerUser.msi` and
-   `installer\out\PackagePerMachine.msi`) with `signtool sign` (or your
-   organization's signing pipeline) using an Authenticode certificate,
-   *before* building the bundle — the bundle embeds the MSIs as-is.
-2. **Rebuild the bundle** (`wix build Bundle.wxs ...`) so it embeds the
-   now-signed MSIs.
-3. **Sign the Burn engine and the final bundle.** Burn bundles require
-   two signing passes: the stub engine is signed once WiX extracts it,
-   then the final `FileCommandSetup.exe` is signed again. See the WiX
-   documentation on signing Burn bundles
-   (https://docs.firegiant.com/wix/tools/signing/) for the
-   `insignia`-based re-signing sequence.
-4. Verify with `signtool verify /pa` on both `Package.msi` and
-   `FileCommandSetup.exe` before publishing.
+```powershell
+.\installer\build.ps1 -Sign
+```
 
-Unsigned builds are accepted for local development and testing; signing
-is a release-time gate, not something `build.ps1` performs automatically.
+This signs, in order: `filecommand.exe` (before packaging), both MSIs
+(before the bundle build, so the bundle embeds already-signed MSIs), then
+the Burn bundle itself via the two-pass sequence — `wix burn detach` to
+extract the stub engine, sign it, `wix burn reattach`, then sign the
+final `FileCommandSetup.exe`. (`wix burn detach`/`reattach` are the WiX
+v4/v5 replacements for the old standalone `insignia` tool; see
+https://docs.firegiant.com/wix/tools/signing/ for background.) Every
+signed file is verified with `signtool verify /pa` immediately after
+signing, and the whole build fails fast if any signature doesn't
+validate.
+
+`-Sign` requires, on the machine running the build:
+
+- An authenticated `az login` / `Connect-AzAccount` session with the
+  Code Signing Certificate Profile Signer role on the
+  `BHGPublic/private-mcp` profile.
+- A local checkout of the CodeSigning repo, for
+  `Azure.CodeSigning.Dlib.dll` and the Trusted Signing metadata JSON.
+  Defaults to `C:\GitHub\CodeSigning`; override with `-CodeSigningDlib`
+  and `-CodeSigningMetadata` if it lives elsewhere.
+- A Windows SDK signtool (10.0.26100.0+ recommended); auto-detected, or
+  pass `-SignToolPath` explicitly.
+
+Unsigned builds remain fine for local development and testing — `-Sign`
+is opt-in, not the default, since most contributors won't have the
+signing certificate's role assignment.
 
 ## Winget
 

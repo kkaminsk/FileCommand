@@ -8,15 +8,21 @@
 //! opposite panel's cursor file, reusing the F3 viewer's text-body
 //! renderer) — plus a mini-status line embedded in the bottom border.
 
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+
+use filecommand_core::fs_ops::JobKind;
 use filecommand_core::git_info::FileStatus;
 use filecommand_core::listing::EntryKind;
 use filecommand_core::listing::{
     display_name_lossy, entry_status_parts, format_date, format_size, format_time, pad_to_width, reading_status, sort_arrow, truncate_with_ellipsis,
     SortColumn,
 };
-use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, SortDirection};
+use filecommand_core::panel::{parent_path, DisplayMode, ListingProgress, PanelState, SortDirection};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::DropTarget;
 use filecommand_core::viewer::{ByteSource, ViewerState};
+use filecommand_core::{DragState, PanelSide};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
@@ -210,6 +216,176 @@ pub fn panel_title(panel: &PanelState, active: bool) -> String {
     }
 }
 
+/// Which drawn row/node/tab (if any) is the drag's current validated target
+/// within this panel — the same identity [`hit_test`] itself uses to key
+/// `PanelHits::rows`/`tree_nodes`/`tabs` (mouse-panel-drag "Drag feedback").
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowHighlight {
+    Row(OsString),
+    TreeNode(PathBuf),
+    Tab(usize),
+}
+
+/// This panel's drag treatment while `state.drag` is `Some` (mouse-panel-drag
+/// "Drag feedback"; design D6): `Valid` when core's already-validated
+/// `DragState::target` names this panel (its directory, a subdirectory/`..`
+/// row, a Tree node, or a tab — see `DropTarget`'s own doc comment), carrying
+/// the row to highlight (`None` for a bare `PanelDir` target — there is no
+/// discrete row for "this panel's directory itself") and the directory the
+/// drop would land in; `Invalid` when this panel is the drag's own source and
+/// no target is currently valid anywhere. The two concrete "Can't drop here"
+/// scenarios (mouse-drag "Directory onto itself is invalid", "Same directory
+/// is invalid") are both a hover back over the source panel itself — the only
+/// case `DragState` (source, target) and this panel's own identity can
+/// jointly distinguish from "the drag is hovering nothing recognized at all"
+/// (e.g. over the key bar), short of the TUI threading raw pointer
+/// coordinates into `State` (design D2 forbids that: "core receives no
+/// coordinates").
+enum DragFeedback {
+    Valid { row: Option<RowHighlight>, dir: PathBuf },
+    Invalid,
+}
+
+/// [`DragFeedback`] for `side`'s `panel`, or `None` when this panel is
+/// unaffected by the in-progress `drag` (an ordinary panel mid-drag, or a
+/// dragged-onto-elsewhere target this panel isn't).
+fn drag_feedback_for(panel: &PanelState, side: PanelSide, drag: &DragState) -> Option<DragFeedback> {
+    let feedback = match &drag.target {
+        Some(DropTarget::PanelDir(s)) if *s == side => DragFeedback::Valid { row: None, dir: panel.cwd.clone() },
+        Some(DropTarget::SubDir { side: s, name }) if *s == side => {
+            let entry = panel.entries.iter().find(|e| &e.name == name)?;
+            let dir = match entry.kind {
+                EntryKind::ParentDir => parent_path(&panel.cwd)?,
+                _ => panel.cwd.join(name),
+            };
+            DragFeedback::Valid { row: Some(RowHighlight::Row(name.clone())), dir }
+        }
+        Some(DropTarget::TreeNode { side: s, path }) if *s == side => DragFeedback::Valid { row: Some(RowHighlight::TreeNode(path.clone())), dir: path.clone() },
+        Some(DropTarget::Tab { side: s, index }) if *s == side => {
+            let dir = panel.tab_dirs().get(*index).cloned()?;
+            DragFeedback::Valid { row: Some(RowHighlight::Tab(*index)), dir }
+        }
+        _ if drag.source == side && drag.target.is_none() => DragFeedback::Invalid,
+        _ => return None,
+    };
+    Some(feedback)
+}
+
+/// `Copy`/`Move`, matching the drop dialog's own verb naming (operation-
+/// dialogs "Drop-initiated destination dialog") rather than
+/// `title_for`'s keyboard-dialog "Rename/Move" — the mini-status names the
+/// verb the drag proposes, not a keyboard F-key.
+fn drag_verb_label(kind: JobKind) -> &'static str {
+    match kind {
+        JobKind::Move => "Move",
+        _ => "Copy",
+    }
+}
+
+/// The drop target directory's display label: its own basename plus a
+/// trailing backslash (`OLD\`), or the whole path (already ending in `\` for
+/// a drive root) when it has no basename — matching the mini-status example
+/// literally (mouse-drag "Drag feedback": `` Copy 3 files ► OLD\ ``).
+fn drag_dir_label(path: &Path) -> String {
+    match path.file_name() {
+        Some(name) => format!("{}\\", name.to_string_lossy()),
+        None => format!("{}\\", path.display().to_string().trim_end_matches(['\\', '/'])),
+    }
+}
+
+/// The target mini-status text for a valid drop: `<Verb> N file(s) ► <dir>\`
+/// (mouse-drag "Drag feedback"), CP437-heritage glyphs only — `\u{25BA}` is
+/// the same "►" glyph `tab_strip`'s own right-overflow marker already uses.
+fn drag_target_status(verb: JobKind, count: usize, dir: &Path) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{} {count} file{plural} \u{25BA} {}", drag_verb_label(verb), drag_dir_label(dir))
+}
+
+fn is_target_row(row_highlight: &Option<RowHighlight>, name: &OsStr) -> bool {
+    matches!(row_highlight, Some(RowHighlight::Row(n)) if n.as_os_str() == name)
+}
+
+fn is_target_tree_node(row_highlight: &Option<RowHighlight>, path: &Path) -> bool {
+    matches!(row_highlight, Some(RowHighlight::TreeNode(p)) if p == path)
+}
+
+fn target_tab_index(row_highlight: &Option<RowHighlight>) -> Option<usize> {
+    match row_highlight {
+        Some(RowHighlight::Tab(i)) => Some(*i),
+        _ => None,
+    }
+}
+
+/// The clickable regions `render_panel` currently draws for `panel` at
+/// `area` (mouse-input "Hit-testing stays in the TUI"): the whole rect, the
+/// title row, the tab strip's cells (any display mode, once 2+ tabs make it
+/// visible — mouse-panel-drag, design D7), and — in Full mode, each drawn
+/// entry row keyed by name, or in Tree mode, each drawn node row keyed by
+/// path (mouse-panel-drag; additional-panel-modes "Tree display mode
+/// structure and rendering"). Mirrors `render_panel`'s own
+/// `has_strip`/`reserved`/`body_y0`/`rows_h` geometry exactly, rather than
+/// re-deriving it independently, so this can never describe a row that
+/// isn't actually where `render_panel` painted it. Brief/Info/QuickView
+/// modes record `area`/`title`(/`tabs`) only — no discrete per-file row
+/// exists in those layouts the way it does in Full/Tree mode.
+pub fn hit_test(area: Rect, panel: &PanelState) -> crate::hitmap::PanelHits {
+    let mut hits = crate::hitmap::PanelHits { area, ..Default::default() };
+    if area.width < 4 || area.height < 3 {
+        return hits;
+    }
+    let x0 = area.x;
+    let y0 = area.y;
+    let right_x = x0 + area.width - 1;
+    hits.title = Rect { x: x0, y: y0, width: area.width, height: 1 };
+
+    let has_strip = area.height >= 4 && tab_strip::is_visible(panel);
+    if has_strip {
+        let strip_area = Rect { x: x0, y: y0 + 1, width: area.width, height: 1 };
+        hits.tabs = tab_strip::hit_test(strip_area, panel);
+    }
+    let reserved = if has_strip { 3 } else { 2 };
+    if area.height < reserved {
+        return hits;
+    }
+    let body_y0 = y0 + if has_strip { 2 } else { 1 };
+    let body_h = area.height - reserved;
+
+    match panel.display_mode {
+        DisplayMode::Full => {
+            let rows_start = body_y0 + 1;
+            let rows_h = body_h.saturating_sub(1);
+            let visible = panel.visible_indices();
+            for row in 0..rows_h {
+                let y = rows_start + row;
+                let Some(entry) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i)) else { continue };
+                let rect = Rect { x: x0 + 1, y, width: right_x.saturating_sub(x0 + 1), height: 1 };
+                hits.rows.push((rect, entry.name.clone()));
+            }
+        }
+        // The `Tree` header row at `body_y0` is skipped, exactly like
+        // `render_tree_body`'s own `rows_start = body_y0 + 1` — it names no
+        // node. `TreeNode` drop targets are keyed by path rather than row
+        // position (design D4's "keying items by row index is rejected"
+        // reasoning applies here too: a sibling expanding/collapsing
+        // re-flattens `tree.nodes` and would silently point a stale index
+        // at the wrong node).
+        DisplayMode::Tree => {
+            let rows_start = body_y0 + 1;
+            let rows_h = body_h.saturating_sub(1);
+            if let Some(tree) = panel.tree.as_ref() {
+                for row in 0..rows_h {
+                    let y = rows_start + row;
+                    let Some(node) = tree.nodes.get(tree.scroll_offset + row as usize) else { continue };
+                    let rect = Rect { x: x0 + 1, y, width: right_x.saturating_sub(x0 + 1), height: 1 };
+                    hits.tree_nodes.push((rect, node.path.clone()));
+                }
+            }
+        }
+        DisplayMode::Info | DisplayMode::Brief | DisplayMode::QuickView => {}
+    }
+    hits
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn render_panel(
     buf: &mut Buffer,
@@ -221,17 +397,47 @@ pub fn render_panel(
     identity_lines: &[String; 4],
     opposite: &PanelState,
     type_ahead: Option<&str>,
+    side: PanelSide,
+    drag: Option<&DragState>,
 ) {
     if area.width < 4 || area.height < 3 {
         return;
     }
-    let frame_style = role_style(theme, Role::PanelFrame, depth);
-    let title_style = role_style(theme, if active { Role::PanelTitleActive } else { Role::PanelTitleInactive }, depth);
+    // This panel's drag treatment for the whole frame (mouse-panel-drag
+    // "Drag feedback"; design D6) — `None` for every panel unaffected by an
+    // in-progress drag, so every style/status computed below is completely
+    // unchanged from before this feature whenever `drag` is `None` or this
+    // panel isn't its current target/source.
+    let feedback = drag.and_then(|d| drag_feedback_for(panel, side, d).map(|f| (d, f)));
+    let row_highlight: Option<RowHighlight> = match &feedback {
+        Some((_, DragFeedback::Valid { row, .. })) => row.clone(),
+        _ => None,
+    };
+    let drag_status: Option<String> = match &feedback {
+        Some((d, DragFeedback::Valid { dir, .. })) => Some(drag_target_status(d.op, d.items.len(), dir)),
+        Some((_, DragFeedback::Invalid)) => Some("Can't drop here".to_string()),
+        None => None,
+    };
+    let dragging_here = feedback.is_some();
+
+    let frame_style = if dragging_here { role_style(theme, Role::PanelFrameDrop, depth) } else { role_style(theme, Role::PanelFrame, depth) };
+    let title_style = if dragging_here {
+        role_style(theme, Role::PanelFrameDrop, depth)
+    } else {
+        role_style(theme, if active { Role::PanelTitleActive } else { Role::PanelTitleInactive }, depth)
+    };
     let header_style = role_style(theme, Role::PanelHeader, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
-    let ministatus_style = role_style(theme, Role::PanelMinistatus, depth);
+    let button_focused_style = role_style(theme, Role::ButtonFocused, depth);
+    // A clipboard action's feedback (clipboard-export "Clipboard feedback")
+    // takes over the mini-status role's color when it reports failure — the
+    // same error role dialogs use — otherwise the normal mini-status role.
+    let ministatus_style = match &panel.clipboard_feedback {
+        Some(feedback) if feedback.is_error => role_style(theme, Role::DialogError, depth),
+        _ => role_style(theme, Role::PanelMinistatus, depth),
+    };
 
     let w = area.width as usize;
     let x0 = area.x;
@@ -261,7 +467,7 @@ pub fn render_panel(
     let has_strip = area.height >= 4 && tab_strip::is_visible(panel);
     if has_strip {
         let strip_area = Rect { x: x0, y: y0 + 1, width: area.width, height: 1 };
-        tab_strip::render_tab_strip(buf, strip_area, panel, theme, depth);
+        tab_strip::render_tab_strip(buf, strip_area, panel, theme, depth, target_tab_index(&row_highlight));
     }
     let reserved = if has_strip { 3 } else { 2 }; // top(+strip) + bottom border
     if area.height < reserved {
@@ -277,6 +483,13 @@ pub fn render_panel(
     // (the highlighted path / previewed file) below, which takes
     // precedence when present.
     let input_override = quick_filter_or_type_ahead_status(panel, type_ahead);
+    // Clipboard feedback (clipboard-export "Clipboard feedback") wins over
+    // the quick-filter/type-ahead pattern and every mode-specific override
+    // below — it is the most recent thing the user asked for, is always
+    // transient (cleared by `crate::update` on the very next command or
+    // after ~3s), and Ctrl+C/Ctrl+Ins/Ctrl+Shift+Ins work over the panels
+    // regardless of the active display mode.
+    let clipboard_override = panel.clipboard_feedback.as_ref().map(|f| f.message.clone());
 
     // Info mode replaces the whole body — header row included — with the
     // stacked info boxes, keeping only the panel's own double-line border
@@ -285,7 +498,7 @@ pub fn render_panel(
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
         return;
     }
 
@@ -293,8 +506,8 @@ pub fn render_panel(
     // modes "Brief display mode").
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
-        render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+        render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, &row_highlight, button_focused_style);
+        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
         return;
     }
 
@@ -302,8 +515,15 @@ pub fn render_panel(
     // driving the opposite panel as the cursor moves (additional-panel-
     // modes "Tree display mode structure and rendering").
     if panel.display_mode == DisplayMode::Tree {
-        let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
+        let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style, &row_highlight, button_focused_style);
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or(mini_status).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -313,7 +533,14 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::QuickView {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let mini_status = render_quick_view_body(buf, x0, body_y0, w, body_h, opposite, theme, depth);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, mini_status.or(input_override));
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or(mini_status).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -361,7 +588,15 @@ pub fn render_panel(
         buf.set_string(x0, y, "\u{2551}", frame_style);
         draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
         if let Some((entry, is_selected)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
-            let style = if is_selected {
+            // The drag's target row (mouse-panel-drag "Drag feedback")
+            // outranks the ordinary selected/dir/file styling — but never a
+            // *source* row, since a dragged item's own directory/descendant
+            // is already rejected as a target by core (design D7), so this
+            // can never coincide with one of the rows the drag is dragging.
+            let is_drag_target = is_target_row(&row_highlight, &entry.name);
+            let style = if is_drag_target {
+                button_focused_style
+            } else if is_selected {
                 cursor_style
             } else if entry.is_dir_like() {
                 dir_style
@@ -381,7 +616,9 @@ pub fn render_panel(
             let rest = format_full_row(name_w, cols, &name, &size_col, &date_col, &time_col);
             if has_git {
                 let marker = git_marker(panel, entry);
-                let marker_style = if is_selected {
+                let marker_style = if is_drag_target {
+                    button_focused_style
+                } else if is_selected {
                     cursor_style
                 } else if let Some((_, role)) = marker {
                     role_style(theme, role, depth)
@@ -398,7 +635,7 @@ pub fn render_panel(
         }
     }
 
-    render_bottom_border(buf, area, panel, frame_style, ministatus_style, input_override);
+    render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.or(clipboard_override).or(input_override));
 }
 
 /// The `\u{2551}` left/right frame verticals for every row of a body region
@@ -417,7 +654,20 @@ fn draw_side_borders(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, body
 /// the standard directory/file/selected/cursor styling and the `..`
 /// up-dir marker (additional-panel-modes "Brief display mode").
 #[allow(clippy::too_many_arguments)]
-fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, w: usize, body_h: u16, panel: &PanelState, theme: &Theme, depth: ColorDepth, active: bool) {
+fn render_brief_body(
+    buf: &mut Buffer,
+    x0: u16,
+    body_y0: u16,
+    right_x: u16,
+    w: usize,
+    body_h: u16,
+    panel: &PanelState,
+    theme: &Theme,
+    depth: ColorDepth,
+    active: bool,
+    row_highlight: &Option<RowHighlight>,
+    button_focused_style: Style,
+) {
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
@@ -456,7 +706,9 @@ fn render_brief_body(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, w: u
             let pos = panel.scroll_offset + c * rows_h + row;
             if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
-                let style = if is_cursor {
+                let style = if is_target_row(row_highlight, &entry.name) {
+                    button_focused_style
+                } else if is_cursor {
                     cursor_style
                 } else if entry.kind != EntryKind::ParentDir && panel.selected.contains(&entry.name) {
                     selected_style
@@ -498,6 +750,8 @@ fn render_tree_body(
     depth: ColorDepth,
     active: bool,
     frame_style: Style,
+    row_highlight: &Option<RowHighlight>,
+    button_focused_style: Style,
 ) -> Option<String> {
     let header_style = role_style(theme, Role::PanelHeader, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
@@ -523,14 +777,18 @@ fn render_tree_body(
         let is_cursor = active && cursor_row == Some(tree_offset + row as usize);
         match panel.tree.as_ref().and_then(|t| t.nodes.get(tree_offset + row as usize)) {
             Some(node) if node.depth == 0 => {
+                let is_target = is_target_tree_node(row_highlight, &node.path);
                 let text = node.path.display().to_string();
-                buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), if is_cursor { cursor_style } else { dir_style });
+                let style = if is_target { button_focused_style } else if is_cursor { cursor_style } else { dir_style };
+                buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), style);
             }
             Some(node) => {
+                let is_target = is_target_tree_node(row_highlight, &node.path);
                 let name = node.path.file_name().map(|n| n.to_string_lossy().to_uppercase()).unwrap_or_default();
-                if is_cursor {
+                if is_target || is_cursor {
                     let text = format!("{}{}", node.prefix, name);
-                    buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), cursor_style);
+                    let style = if is_target { button_focused_style } else { cursor_style };
+                    buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), style);
                 } else {
                     buf.set_string(x0 + 1, y, &node.prefix, frame_style);
                     let name_x = x0 + 1 + display_width(&node.prefix) as u16;
@@ -710,7 +968,198 @@ fn brief_column_widths(inner_w: usize) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
+    use filecommand_core::fs_ops::SourceItem;
+    use filecommand_core::listing::Entry;
+    use filecommand_core::panel::TreeState;
+
+    // -----------------------------------------------------------------
+    // mouse-panel-drag: drag feedback (tasks.md 2.2).
+    // -----------------------------------------------------------------
+
+    fn fixed_identity() -> [String; 4] {
+        ["FileCommand".to_string(), "Version 0.1.0".to_string(), "Copyright".to_string(), "Tribute".to_string()]
+    }
+
+    fn buffer_to_text(buf: &Buffer, area: Rect) -> String {
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(area.x + x, area.y + y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// A `C:\left` panel with a `src` subdirectory and a file, plus a bare
+    /// `C:\right` opposite panel — the fixture every drag-feedback test
+    /// below drags `a.txt` out of.
+    fn drag_test_panels() -> (PanelState, PanelState) {
+        let mut left = PanelState::new(PathBuf::from(r"C:\left"));
+        left.entries = vec![
+            Entry::parent_dir(),
+            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None },
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None },
+        ];
+        left.progress = ListingProgress::Complete { count: left.entries.len() };
+        let mut right = PanelState::new(PathBuf::from(r"C:\right"));
+        right.entries = vec![Entry::parent_dir()];
+        right.progress = ListingProgress::Complete { count: right.entries.len() };
+        (left, right)
+    }
+
+    fn dragging_a_txt(target: Option<DropTarget>) -> DragState {
+        DragState {
+            source: PanelSide::Left,
+            source_dir: PathBuf::from(r"C:\left"),
+            items: vec![SourceItem { original_name: OsString::from("a.txt"), path: PathBuf::from(r"C:\left\a.txt"), is_dir: false }],
+            op: JobKind::Copy,
+            target,
+        }
+    }
+
+    #[test]
+    fn valid_target_panel_gets_the_frame_drop_role_and_the_verb_count_dir_mini_status() {
+        let (left, right) = drag_test_panels();
+        let theme = Theme::classic();
+        let drag = dragging_a_txt(Some(DropTarget::PanelDir(PanelSide::Right)));
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &right, &theme, ColorDepth::Ansi16, false, &fixed_identity(), &left, None, PanelSide::Right, Some(&drag));
+
+        let expected = role_style(&theme, Role::PanelFrameDrop, ColorDepth::Ansi16);
+        assert_eq!(buf[(area.x, area.y)].style().fg, expected.fg, "the target panel's frame must use panel.frame.drop");
+        assert_eq!(buf[(area.x, area.y)].style().bg, expected.bg, "the target panel's frame must use panel.frame.drop");
+        let text = buffer_to_text(&buf, area);
+        assert!(text.contains("Copy 1 file \u{25BA} right\\"), "mini-status must read `<Verb> N file(s) \u{25BA} <dir>\\`:\n{text}");
+    }
+
+    #[test]
+    fn a_panel_that_is_neither_source_nor_target_is_completely_unaffected() {
+        let (left, right) = drag_test_panels();
+        let theme = Theme::classic();
+        // The drag's target is the *other* panel (Right); Left is the
+        // source but the target is resolved elsewhere, so Left's own
+        // rendering (source rows untouched — mouse-drag "Drag feedback")
+        // must be identical whether or not a drag is in progress.
+        let drag = dragging_a_txt(Some(DropTarget::PanelDir(PanelSide::Right)));
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+
+        let mut with_drag = Buffer::empty(area);
+        render_panel(&mut with_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, Some(&drag));
+        let mut without_drag = Buffer::empty(area);
+        render_panel(&mut without_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        assert_eq!(buffer_to_text(&with_drag, area), buffer_to_text(&without_drag, area), "source rows/frame must render unchanged while a drag targets the other panel");
+    }
+
+    #[test]
+    fn subdir_row_target_highlights_that_row_in_button_focused() {
+        let (left, right) = drag_test_panels();
+        let theme = Theme::classic();
+        // Same-panel subdirectory drop (mouse-drag "Same-panel
+        // subdirectory"): dragging `a.txt` onto the `src` row of the same
+        // panel it came from.
+        let drag = dragging_a_txt(Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("src") }));
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, Some(&drag));
+
+        let hits = hit_test(area, &left);
+        let (rect, _) = hits.rows.iter().find(|(_, name)| name == &OsString::from("src")).expect("the src row is drawn");
+        let expected = role_style(&theme, Role::ButtonFocused, ColorDepth::Ansi16);
+        assert_eq!(buf[(rect.x, rect.y)].style().fg, expected.fg, "the target row must use button.focused");
+        assert_eq!(buf[(rect.x, rect.y)].style().bg, expected.bg, "the target row must use button.focused");
+
+        // The dragged item's own row (a.txt) must render completely
+        // unchanged (mouse-drag "Drag feedback": "Source rows SHALL render
+        // unchanged").
+        let (a_txt_rect, _) = hits.rows.iter().find(|(_, name)| name == &OsString::from("a.txt")).unwrap();
+        let mut without_drag = Buffer::empty(area);
+        render_panel(&mut without_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        assert_eq!(buf[(a_txt_rect.x, a_txt_rect.y)].style().fg, without_drag[(a_txt_rect.x, a_txt_rect.y)].style().fg);
+        assert_eq!(buf[(a_txt_rect.x, a_txt_rect.y)].style().bg, without_drag[(a_txt_rect.x, a_txt_rect.y)].style().bg);
+    }
+
+    #[test]
+    fn no_valid_target_shows_cant_drop_here_on_the_source_panel() {
+        let (left, right) = drag_test_panels();
+        let theme = Theme::classic();
+        // Core has already rejected whatever the pointer is over (e.g. the
+        // `src` directory itself, or the panel's own blank area — mouse-drag
+        // "Directory onto itself is invalid", "Same directory is invalid"),
+        // so `target` is `None`.
+        let drag = dragging_a_txt(None);
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, Some(&drag));
+
+        let expected = role_style(&theme, Role::PanelFrameDrop, ColorDepth::Ansi16);
+        assert_eq!(buf[(area.x, area.y)].style().fg, expected.fg);
+        let text = buffer_to_text(&buf, area);
+        assert!(text.contains("Can't drop here"), "expected the invalid-target mini-status:\n{text}");
+    }
+
+    #[test]
+    fn no_drag_renders_the_ordinary_frame_role_with_no_lingering_feedback() {
+        let (left, right) = drag_test_panels();
+        let theme = Theme::classic();
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+
+        let expected = role_style(&theme, Role::PanelFrame, ColorDepth::Ansi16);
+        assert_eq!(buf[(area.x, area.y)].style().fg, expected.fg, "with no drag, the frame must stay panel.frame, never panel.frame.drop");
+        let text = buffer_to_text(&buf, area);
+        assert!(!text.contains("Can't drop here"));
+    }
+
+    // -----------------------------------------------------------------
+    // mouse-panel-drag: hit_test's Tree-node and tab-strip regions
+    // (tasks.md 2.1).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn hit_test_populates_tree_nodes_keyed_by_path_in_tree_mode() {
+        let mut panel = PanelState::new(PathBuf::from(r"C:\"));
+        panel.display_mode = DisplayMode::Tree;
+        panel.tree = Some(TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full));
+        let area = Rect { x: 0, y: 0, width: 30, height: 10 };
+        let hits = hit_test(area, &panel);
+        assert!(hits.rows.is_empty(), "Tree mode never populates the Full-mode `rows` field");
+        assert_eq!(hits.tree_nodes.len(), 1, "the single root node is the only row so far");
+        assert_eq!(hits.tree_nodes[0].1, PathBuf::from(r"C:\"));
+    }
+
+    #[test]
+    fn hit_test_records_no_tree_nodes_outside_tree_mode() {
+        let panel = PanelState::new(PathBuf::from(r"C:\"));
+        let area = Rect { x: 0, y: 0, width: 30, height: 10 };
+        let hits = hit_test(area, &panel);
+        assert!(hits.tree_nodes.is_empty());
+    }
+
+    #[test]
+    fn hit_test_populates_tab_strip_hits_once_two_tabs_exist() {
+        let mut panel = PanelState::new(PathBuf::from(r"C:\left"));
+        panel.open_tab();
+        assert_eq!(panel.tab_count(), 2);
+        let area = Rect { x: 0, y: 0, width: 30, height: 10 };
+        let hits = hit_test(area, &panel);
+        assert_eq!(hits.tabs.len(), 2, "both tabs render as cells at this width");
+        assert_eq!(hits.tabs[0].1, 0);
+        assert_eq!(hits.tabs[1].1, 1);
+    }
+
+    #[test]
+    fn hit_test_records_no_tab_hits_with_a_single_tab() {
+        let panel = PanelState::new(PathBuf::from(r"C:\left"));
+        let area = Rect { x: 0, y: 0, width: 30, height: 10 };
+        let hits = hit_test(area, &panel);
+        assert!(hits.tabs.is_empty());
+    }
 
     #[test]
     fn choose_columns_all_four_at_nominal_interior() {

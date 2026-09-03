@@ -5,6 +5,7 @@ use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::ErrorInfo;
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::ButtonId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -40,4 +41,34 @@ pub fn render_error(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDep
     row(buf, 3, "");
     row(buf, 4, "(R)etry  (S)kip  Skip (A)ll  A(b)ort");
     buf.set_string(x, y + box_h - 1, &bottom, body);
+}
+
+/// The hotkey-text button spans `render_error` currently draws at `area`
+/// for the `(R)etry  (S)kip  Skip (A)ll  A(b)ort` row — no framed buttons,
+/// so each hotkey span is recorded as a button (design D2). Mirrors
+/// `render_error`'s own `overlay_rect` geometry exactly.
+pub fn hit_buttons(area: Rect, info: &ErrorInfo) -> Vec<(Rect, ButtonId)> {
+    let path_line = info.path.display().to_string();
+    let preferred_inner_w = display_width(&info.message).max(display_width(&path_line)).max(30) + 2;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, 6), (MIN_INNER_W as u16, 6), (area.width, area.height));
+    let inner_w = r.width.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+    let text = truncate_with_ellipsis("(R)etry  (S)kip  Skip (A)ll  A(b)ort", inner_w);
+    let base_x = x + 1;
+    let row_y = y + 4;
+
+    let mut out = Vec::new();
+    for (label, id) in [
+        ("(R)etry", ButtonId::ErrorRetry),
+        ("(S)kip", ButtonId::ErrorSkip),
+        ("Skip (A)ll", ButtonId::ErrorSkipAll),
+        ("A(b)ort", ButtonId::ErrorAbort),
+    ] {
+        if let Some(byte_idx) = text.find(label) {
+            let col = text[..byte_idx].chars().count() as u16;
+            out.push((Rect { x: base_x + col, y: row_y, width: display_width(label) as u16, height: 1 }, id));
+        }
+    }
+    out
 }

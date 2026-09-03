@@ -10,14 +10,14 @@ expression: text
     ╠────────────────────────────────────────────────────────────╣    
     ║ About FileCommand                                          ║    
     ║ Keyboard reference                                         ║    
+    ║ Mouse                                                      ║    
     ║ Panels and display modes                                   ║    
     ║ File operations                                            ║    
     ║ Menus                                                      ║    
     ║ Viewer                                                     ║    
     ║ Editor                                                     ║    
     ║ Command line                                               ║    
-    ║ Modern extras                                              ║    
-    ║ Configuration                                              ║    
+    ║ Modern extras                                             ↓║    
     ╠────────────────────────────────────────────────────────────╣    
     ║                      Help     Cancel                       ║    
     ╚════════════════════════════════════════════════════════════╝

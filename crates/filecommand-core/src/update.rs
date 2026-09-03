@@ -14,13 +14,13 @@ use crate::drives::{self, DriveSelect};
 use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
 use crate::find_file::FindFileState;
-use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
+use crate::fs_ops::dialog::{DropButtons, FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
 use crate::git_info::GitInfo;
 use crate::info::InfoValues;
 use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
-use crate::menu::{MenuAction, MenuId, MenuState};
-use crate::panel::{CursorMove, DisplayMode, PanelState, TreeState};
+use crate::menu::{MenuAction, MenuEntry, MenuId, MenuState};
+use crate::panel::{ClipboardFeedback, CursorMove, DisplayMode, PanelState, TreeState};
 use crate::panel_split;
 use crate::quicksearch::{self, FrecencyEntry, FuzzyJumpState};
 use crate::shell::{self, ShellConfig};
@@ -30,6 +30,10 @@ use crate::viewer::ViewerState;
 pub const MIN_COLS: u16 = 60;
 pub const MIN_ROWS: u16 = 16;
 pub const SPLASH_MIN_HOLD_MS: u64 = 800;
+/// How long a clipboard action's mini-status feedback stays up before a
+/// `Tick` expires it, absent an intervening key press (clipboard-export
+/// "Clipboard feedback").
+pub const CLIPBOARD_FEEDBACK_MS: u64 = 3000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PanelSide {
@@ -44,6 +48,97 @@ impl PanelSide {
             PanelSide::Right => PanelSide::Left,
         }
     }
+}
+
+/// A mouse click's modifier state, as `input::map_mouse` resolves it from
+/// the raw `crossterm::event::KeyModifiers` on a `MouseEvent` — never
+/// `crossterm::event::KeyModifiers` itself, which must never cross into this
+/// crate (mouse-input "Hit-testing stays in the TUI"; design D2). `Shift` is
+/// carried for completeness even though Shift+click range selection is
+/// deliberately unspecified (design D3) — most terminal emulators intercept
+/// it for native text selection before it ever reaches crossterm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClickMods {
+    Plain,
+    Ctrl,
+    Shift,
+}
+
+/// Where a drag-and-drop is currently hovering, already validated against
+/// mouse-drag's "Valid drop targets" (design D4) — never a raw, unvalidated
+/// coordinate hit. `PanelDir`'s `side` stands for that whole panel as a
+/// target — its title, blank body area, or any non-directory row all
+/// resolve to this same variant, since they all mean "drop into this
+/// panel's current directory" (the TUI's hit-testing doesn't need to
+/// distinguish them). `SubDir`'s `name` covers the `..` row exactly like an
+/// ordinary subdirectory row. `TreeNode` is a Tree-mode panel's node.
+/// `Tab`'s `index` is a position in that panel's full ordered tab list
+/// (`PanelState::tab_dirs`), standing for that tab's directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropTarget {
+    PanelDir(PanelSide),
+    SubDir { side: PanelSide, name: OsString },
+    TreeNode { side: PanelSide, path: PathBuf },
+    Tab { side: PanelSide, index: usize },
+}
+
+/// An in-progress mouse drag's frozen identity plus its live target and
+/// proposed verb (mouse-drag "Drag lifecycle"; design D4). `source`,
+/// `source_dir`, and `items` are captured once at `DragBegin` and never
+/// change for the life of the drag — a streamed listing chunk, a re-sort, or
+/// even the source panel navigating away changes nothing here (mouse-drag
+/// "Robust against listing changes"); `op` and `target` are instead updated
+/// by every later `DragOver`/`DragDrop`, since the proposed verb is
+/// recomputed from the modifiers of each of those events (design D2) and the
+/// hovered target can change on every pointer move. Lives beside `UiPhase`,
+/// like `State::menu`/`drive_select`/etc., rather than inside it — a drag
+/// overlays the live panels, it is not itself a phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragState {
+    pub source: PanelSide,
+    pub source_dir: PathBuf,
+    pub items: Vec<SourceItem>,
+    pub op: JobKind,
+    pub target: Option<DropTarget>,
+}
+
+/// Which dialog button a click landed on, resolved by the TUI's hit map
+/// (design D2: "Dialog buttons" includes the hotkey text spans of dialogs
+/// with no framed buttons, e.g. the conflict dialog's `(O)verwrite  (S)kip
+/// …` row). `Command::DialogButtonClick` maps one of these straight onto the
+/// exact command the equivalent keypress already issues, via
+/// [`button_command`] — a dialog button is never a new way to do something,
+/// only a new way to reach an existing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ButtonId {
+    DeleteConfirmYes,
+    DeleteConfirmNo,
+    ConflictOverwrite,
+    ConflictOverwriteAll,
+    ConflictSkip,
+    ConflictSkipAll,
+    ConflictRename,
+    ErrorRetry,
+    ErrorSkip,
+    ErrorSkipAll,
+    ErrorAbort,
+    ProgressCancel,
+    /// The skipped-items summary's "Press any key to continue" footer —
+    /// there is no literal button glyph, but design D5 gates this dialog as
+    /// buttons-only, so the whole footer row is recorded as one clickable
+    /// span (mirroring how `Command::FileOpConfirm` is what any key already
+    /// does here).
+    SummaryContinue,
+    QuitYes,
+    QuitNo,
+    /// The drop-initiated destination dialog's `[ Copy ]` button
+    /// (operation-dialogs "Drop-initiated destination dialog").
+    DropDialogCopy,
+    /// Its `[ Move ]` button.
+    DropDialogMove,
+    /// Its `[ Cancel ]` button — routes to exactly the same command as the
+    /// keyboard dialog's Esc.
+    DropDialogCancel,
 }
 
 /// Top-level UI phase. Governs how commands are interpreted by `update`.
@@ -165,6 +260,14 @@ pub struct State {
     /// which is what makes cancel-restores-context exact (application-shell
     /// "Quit request keys and confirmation"; design D5).
     pub quit_confirm: bool,
+    /// A mouse drag-and-drop in progress, or `None` otherwise
+    /// (mouse-panel-drag). Lives beside the phase like `menu`/`drive_select`
+    /// — it overlays the live panels rather than replacing them. Cleared by
+    /// a reducer post-condition (see `update`'s wrapper below) whenever a
+    /// command leaves `UiPhase::Panels` or opens any of the overlays above,
+    /// so it can never survive into a context where a drop could complete
+    /// (mouse-drag "Cancel and phase-change clear the drag"; design D5).
+    pub drag: Option<DragState>,
 }
 
 impl State {
@@ -243,6 +346,7 @@ impl State {
             help: None,
             startup_warning: None,
             quit_confirm: false,
+            drag: None,
         }
     }
 
@@ -346,6 +450,14 @@ pub enum Command {
     FileOpInputBackspace,
     FileOpConfirm,
     FileOpCancel,
+    /// The drop-initiated destination dialog's `[ Copy ]`/`[ Move ]` buttons:
+    /// confirms exactly as `Command::FileOpConfirm` does, but commits the
+    /// given verb regardless of whichever `kind` the dialog opened with —
+    /// the only way to switch the verb without reopening the dialog
+    /// (operation-dialogs "Switching the verb in the dialog"). A no-op
+    /// outside `FileOpSetup::DestinationInput` (`DeleteConfirm`/
+    /// `RenameInput` never carry a button row that could produce this).
+    FileOpConfirmAs(JobKind),
 
     // FileOpRunning dialog interaction.
     FileOpConflictChoice(ConflictChoice),
@@ -663,6 +775,125 @@ pub enum Command {
     /// as if it had been highlighted and confirmed (file-action-menu
     /// "First-letter hotkey activates directly").
     FileActionMenuHotkey(char),
+
+    // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
+    // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
+    // group, and the file-action menu's `Send to clipboard` (which always
+    // requests `Files`, scoped to its single target entry rather than
+    // `active_selection_sources` — see `activate_file_action`).
+    /// Places the F5-scope entries (`active_selection_sources`) on the OS
+    /// clipboard per `kind` (clipboard-export "Clipboard payloads and
+    /// scope"). A no-op, reported in the mini-status, when the scope is
+    /// empty (nothing selected and the cursor is on `..` or off the list).
+    CopyToClipboard(ClipboardPayloadKind),
+    /// Reply to `Effect::SetClipboard` once the TUI's `Clipboard` trait has
+    /// run. `payload` echoes back the request (the resolved paths are
+    /// needed to render the singular "Path copied: <path>" message without
+    /// re-deriving scope); `fell_back_to_paths` is set only when a `Files`
+    /// request was carried out as a plain-text `Paths` write because file
+    /// objects aren't supported on this platform (clipboard-export
+    /// "Non-Windows fallback"). `Ok(())` shows the per-kind success
+    /// message; `Err(message)` shows `message` verbatim in the error role
+    /// (clipboard-export "Clipboard busy retry" — the TUI retries before
+    /// giving up, so by the time this arrives the failure is final).
+    ClipboardResult { payload: ClipboardPayload, fell_back_to_paths: bool, result: Result<(), String> },
+
+    // Mouse (mouse-basics). `input::map_mouse` is the only source of these —
+    // raw coordinates and `crossterm::event::KeyModifiers` never reach this
+    // crate (mouse-input "Hit-testing stays in the TUI"; design D2).
+    /// A left-click on an entry row: focuses `side` and moves its cursor to
+    /// the named entry, without changing the selection set (`Plain`), or
+    /// toggles that entry's selection in place (`Ctrl`) — never both
+    /// (mouse-input "Click focuses and places the cursor", "Ctrl+click
+    /// toggles selection"). `input::map_mouse` also turns a same-row
+    /// double-click into a plain `Command::Enter` instead of this (mouse-
+    /// input "Double-click acts as Enter").
+    ClickEntry { side: PanelSide, name: OsString, mods: ClickMods },
+    /// A left-click on a panel's title or blank body area: focuses `side`
+    /// without moving its cursor (mouse-input "Click focuses and places the
+    /// cursor").
+    FocusPanel(PanelSide),
+    /// A wheel notch (or several, coalesced — design D7) over `side`'s
+    /// panel: move its cursor by `delta` rows (positive down, negative up),
+    /// independent of which panel is active (mouse-input "Wheel moves the
+    /// cursor of the panel under the pointer"). The viewer/editor have their
+    /// own wheel handling that never reaches this command (design D6).
+    ScrollPanel { side: PanelSide, delta: isize },
+    /// A left-click on a function-key-bar slot (1..=10, `10` for F10):
+    /// dispatches exactly what that F-key would (mouse-input "Key bar, menu
+    /// bar, pull-down items, and dialog buttons are clickable").
+    KeybarPress(u8),
+    /// A left-click on a menu-bar title: opens that pull-down (or switches
+    /// to it, if a different one is already open).
+    MenuTitleClick(MenuId),
+    /// A left-click on an open pull-down's `index`'th row: activates it
+    /// exactly as `Command::MenuActivate` would once the highlight is there.
+    MenuItemClick(usize),
+    /// A left-click on a dialog button (or a buttonless dialog's hotkey text
+    /// span — design D2): activates it exactly as the equivalent key would,
+    /// via [`button_command`].
+    DialogButtonClick(ButtonId),
+    /// A right-click on an entry row: moves the cursor to the named entry
+    /// and opens the file-action menu for it (mouse-input "Right-click opens
+    /// the action menu"). `input::map_mouse` reaches this only for files
+    /// until the directory-target support of `file-action-menu` "Directory
+    /// targets and selection-scoped invocation" lands (mouse-basics section
+    /// 3).
+    OpenActionMenuAt { side: PanelSide, name: OsString },
+
+    // Mouse drag-and-drop (mouse-panel-drag; design D2/D4). `op` on each of
+    // these is the verb the drag's button/modifiers propose right now,
+    // recomputed by the TUI on every drag/release event and carried fresh
+    // rather than derived once and cached (design D2: "recomputed ... on
+    // every drag event"). `target`/`candidate` are the TUI's raw geometric
+    // hit-test result — a `DropTarget` or `None` for "off any potential
+    // target region" — which `update` is responsible for validating (mouse-
+    // drag "Valid drop targets"); core never receives raw coordinates.
+    /// A press on an entry row moved at least one cell (mouse-basics'
+    /// `press.moved`, mouse-panel-drag's territory): freezes the drag's
+    /// items — `name`'s panel's selection set if `name` is a member of it,
+    /// else `name` alone, never `..` — and its initial proposed verb
+    /// (mouse-drag "Drag lifecycle"). A no-op if `name` no longer names a
+    /// selectable entry.
+    DragBegin { side: PanelSide, name: OsString, op: JobKind },
+    /// The drag's pointer resolved to a new de-duplicated position (the
+    /// TUI's `MouseTracker` owns de-duplication, so core only sees actual
+    /// changes — design D4). A no-op if no drag is in progress.
+    DragOver { op: JobKind, target: Option<DropTarget> },
+    /// The button released. Opens the drop-initiated destination dialog if
+    /// the drag's target is (still) valid and the source panel still shows
+    /// the captured directory; otherwise ends the drag with no effect
+    /// (mouse-drag "Release on an invalid spot", "Robust against listing
+    /// changes"). A no-op if no drag is in progress.
+    DragDrop { op: JobKind },
+    /// Esc mid-drag: ends the drag with no effect (mouse-drag "Esc
+    /// cancels").
+    DragCancel,
+}
+
+/// Which of the three clipboard actions a `Command::CopyToClipboard` /
+/// `Effect::SetClipboard` targets (clipboard-export "Clipboard payloads and
+/// scope"). `Names` is menu-only — reachable only through the Files
+/// pull-down, never a key binding (design D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardPayloadKind {
+    /// `CF_HDROP` file objects on Windows; falls back to `Paths`-as-text
+    /// elsewhere (clipboard-export "Windows file-object payload",
+    /// "Non-Windows fallback").
+    Files,
+    /// One absolute path per line, plain text.
+    Paths,
+    /// One file name per line, plain text.
+    Names,
+}
+
+/// The resolved payload for an `Effect::SetClipboard`: the action kind and
+/// the absolute, `..`-excluded paths of the F5-scope entries
+/// (`active_selection_sources`/`named_entry_source`) it was built from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardPayload {
+    pub kind: ClipboardPayloadKind,
+    pub items: Vec<PathBuf>,
 }
 
 /// A side-effect request. `update` only ever returns these; it never
@@ -764,11 +995,81 @@ pub enum Effect {
     /// stale/abandoned search's results are dropped once the dialog has
     /// moved on.
     FindInSubtree { root: PathBuf, pattern: String, request: u64 },
+    /// Write `payload` to the OS clipboard via the TUI's `Clipboard` trait
+    /// and report the outcome back via `Command::ClipboardResult`. Executed
+    /// synchronously, like `EnumerateDrives` — `OpenClipboard` binds to the
+    /// calling thread and set-and-close is sub-millisecond, so no worker
+    /// thread is needed (design D3; clipboard-export "Clipboard payloads
+    /// and scope").
+    SetClipboard(ClipboardPayload),
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
-/// `(state, Vec<Effect>)`.
-pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
+/// `(state, Vec<Effect>)`. A thin wrapper around [`update_impl`] that
+/// enforces the one invariant that must hold no matter which internal path a
+/// command took: `state.drag` is never `Some` outside `UiPhase::Panels` with
+/// no overlay open (mouse-drag "Cancel and phase-change clear the drag";
+/// design D5) — see [`drag_allowed`]. Applying it here, once, after every
+/// call — rather than threading a clear into each of `update_impl`'s many
+/// phase-transition arms — is what makes it a true postcondition: every
+/// return path is covered by construction, including ones a future phase
+/// addition might add without remembering this rule.
+pub fn update(state: State, cmd: Command) -> (State, Vec<Effect>) {
+    let listing_failed = matches!(cmd, Command::ListingFailed { .. });
+    let (mut state, effects) = update_impl(state, cmd);
+    // A listing failure doesn't change `state.phase` or open any overlay —
+    // `drag_allowed` alone wouldn't catch it — but mouse-drag's "Cancel and
+    // phase-change clear the drag" explicitly lists listing failure as a
+    // trigger: the failed panel's contents are no longer trustworthy enough
+    // to resolve a drop against.
+    if listing_failed || !drag_allowed(&state) {
+        state.drag = None;
+    }
+    (state, effects)
+}
+
+/// Whether `state.drag` is allowed to remain `Some`: only in
+/// `UiPhase::Panels` with none of the modal overlays below open — the same
+/// set `input::mouse::context` (mouse-basics) already gates ordinary mouse
+/// input behind, extended with `quit_confirm` since it uniquely overlays
+/// every other context too (mouse-drag "Cancel and phase-change clear the
+/// drag": job completion, listing failure, F9, quit request, resize below
+/// the minimum — every one of those either leaves `UiPhase::Panels` or sets
+/// one of these fields).
+fn drag_allowed(state: &State) -> bool {
+    matches!(state.phase, UiPhase::Panels)
+        && state.menu.is_none()
+        && state.drive_select.is_none()
+        && state.fuzzy_jump.is_none()
+        && state.find_file.is_none()
+        && state.user_menu.is_none()
+        && state.theme_picker.is_none()
+        && state.file_action_menu.is_none()
+        && state.help.is_none()
+        && state.startup_warning.is_none()
+        && !state.quit_confirm
+}
+
+/// The actual state-transition logic. Never call this directly outside
+/// [`update`]'s own recursive re-entry (a dialog-button click, an activated
+/// menu item, a key-bar slot) — every one of those re-enters here rather
+/// than through the public `update`, so the drag-clearing postcondition runs
+/// exactly once per external call instead of once per internal recursion.
+fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
+    // A dialog button click is never a new way to do something — only a new
+    // way to reach an existing keyboard command — so it translates via
+    // `button_command` and re-enters here with that command, independent of
+    // phase: the TUI's mode-gating table (design D5) only ever dispatches
+    // this while the matching dialog is actually on screen (e.g. `QuitYes`/
+    // `QuitNo` only while `state.quit_confirm` is set), so no extra gating is
+    // needed here.
+    if let Command::DialogButtonClick(id) = cmd {
+        return match button_command(id) {
+            Some(next) => update_impl(state, next),
+            None => (state, Vec::new()),
+        };
+    }
+
     let mut effects = Vec::new();
 
     // Resize is handled uniformly regardless of phase.
@@ -791,9 +1092,22 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
     // Every `Tick` updates the clock reading `begin_listing` timestamps
     // frecency visits with, regardless of phase — mirrored generically here
-    // rather than duplicated in every phase arm that might navigate.
+    // rather than duplicated in every phase arm that might navigate. A tick
+    // also expires any clipboard feedback whose ~3s has elapsed
+    // (clipboard-export "Clipboard feedback"); every other command counts
+    // as "the next key press" and clears it immediately instead of waiting
+    // out the timer — except the two commands that manage the feedback
+    // themselves, whose own handling below sets it fresh.
     if let Command::Tick(now) = cmd {
         state.clock_ms = now;
+        for side in [PanelSide::Left, PanelSide::Right] {
+            if matches!(&state.panel(side).clipboard_feedback, Some(f) if now >= f.expires_at_ms) {
+                state.panel_mut(side).clipboard_feedback = None;
+            }
+        }
+    } else if !matches!(cmd, Command::CopyToClipboard(_) | Command::ClipboardResult { .. }) {
+        state.left.clipboard_feedback = None;
+        state.right.clipboard_feedback = None;
     }
 
     // Listing events fold in identically regardless of phase — a background
@@ -917,10 +1231,9 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     if state.menu.is_some() && is_menu_command(&cmd) {
         let follow_up = handle_menu(&mut state, cmd);
         if let Some(next) = follow_up {
-            // An activated item re-enters `update` as the command it stands
-            // for, so a menu action and its keyboard shortcut share one
-            // implementation.
-            let (state, more) = update(state, next);
+            // An activated item re-enters as the command it stands for, so a
+            // menu action and its keyboard shortcut share one implementation.
+            let (state, more) = update_impl(state, next);
             return (state, more);
         }
         return (state, effects);
@@ -1015,6 +1328,10 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::RequestMove => enter_file_op_setup(&mut state, JobKind::Move),
             Command::RequestMkdir => enter_file_op_setup(&mut state, JobKind::Mkdir),
             Command::RequestDelete => enter_delete_confirm(&mut state),
+            Command::CopyToClipboard(kind) => effects.extend(handle_copy_to_clipboard(&mut state, kind)),
+            Command::ClipboardResult { payload, fell_back_to_paths, result } => {
+                apply_clipboard_result(&mut state, payload, fell_back_to_paths, result)
+            }
 
             Command::CommandLineChar(c) => {
                 state.command_line.push(c);
@@ -1181,8 +1498,76 @@ pub fn update(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 }
             }
 
+            // Mouse (mouse-basics; design D2).
+            Command::FocusPanel(side) => state.active = side,
+            Command::ClickEntry { side, name, mods } => effects.extend(handle_click_entry(&mut state, side, name, mods)),
+            Command::ScrollPanel { side, delta } => effects.extend(handle_scroll_panel(&mut state, side, delta)),
+            Command::KeybarPress(slot) => {
+                if let Some(next) = keybar_command(slot) {
+                    return update_impl(state, next);
+                }
+            }
+            Command::MenuTitleClick(id) => state.menu = Some(MenuState::for_menu(id)),
+            Command::MenuItemClick(index) => {
+                if let Some(next) = handle_menu_item_click(&mut state, index) {
+                    return update_impl(state, next);
+                }
+            }
+            Command::OpenActionMenuAt { side, name } => effects.extend(handle_open_action_menu_at(&mut state, side, name)),
+
+            // Mouse drag-and-drop (mouse-panel-drag; design D2/D4).
+            Command::DragBegin { side, name, op } => {
+                let items = drag_selection_sources(&state, side, &name);
+                if !items.is_empty() {
+                    let source_dir = state.panel(side).cwd.clone();
+                    state.drag = Some(DragState { source: side, source_dir, items, op, target: None });
+                }
+            }
+            Command::DragOver { op, target } => {
+                // Both borrows below are immutable — computed fully before
+                // the mutable one that follows — so there's no conflict with
+                // `state.drag.as_mut()` afterwards.
+                let valid_target =
+                    state.drag.as_ref().and_then(|drag| target.as_ref().filter(|t| valid_drop_target(&state, drag, t)).cloned());
+                if let Some(drag) = state.drag.as_mut() {
+                    drag.op = op;
+                    drag.target = valid_target;
+                }
+            }
+            Command::DragDrop { op } => {
+                if let Some(mut drag) = state.drag.take() {
+                    drag.op = op;
+                    // "Robust against listing changes": the source panel
+                    // must still show the directory the items were captured
+                    // from, and the target must still resolve to a live
+                    // directory (mouse-drag "Robust against listing
+                    // changes").
+                    let source_ok = state.panel(drag.source).cwd == drag.source_dir;
+                    let resolved = if source_ok {
+                        drag.target.as_ref().filter(|t| valid_drop_target(&state, &drag, t)).and_then(|t| drop_target_path(&state, t))
+                    } else {
+                        None
+                    };
+                    if let Some(target_path) = resolved {
+                        let prefill = target_path.display().to_string();
+                        enter_file_op_setup_for_sources(
+                            &mut state,
+                            drag.op,
+                            drag.items,
+                            drag.source,
+                            prefill,
+                            Some(DropButtons { focused: drag.op }),
+                        );
+                    }
+                    // Otherwise: invalid/cancelled — the drag is already
+                    // taken (cleared), and nothing else happens (mouse-drag
+                    // "Release on an invalid spot").
+                }
+            }
+            Command::DragCancel => state.drag = None,
+
             Command::Tick(_) => {}
-            Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) => unreachable!("handled above"),
+            Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) | Command::DialogButtonClick(_) => unreachable!("handled above"),
             _ => {}
         },
         UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) | UiPhase::Viewer(_) | UiPhase::Editor(_) => {
@@ -1871,6 +2256,9 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::Move => Some(Command::RequestMove),
         MenuAction::Mkdir => Some(Command::RequestMkdir),
         MenuAction::Delete => Some(Command::RequestDelete),
+        MenuAction::ClipboardFiles => Some(Command::CopyToClipboard(ClipboardPayloadKind::Files)),
+        MenuAction::ClipboardPaths => Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths)),
+        MenuAction::ClipboardNames => Some(Command::CopyToClipboard(ClipboardPayloadKind::Names)),
         MenuAction::SelectGroup => Some(Command::GroupSelectAll),
         MenuAction::DeselectGroup => Some(Command::GroupDeselectAll),
         MenuAction::InvertSelection => Some(Command::InvertSelection),
@@ -1881,6 +2269,81 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::OpenThemes => Some(Command::ThemePickerOpen),
         MenuAction::Unimplemented => None,
     }
+}
+
+// ---------------------------------------------------------------------
+// Clipboard export (clipboard-export)
+// ---------------------------------------------------------------------
+
+/// Ctrl+C/Ctrl+Ins, Ctrl+Shift+Ins, and the Files pull-down's clipboard
+/// group: resolve the F5 scope and either request the write (leaving
+/// feedback to `apply_clipboard_result` once `Effect::SetClipboard`
+/// replies) or, when the scope is empty, report that directly — the parent
+/// pseudo-entry is never included, since `active_selection_sources` already
+/// excludes it (clipboard-export "Clipboard payloads and scope": "Parent
+/// entry is never copied").
+fn handle_copy_to_clipboard(state: &mut State, kind: ClipboardPayloadKind) -> Vec<Effect> {
+    let sources = active_selection_sources(state);
+    if sources.is_empty() {
+        set_clipboard_feedback(state, "Nothing to copy".to_string(), false);
+        return vec![];
+    }
+    let items = sources.into_iter().map(|s| s.path).collect();
+    vec![Effect::SetClipboard(ClipboardPayload { kind, items })]
+}
+
+/// The file-action menu's `Send to clipboard`: always `Files`, scoped to
+/// whatever `selection_or_single_source` resolved — the menu's single
+/// target entry, or the whole selection set for a selection-scoped
+/// invocation (design D3 of `file-action-menu`, D4 of `mouse-basics`,
+/// mirrored here from `activate_file_action`'s existing Copy/Move/Delete
+/// handling). A no-op if the target has already vanished from the panel.
+fn handle_send_target_to_clipboard(sources: Vec<SourceItem>) -> Vec<Effect> {
+    if sources.is_empty() {
+        return vec![];
+    }
+    let items = sources.into_iter().map(|s| s.path).collect();
+    vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items })]
+}
+
+/// Reply to `Effect::SetClipboard`: render the outcome into the active
+/// panel's mini-status feedback (clipboard-export "Clipboard feedback",
+/// "Non-Windows fallback").
+fn apply_clipboard_result(state: &mut State, payload: ClipboardPayload, fell_back_to_paths: bool, result: Result<(), String>) {
+    let (message, is_error) = match result {
+        Err(message) => (message, true),
+        Ok(()) => (clipboard_success_message(&payload, fell_back_to_paths), false),
+    };
+    set_clipboard_feedback(state, message, is_error);
+}
+
+/// The success feedback template for a completed `ClipboardPayload`
+/// (clipboard-export "Clipboard feedback"). `Paths` gets a singular
+/// variant naming the one path copied; `Files`/`Names` always use the
+/// plural template, matching the literal message set the requirement
+/// enumerates. A `Files` request downgraded to a `Paths` text write on a
+/// non-Windows host reports that explicitly instead (clipboard-export
+/// "Non-Windows fallback").
+fn clipboard_success_message(payload: &ClipboardPayload, fell_back_to_paths: bool) -> String {
+    if fell_back_to_paths {
+        return "Paths copied (file objects unsupported here)".to_string();
+    }
+    let n = payload.items.len();
+    match payload.kind {
+        ClipboardPayloadKind::Files => format!("{n} files copied to clipboard"),
+        ClipboardPayloadKind::Paths if n == 1 => format!("Path copied: {}", payload.items[0].display()),
+        ClipboardPayloadKind::Paths => format!("{n} paths copied"),
+        ClipboardPayloadKind::Names => format!("{n} names copied"),
+    }
+}
+
+/// Show `message` in the active panel's mini-status until the next key
+/// press or `CLIPBOARD_FEEDBACK_MS` elapses, whichever comes first
+/// (clipboard-export "Clipboard feedback").
+fn set_clipboard_feedback(state: &mut State, message: String, is_error: bool) {
+    let side = state.active;
+    let expires_at_ms = state.clock_ms.saturating_add(CLIPBOARD_FEEDBACK_MS);
+    state.panel_mut(side).clipboard_feedback = Some(ClipboardFeedback { message, is_error, expires_at_ms });
 }
 
 // ---------------------------------------------------------------------
@@ -1913,24 +2376,42 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
     if kind == JobKind::Mkdir {
         let side = state.active;
         let source_dir = state.panel(side).cwd.clone();
-        state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: String::new() });
+        state.phase =
+            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: String::new(), buttons: None });
         return;
     }
     let sources = active_selection_sources(state);
     if sources.is_empty() {
         return;
     }
-    enter_file_op_setup_for_sources(state, kind, sources);
+    let side = state.active;
+    let prefill = state.panel(side.toggle()).cwd.display().to_string();
+    enter_file_op_setup_for_sources(state, kind, sources, side, prefill, None);
 }
 
-/// Shared by `enter_file_op_setup` (F5/F6, selection- or cursor-scoped) and
-/// the file-action menu's Copy/Move (cursor-entry-only, D3) — the setup
-/// dialog itself doesn't care which chose its `sources`.
-fn enter_file_op_setup_for_sources(state: &mut State, kind: JobKind, sources: Vec<SourceItem>) {
-    let side = state.active;
-    let source_dir = state.panel(side).cwd.clone();
-    let prefill = state.panel(side.toggle()).cwd.display().to_string();
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: prefill });
+/// Shared by `enter_file_op_setup` (F5/F6, selection- or cursor-scoped), the
+/// file-action menu's Copy/Move (cursor-entry-only, D3), and `Command::
+/// DragDrop` (mouse-panel-drag) — the setup dialog itself doesn't care which
+/// chose its `sources`. `source_side`/`prefill` are explicit rather than
+/// derived from `state.active`/its opposite panel internally, so a caller
+/// acting on a side other than the active panel (a drag begun on the
+/// inactive panel, which a press never focuses before the drag completes)
+/// gets the right source directory and the right prefill without the dialog
+/// silently assuming the active panel (operation-dialogs design D3).
+/// `buttons` is `None` for every keyboard-reached caller (byte-identical to
+/// the pre-`mouse-panel-drag` dialog) and `Some` only from `DragDrop`, which
+/// also passes the exact drop path as `prefill` rather than the opposite
+/// panel's cwd (operation-dialogs "Drop-initiated destination dialog").
+fn enter_file_op_setup_for_sources(
+    state: &mut State,
+    kind: JobKind,
+    sources: Vec<SourceItem>,
+    source_side: PanelSide,
+    prefill: String,
+    buttons: Option<DropButtons>,
+) {
+    let source_dir = state.panel(source_side).cwd.clone();
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: prefill, buttons });
 }
 
 /// F8: enter the delete-confirmation dialog. A no-op when there is nothing
@@ -1992,7 +2473,7 @@ fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
         Command::FileActionMenuConfirm => {
             let menu = state.file_action_menu.take().unwrap();
             let target_name = menu.target_name.clone();
-            activate_file_action(state, menu.selected(), target_name)
+            activate_file_action(state, menu.selected(), target_name, menu.selection_scoped)
         }
         Command::FileActionMenuHotkey(c) => {
             let menu = state.file_action_menu.as_ref().unwrap();
@@ -2000,8 +2481,9 @@ fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
             match action {
                 Some(action) => {
                     let target_name = menu.target_name.clone();
+                    let selection_scoped = menu.selection_scoped;
                     state.file_action_menu = None;
-                    activate_file_action(state, action, target_name)
+                    activate_file_action(state, action, target_name, selection_scoped)
                 }
                 None => vec![],
             }
@@ -2018,14 +2500,18 @@ fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// applied unconditionally regardless of any open modal and resets the
 /// cursor to row 0 whenever the panel hasn't seen a user-driven move since
 /// the listing began (file-action-menu "Menu actions route to existing
-/// flows").
-fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_name: OsString) -> Vec<Effect> {
+/// flows"). `selection_scoped` — also captured at open time — widens
+/// Copy/Move/Delete/Send to clipboard to the whole selection set when the
+/// menu was opened on an already-selected entry (mouse-basics design D4;
+/// file-action-menu "Directory targets and selection-scoped invocation").
+fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_name: OsString, selection_scoped: bool) -> Vec<Effect> {
     let side = state.active;
     match action {
         // Run: the same suspended-shell spawn path a typed command line
         // uses, and the only way to reach it now that Enter no longer
         // spawns an executable directly (command-line: "Enter on an
-        // executable opens the menu instead of spawning").
+        // executable opens the menu instead of spawning"). Always
+        // single-target — Run has no selection-scoped meaning.
         FileActionMenuEntry::Run => {
             let Some(_) = named_entry_source(state, side, &target_name) else { return vec![] };
             let name = target_name.to_string_lossy().into_owned();
@@ -2038,33 +2524,69 @@ fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_n
         FileActionMenuEntry::View => handle_request_viewer(state),
         FileActionMenuEntry::Edit => handle_request_editor(state),
         // Copy/Move/Delete: the existing F5/F6/F8 setup dialogs, scoped to
-        // the menu's target entry only — never the panel's selection (D3).
+        // the whole selection when `selection_scoped`, else to the menu's
+        // target entry only (design D3/D4) — `enter_file_op_setup_for_sources`/
+        // `enter_delete_confirm_for_sources` already title their dialog with
+        // `sources.len()`, so a selection-scoped invocation gets the count
+        // for free.
         FileActionMenuEntry::Copy => {
-            if let Some(source) = named_entry_source(state, side, &target_name) {
-                enter_file_op_setup_for_sources(state, JobKind::Copy, vec![source]);
+            let sources = selection_or_single_source(state, side, &target_name, selection_scoped);
+            if !sources.is_empty() {
+                let prefill = state.panel(side.toggle()).cwd.display().to_string();
+                enter_file_op_setup_for_sources(state, JobKind::Copy, sources, side, prefill, None);
             }
             vec![]
         }
         FileActionMenuEntry::Move => {
-            if let Some(source) = named_entry_source(state, side, &target_name) {
-                enter_file_op_setup_for_sources(state, JobKind::Move, vec![source]);
+            let sources = selection_or_single_source(state, side, &target_name, selection_scoped);
+            if !sources.is_empty() {
+                let prefill = state.panel(side.toggle()).cwd.display().to_string();
+                enter_file_op_setup_for_sources(state, JobKind::Move, sources, side, prefill, None);
             }
             vec![]
         }
         FileActionMenuEntry::Delete => {
-            if let Some(source) = named_entry_source(state, side, &target_name) {
-                enter_delete_confirm_for_sources(state, vec![source]);
+            let sources = selection_or_single_source(state, side, &target_name, selection_scoped);
+            if !sources.is_empty() {
+                enter_delete_confirm_for_sources(state, sources);
             }
             vec![]
         }
         // Rename: new in-place variant (file-action-menu "In-place Rename").
+        // Always single-target — an in-place rename of several entries at
+        // once has no meaning, and the requirement only lists
+        // Copy/Move/Delete/Send to clipboard as selection-scoped.
         FileActionMenuEntry::Rename => {
             if let Some(source) = named_entry_source(state, side, &target_name) {
                 enter_rename_input(state, source.original_name, source.is_dir);
             }
             vec![]
         }
+        // Send to clipboard: the `clipboard-export` Files action, scoped the
+        // same way Copy/Move/Delete are above — never mutates the filesystem
+        // (file-action-menu "Menu actions route to existing flows", "No
+        // mutation without an intervening dialog").
+        FileActionMenuEntry::SendToClipboard => {
+            let sources = selection_or_single_source(state, side, &target_name, selection_scoped);
+            handle_send_target_to_clipboard(sources)
+        }
     }
+}
+
+/// Copy/Move/Delete/Send to clipboard's shared scope resolution: the whole
+/// selection set via the same `active_selection_sources` F5/F6/Ctrl+C
+/// already use when `selection_scoped`, else `target_name` alone — falling
+/// back to the single target if the selection somehow emptied out while the
+/// menu was open (mouse-basics design D4; file-action-menu "Directory
+/// targets and selection-scoped invocation").
+fn selection_or_single_source(state: &State, side: PanelSide, target_name: &OsStr, selection_scoped: bool) -> Vec<SourceItem> {
+    if selection_scoped {
+        let sources = active_selection_sources(state);
+        if !sources.is_empty() {
+            return sources;
+        }
+    }
+    named_entry_source(state, side, target_name).into_iter().collect()
 }
 
 /// The panel entry on `side` named `name` as a single-item `SourceItem`,
@@ -2085,6 +2607,96 @@ fn named_entry_source(state: &State, side: PanelSide, name: &OsStr) -> Option<So
         return None;
     }
     Some(SourceItem { original_name: entry.name.clone(), path: panel.cwd.join(&entry.name), is_dir: entry.is_dir_like() })
+}
+
+// ---------------------------------------------------------------------
+// Mouse drag-and-drop (mouse-panel-drag)
+// ---------------------------------------------------------------------
+
+/// The items a drag beginning on `side`'s entry named `name` freezes at
+/// `DragBegin` (mouse-drag "Drag lifecycle"; design D4): the panel's
+/// selection set if `name` is a member of it, else `name` alone. Empty (and
+/// so a no-op for the caller) if `name` no longer names a selectable entry —
+/// `named_entry_source` already excludes the `..` pseudo-entry, matching
+/// "the parent-directory pseudo-entry SHALL never be dragged". Unlike
+/// `selection_or_single_source` (used by the file-action menu, always
+/// scoped to `state.active`), this is keyed by the drag's own source `side`:
+/// a press-drag never changes `state.active` before the drag completes, so
+/// the source panel need not be the active one at all.
+fn drag_selection_sources(state: &State, side: PanelSide, name: &OsStr) -> Vec<SourceItem> {
+    let panel = state.panel(side);
+    if panel.selected.contains(name) {
+        panel
+            .entries
+            .iter()
+            .filter(|e| panel.selected.contains(&e.name))
+            .map(|e| SourceItem { original_name: e.name.clone(), path: panel.cwd.join(&e.name), is_dir: e.is_dir_like() })
+            .collect()
+    } else {
+        named_entry_source(state, side, name).into_iter().collect()
+    }
+}
+
+/// The directory `target` currently names, re-resolved live against
+/// whichever panel it points into — `None` if it no longer resolves to a
+/// directory (mouse-drag "Robust against listing changes": "the target row
+/// no longer resolves to a directory"). Never touches the filesystem: a
+/// renamed-away or deleted row is indistinguishable here from one that never
+/// existed, and both are simply not found.
+fn drop_target_path(state: &State, target: &DropTarget) -> Option<PathBuf> {
+    match target {
+        DropTarget::PanelDir(side) => Some(state.panel(*side).cwd.clone()),
+        DropTarget::SubDir { side, name } => {
+            let panel = state.panel(*side);
+            let entry = panel.entries.iter().find(|e| &e.name == name)?;
+            match entry.kind {
+                // The `..` row: the panel's own parent, exactly like
+                // `Command::ParentDir` resolves it.
+                EntryKind::ParentDir => crate::panel::parent_path(&panel.cwd),
+                EntryKind::Directory => Some(panel.cwd.join(name)),
+                EntryKind::File => None,
+            }
+        }
+        DropTarget::TreeNode { path, .. } => Some(path.clone()),
+        DropTarget::Tab { side, index } => state.panel(*side).tab_dirs().get(*index).cloned(),
+    }
+}
+
+/// Whether `candidate` is a valid drop target for `drag`'s frozen items
+/// right now (mouse-drag "Valid drop targets"): the region it names must
+/// still make sense for the panel's current display mode (Info/Quick View
+/// panels, and a Tree node/subdirectory row that no longer matches the
+/// panel's actual mode, are never targets), the target must still resolve
+/// to a live directory ([`drop_target_path`]), and it must be neither the
+/// items' own source directory nor equal to/inside a directory being
+/// dragged. Shared by `DragOver` (validating the TUI's raw geometric hit
+/// before it is allowed onto `state.drag.target`) and `DragDrop`
+/// (re-validating at release, since a listing can change between the last
+/// `DragOver` and the button-up — mouse-drag "Robust against listing
+/// changes").
+fn valid_drop_target(state: &State, drag: &DragState, candidate: &DropTarget) -> bool {
+    let region_ok = match candidate {
+        DropTarget::PanelDir(side) => !matches!(state.panel(*side).display_mode, DisplayMode::Info | DisplayMode::QuickView),
+        DropTarget::SubDir { side, .. } => matches!(state.panel(*side).display_mode, DisplayMode::Full | DisplayMode::Brief),
+        DropTarget::TreeNode { side, .. } => state.panel(*side).display_mode == DisplayMode::Tree,
+        // A tab always stands for its own directory, independent of
+        // whichever mode its panel's *active* tab currently renders in
+        // (design D7: "a tab in the strip stands for its directory").
+        DropTarget::Tab { .. } => true,
+    };
+    if !region_ok {
+        return false;
+    }
+    let Some(target_path) = drop_target_path(state, candidate) else { return false };
+    // "A target equal to the items' own directory ... SHALL be invalid"
+    // (mouse-drag "Valid drop targets").
+    if target_path == drag.source_dir {
+        return false;
+    }
+    // "... or equal to or inside a dragged directory, SHALL be invalid."
+    // Only dragged directories can have descendants to protect; a dragged
+    // file has none.
+    drag.items.iter().filter(|item| item.is_dir).all(|item| target_path != item.path && !target_path.starts_with(&item.path))
 }
 
 fn panels_matching(state: &State, dirs: &[&PathBuf]) -> Vec<PanelSide> {
@@ -2120,42 +2732,61 @@ fn handle_file_op(state: &mut State, cmd: Command) -> Vec<Effect> {
     effects
 }
 
+/// Shared by `Command::FileOpConfirm` (Enter — confirms with whatever `kind`
+/// the dialog opened with) and `Command::FileOpConfirmAs` (the drop
+/// dialog's `[ Copy ]`/`[ Move ]` buttons — confirms with an explicit `kind`
+/// override instead): an empty/whitespace destination re-shows the same
+/// dialog unchanged, exactly as before this was split out; otherwise builds
+/// and dispatches the job. `buttons` only ever rides along unchanged — it
+/// has no bearing on which job runs.
+fn confirm_destination_input(
+    kind: JobKind,
+    sources: Vec<SourceItem>,
+    source_dir: PathBuf,
+    input: String,
+    buttons: Option<DropButtons>,
+    effects: &mut Vec<Effect>,
+) -> UiPhase {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons });
+    }
+    let job = match kind {
+        JobKind::Mkdir => {
+            Job { kind, sources: vec![], source_dir: source_dir.clone(), dest_dir: source_dir.clone(), new_dir_name: Some(OsString::from(trimmed)) }
+        }
+        _ => Job { kind, sources, source_dir: source_dir.clone(), dest_dir: PathBuf::from(trimmed), new_dir_name: None },
+    };
+    let running = UiPhase::FileOpRunning {
+        source_dir: job.source_dir.clone(),
+        dest_dir: job.dest_dir.clone(),
+        dialog: RunningDialog::Progress { kind: job.kind, progress: ProgressInfo::starting(0, 0) },
+    };
+    effects.push(Effect::RunJob(job));
+    running
+}
+
 fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effect>) -> UiPhase {
     match setup {
-        FileOpSetup::DestinationInput { kind, sources, source_dir, mut input } => match cmd {
+        FileOpSetup::DestinationInput { kind, sources, source_dir, mut input, buttons } => match cmd {
             Command::FileOpInputChar(c) => {
                 input.push(c);
-                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input })
+                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
             }
             Command::FileOpInputBackspace => {
                 input.pop();
-                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input })
+                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
             }
             Command::FileOpCancel => UiPhase::Panels,
-            Command::FileOpConfirm => {
-                let trimmed = input.trim();
-                if trimmed.is_empty() {
-                    return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input });
-                }
-                let job = match kind {
-                    JobKind::Mkdir => Job {
-                        kind,
-                        sources: vec![],
-                        source_dir: source_dir.clone(),
-                        dest_dir: source_dir.clone(),
-                        new_dir_name: Some(OsString::from(trimmed)),
-                    },
-                    _ => Job { kind, sources, source_dir: source_dir.clone(), dest_dir: PathBuf::from(trimmed), new_dir_name: None },
-                };
-                let running = UiPhase::FileOpRunning {
-                    source_dir: job.source_dir.clone(),
-                    dest_dir: job.dest_dir.clone(),
-                    dialog: RunningDialog::Progress { kind: job.kind, progress: ProgressInfo::starting(0, 0) },
-                };
-                effects.push(Effect::RunJob(job));
-                running
-            }
-            _ => UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input }),
+            // Enter: confirm with whatever `kind` the dialog opened with —
+            // the drop dialog's initially proposed verb, or the plain
+            // keyboard dialog's fixed Copy/Move/Mkdir.
+            Command::FileOpConfirm => confirm_destination_input(kind, sources, source_dir, input, buttons, effects),
+            // The drop dialog's `[ Copy ]`/`[ Move ]` buttons: confirm with
+            // an explicit verb instead, overriding `kind` (operation-dialogs
+            // "Switching the verb in the dialog").
+            Command::FileOpConfirmAs(explicit_kind) => confirm_destination_input(explicit_kind, sources, source_dir, input, buttons, effects),
+            _ => UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons }),
         },
         FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once } => match cmd {
             Command::FileOpCancel => UiPhase::Panels,
@@ -2726,6 +3357,152 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
         }
         _ => unreachable!("apply_listing_event only called for listing events"),
     }
+}
+
+// ---------------------------------------------------------------------
+// Mouse (mouse-basics, design D2)
+// ---------------------------------------------------------------------
+
+/// The command a dialog button click stands for — the exact command the
+/// equivalent keypress already issues, so a click is never a new way to do
+/// something, only a new way to reach an existing one. `None` for a button
+/// that has no reachable meaning outside its own gated context (there is
+/// none today — kept `Option` for symmetry with [`menu_action_command`] and
+/// so a future button can be added without an infallible-match refactor).
+pub fn button_command(id: ButtonId) -> Option<Command> {
+    match id {
+        ButtonId::DeleteConfirmYes => Some(Command::FileOpConfirm),
+        ButtonId::DeleteConfirmNo => Some(Command::FileOpCancel),
+        ButtonId::ConflictOverwrite => Some(Command::FileOpConflictChoice(ConflictChoice::Overwrite)),
+        ButtonId::ConflictOverwriteAll => Some(Command::FileOpConflictChoice(ConflictChoice::OverwriteAll)),
+        ButtonId::ConflictSkip => Some(Command::FileOpConflictChoice(ConflictChoice::Skip)),
+        ButtonId::ConflictSkipAll => Some(Command::FileOpConflictChoice(ConflictChoice::SkipAll)),
+        ButtonId::ConflictRename => Some(Command::FileOpBeginRename),
+        ButtonId::ErrorRetry => Some(Command::FileOpErrorChoice(ErrorChoice::Retry)),
+        ButtonId::ErrorSkip => Some(Command::FileOpErrorChoice(ErrorChoice::Skip)),
+        ButtonId::ErrorSkipAll => Some(Command::FileOpErrorChoice(ErrorChoice::SkipAll)),
+        ButtonId::ErrorAbort => Some(Command::FileOpErrorChoice(ErrorChoice::Abort)),
+        ButtonId::ProgressCancel => Some(Command::FileOpCancelJob),
+        ButtonId::SummaryContinue => Some(Command::FileOpConfirm),
+        ButtonId::QuitYes => Some(Command::ConfirmQuit),
+        ButtonId::QuitNo => Some(Command::CancelQuit),
+        ButtonId::DropDialogCopy => Some(Command::FileOpConfirmAs(JobKind::Copy)),
+        ButtonId::DropDialogMove => Some(Command::FileOpConfirmAs(JobKind::Move)),
+        ButtonId::DropDialogCancel => Some(Command::FileOpCancel),
+    }
+}
+
+/// `Command::ClickEntry`: focus `side`, and either move the cursor to the
+/// named entry (`Plain`/`Shift`) or toggle its selection in place without
+/// advancing the cursor from wherever it lands (`Ctrl`) — mirroring `Ins`'s
+/// `toggle_selection_and_advance` except the cursor's destination is the
+/// clicked entry, not "one past wherever it already was" (mouse-input
+/// "Click focuses and places the cursor", "Ctrl+click toggles selection"). A
+/// name the panel no longer lists (e.g. a listing that changed between the
+/// hit map being built and the click landing) is a silent no-op rather than
+/// a panic. The parent `..` pseudo-entry is never selectable, matching
+/// `toggle_selection_and_advance`'s own guard (mouse-input "Parent entry
+/// ignored").
+fn handle_click_entry(state: &mut State, side: PanelSide, name: OsString, mods: ClickMods) -> Vec<Effect> {
+    state.active = side;
+    let panel = state.panel_mut(side);
+    let Some(idx) = panel.entries.iter().position(|e| e.name == name) else { return vec![] };
+    panel.cursor = idx;
+    panel.cursor_user_moved = true;
+    if mods == ClickMods::Ctrl && panel.entries[idx].kind != EntryKind::ParentDir {
+        if !panel.selected.remove(&name) {
+            panel.selected.insert(name);
+        }
+    }
+    reconcile_panel_viewport(state, side);
+    vec![]
+}
+
+/// `Command::ScrollPanel`: move `side`'s cursor by `delta` rows and let the
+/// existing scroll-offset clamp bring the viewport along, so the
+/// cursor-in-window invariant holds exactly as it does for a keyboard
+/// Up/Down (mouse-input "Wheel moves the cursor of the panel under the
+/// pointer"; design D6). Tree mode has no flat `entries` list to move a
+/// bare `CursorMove` over, so it reuses the same tree-cursor path the
+/// keyboard's Up/Down already takes there.
+fn handle_scroll_panel(state: &mut State, side: PanelSide, delta: isize) -> Vec<Effect> {
+    let m = if delta < 0 { CursorMove::Up(delta.unsigned_abs()) } else { CursorMove::Down(delta as usize) };
+    if state.panel(side).display_mode == DisplayMode::Tree {
+        return handle_tree_cursor_move(state, side, m);
+    }
+    state.panel_mut(side).move_cursor(m);
+    reconcile_panel_viewport(state, side);
+    vec![]
+}
+
+/// `Command::KeybarPress`: the command each function-key-bar slot stands
+/// for, exactly mirroring `input::map_panel_key`'s own F-key arms (mouse-
+/// input "Key bar, menu bar, pull-down items, and dialog buttons are
+/// clickable"). `None` for a slot number the bar never actually draws.
+fn keybar_command(slot: u8) -> Option<Command> {
+    match slot {
+        1 => Some(Command::HelpOpen),
+        2 => Some(Command::UserMenuOpen),
+        3 => Some(Command::RequestViewer),
+        4 => Some(Command::RequestEditor),
+        5 => Some(Command::RequestCopy),
+        6 => Some(Command::RequestMove),
+        7 => Some(Command::RequestMkdir),
+        8 => Some(Command::RequestDelete),
+        9 => Some(Command::MenuOpen),
+        10 => Some(Command::RequestQuit),
+        _ => None,
+    }
+}
+
+/// `Command::MenuItemClick`: highlight `index` (only if it names an enabled
+/// item) and return the command activating it stands for, exactly like
+/// `handle_menu`'s own `Command::MenuActivate` arm — the caller re-enters
+/// `update` with it. `None` (no-op) for an index that is out of range, a
+/// separator, or disabled, and whenever no menu is open at all.
+fn handle_menu_item_click(state: &mut State, index: usize) -> Option<Command> {
+    let active_side = state.active;
+    let menu = state.menu.as_mut()?;
+    match menu.items().get(index) {
+        Some(MenuEntry::Item(item)) if item.is_enabled() => {
+            menu.selected = index;
+            let side = menu.active.target_side(active_side);
+            let action = item.action;
+            state.menu = None;
+            menu_action_command(action, side)
+        }
+        _ => None,
+    }
+}
+
+/// `Command::OpenActionMenuAt`: move `side`'s cursor to the named entry and
+/// open the file-action menu for it — for a file, the same shape
+/// `handle_enter`'s `EntryKind::File` arm builds; for a directory, the
+/// `View`/`Edit`/`Run`-less menu `file-action-menu`'s "Directory targets and
+/// selection-scoped invocation" requirement adds (mouse-input "Right-click
+/// opens the action menu"; design D4). The menu is also opened
+/// selection-scoped whenever `name` is already a member of the panel's
+/// selection set, so `activate_file_action` later acts on the whole
+/// selection rather than `name` alone. A `..` target, or a name the panel no
+/// longer lists, is a no-op — `..` is never a valid action-menu target,
+/// mirroring Ctrl+click's own "Parent entry ignored" guard.
+fn handle_open_action_menu_at(state: &mut State, side: PanelSide, name: OsString) -> Vec<Effect> {
+    state.active = side;
+    let panel = state.panel_mut(side);
+    let Some(idx) = panel.entries.iter().position(|e| e.name == name) else { return vec![] };
+    panel.cursor = idx;
+    panel.cursor_user_moved = true;
+    reconcile_panel_viewport(state, side);
+    let panel = state.panel(side);
+    let kind = panel.entries[idx].kind;
+    if kind == EntryKind::ParentDir {
+        return vec![];
+    }
+    let is_dir = kind == EntryKind::Directory;
+    let executable = !is_dir && shell::is_executable_name(&name.to_string_lossy(), &state.shell.pathext);
+    let selection_scoped = panel.selected.contains(&name);
+    state.file_action_menu = Some(FileActionMenuState::open(name, is_dir, executable, selection_scoped));
+    vec![]
 }
 
 #[cfg(test)]

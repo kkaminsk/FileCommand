@@ -198,6 +198,23 @@ pub enum CursorMove {
     End,
 }
 
+/// The outcome of a clipboard action (`clipboard-export` "Clipboard
+/// feedback"), shown in place of the panel's normal mini-status content
+/// until the next key press or `clock_ms` reaches `expires_at_ms` —
+/// whichever comes first (`crate::update` clears it on any non-`Tick`
+/// command and on a `Tick` once `State::clock_ms >= expires_at_ms`). Unlike
+/// `PanelState::last_error`, which lingers until superseded by success, this
+/// is always transient — every clipboard action, success or failure,
+/// produces exactly one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClipboardFeedback {
+    pub message: String,
+    /// Rendered in the error color role (like `last_error`) rather than the
+    /// normal mini-status role.
+    pub is_error: bool,
+    pub expires_at_ms: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelState {
     pub cwd: PathBuf,
@@ -223,6 +240,11 @@ pub struct PanelState {
     /// yanking it back to row 0.
     pub cursor_user_moved: bool,
     pub last_error: Option<String>,
+    /// The most recent clipboard action's outcome, or `None` when nothing
+    /// is being shown (`clipboard-export` "Clipboard feedback"). Set by
+    /// `crate::update`'s `Command::CopyToClipboard`/`Command::ClipboardResult`
+    /// handling.
+    pub clipboard_feedback: Option<ClipboardFeedback>,
     /// Selected entries, keyed by original on-disk name — never by row
     /// index, so selection survives cursor movement, re-sort, and scroll.
     /// The parent-directory pseudo-entry can never appear here.
@@ -291,6 +313,7 @@ impl PanelState {
             progress: ListingProgress::Streaming { count: 0 },
             cursor_user_moved: false,
             last_error: None,
+            clipboard_feedback: None,
             selected: HashSet::new(),
             quick_filter: None,
             tabs: Vec::new(),
@@ -644,6 +667,7 @@ impl PanelState {
             progress: self.progress,
             cursor_user_moved: self.cursor_user_moved,
             last_error: self.last_error.clone(),
+            clipboard_feedback: self.clipboard_feedback.clone(),
             selected: self.selected.clone(),
             quick_filter: self.quick_filter.clone(),
             git_info: self.git_info.clone(),
@@ -667,6 +691,7 @@ impl PanelState {
         self.progress = data.progress;
         self.cursor_user_moved = data.cursor_user_moved;
         self.last_error = data.last_error;
+        self.clipboard_feedback = data.clipboard_feedback;
         self.selected = data.selected;
         self.quick_filter = data.quick_filter;
         self.git_info = data.git_info;
@@ -768,6 +793,7 @@ pub struct TabData {
     pub progress: ListingProgress,
     pub cursor_user_moved: bool,
     pub last_error: Option<String>,
+    pub clipboard_feedback: Option<ClipboardFeedback>,
     pub selected: HashSet<OsString>,
     pub quick_filter: Option<String>,
     pub git_info: GitInfo,

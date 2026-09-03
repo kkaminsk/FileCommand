@@ -16,6 +16,7 @@ use filecommand_core::dialogs::HelpState;
 use filecommand_core::listing::{DateTime, Entry, EntryKind};
 use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState};
 use filecommand_core::theme::{ColorDepth, Theme};
+use filecommand_core::PanelSide;
 
 use filecommand_tui::views;
 
@@ -72,14 +73,14 @@ fn render_panel_at(display_mode: DisplayMode, size: (u16, u16)) -> String {
     let panel = sample_panel(display_mode);
     let opposite = sample_panel(DisplayMode::Full);
     let theme = Theme::classic();
-    views::panel::render_panel(&mut buf, area, &panel, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &opposite, None);
+    views::panel::render_panel(&mut buf, area, &panel, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &opposite, None, PanelSide::Left, None);
     buffer_to_text(&buf, area)
 }
 
 fn render_keybar_at(width: u16) -> String {
     let area = Rect { x: 0, y: 0, width, height: 1 };
     let mut buf = Buffer::empty(area);
-    views::keybar::render_keybar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16);
+    views::keybar::render_keybar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, false);
     buffer_to_text(&buf, area)
 }
 

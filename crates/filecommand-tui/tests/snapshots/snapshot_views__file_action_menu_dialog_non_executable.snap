@@ -9,15 +9,15 @@ expression: text
 ║Cargo.toml   │ 612     01-02-2 03:0   ║║Cargo.toml   │ 612     01-02-2 03:0   ║
 ║readme.txt   │ 12K     01-02-2 03:0   ║║readme.txt   │ 12K     01-02-2 03:0   ║
 ║                                      ║║                                      ║
-║                                      ║║                                      ║
-║                              ╔══ readme.txt ══╗                              ║
-║                              ║ View           ║                              ║
-║                              ║ Edit           ║                              ║
-║                              ║ Copy           ║                              ║
-║                              ║ Rename         ║                              ║
-║                              ║ Move           ║                              ║
-║                              ║ Delete         ║                              ║
-║                              ╚════════════════╝                              ║
+║                            ╔═══ readme.txt ════╗                             ║
+║                            ║ View              ║                             ║
+║                            ║ Edit              ║                             ║
+║                            ║ Copy              ║                             ║
+║                            ║ Rename            ║                             ║
+║                            ║ Move              ║                             ║
+║                            ║ Delete            ║                             ║
+║                            ║ Send to clipboard ║                             ║
+║                            ╚═══════════════════╝                             ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║

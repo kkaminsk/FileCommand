@@ -35,7 +35,23 @@ use filecommand_core::{PanelSide, State, UiPhase};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use crate::hitmap::HitMap;
 use crate::layout;
+
+/// `views::render`'s full result: the terminal-cursor position it already
+/// returned, plus the [`HitMap`] `input::map_mouse` needs for the *next*
+/// frame's mouse events (design D2). Bundled as one struct — rather than
+/// widening `render`'s return to a tuple — so a future addition doesn't
+/// force every call site to re-destructure.
+#[derive(Debug, Clone, Default)]
+pub struct RenderOutput {
+    /// The real terminal cursor's `(x, y)` position when the current phase
+    /// wants one shown (only `UiPhase::Editor`, for the caret) — `None`
+    /// otherwise. See `render`'s own doc comment for why a stale position
+    /// must not linger.
+    pub cursor: Option<(u16, u16)>,
+    pub hitmap: HitMap,
+}
 
 /// Render the entire screen for the current `state`. Pure with respect to
 /// state — never mutates it, never performs I/O itself. `clock_text` is the
@@ -46,11 +62,14 @@ use crate::layout;
 /// `ByteSource`, `core::State` never does); it is ignored in every other
 /// phase.
 ///
-/// Returns the real terminal cursor's `(x, y)` position when the current
-/// phase wants one shown (only `UiPhase::Editor`, for the caret) — `None`
-/// otherwise, which the caller must treat as "leave the cursor hidden"
-/// since a stale position from a previous frame's phase would otherwise
-/// linger.
+/// Returns [`RenderOutput`]: the real terminal cursor's `(x, y)` position
+/// when the current phase wants one shown (only `UiPhase::Editor`, for the
+/// caret) — `None` otherwise, which the caller must treat as "leave the
+/// cursor hidden" since a stale position from a previous frame's phase
+/// would otherwise linger — alongside the [`HitMap`] `input::map_mouse`
+/// needs for the next frame's mouse events (design D2; this is the same
+/// return value the M4 caret position already was, just extended rather
+/// than replaced).
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -59,7 +78,7 @@ pub fn render(
     identity_lines: &[String; 4],
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
-) -> Option<(u16, u16)> {
+) -> RenderOutput {
     // Resolved once per frame: the highlighted built-in theme while the
     // theme picker is open, else the applied theme (theme-selection "Live
     // theme preview while the picker is open"). Every renderer below —
@@ -85,7 +104,65 @@ pub fn render(
     if let Some(message) = &state.startup_warning {
         startup_warning::render_startup_warning(buf, area, &render_theme, depth, message);
     }
-    cursor
+    RenderOutput { cursor, hitmap: build_hitmap(area, state) }
+}
+
+/// Builds the frame's [`HitMap`] by asking each relevant view module for the
+/// clickable regions it just drew — `panel::hit_test`, `keybar::hit_slots`,
+/// `menubar::hit_titles`/`hit_items`, and each open dialog's own
+/// `hit_buttons` — mirroring `render_phase`'s own "what's open" dispatch so
+/// the two can never disagree about what's actually on screen this frame
+/// (mouse-input "Hit-testing stays in the TUI"; design D2). Never draws
+/// anything itself.
+fn build_hitmap(area: Rect, state: &State) -> HitMap {
+    let mut hm = HitMap::default();
+    match &state.phase {
+        UiPhase::Panels | UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => {
+            let l = layout::compute((area.width, area.height), state.split_percent);
+            *hm.panel_mut(PanelSide::Left) = panel::hit_test(l.left, &state.left);
+            *hm.panel_mut(PanelSide::Right) = panel::hit_test(l.right, &state.right);
+            hm.cmdline = l.cmdline;
+            hm.keybar = keybar::hit_slots(l.keybar);
+            if let Some(menu) = &state.menu {
+                hm.menu_titles = menubar::hit_titles(area);
+                hm.menu_items = menubar::hit_items(area, menu);
+            }
+            match &state.phase {
+                UiPhase::FileOpSetup(setup) => {
+                    // Exactly one of these is ever non-empty for a given
+                    // `setup` — `delete_confirm::hit_buttons` no-ops outside
+                    // `DeleteConfirm`, `destination_input::hit_buttons`
+                    // outside a drop-initiated `DestinationInput` — so
+                    // concatenating both is simply "whichever dialog is
+                    // actually showing its buttons this frame."
+                    hm.dialog_buttons = delete_confirm::hit_buttons(area, setup);
+                    hm.dialog_buttons.extend(destination_input::hit_buttons(area, setup));
+                }
+                UiPhase::FileOpRunning { dialog, .. } => {
+                    hm.dialog_buttons = match dialog {
+                        RunningDialog::Progress { .. } => progress_dialog::hit_buttons(area),
+                        RunningDialog::Conflict { rename_input, .. } => conflict_dialog::hit_buttons(area, rename_input),
+                        RunningDialog::Error { info, .. } => error_dialog::hit_buttons(area, info),
+                    };
+                }
+                UiPhase::FileOpSummary(skipped) => hm.dialog_buttons = skipped_summary::hit_buttons(area, skipped),
+                _ => {}
+            }
+        }
+        // Splash/Placeholder have nothing clickable; Viewer/Editor's wheel-
+        // only handling is dispatched directly by the event loop from
+        // `state.phase` (mirroring how it already calls `map_viewer_key`/
+        // `map_editor_key` directly rather than through `map_key`), so
+        // neither needs a hit map at all.
+        _ => {}
+    }
+    // The quit-confirmation dialog is drawn above whatever the phase
+    // painted (see `render`, above) and is reachable from every context, so
+    // its buttons are recorded the same way, independent of the match above.
+    if state.quit_confirm {
+        hm.dialog_buttons.extend(quit_dialog::hit_buttons(area));
+    }
+    hm
 }
 
 fn render_phase(
@@ -129,6 +206,8 @@ fn render_phase(
                 identity_lines,
                 &state.right,
                 left_type_ahead,
+                PanelSide::Left,
+                state.drag.as_ref(),
             );
             panel::render_panel(
                 buf,
@@ -140,6 +219,8 @@ fn render_phase(
                 identity_lines,
                 &state.left,
                 right_type_ahead,
+                PanelSide::Right,
+                state.drag.as_ref(),
             );
             // Drawn unconditionally, before the F9 overlay below — the menu
             // bar (when open) paints over the whole top row including this,
@@ -152,7 +233,7 @@ fn render_phase(
                 clock::render_clock(buf, l.right, theme, depth, clock_text);
             }
             command_line::render_command_line(buf, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
-            keybar::render_keybar(buf, l.keybar, theme, depth);
+            keybar::render_keybar(buf, l.keybar, theme, depth, state.drag.is_some());
 
             // The F9 bar overlays the panels' top borders (and the clock)
             // rather than reserving a row of its own.

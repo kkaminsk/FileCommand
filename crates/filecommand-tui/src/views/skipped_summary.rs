@@ -4,6 +4,7 @@ use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::SkippedItem;
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
+use filecommand_core::update::ButtonId;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
@@ -48,4 +49,26 @@ pub fn render_skipped_summary(buf: &mut Buffer, area: Rect, theme: &Theme, depth
     buf.set_string(x + 1, footer_y, pad_to_width(&truncate_with_ellipsis("Press any key to continue", inner_w), inner_w), body);
     buf.set_string(x + 1 + inner_w as u16, footer_y, "\u{2551}", body);
     buf.set_string(x, footer_y + 1, &bottom, body);
+}
+
+/// The "Press any key to continue" footer row `render_skipped_summary`
+/// currently draws at `area`, recorded as one clickable span — this dialog
+/// has no literal button glyph, but design D5 gates it as buttons-only, so
+/// the whole footer stands in for "any key" (mirroring
+/// `Command::FileOpConfirm`, which is what any key already does here).
+/// Mirrors the renderer's own row-count/`overlay_rect` geometry exactly.
+pub fn hit_buttons(area: Rect, skipped: &[SkippedItem]) -> Vec<(Rect, ButtonId)> {
+    let title = format!(" Skipped {} item(s) ", skipped.len());
+    let all_rows: Vec<String> = skipped.iter().take(MAX_ROWS).map(|s| format!("{}: {}", s.path.display(), s.reason)).collect();
+    let preferred_inner_w = all_rows.iter().map(|r| display_width(r)).max().unwrap_or(0).max(display_width(&title)).max(30) + 2;
+    let preferred_h = CHROME_ROWS + all_rows.len() as u16;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, preferred_h), (MIN_INNER_W as u16, 5), (area.width, area.height));
+    let inner_w = r.width.saturating_sub(2);
+    let box_h = r.height;
+    let visible_rows = box_h.saturating_sub(CHROME_ROWS) as usize;
+    let rows_len = all_rows.len().min(visible_rows);
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+    let footer_y = y + 1 + rows_len as u16;
+    vec![(Rect { x: x + 1, y: footer_y, width: inner_w, height: 1 }, ButtonId::SummaryContinue)]
 }

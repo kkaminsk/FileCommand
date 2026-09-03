@@ -9,20 +9,20 @@ expression: text
 ║Cargo.toml   │ 612     01-02-2 03:0   ║║Cargo.toml   │ 612     01-02-2 03:0   ║
 ║readme.txt   │ 12K     01-02-2 03:0   ║║readme.txt   │ 12K     01-02-2 03:0   ║
 ║                                      ║║                                      ║
-║                            ╔════ setup.exe ════╗                             ║
-║                            ║ Run               ║                             ║
-║                            ║ View              ║                             ║
-║                            ║ Edit              ║                             ║
-║                            ║ Copy              ║                             ║
-║                            ║ Rename            ║                             ║
-║                            ║ Move              ║                             ║
-║                            ║ Delete            ║                             ║
-║                            ║ Send to clipboard ║                             ║
-║                            ╚═══════════════════╝                             ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
-╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
+╚═══════════ docs  SUB-DIR ════════════╝╚════════ Copy 1 file ► docs\ ═════════╝
 C:\Users\demo\left>_                                                            
-1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit
+Drop=Copy  Shift/RightBtn=Move  Esc=Cancel

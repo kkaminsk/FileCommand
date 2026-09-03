@@ -17,8 +17,12 @@ use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
 use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
+use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::ViewerState;
 use filecommand_core::{Command, PanelSide, State, UiPhase};
+
+mod mouse;
+pub use mouse::{map_mouse, MouseTracker};
 
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
     // The quit-confirmation dialog is the topmost modal overlay of all: it
@@ -122,12 +126,12 @@ const VIEWER_H_SCROLL_STEP: i64 = 4;
 /// count (from `views::viewer::body_rows`), used as the Page Up/Down step —
 /// the same "page size follows the layout" convention `map_panel_key` uses.
 pub fn map_viewer_key(key: KeyEvent, viewer: &ViewerState, rows_visible: usize) -> Option<ViewerInput> {
-    // Ctrl+C requests quit from the viewer in any state, including while
-    // the F7 search prompt is open, ahead of every other viewer key
-    // (application-shell "Quit request keys and confirmation").
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(ViewerInput::Cmd(Command::RequestQuit));
-    }
+    // Ctrl+C no longer requests quit here (application-shell "Quit request
+    // keys and confirmation"): it falls through every arm below (the F7
+    // search prompt's `Char(c) if is_plain` guard excludes it too) to the
+    // final `_ => None`, "neither quits nor triggers any unmodified-key
+    // action" (clipboard-export "Clipboard key bindings" — the viewer isn't
+    // "over the panels", so it has no clipboard meaning here either).
     // The F7 search prompt owns the keyboard while it is open, exactly like
     // the command line and quick-search do elsewhere.
     if viewer.search_input.is_some() {
@@ -235,6 +239,17 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let active = state.active;
     let typing = !state.command_line.is_empty();
 
+    // A drag in progress claims Esc unconditionally, cancelling it rather
+    // than reaching the unconditional-quit-request arm below (mouse-drag
+    // "Cancel and phase-change clear the drag": "Pressing Esc during a drag
+    // SHALL cancel it"). `state.drag` is `Some` only in `UiPhase::Panels`
+    // with no overlay open (core's `drag_allowed`), which this function is
+    // already gated on by `map_key`'s own dispatch, so this can never
+    // shadow a dialog's own Esc handling.
+    if state.drag.is_some() && key.code == KeyCode::Esc {
+        return Some(Command::DragCancel);
+    }
+
     // The Ctrl+P quick filter, while active on the active panel, claims
     // plain printables/Backspace before anything else — but leaves every
     // other key (movement, Enter, Esc, ...) to fall through to the normal
@@ -287,6 +302,28 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         return Some(Command::SplitReset);
     }
 
+    // Clipboard export (clipboard-export "Clipboard key bindings"). Checked
+    // ahead of the ctrl/alt group and the general match below — in
+    // particular ahead of the unguarded `Insert -> ToggleSelectAtCursor`
+    // arm further down, since both Insert chords here must win over it.
+    // Ctrl+Shift+Ins (Paths) is checked before the plain Files chord so a
+    // custom `clipboard_files` binding can never shadow it. Ctrl+C no
+    // longer requests quit anywhere (design D1; application-shell "Quit
+    // request keys and confirmation").
+    if matches_binding(&key, &keys.clipboard_paths) {
+        return Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths));
+    }
+    if matches_binding(&key, &keys.clipboard_files) {
+        return Some(Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    }
+    // Ctrl+Ins is a fixed alias for Files, independent of any
+    // `key.clipboard_files` rebinding (design D1: "Ctrl+Ins is a fixed
+    // alias (not rebindable)"). Shift is excluded so it never shadows
+    // Ctrl+Shift+Ins above.
+    if key.code == KeyCode::Insert && key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        return Some(Command::CopyToClipboard(ClipboardPayloadKind::Files));
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
@@ -296,14 +333,6 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     // claimed by any other alt-combination here).
     if ctrl && !alt {
         match key.code {
-            // Ctrl+C requests quit from the panels in any command-line
-            // state (typing, quick filter, or type-ahead) — the universal
-            // terminal interrupt chord, routed through the same
-            // confirmation dialog as every other quit trigger
-            // (application-shell "Quit request keys and confirmation").
-            // Checked ahead of the quick-filter/type-ahead blocks above
-            // implicitly, since neither of those claims Ctrl-modified keys.
-            KeyCode::Char('c') | KeyCode::Char('C') => return Some(Command::RequestQuit),
             KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
             KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
             _ => {}
@@ -402,14 +431,13 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
 
 /// The quit-confirmation dialog (`state.quit_confirm`), checked first of
 /// every overlay in `map_key`. Esc keeps its universal dialog-cancel
-/// meaning; Ctrl+C — pressed again, since it is what opened the dialog from
-/// most contexts — confirms instead, the terminal "press Ctrl+C again to
-/// exit" convention (application-shell "Quit request keys and
-/// confirmation"; design D4).
+/// meaning; Ctrl+C no longer confirms here (the terminal "press Ctrl+C
+/// again to exit" convention `quit-keys` used is reversed per the user's
+/// decision) — it isn't bound to anything in this match, so it falls
+/// through to `_ => None` and "the dialog stays open and the application
+/// does not exit" (application-shell "Quit request keys and confirmation";
+/// design D1).
 fn map_quit_confirm_key(key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::ConfirmQuit);
-    }
     match key.code {
         KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::ConfirmQuit),
         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::CancelQuit),
@@ -418,12 +446,10 @@ fn map_quit_confirm_key(key: KeyEvent) -> Option<Command> {
 }
 
 fn map_menu_key(key: KeyEvent) -> Option<Command> {
-    // Ctrl+C requests quit with a pull-down open, ahead of the menu's own
-    // key handling (application-shell "Quit request keys and
-    // confirmation").
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
+    // Ctrl+C no longer requests quit with a pull-down open
+    // (application-shell "Quit request keys and confirmation"); it isn't
+    // bound to anything below (the hotkey arm's `is_plain` guard excludes
+    // it), so it falls through to `_ => None`.
     match key.code {
         KeyCode::Esc => Some(Command::MenuCollapse),
         KeyCode::F(9) | KeyCode::F(10) => Some(Command::MenuClose),
@@ -439,9 +465,6 @@ fn map_menu_key(key: KeyEvent) -> Option<Command> {
 
 /// Ctrl+J fuzzy-jump dialog (fuzzy-jump "Fuzzy jump dialog invocation").
 fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::FuzzyJumpCancel),
         KeyCode::Enter => Some(Command::FuzzyJumpConfirm),
@@ -459,9 +482,6 @@ fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
 /// confirm a result instead (find-file "Find-file invocation", "Navigate to
 /// a chosen result").
 fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     if dialog.request.is_none() {
         return match key.code {
             KeyCode::Esc => Some(Command::FindFileCancel),
@@ -482,9 +502,6 @@ fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
 
 /// F2 user menu (user-menu "Navigate and dismiss the user menu").
 fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::UserMenuCancel),
         KeyCode::Enter => Some(Command::UserMenuConfirm),
@@ -497,9 +514,6 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
 /// Options → Themes picker (theme-selection "Picker navigation, apply, and
 /// cancel").
 fn map_theme_picker_key(key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::ThemePickerCancel),
         KeyCode::Enter => Some(Command::ThemePickerConfirm),
@@ -518,9 +532,6 @@ fn map_theme_picker_key(key: KeyEvent) -> Option<Command> {
 /// and pressing an entry's first letter SHALL activate that entry
 /// directly").
 fn map_file_action_menu_key(key: KeyEvent, _dialog: &FileActionMenuState) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::FileActionMenuCancel),
         KeyCode::Enter => Some(Command::FileActionMenuConfirm),
@@ -537,9 +548,6 @@ fn map_file_action_menu_key(key: KeyEvent, _dialog: &FileActionMenuState) -> Opt
 /// of Enter/Esc/`O` as "go back a level", which `Command::HelpCancel`
 /// already implements uniformly via `HelpState::back`.
 fn map_help_key(key: KeyEvent, dialog: &HelpState) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     if dialog.about_open {
         return match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('o') | KeyCode::Char('O') => Some(Command::HelpCancel),
@@ -553,7 +561,12 @@ fn map_help_key(key: KeyEvent, dialog: &HelpState) -> Option<Command> {
         };
     }
     match key.code {
-        KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => Some(Command::HelpCancel),
+        KeyCode::Esc => Some(Command::HelpCancel),
+        // No-modifier guard (clipboard-export "Clipboard key bindings";
+        // design D1): without it this arm would catch Ctrl+C too, since
+        // `Char('c')` alone doesn't distinguish the plain key from a
+        // Ctrl-modified one — and Ctrl+C no longer closes Help.
+        KeyCode::Char('c') | KeyCode::Char('C') if is_plain(&key) => Some(Command::HelpCancel),
         KeyCode::Enter | KeyCode::Char('h') | KeyCode::Char('H') => Some(Command::HelpActivate),
         KeyCode::Up => Some(Command::HelpMove(-1)),
         KeyCode::Down => Some(Command::HelpMove(1)),
@@ -571,9 +584,6 @@ fn map_startup_warning_key(_key: KeyEvent) -> Option<Command> {
 }
 
 fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::DriveSelectCancel),
         KeyCode::Up => Some(Command::DriveSelectMove(-1)),
@@ -601,9 +611,6 @@ fn map_drive_select_key(key: KeyEvent) -> Option<Command> {
 /// requests application quit"; application-shell "Quit request keys and
 /// confirmation").
 fn map_quick_search_key(key: KeyEvent, page_size: usize) -> Option<Command> {
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
     match key.code {
         KeyCode::Esc => Some(Command::RequestQuit),
         KeyCode::Backspace => Some(Command::QuickSearchBackspace),
@@ -654,14 +661,13 @@ pub fn matches_binding(key: &KeyEvent, binding: &KeyBinding) -> bool {
 }
 
 fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> {
-    // Ctrl+C requests quit from every file-op setup dialog, ahead of each
-    // dialog's own key handling — checked with an explicit modifier guard
-    // since `DestinationInput`/`RenameInput` below otherwise claim every
-    // `Char(c)` unconditionally (application-shell "Quit request keys and
-    // confirmation").
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
+    // Ctrl+C no longer requests quit from any file-op setup dialog
+    // (application-shell "Quit request keys and confirmation"). Unlike the
+    // Progress/Help cancel arms, `DestinationInput`/`RenameInput`'s
+    // `Char(c) => FileOpInputChar(c)` below needs no extra guard: it has
+    // never filtered by modifier (every other Ctrl-letter already types its
+    // base character there today), so Ctrl+C typing `c` is consistent with
+    // that existing behavior rather than a new special case.
     match setup {
         FileOpSetup::DeleteConfirm { .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::FileOpConfirm),
@@ -682,18 +688,16 @@ fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> 
 }
 
 fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Command> {
-    // Ctrl+C requests quit from every running-job dialog — including the
-    // Progress dialog, whose own plain `c`/`C` already means "cancel job"
-    // (matched below with no modifier guard), so the Ctrl+C case must be
-    // intercepted here first. Confirming the quit dialog this opens aborts
-    // the job via the same cancel path before quitting (design D3;
-    // application-shell "Quit request keys and confirmation").
-    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        return Some(Command::RequestQuit);
-    }
+    // Ctrl+C no longer requests quit from any running-job dialog
+    // (application-shell "Quit request keys and confirmation"). The
+    // Progress dialog's own plain `c`/`C` cancel-job arm below needs an
+    // explicit no-modifier guard, since without one `Char('c')` alone would
+    // still catch a Ctrl-modified press (clipboard-export "Clipboard key
+    // bindings"; design D1).
     match dialog {
         RunningDialog::Progress { .. } => match key.code {
-            KeyCode::Esc | KeyCode::Char('c') | KeyCode::Char('C') => Some(Command::FileOpCancelJob),
+            KeyCode::Esc => Some(Command::FileOpCancelJob),
+            KeyCode::Char('c') | KeyCode::Char('C') if is_plain(&key) => Some(Command::FileOpCancelJob),
             _ => None,
         },
         RunningDialog::Conflict { rename_input: Some(_), .. } => match key.code {

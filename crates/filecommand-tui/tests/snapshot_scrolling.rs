@@ -25,6 +25,7 @@ use filecommand_core::listing::{Entry, EntryKind};
 use filecommand_core::panel::{DisplayMode, ListingProgress, PanelState, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::update::panel_viewport_rows;
+use filecommand_core::PanelSide;
 
 use filecommand_tui::views;
 
@@ -60,7 +61,7 @@ fn render_panel_at(panel: &PanelState, area: Rect) -> String {
     let opposite = overflow_panel(r"C:\opposite", 3, 0);
     let theme = Theme::classic();
     let mut buf = Buffer::empty(area);
-    views::panel::render_panel(&mut buf, area, panel, &theme, ColorDepth::Ansi16, true, &pinned_identity(), &opposite, None);
+    views::panel::render_panel(&mut buf, area, panel, &theme, ColorDepth::Ansi16, true, &pinned_identity(), &opposite, None, PanelSide::Left, None);
     buffer_to_text(&buf, area)
 }
 

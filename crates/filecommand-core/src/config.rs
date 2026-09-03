@@ -5,8 +5,13 @@
 //! (integer left-panel percentage; panel-split), and the overridable
 //! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
 //! `key.fuzzy_jump` / `key.split_left` / `key.split_right` /
-//! `key.split_reset`. Missing files and unrecognized or malformed lines are
-//! tolerated; unrecognized keys are ignored.
+//! `key.split_reset` / `key.clipboard_files` / `key.clipboard_paths`.
+//! A `[mouse]` table holds `enabled` (bool, default true; mouse-input
+//! "Mouse capture configuration") — the one section header this otherwise
+//! flat, line-based parser recognizes, so `enabled` under `[mouse]` doesn't
+//! collide with any bare top-level key of the same name.
+//! Missing files and unrecognized or malformed lines are tolerated;
+//! unrecognized keys are ignored.
 //!
 //! Command history persists to `history.json` next to the config, written
 //! atomically (temp file + rename) so a crash mid-write can never leave a
@@ -85,6 +90,13 @@ pub struct Keys {
     /// table flagged as potentially undeliverable in some terminal hosts
     /// (design D8) — hence overridable here.
     pub split_reset: KeyBinding,
+    /// Copies the F5-scope entries to the clipboard as file objects.
+    /// Default Ctrl+C (clipboard-export "Clipboard key bindings"). Ctrl+Ins
+    /// is a fixed alias, not rebindable through this key.
+    pub clipboard_files: KeyBinding,
+    /// Copies the F5-scope entries' absolute paths to the clipboard as
+    /// text. Default Ctrl+Shift+Ins.
+    pub clipboard_paths: KeyBinding,
 }
 
 impl Default for Keys {
@@ -97,6 +109,8 @@ impl Default for Keys {
             split_left: KeyBinding::new(true, false, false, "left"),
             split_right: KeyBinding::new(true, false, false, "right"),
             split_reset: KeyBinding::new(true, false, false, "="),
+            clipboard_files: KeyBinding::new(true, false, false, "c"),
+            clipboard_paths: KeyBinding::new(true, false, true, "insert"),
         }
     }
 }
@@ -118,6 +132,11 @@ pub struct Config {
     /// non-integer, or out-of-`[MIN_PANEL_PERCENT, MAX_PANEL_PERCENT]`
     /// value falls back to `panel_split::DEFAULT_SPLIT_PERCENT`.
     pub panel_split: u16,
+    /// `[mouse]` table's `enabled` key: whether the terminal guard issues
+    /// mouse-capture escape sequences at all. Defaults to `true`; overridden
+    /// off by `[mouse] enabled = false` here or by `--nomouse` at launch
+    /// (mouse-input "Mouse capture configuration").
+    pub mouse_enabled: bool,
     pub keys: Keys,
 }
 
@@ -129,6 +148,7 @@ impl Default for Config {
             shell: None,
             editor: None,
             panel_split: crate::panel_split::DEFAULT_SPLIT_PERCENT,
+            mouse_enabled: true,
             keys: Keys::default(),
         }
     }
@@ -163,14 +183,34 @@ pub fn parse_binding(value: &str) -> Option<KeyBinding> {
 /// skipped rather than causing a parse failure.
 pub fn parse(input: &str) -> Config {
     let mut config = Config::default();
+    // Real TOML-style table tracking, limited to `[mouse]`: once a `[mouse]`
+    // header is seen, subsequent `key = value` lines belong to that table
+    // (currently just `enabled`) until another `[...]` header appears —
+    // mirroring genuine TOML section scoping rather than this parser's
+    // usual flat `key.sub` dotted-namespace convention, because the spec
+    // scenario is written as a literal `[mouse]` table (mouse-input "Mouse
+    // capture configuration").
+    let mut in_mouse_table = false;
     for line in input.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
+        if line.starts_with('[') && line.ends_with(']') {
+            in_mouse_table = line[1..line.len() - 1].trim() == "mouse";
+            continue;
+        }
         let Some((key, value)) = line.split_once('=') else { continue };
         let key = key.trim();
         let value = value.trim();
+        if in_mouse_table {
+            if key == "enabled" {
+                if let Some(b) = parse_bool(value) {
+                    config.mouse_enabled = b;
+                }
+            }
+            continue;
+        }
         match key {
             "splash" => {
                 if let Some(b) = parse_bool(value) {
@@ -229,6 +269,16 @@ pub fn parse(input: &str) -> Config {
             "key.split_reset" => {
                 if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
                     config.keys.split_reset = b;
+                }
+            }
+            "key.clipboard_files" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.clipboard_files = b;
+                }
+            }
+            "key.clipboard_paths" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.clipboard_paths = b;
                 }
             }
             "panel_split" => {
@@ -995,6 +1045,60 @@ mod tests {
         assert_eq!(config.theme, "nc-classic");
         assert!(config.splash);
         assert_eq!(config.shell, None);
+        assert!(config.mouse_enabled, "mouse-input: capture is on by default");
+    }
+
+    // -------------------------------------------------------------------
+    // [mouse] table (mouse-input "Mouse capture configuration")
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mouse_table_disables_capture() {
+        let config = parse("[mouse]\nenabled = false\n");
+        assert!(!config.mouse_enabled);
+    }
+
+    #[test]
+    fn mouse_table_explicit_true_stays_enabled() {
+        let config = parse("[mouse]\nenabled = true\n");
+        assert!(config.mouse_enabled);
+    }
+
+    #[test]
+    fn bare_top_level_enabled_key_is_not_the_mouse_key() {
+        // A bare `enabled = false` with no `[mouse]` header anywhere in the
+        // document is an unrecognized top-level key (ignored, like any
+        // other) — it must not be mistaken for `[mouse] enabled`.
+        let config = parse("enabled = false\ntheme = \"nc-mono\"\n");
+        assert!(config.mouse_enabled, "top-level `enabled` outside any table is not the mouse key");
+        assert_eq!(config.theme, "nc-mono");
+    }
+
+    #[test]
+    fn mouse_table_keys_are_scoped_until_the_next_header() {
+        // Once a `[mouse]` header is seen, subsequent `key = value` lines
+        // belong to that table (only `enabled` is recognized there) until
+        // another `[...]` header appears — real TOML section scoping, so a
+        // key placed after `[mouse]` is not read as a top-level key.
+        let config = parse("[mouse]\nenabled = false\ntheme = \"nc-mono\"\n");
+        assert!(!config.mouse_enabled);
+        assert_eq!(config.theme, "nc-classic", "theme after the [mouse] header is inside that table, not recognized there");
+    }
+
+    #[test]
+    fn a_later_mouse_table_overrides_an_earlier_bare_enabled_key() {
+        // The bare top-level `enabled` above is never the mouse key, but a
+        // `[mouse]` table appearing later in the same document still takes
+        // effect normally — table scoping, not a one-shot ignore flag.
+        let config = parse("enabled = false\ntheme = \"nc-mono\"\n[mouse]\nenabled = false\n");
+        assert!(!config.mouse_enabled);
+        assert_eq!(config.theme, "nc-mono", "the top-level theme key, read before the [mouse] header, is unaffected");
+    }
+
+    #[test]
+    fn mouse_table_tolerates_unknown_keys_and_malformed_value() {
+        let config = parse("[mouse]\nfoo = \"bar\"\nenabled = maybe\n");
+        assert!(config.mouse_enabled, "an unparsable bool value falls back to the default");
     }
 
     #[test]
@@ -1063,6 +1167,19 @@ mod tests {
         assert_eq!(keys.split_left, KeyBinding::new(true, false, false, "left"));
         assert_eq!(keys.split_right, KeyBinding::new(true, false, false, "right"));
         assert_eq!(keys.split_reset, KeyBinding::new(true, false, false, "="));
+        // clipboard-export "Clipboard key bindings": Ctrl+C for Files,
+        // Ctrl+Shift+Ins for Paths.
+        assert_eq!(keys.clipboard_files, KeyBinding::new(true, false, false, "c"));
+        assert_eq!(keys.clipboard_paths, KeyBinding::new(true, false, true, "insert"));
+    }
+
+    #[test]
+    fn parses_overridable_clipboard_bindings() {
+        // clipboard-export "Rebinding the files chord": `key.clipboard_files
+        // = "ctrl+k"` rebinds Files; Paths is independently overridable too.
+        let config = parse("key.clipboard_files = \"ctrl+k\"\nkey.clipboard_paths = \"alt+shift+c\"\n");
+        assert_eq!(config.keys.clipboard_files, KeyBinding::new(true, false, false, "k"));
+        assert_eq!(config.keys.clipboard_paths, KeyBinding::new(false, true, true, "c"));
     }
 
     #[test]

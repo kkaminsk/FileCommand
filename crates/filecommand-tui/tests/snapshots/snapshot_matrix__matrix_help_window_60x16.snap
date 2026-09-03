@@ -1,6 +1,5 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_matrix.rs
-assertion_line: 121
 expression: text
 ---
                                                             
@@ -11,10 +10,10 @@ expression: text
  ╠────────────────────────────────────────────────────────╣ 
  ║ About FileCommand                                      ║ 
  ║ Keyboard reference                                     ║ 
+ ║ Mouse                                                  ║ 
  ║ Panels and display modes                               ║ 
  ║ File operations                                        ║ 
- ║ Menus                                                  ║ 
- ║ Viewer                                                ↓║ 
+ ║ Menus                                                 ↓║ 
  ╠────────────────────────────────────────────────────────╣ 
  ║                    Help     Cancel                     ║ 
  ╚════════════════════════════════════════════════════════╝

@@ -9,16 +9,16 @@ expression: text
 ║Cargo.toml   │ 612     01-02-2 03:0   ║║Cargo.toml   │ 612     01-02-2 03:0   ║
 ║readme.txt   │ 12K     01-02-2 03:0   ║║readme.txt   │ 12K     01-02-2 03:0   ║
 ║                                      ║║                                      ║
-║                            ╔════ setup.exe ════╗                             ║
-║                            ║ Run               ║                             ║
-║                            ║ View              ║                             ║
-║                            ║ Edit              ║                             ║
-║                            ║ Copy              ║                             ║
-║                            ║ Rename            ║                             ║
-║                            ║ Move              ║                             ║
-║                            ║ Delete            ║                             ║
-║                            ║ Send to clipboard ║                             ║
-║                            ╚═══════════════════╝                             ║
+║                                      ║║                                      ║
+║                ╔═══════════════ Move 1 file ════════════════╗                ║
+║                ║                                            ║                ║
+║                ║ Copy/move to:       ║║                     ║                ║
+║                ║ [C:\Users\demo\right.....................] ║                ║
+║                ║                                            ║                ║
+║                ║       [ Copy ]  [ Move ]  [ Cancel ]       ║                ║
+║                ╚════════════════════════════════════════════╝                ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
