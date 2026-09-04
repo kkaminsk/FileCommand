@@ -775,6 +775,11 @@ pub enum Command {
     /// as if it had been highlighted and confirmed (file-action-menu
     /// "First-letter hotkey activates directly").
     FileActionMenuHotkey(char),
+    /// A left-click on the open file-action menu's `index`'th row: activates
+    /// it exactly as `Command::FileActionMenuConfirm` would once the
+    /// highlight is there (mouse-input "File-action menu entries are
+    /// clickable"). `input::map_mouse` is the only source of this.
+    FileActionMenuItemClick(usize),
 
     // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
     // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
@@ -2581,7 +2586,11 @@ fn enter_rename_input(state: &mut State, original_name: OsString, is_dir: bool) 
 fn is_file_action_menu_command(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::FileActionMenuMove(_) | Command::FileActionMenuConfirm | Command::FileActionMenuCancel | Command::FileActionMenuHotkey(_)
+        Command::FileActionMenuMove(_)
+            | Command::FileActionMenuConfirm
+            | Command::FileActionMenuCancel
+            | Command::FileActionMenuHotkey(_)
+            | Command::FileActionMenuItemClick(_)
     )
 }
 
@@ -2602,6 +2611,21 @@ fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
             vec![]
         }
         Command::FileActionMenuConfirm => {
+            let menu = state.file_action_menu.take().unwrap();
+            let target_name = menu.target_name.clone();
+            activate_file_action(state, menu.selected(), target_name, menu.selection_scoped)
+        }
+        Command::FileActionMenuItemClick(index) => {
+            let menu = state.file_action_menu.as_ref().unwrap();
+            if index >= menu.entries.len() {
+                // Shouldn't normally happen given hit-testing (the hit map
+                // only ever records rects for real entries), but a stale
+                // hit map click — same reasoning as
+                // `click_entry_on_a_vanished_name_is_a_no_op` — is safer
+                // treated as a no-op than an out-of-bounds panic.
+                return vec![];
+            }
+            state.file_action_menu.as_mut().unwrap().cursor = index;
             let menu = state.file_action_menu.take().unwrap();
             let target_name = menu.target_name.clone();
             activate_file_action(state, menu.selected(), target_name, menu.selection_scoped)

@@ -127,6 +127,9 @@ fn build_hitmap(area: Rect, state: &State) -> HitMap {
                 hm.menu_titles = menubar::hit_titles(area);
                 hm.menu_items = menubar::hit_items(area, menu);
             }
+            if let Some(dialog) = &state.file_action_menu {
+                hm.file_action_menu_items = file_action_menu::hit_items(area, dialog);
+            }
             match &state.phase {
                 UiPhase::FileOpSetup(setup) => {
                     // Exactly one of these is ever non-empty for a given

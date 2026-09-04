@@ -4516,6 +4516,58 @@ fn enter_on_a_selected_entry_still_opens_a_single_target_menu() {
 }
 
 // ---------------------------------------------------------------------
+// File-action-menu row clicks (file-action-menu-mouse-click; mouse-input
+// "File-action menu entries are clickable")
+// ---------------------------------------------------------------------
+
+/// Clicking a row activates it exactly like `Command::FileActionMenuConfirm`
+/// would once the highlight is there —
+/// `menu_item_click_activates_the_item_exactly_like_menu_activate`, mirrored
+/// for the file-action menu.
+#[test]
+fn file_action_menu_item_click_activates_the_item_exactly_like_confirm() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let edit_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Edit).unwrap();
+    let (state, effects) = update(state, Command::FileActionMenuItemClick(edit_index));
+    assert!(state.file_action_menu.is_none(), "activating an entry closes the menu");
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+}
+
+#[test]
+fn file_action_menu_item_click_with_no_menu_open_is_a_no_op() {
+    let state = test_state(UiPhase::Panels);
+    let before = state.clone();
+    let (state, effects) = update(state, Command::FileActionMenuItemClick(0));
+    assert!(effects.is_empty());
+    assert_eq!(state, before);
+}
+
+/// A stale/out-of-range index (shouldn't normally happen given hit-testing,
+/// but guarded anyway) leaves the menu untouched.
+#[test]
+fn file_action_menu_item_click_out_of_range_is_a_no_op() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt");
+    let before = state.clone();
+    let (state, effects) = update(state, Command::FileActionMenuItemClick(999));
+    assert!(effects.is_empty());
+    assert_eq!(state, before, "an out-of-range index leaves the menu untouched");
+}
+
+/// Clicking a row other than the highlighted one activates the clicked row,
+/// not the previously-highlighted one (file-action-menu-mouse-click
+/// "Clicking a different row than the highlighted one activates the clicked
+/// row").
+#[test]
+fn file_action_menu_item_click_on_a_non_highlighted_row_activates_the_clicked_row() {
+    let state = opened_menu_state(&["notes.txt"], "notes.txt"); // View highlighted first
+    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::View, "setup precondition");
+    let delete_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Delete).unwrap();
+    let (state, _) = update(state, Command::FileActionMenuItemClick(delete_index));
+    assert!(state.file_action_menu.is_none());
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })), "Delete was activated, not View");
+}
+
+// ---------------------------------------------------------------------
 // Mouse drag-and-drop (mouse-panel-drag)
 // ---------------------------------------------------------------------
 
