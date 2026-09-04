@@ -1635,8 +1635,13 @@ fn paste_cursor_entry(state: &mut State, full_path: bool) {
     state.history_cursor = None;
 }
 
-/// Run the typed line: record it in history, clear the buffer, and hand the
-/// TUI a fully-formed invocation to spawn with the terminal suspended.
+/// Run the typed line: only the three built-in verbs (`cd`, `del`,
+/// `rmdir`) are recognized (command-line "Command-line builtin
+/// whitelist") — anything else is rejected without spawning anything. The
+/// file-action menu's Run entry and the F2 user menu build their own
+/// `Effect::RunShellCommand` independently and are unaffected by this
+/// dispatch (design.md "`Effect::RunShellCommand` and `shell::
+/// build_command` are untouched").
 fn run_command_line(state: &mut State) -> Vec<Effect> {
     let text = state.command_line.trim().to_string();
     if text.is_empty() {
@@ -1649,29 +1654,145 @@ fn run_command_line(state: &mut State) -> Vec<Effect> {
     // child, so its working directory dies with it. NC navigates the panel
     // instead, which is also how a UNC path is entered by hand.
     if let Some(target) = parse_cd(&text) {
-        config::push_history(&mut state.history, &text);
-        let side = state.active;
-        let mut effects =
-            vec![Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() })];
-        if let Some(path) = resolve_cd_target(&state.panel(side).cwd, &target) {
-            effects.extend(begin_listing(state, side, path));
-        }
-        return effects;
+        return dispatch_cd(state, &text, &target);
+    }
+    if let Some(target) = parse_del(&text) {
+        return dispatch_delete_builtin(state, &target, false);
+    }
+    if let Some(target) = parse_rmdir(&text) {
+        return dispatch_delete_builtin(state, &target, true);
     }
 
-    config::push_history(&mut state.history, &text);
+    // Unrecognized: reject outright — no process spawns, and (matching
+    // `cd`'s own rejection below) nothing is added to command history
+    // (command-line "An unrecognized command is rejected without spawning
+    // anything").
     let side = state.active;
-    let cwd = state.active_panel().cwd.clone();
-    vec![
-        Effect::RunShellCommand(shell::build_command(state.shell.shell.as_deref(), &text, &cwd), side),
-        Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }),
-    ]
+    let word = text.split_whitespace().next().unwrap_or(text.as_str());
+    state.panel_mut(side).last_error = Some(format!("'{word}' is not a recognized command"));
+    vec![]
+}
+
+/// `cd <path>`: navigate the active panel to `target` resolved against its
+/// cwd, but only after confirming the resolved path exists and is a
+/// directory — a nonexistent or non-directory target is rejected outright,
+/// leaving `cwd` untouched and starting no listing (command-line "cd
+/// navigates the active panel or rejects a nonexistent target"; this is
+/// also what fixes the panel switching into a nonexistent directory).
+fn dispatch_cd(state: &mut State, text: &str, target: &str) -> Vec<Effect> {
+    let side = state.active;
+    let Some(path) = resolve_cd_target(&state.panel(side).cwd, target) else {
+        // ".." at a drive root, the only case `resolve_cd_target` itself
+        // rejects — there is nowhere to navigate to.
+        state.panel_mut(side).last_error = Some(format!("{target} not found"));
+        return vec![];
+    };
+    match probe_command_line_target(state, side, &path) {
+        Some((true, _)) => {
+            config::push_history(&mut state.history, text);
+            let mut effects =
+                vec![Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() })];
+            effects.extend(begin_listing(state, side, path));
+            effects
+        }
+        Some((false, _)) => {
+            state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
+            vec![]
+        }
+        None => {
+            state.panel_mut(side).last_error = Some(format!("{} not found", path.display()));
+            vec![]
+        }
+    }
+}
+
+/// `del <target>` (`want_dir == false`) / `rmdir <target>`
+/// (`want_dir == true`): resolve `target` against the active panel's cwd
+/// and, for an existing target of the matching type, open the same F8
+/// delete-confirmation dialog `enter_delete_confirm` uses — never deleting
+/// directly. A missing target or a type mismatch (`del` on a directory,
+/// `rmdir` on a file) is rejected: no dialog opens (command-line "del and
+/// rmdir route into the existing delete-confirmation flow").
+fn dispatch_delete_builtin(state: &mut State, target: &str, want_dir: bool) -> Vec<Effect> {
+    let side = state.active;
+    let Some(path) = resolve_cd_target(&state.panel(side).cwd, target) else {
+        state.panel_mut(side).last_error = Some(format!("{target} not found"));
+        return vec![];
+    };
+    match probe_command_line_target(state, side, &path) {
+        Some((is_dir, original_name)) if is_dir == want_dir => {
+            enter_delete_confirm_for_sources(state, vec![SourceItem { original_name, path, is_dir }]);
+            vec![]
+        }
+        Some((true, _)) => {
+            state.panel_mut(side).last_error = Some(format!("{} is a directory", path.display()));
+            vec![]
+        }
+        Some((false, _)) => {
+            state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
+            vec![]
+        }
+        None => {
+            state.panel_mut(side).last_error = Some(format!("{} not found", path.display()));
+            vec![]
+        }
+    }
+}
+
+/// Whether `path` exists and, if so, whether it's a directory, plus its
+/// on-disk name — preferring the active panel's already-listed entries (no
+/// I/O, and the exact on-disk-cased name) when `path` names a currently
+/// visible direct child of the panel's directory, and otherwise falling
+/// back to a single synchronous filesystem check. `None` means the target
+/// doesn't exist. Shared by `cd`'s existence check and `del`/`rmdir`'s
+/// target resolution (design.md decisions on both).
+fn probe_command_line_target(state: &State, side: PanelSide, path: &Path) -> Option<(bool, OsString)> {
+    let panel = state.panel(side);
+    if let (Some(name), Some(parent)) = (path.file_name(), path.parent()) {
+        if parent == panel.cwd.as_path() {
+            if let Some(entry) = panel.entries.iter().find(|e| e.name == name) {
+                return Some((entry.is_dir_like(), entry.name.clone()));
+            }
+        }
+    }
+    let metadata = std::fs::metadata(path).ok()?;
+    let name = path.file_name().map(OsString::from).unwrap_or_else(|| OsString::from(path.display().to_string()));
+    Some((metadata.is_dir(), name))
 }
 
 /// The target of a `cd <path>` line, or `None` if this isn't a `cd`.
 pub fn parse_cd(text: &str) -> Option<String> {
+    parse_builtin_arg(text, "cd")
+}
+
+/// The target of a `del <target>` line, or `None` if this isn't a `del`.
+pub fn parse_del(text: &str) -> Option<String> {
+    parse_builtin_arg(text, "del")
+}
+
+/// The target of a `rmdir <target>` line, or `None` if this isn't a
+/// `rmdir`.
+pub fn parse_rmdir(text: &str) -> Option<String> {
+    parse_builtin_arg(text, "rmdir")
+}
+
+/// Strip a case-insensitive `"<verb> "` prefix (`cd`/`CD`/`Cd`/...,
+/// matching classic NC/cmd usage — command-line "Builtin verbs are
+/// case-insensitive") and return the trimmed, unquoted argument, or `None`
+/// if `text` isn't `verb` or carries no argument.
+fn parse_builtin_arg(text: &str, verb: &str) -> Option<String> {
     let trimmed = text.trim();
-    let rest = trimmed.strip_prefix("cd ").or_else(|| trimmed.strip_prefix("CD ")).or_else(|| trimmed.strip_prefix("Cd "))?;
+    // `get` (rather than `split_at`) never panics on a non-ASCII `trimmed`
+    // whose byte offset `verb.len()` doesn't land on a char boundary — it
+    // just reports no match, which is the correct outcome either way.
+    let head = trimmed.get(..verb.len())?;
+    if !head.eq_ignore_ascii_case(verb) {
+        return None;
+    }
+    let rest = &trimmed[verb.len()..];
+    if !rest.starts_with(char::is_whitespace) {
+        return None;
+    }
     let target = rest.trim().trim_matches('"');
     if target.is_empty() {
         None
