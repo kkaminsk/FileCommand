@@ -429,13 +429,46 @@ fn pulldown_click_elsewhere_closes_the_bar() {
     assert_eq!(cmd, Some(Command::MenuClose));
 }
 
+/// mouse-input "File-action menu entries are clickable": a click on an
+/// open file-action menu's row dispatches the click command — the pull-
+/// down's `pulldown_item_click_dispatches_menu_item_click`, mirrored.
+#[test]
+fn file_action_menu_item_click_dispatches_file_action_menu_item_click() {
+    let mut hitmap = sample_hitmap();
+    hitmap.file_action_menu_items = vec![(Rect { x: 6, y: 2, width: 8, height: 1 }, 2)];
+    let mut state = test_state();
+    state.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false));
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 8, 2), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 8, 2), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::FileActionMenuItemClick(2)));
+}
+
+/// mouse-input "File-action menu entries are clickable": a click outside
+/// the open menu closes it with no action taken — the pull-down's
+/// `pulldown_click_elsewhere_closes_the_bar`, mirrored.
+#[test]
+fn file_action_menu_click_elsewhere_closes_it() {
+    let mut hitmap = sample_hitmap();
+    hitmap.file_action_menu_items = vec![(Rect { x: 6, y: 2, width: 8, height: 1 }, 2)];
+    let mut state = test_state();
+    state.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false));
+    let mut tracker = MouseTracker::new();
+    // Lands on the left panel's entry row — while the file-action menu is
+    // open, panel rows are not honoured at all; the click just closes it.
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::FileActionMenuCancel));
+}
+
 // ---------------------------------------------------------------------
 // Mode-gating table (design D5; mouse-input "Mouse is honoured only where
 // the key would be"). The tests above already cover `Panels`
-// (`map_panels`), `PulldownOpen` (`map_pulldown`), and two `DialogButtons`/
-// `Ignored` cases (`quit_confirm`, an open Help window) — the tests below
-// round out every remaining arm of `context()` so the whole table is
-// exercised, not just a sample of it.
+// (`map_panels`), `PulldownOpen` (`map_pulldown`), `FileActionMenuOpen`
+// (`map_file_action_menu`), and two `DialogButtons`/`Ignored` cases
+// (`quit_confirm`, an open Help window) — the tests below round out every
+// remaining arm of `context()` so the whole table is exercised, not just a
+// sample of it.
 // ---------------------------------------------------------------------
 
 /// A file-op setup dialog (e.g. the destination-input/rename/delete-confirm
@@ -533,12 +566,10 @@ fn startup_warning_overlay_ignores_mouse() {
     assert_ignores_mouse_over_a_hit_row(state);
 }
 
-#[test]
-fn file_action_menu_overlay_ignores_mouse() {
-    let mut state = test_state();
-    state.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false));
-    assert_ignores_mouse_over_a_hit_row(state);
-}
+// The file-action menu is no longer a genuinely-ignored overlay — see
+// `file_action_menu_item_click_dispatches_file_action_menu_item_click` and
+// `file_action_menu_click_elsewhere_closes_it` above, which cover its
+// `Context::FileActionMenuOpen` arm instead.
 
 #[test]
 fn splash_phase_ignores_mouse() {

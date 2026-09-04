@@ -70,6 +70,11 @@ pub struct HitMap {
     /// the index always names the exact same row `MenuState::selected`
     /// would.
     pub menu_items: Vec<(Rect, usize)>,
+    /// The open file-action menu's item rects, indexed by position in
+    /// `FileActionMenuState::entries` — the same index `FileActionMenuState::
+    /// cursor` would land on (mouse-input "File-action menu entries are
+    /// clickable").
+    pub file_action_menu_items: Vec<(Rect, usize)>,
     /// Every dialog button currently on screen — including a no-framed-
     /// button dialog's hotkey text spans (design D2: the conflict dialog's
     /// `(O)verwrite  (S)kip …` row).

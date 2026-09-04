@@ -46,6 +46,34 @@ pub fn render_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, dept
     buf.set_string(x, y + box_h - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body);
 }
 
+/// The open file-action menu's clickable row rects at `area` (the same
+/// full-screen `area` `render_file_action_menu` is given), indexed by
+/// position in `dialog.entries` so the index matches exactly what
+/// `FileActionMenuState::cursor` would land on (mouse-input "File-action
+/// menu entries are clickable"). Mirrors `render_file_action_menu`'s own
+/// box-geometry math (`overlay_rect`, `box_h`, `inner_w`, `visible_rows`,
+/// `x`, `y`) so a row rect can never land somewhere the box isn't actually
+/// drawn this frame.
+pub fn hit_items(area: Rect, dialog: &FileActionMenuState) -> Vec<(Rect, usize)> {
+    let title = format!(" {} ", dialog.target_name.to_string_lossy());
+    let widest_label = dialog.entries.iter().map(|e| display_width(e.label())).max().unwrap_or(0);
+    let preferred_inner_w = (widest_label + 2).max(display_width(&title)).clamp(MIN_INNER_W, MAX_INNER_W);
+    let content_rows = dialog.entries.len() as u16;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, content_rows + 2), (MIN_INNER_W as u16 + 2, 3), (area.width, area.height));
+    let box_h = r.height;
+    let inner_w = r.width.saturating_sub(2);
+    let visible_rows = box_h.saturating_sub(2) as usize;
+    let x = area.x + r.x;
+    let y = area.y + r.y;
+
+    let mut out = Vec::with_capacity(dialog.entries.len().min(visible_rows));
+    for i in 0..dialog.entries.len().min(visible_rows) {
+        let ry = y + 1 + i as u16;
+        out.push((Rect { x: x + 1, y: ry, width: inner_w, height: 1 }, i));
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

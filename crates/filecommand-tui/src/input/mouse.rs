@@ -142,10 +142,14 @@ enum Context {
     /// overlay (which can appear over any of the others, hence checked
     /// first in `context`).
     DialogButtons,
+    /// The file-action menu is open: only its own row rects and click-
+    /// outside-to-close are live — no hover-highlight-on-move (mouse-input
+    /// "File-action menu entries are clickable").
+    FileActionMenuOpen,
     /// An overlay mouse-basics does not support yet (drive select, fuzzy
-    /// jump, find file, user menu, theme picker, help, the file-action
-    /// menu, the startup warning) or a phase with nothing clickable
-    /// (splash, placeholder) — every event is ignored.
+    /// jump, find file, user menu, theme picker, help, the startup warning)
+    /// or a phase with nothing clickable (splash, placeholder) — every
+    /// event is ignored.
     Ignored,
 }
 
@@ -164,9 +168,11 @@ fn context(state: &State) -> Context {
         || state.user_menu.is_some()
         || state.theme_picker.is_some()
         || state.help.is_some()
-        || state.file_action_menu.is_some()
     {
         return Context::Ignored;
+    }
+    if state.file_action_menu.is_some() {
+        return Context::FileActionMenuOpen;
     }
     match &state.phase {
         UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => Context::DialogButtons,
@@ -199,6 +205,7 @@ pub fn map_mouse(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker,
         }
         Context::DialogButtons => map_dialog_buttons(event, hitmap, tracker),
         Context::PulldownOpen => map_pulldown(event, hitmap, tracker),
+        Context::FileActionMenuOpen => map_file_action_menu(event, hitmap, tracker),
         Context::Panels => map_panels(event, hitmap, tracker, state),
     }
 }
@@ -250,6 +257,40 @@ fn map_pulldown(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker) 
             // buttons are clickable": "a click outside an open pull-down
             // SHALL close it".
             Some(Command::MenuClose)
+        }
+        _ => None,
+    }
+}
+
+/// The open file-action menu's own click-mapping path (mirroring
+/// `map_pulldown`): a click on one of its own row rects activates that
+/// entry, a click anywhere else closes the menu with no action taken —
+/// exactly like Esc (mouse-input "File-action menu entries are clickable").
+/// No hover-highlight-on-move: `Drag` only tracks press movement so a moved
+/// press still isn't treated as a click, same as every other context.
+fn map_file_action_menu(event: MouseEvent, hitmap: &HitMap, tracker: &mut MouseTracker) -> Option<Command> {
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            tracker.begin_press(event.column, event.row, MouseButton::Left, false, None);
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            tracker.note_drag(event.column, event.row, MouseButton::Left);
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let press = tracker.take_press(MouseButton::Left)?;
+            if press.moved {
+                return None;
+            }
+            let (x, y) = (event.column, event.row);
+            if let Some(index) = find_hit(&hitmap.file_action_menu_items, x, y) {
+                return Some(Command::FileActionMenuItemClick(index));
+            }
+            // mouse-input "File-action menu entries are clickable": "a
+            // left-click outside the open menu SHALL close it with no
+            // action taken, exactly as Esc does."
+            Some(Command::FileActionMenuCancel)
         }
         _ => None,
     }
