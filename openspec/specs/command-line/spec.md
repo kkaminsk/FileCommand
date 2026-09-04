@@ -33,7 +33,7 @@ When the user presses Enter with a non-empty command-line buffer, the system SHA
 
 Running a command SHALL leave raw mode and the alternate screen, spawn the child inheriting stdio in the panel directory, wait for it to exit, prompt the user to press a key, then re-enter the alternate screen and raw mode and redraw. Terminal restore SHALL be idempotent so a failing or panicking child cannot leave the terminal in raw mode or the alternate screen.
 
-Enter on an executable target (PATHEXT match or `.lnk`) SHALL use this same suspended-spawn path.
+Enter on an executable target (PATHEXT match or `.lnk`) SHALL NOT spawn the target directly; it SHALL open the file-action menu for that entry, whose Run entry uses this same suspended-spawn path.
 
 #### Scenario: Enter runs the typed command
 - **WHEN** the active panel is `C:\NORTON`, the command buffer is `dir`, and the user presses Enter
@@ -47,23 +47,32 @@ Enter on an executable target (PATHEXT match or `.lnk`) SHALL use this same susp
 - **WHEN** the spawned child exits with an error or the spawn fails
 - **THEN** the TUI is restored to the alternate screen and raw mode exactly once, and the app does not crash
 
+#### Scenario: Enter on an executable opens the menu instead of spawning
+- **WHEN** the command-line buffer is empty and the user presses Enter with the cursor on `setup.exe`
+- **THEN** no child process spawns and the file-action menu opens for `setup.exe`
+- **AND** activating the menu's Run entry spawns `setup.exe` via the suspended-TUI path described above
+
 ### Requirement: Command history navigation
 
-The system SHALL maintain a command history and, while the command-line buffer is non-empty, Up and Down SHALL navigate previous and next history entries into the buffer. While the buffer is empty, Up and Down SHALL instead move the panel cursor. Esc SHALL clear the command-line buffer, which is the explicit mechanism that hands Up/Down back to the panel. Command history SHALL persist to `history.json`, written atomically.
+The system SHALL maintain a command history and, while the command-line buffer is non-empty, Up and Down SHALL navigate previous and next history entries into the buffer. While the buffer is empty, Up and Down SHALL instead move the panel cursor. Backspacing the buffer to empty SHALL be the mechanism that hands Up/Down back to the panel; Esc SHALL NOT clear the buffer — over the panels it requests application quit (application-shell "Quit request keys and confirmation"). Command history SHALL persist to `history.json`, written atomically.
 
 #### Scenario: Up recalls previous command while composing
+
 - **WHEN** the command buffer contains text and the user presses Up
 - **THEN** the buffer is replaced with the previous history entry and the panel cursor does not move
 
-#### Scenario: Up moves panel cursor when buffer empty
-- **WHEN** the command buffer is empty and the user presses Up
-- **THEN** the panel cursor moves up and no history entry is recalled
+#### Scenario: Backspacing to empty releases Up/Down to panel
 
-#### Scenario: Esc clears buffer to release Up/Down to panel
-- **WHEN** the command buffer is non-empty and the user presses Esc, then presses Up
-- **THEN** the buffer is cleared by Esc and the subsequent Up moves the panel cursor
+- **WHEN** the command buffer is non-empty and the user backspaces until it is empty, then presses Up
+- **THEN** the subsequent Up moves the panel cursor and recalls no history entry
+
+#### Scenario: Esc does not clear the buffer
+
+- **WHEN** the command buffer is non-empty and the user presses Esc
+- **THEN** the buffer is not cleared and the quit-confirmation dialog opens instead
 
 #### Scenario: Executed command persisted to history
+
 - **WHEN** the user runs a command with Enter
 - **THEN** the command is appended to the history and `history.json` is written atomically
 

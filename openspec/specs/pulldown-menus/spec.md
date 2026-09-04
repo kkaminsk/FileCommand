@@ -91,12 +91,12 @@ The system SHALL move the active menu one position with Left/Right arrows while 
 
 ### Requirement: Menu contents
 
-The system SHALL populate the five menus with their defined items: Left and Right SHALL each offer display mode, sort mode, filter, re-read, drive select, and new/close tab (mirroring each other); Files SHALL offer View, Edit, Copy, Rename/Move, Make directory, Delete, Attributes, Select group, Deselect group, Invert, and Quit; Commands SHALL offer Find file, History, Swap panels, Panels on/off, Compare directories, Fuzzy jump, and Menu file edit; Options SHALL offer Configuration, Themes, Editor selection, and Save setup. Items whose backing feature is not yet available SHALL render as disabled entries rather than being omitted.
+The system SHALL populate the five menus with their defined items: Left and Right SHALL each offer display mode, sort mode, filter, re-read, drive select, and new/close tab (mirroring each other); Files SHALL offer View, Edit, Copy, Rename/Move, Make directory, Delete, then a separated group Copy to clipboard, Copy path(s), Copy name(s), then Attributes, Select group, Deselect group, Invert, and Quit; Commands SHALL offer Find file, History, Swap panels, Panels on/off, Compare directories, Fuzzy jump, and Menu file edit; Options SHALL offer Configuration, Themes, Editor selection, and Save setup. Items whose backing feature is not yet available SHALL render as disabled entries rather than being omitted.
 
 #### Scenario: Files menu lists its items
 
 - **WHEN** the user opens the `Files` menu
-- **THEN** the pull-down lists View, Edit, Copy, Rename/Move, Make directory, Delete, Attributes, Select group, Deselect group, Invert, and Quit
+- **THEN** the pull-down lists View, Edit, Copy, Rename/Move, Make directory, Delete, a separator, Copy to clipboard, Copy path(s), Copy name(s), a separator, Attributes, Select group, Deselect group, Invert, and Quit
 
 #### Scenario: Left and Right menus mirror each other
 
