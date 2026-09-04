@@ -130,9 +130,10 @@ impl ThemePickerState {
 
 /// One entry in the file-action menu, in menu order. `Run` is included only
 /// when the target is executable, and always sorts first (file-action-menu
-/// "Menu contents, ordering, and navigation"). `SendToClipboard` is always
-/// last and never mutates the filesystem (file-action-menu "No mutation
-/// without an intervening dialog").
+/// "Menu contents, ordering, and navigation"). `SendToClipboard` sits
+/// immediately after `Edit` (or first, for directory targets, which omit
+/// `View`/`Edit`/`Run`) and never mutates the filesystem (file-action-menu
+/// "No mutation without an intervening dialog").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileActionMenuEntry {
     Run,
@@ -212,12 +213,12 @@ impl FileActionMenuState {
             entries.push(FileActionMenuEntry::View);
             entries.push(FileActionMenuEntry::Edit);
         }
+        entries.push(FileActionMenuEntry::SendToClipboard);
         entries.extend([
             FileActionMenuEntry::Copy,
             FileActionMenuEntry::Rename,
             FileActionMenuEntry::Move,
             FileActionMenuEntry::Delete,
-            FileActionMenuEntry::SendToClipboard,
         ]);
         FileActionMenuState { target_name, entries, cursor: 0, selection_scoped }
     }
@@ -566,11 +567,26 @@ mod tests {
                 FileActionMenuEntry::Run,
                 FileActionMenuEntry::View,
                 FileActionMenuEntry::Edit,
+                FileActionMenuEntry::SendToClipboard,
                 FileActionMenuEntry::Copy,
                 FileActionMenuEntry::Rename,
                 FileActionMenuEntry::Move,
                 FileActionMenuEntry::Delete,
+            ]
+        );
+    }
+
+    #[test]
+    fn file_action_menu_directory_target_lists_send_to_clipboard_first() {
+        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        assert_eq!(
+            m.entries,
+            vec![
                 FileActionMenuEntry::SendToClipboard,
+                FileActionMenuEntry::Copy,
+                FileActionMenuEntry::Rename,
+                FileActionMenuEntry::Move,
+                FileActionMenuEntry::Delete,
             ]
         );
     }
