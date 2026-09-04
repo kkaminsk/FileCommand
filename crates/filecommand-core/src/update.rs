@@ -1403,17 +1403,27 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
             Command::OpenTab => {
                 let side = state.active;
+                // The new tab inherits the active tab's own (never-stale)
+                // state, so it can never itself come up stale — no
+                // fresh-read check needed here (panel-tabs "Stale
+                // background tab refresh on activation").
                 state.panel_mut(side).open_tab();
                 reconcile_panel_viewport(&mut state, side);
             }
             Command::CloseTab => {
                 let side = state.active;
-                state.panel_mut(side).close_tab();
+                if state.panel_mut(side).close_tab() {
+                    let path = state.panel(side).cwd.clone();
+                    effects.extend(begin_listing(&mut state, side, path));
+                }
                 reconcile_panel_viewport(&mut state, side);
             }
             Command::SwitchTab(n) => {
                 let side = state.active;
-                state.panel_mut(side).switch_tab(n);
+                if state.panel_mut(side).switch_tab(n) {
+                    let path = state.panel(side).cwd.clone();
+                    effects.extend(begin_listing(&mut state, side, path));
+                }
                 reconcile_panel_viewport(&mut state, side);
             }
 
@@ -2932,6 +2942,20 @@ fn handle_file_op_running(
             for side in panels_matching(state, &[&source_dir, &dest_dir]) {
                 let path = state.panel(side).cwd.clone();
                 effects.extend(begin_listing(state, side, path));
+            }
+            // Background tabs (not currently displayed on either side)
+            // don't get the immediate re-read above — their cached listing
+            // would otherwise go silently stale. Mark any whose directory
+            // was touched by this job so activating them later (Alt+`n`,
+            // or the neighbor a Ctrl+W close falls back to) triggers a
+            // fresh read instead (file-operations "Automatic panel re-read
+            // on completion"; panel-tabs "Stale background tab refresh on
+            // activation"). `dest_dir == source_dir` for Delete/Rename, so
+            // this is a harmless duplicate match in that case, not a bug.
+            for side in [PanelSide::Left, PanelSide::Right] {
+                let panel = state.panel_mut(side);
+                panel.mark_background_tabs_stale(&source_dir);
+                panel.mark_background_tabs_stale(&dest_dir);
             }
             if skipped.is_empty() {
                 UiPhase::Panels

@@ -653,7 +653,11 @@ impl PanelState {
     }
 
     /// Snapshot everything a tab independently owns from the fields
-    /// currently inline (i.e. the active tab's state).
+    /// currently inline (i.e. the active tab's state). The active tab is
+    /// never itself stale — a completed job re-reads it immediately rather
+    /// than deferring — so this always snapshots `stale: false`; only
+    /// [`Self::mark_background_tabs_stale`] sets the flag, directly on
+    /// entries already sitting in `tabs`.
     fn to_tab_data(&self) -> TabData {
         TabData {
             cwd: self.cwd.clone(),
@@ -675,6 +679,7 @@ impl PanelState {
             tree: self.tree.clone(),
             pending_cursor_target: self.pending_cursor_target.clone(),
             scroll_offset: self.scroll_offset,
+            stale: false,
         }
     }
 
@@ -706,6 +711,11 @@ impl PanelState {
         // (panel-navigation "Tab restore re-clamps against the current
         // viewport").
         self.scroll_offset = data.scroll_offset;
+        // `data.stale` is deliberately not stored anywhere inline — there is
+        // no "the active tab is stale" state, only "a background tab in
+        // `tabs` is stale". Callers that need to know whether the tab being
+        // adopted here was stale (`switch_tab`/`close_tab`) read `.stale`
+        // off the `TabData` themselves before it reaches this point.
     }
 
     /// The full ordered tab list, with the active tab's live state
@@ -736,15 +746,22 @@ impl PanelState {
     }
 
     /// Ctrl+W: close the active tab and activate an adjacent tab. A no-op
-    /// when only one tab remains (panel-tabs "Close tab (Ctrl+W)").
-    pub fn close_tab(&mut self) {
+    /// when only one tab remains (panel-tabs "Close tab (Ctrl+W)"). Returns
+    /// whether the newly-active neighbor had been marked stale by a
+    /// completed file-operation job — the flag is consumed by this call;
+    /// `core::update`'s `Command::CloseTab` handler uses the return value to
+    /// issue a fresh read instead of showing the stale cached listing
+    /// (panel-tabs "Stale background tab refresh on activation").
+    pub fn close_tab(&mut self) -> bool {
         let mut list = self.full_tab_list();
         if list.len() <= 1 {
-            return;
+            return false;
         }
         list.remove(self.active_tab_index);
         let new_active = self.active_tab_index.min(list.len() - 1);
+        let stale = list[new_active].stale;
         self.apply_tab_list(list, new_active);
+        stale
     }
 
     /// Each tab's directory, in tab order — cheap to call every frame for
@@ -761,17 +778,36 @@ impl PanelState {
 
     /// Alt+`n`: activate the tab at one-based position `n`. Out of range
     /// (including `n == 0`) is a no-op (panel-tabs "Switch tab
-    /// (Alt+1..9)").
-    pub fn switch_tab(&mut self, n: usize) {
+    /// (Alt+1..9)"). Returns whether the newly-active tab had been marked
+    /// stale by a completed file-operation job — the flag is consumed by
+    /// this call; see [`Self::close_tab`] for how the return value is used.
+    pub fn switch_tab(&mut self, n: usize) -> bool {
         if n == 0 {
-            return;
+            return false;
         }
         let target = n - 1;
         if target == self.active_tab_index || target >= self.tab_count() {
-            return;
+            return false;
         }
         let list = self.full_tab_list();
+        let stale = list[target].stale;
         self.apply_tab_list(list, target);
+        stale
+    }
+
+    /// Mark every background tab (an entry in `tabs`; the active tab's own
+    /// state lives inline and is refreshed immediately elsewhere, never
+    /// deferred) whose directory is exactly `dir` as stale, so it is
+    /// refreshed with a fresh read the moment it next becomes active
+    /// instead of keeping its now possibly-incorrect cached listing
+    /// (file-operations "Automatic panel re-read on completion"; panel-tabs
+    /// "Stale background tab refresh on activation").
+    pub fn mark_background_tabs_stale(&mut self, dir: &Path) {
+        for tab in &mut self.tabs {
+            if tab.cwd == dir {
+                tab.stale = true;
+            }
+        }
     }
 }
 
@@ -801,6 +837,15 @@ pub struct TabData {
     pub tree: Option<TreeState>,
     pub pending_cursor_target: Option<OsString>,
     pub scroll_offset: usize,
+    /// Set when a completed/cancelled-with-partial-changes file-operation
+    /// job touched `cwd` while this tab was in the background, so its
+    /// cached `entries` may no longer reflect the on-disk state. Cleared
+    /// (consumed) the moment this tab becomes active again — `switch_tab`/
+    /// `close_tab` read it before reinstating this data and issue a fresh
+    /// read instead of restoring the stale cache (file-operations
+    /// "Automatic panel re-read on completion"; panel-tabs "Stale
+    /// background tab refresh on activation").
+    pub stale: bool,
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single
