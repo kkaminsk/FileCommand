@@ -67,59 +67,69 @@ The system SHALL run one thread that owns the terminal and drives the event loop
 
 ### Requirement: Terminal ownership and restoration on every exit
 
-The system SHALL acquire the alternate screen and raw mode on startup and guarantee their release on every exit path — normal quit, error, and panic — via an RAII guard, so the user's terminal is never left in raw mode or on the alternate screen after the process ends.
+The system SHALL acquire the alternate screen, raw mode, and (when enabled) mouse capture on startup and guarantee their release on every exit path — normal quit, error, and panic — via an RAII guard, so the user's terminal is never left in raw mode, on the alternate screen, or with mouse capture active after the process ends. When the TUI is suspended to run a shell command, an external editor, or the scrollback view, mouse capture SHALL be released before the alternate screen is left and re-acquired on resume.
 
 #### Scenario: Terminal acquired on startup
 
 - **WHEN** the application starts
-- **THEN** it enters the alternate screen and enables raw mode
+- **THEN** it enters the alternate screen, enables raw mode, and enables mouse capture when configured
 
 #### Scenario: Terminal restored on normal exit
 
 - **WHEN** the application exits normally (for example via F10 quit)
-- **THEN** raw mode is disabled and the alternate screen is left before the process terminates
+- **THEN** mouse capture is disabled, raw mode is disabled, and the alternate screen is left before the process terminates
 
 #### Scenario: Terminal restored on error exit
 
 - **WHEN** the application exits because of an error after the terminal was acquired
-- **THEN** the RAII guard still disables raw mode and leaves the alternate screen
+- **THEN** the RAII guard still disables mouse capture and raw mode and leaves the alternate screen
+
+#### Scenario: Suspended shell run gets a normal terminal
+
+- **WHEN** the user runs a command from the command line
+- **THEN** mouse capture is released before the child process runs and re-enabled after the TUI resumes
 
 ### Requirement: Panic hook restores the terminal before reporting
 
-The system SHALL install a panic hook that leaves raw mode and the alternate screen BEFORE the panic report is printed, and that chains to the previously installed hook so the backtrace still surfaces, so that a panic while in raw mode never leaves the terminal unusable.
+The system SHALL install a panic hook that disables mouse capture, leaves raw mode, and leaves the alternate screen BEFORE the panic report is printed, and that chains to the previously installed hook so the backtrace still surfaces, so that a panic while in raw mode never leaves the terminal unusable.
 
 #### Scenario: Panic in raw mode restores the terminal first
 
-- **WHEN** a panic occurs while the terminal is in raw mode on the alternate screen
-- **THEN** raw mode is disabled and the alternate screen is left before any panic report is written
+- **WHEN** a panic occurs while the terminal is in raw mode on the alternate screen with mouse capture enabled
+- **THEN** mouse capture is disabled, raw mode is disabled, and the alternate screen is left before any panic report is written
 
 #### Scenario: Original hook still runs
 
 - **WHEN** the panic hook completes its terminal restoration
 - **THEN** it delegates to the previously installed hook so the panic message and backtrace are still reported
 
-### Requirement: Resize handling with 80x24 minimum and placeholder
+### Requirement: Resize handling with 60x16 hard floor and placeholder
 
-The system SHALL reflow the UI on terminal resize events, laying out the interface only at or above the 80x24 minimum, and MUST draw a `screen.placeholder` "terminal too small" message instead whenever the terminal is below that minimum, using a single size check that governs both normal and splash states.
+The system SHALL reflow the UI on terminal resize events, laying out the interface at any size at or above the 60x16 hard floor, and MUST draw a `screen.placeholder` "terminal too small" message instead whenever the terminal is below that floor, using a single size check that governs both normal and splash states. The placeholder message SHALL name the floor: "resize to at least 60x16". Between the floor and the 80x24 nominal size the interface renders in the degraded forms defined by the `responsive-layout` capability; at or above 80x24 it renders at full fidelity.
 
-#### Scenario: Reflow at or above minimum
+#### Scenario: Reflow at or above the floor
 
-- **WHEN** the terminal is resized to a size at or above 80x24
+- **WHEN** the terminal is resized to a size at or above 60x16
 - **THEN** the UI reflows and lays out its regions to the new dimensions
 
-#### Scenario: Placeholder below minimum
+#### Scenario: Degraded band renders panels, not the placeholder
 
-- **WHEN** the terminal is below 80 columns or below 24 rows
-- **THEN** the "terminal too small" placeholder message is drawn instead of the normal layout
+- **WHEN** the terminal is 70x20 — below the 80x24 nominal size but at or above the floor
+- **THEN** the panels, command line, and key bar render in their degraded forms and the placeholder is not shown
 
-#### Scenario: Shrinking below minimum during splash
+#### Scenario: Placeholder below the floor
 
-- **WHEN** the terminal shrinks below 80x24 while the startup splash is showing
+- **WHEN** the terminal is below 60 columns or below 16 rows
+- **THEN** the "terminal too small" placeholder message is drawn instead of the normal layout, naming the 60x16 floor
+
+#### Scenario: Shrinking below the floor during splash
+
+- **WHEN** the terminal shrinks below 60x16 while the startup splash is showing
 - **THEN** the placeholder replaces the splash, and the splash does not return when the terminal is enlarged again
 
 #### Scenario: Recovery when resized back up
 
-- **WHEN** the terminal is enlarged from below the minimum back to at or above 80x24
+- **WHEN** the terminal is enlarged from below the floor back to at or above 60x16
 - **THEN** the normal layout is drawn again in place of the placeholder
 
 ### Requirement: Quit request keys and confirmation

@@ -5,12 +5,22 @@ TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose af
 ## Requirements
 ### Requirement: Brief display mode
 
-The panel SHALL provide a Brief display mode that lists entry names only, arranged in three columns across the panel width, with no Size/Date/Time columns. Column alignment MUST use display width (`unicode-width`) so that CJK, emoji, and wide-glyph names stay aligned, and entries MUST retain the standard directory/file/selection/cursor styling and the `▶UP--DIR◀` marker for `..`.
+The panel SHALL provide a Brief display mode that lists entry names only, arranged in `max(1, floor(interior_width / 12))` columns across the panel width — where `interior_width` is the panel's width inside its border — with the division remainder given to the last column and no Size/Date/Time columns. At the 80×24 nominal size with the default split this yields exactly three columns. Column alignment MUST use display width (`unicode-width`) so that CJK, emoji, and wide-glyph names stay aligned, and entries MUST retain the standard directory/file/selection/cursor styling and the `▶UP--DIR◀` marker for `..`.
 
-#### Scenario: Brief mode renders three name-only columns
+#### Scenario: Brief mode renders three columns at the nominal size
 
-- **WHEN** the panel is in Brief display mode with more entries than fit in one column
-- **THEN** entry names are laid out across three columns and no size, date, or time fields are shown for any entry
+- **WHEN** the panel is in Brief display mode at terminal size 80×24 with the default 50/50 split (interior width 38)
+- **THEN** entry names are laid out across exactly three columns of widths 12, 12, and 14, and no size, date, or time fields are shown for any entry
+
+#### Scenario: Wider panels earn more columns
+
+- **WHEN** the panel is in Brief mode with an interior width of 60
+- **THEN** entry names are laid out across five columns
+
+#### Scenario: Narrow panels drop to fewer columns
+
+- **WHEN** the panel is in Brief mode with an interior width of 23
+- **THEN** entry names are laid out in a single column spanning the interior width
 
 #### Scenario: Brief mode aligns wide-character names by display width
 
