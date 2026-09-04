@@ -1221,14 +1221,14 @@ fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
 #[test]
 fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    // Non-executable: View, Edit, Copy, Rename, Move, Delete, Send to
-    // clipboard (7 entries).
+    // Non-executable: View, Edit, Send to clipboard, Copy, Rename, Move,
+    // Delete (7 entries).
     let (state, _) = update(state, Command::FileActionMenuMove(-5));
     assert_eq!(state.file_action_menu.as_ref().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
     let (state, _) = update(state, Command::FileActionMenuMove(100));
     let menu = state.file_action_menu.as_ref().unwrap();
     assert_eq!(menu.cursor, menu.entries.len() - 1, "Down past the last entry clamps, it does not wrap");
-    assert_eq!(menu.selected(), FileActionMenuEntry::SendToClipboard);
+    assert_eq!(menu.selected(), FileActionMenuEntry::Delete);
 }
 
 #[test]
@@ -1319,7 +1319,7 @@ fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_on
     state.left.selected.insert(OsString::from("a.txt")); // an unrelated selection must not leak in
     state.left.cursor = 1; // report.txt
     let (state, _) = update(state, Command::Enter);
-    let (state, _) = update(state, Command::FileActionMenuMove(2)); // View, Edit, Copy
+    let (state, _) = update(state, Command::FileActionMenuMove(3)); // View, Edit, SendToClipboard, Copy
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(effects.is_empty(), "opening the destination dialog is not itself a mutation");
     match state.phase {
@@ -1336,7 +1336,7 @@ fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_on
 #[test]
 fn file_action_menu_move_opens_the_f6_destination_dialog_scoped_to_the_target_only() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    let (state, _) = update(state, Command::FileActionMenuMove(4)); // View, Edit, Copy, Rename, Move
+    let (state, _) = update(state, Command::FileActionMenuMove(5)); // View, Edit, SendToClipboard, Copy, Rename, Move
     let (state, _) = update(state, Command::FileActionMenuConfirm);
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, .. }) => {
@@ -4295,11 +4295,11 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
     assert_eq!(
         menu.entries,
         vec![
+            FileActionMenuEntry::SendToClipboard,
             FileActionMenuEntry::Copy,
             FileActionMenuEntry::Rename,
             FileActionMenuEntry::Move,
             FileActionMenuEntry::Delete,
-            FileActionMenuEntry::SendToClipboard,
         ]
     );
 }

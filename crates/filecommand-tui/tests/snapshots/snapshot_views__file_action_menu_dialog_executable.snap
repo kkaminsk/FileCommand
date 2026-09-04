@@ -13,11 +13,11 @@ expression: text
 ║                            ║ Run               ║                             ║
 ║                            ║ View              ║                             ║
 ║                            ║ Edit              ║                             ║
+║                            ║ Send to clipboard ║                             ║
 ║                            ║ Copy              ║                             ║
 ║                            ║ Rename            ║                             ║
 ║                            ║ Move              ║                             ║
 ║                            ║ Delete            ║                             ║
-║                            ║ Send to clipboard ║                             ║
 ║                            ╚═══════════════════╝                             ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║

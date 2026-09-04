@@ -12,11 +12,11 @@ expression: text
 ║                            ╔═══ readme.txt ════╗                             ║
 ║                            ║ View              ║                             ║
 ║                            ║ Edit              ║                             ║
+║                            ║ Send to clipboard ║                             ║
 ║                            ║ Copy              ║                             ║
 ║                            ║ Rename            ║                             ║
 ║                            ║ Move              ║                             ║
 ║                            ║ Delete            ║                             ║
-║                            ║ Send to clipboard ║                             ║
 ║                            ╚═══════════════════╝                             ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
