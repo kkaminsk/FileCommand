@@ -674,6 +674,68 @@ fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
 }
 
 #[test]
+fn job_done_delete_rereads_both_panels_when_both_browse_the_same_directory() {
+    // BIG-162 base case: both panels' *active* tabs already sat on the
+    // directory a Delete completed in — this must keep re-reading both
+    // immediately, unchanged by the background-tab staleness work
+    // (file-operations "The opposite panel sharing the affected directory
+    // also refreshes").
+    let mut state = test_state(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/shared"),
+        dest_dir: PathBuf::from("/shared"),
+        dialog: RunningDialog::Progress { kind: JobKind::Delete, progress: ProgressInfo::starting(1, 1) },
+    });
+    state.left.cwd = PathBuf::from("/shared");
+    state.right.cwd = PathBuf::from("/shared");
+    let (state, effects) = update(
+        state,
+        Command::JobDone {
+            outcome: JobOutcome::Completed { skipped: vec![] },
+            source_dir: PathBuf::from("/shared"),
+            dest_dir: PathBuf::from("/shared"),
+        },
+    );
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![
+            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/shared") },
+            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/shared") },
+        ]
+    );
+}
+
+#[test]
+fn job_done_marks_background_tab_stale_without_eager_reread() {
+    // A background tab (not the active one) sitting on the deleted-from
+    // directory must be marked stale, not eagerly re-read — the read is
+    // deferred until it becomes active (file-operations "A background tab
+    // on the affected directory is marked stale, not eagerly re-read").
+    let mut state = test_state(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/left"),
+        dialog: RunningDialog::Progress { kind: JobKind::Delete, progress: ProgressInfo::starting(1, 1) },
+    });
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab(); // tab 0 stashed at "/left" (background); tab 1 (active) also starts at "/left"
+    state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere; tab 0 remains at "/left"
+    state.right.cwd = PathBuf::from("/right"); // unaffected panel
+
+    let (state, effects) = update(
+        state,
+        Command::JobDone {
+            outcome: JobOutcome::Completed { skipped: vec![] },
+            source_dir: PathBuf::from("/left"),
+            dest_dir: PathBuf::from("/left"),
+        },
+    );
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert!(without_git_info_effects(effects).is_empty(), "a background tab must not be eagerly re-read");
+    assert_eq!(state.left.tabs.len(), 1);
+    assert!(state.left.tabs[0].stale, "the background tab on the deleted-from directory must be marked stale");
+}
+
+#[test]
 fn listing_complete_reconciles_selection_against_fresh_entries() {
     let mut state = test_state(UiPhase::Panels);
     state.left.selected.insert(OsString::from("gone.txt"));
@@ -897,6 +959,70 @@ fn switch_tab_out_of_range_is_a_no_op() {
     let (state, _) = update(state, Command::SwitchTab(9));
     assert_eq!(state.right.cwd, before);
     assert_eq!(state.right.tab_count(), 1);
+}
+
+// ---------------------------------------------------------------------
+// Stale background tab refresh on activation (refresh-inactive-panel-on-
+// delete; BIG-162)
+// ---------------------------------------------------------------------
+
+#[test]
+fn switch_tab_to_stale_tab_issues_fresh_read_and_clears_the_flag() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab(); // tab 0 stashed at "/left" (background); tab 1 (active) also starts at "/left"
+    state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere
+    state.left.mark_background_tabs_stale(Path::new("/left"));
+    assert!(state.left.tabs[0].stale);
+
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "activated the previously-stale background tab");
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }],
+        "activating a stale tab must issue a fresh read"
+    );
+
+    // The flag must be consumed, not left set: switching away and back
+    // must not trigger a second read.
+    let (state, _) = update(state, Command::SwitchTab(2));
+    assert_eq!(state.left.cwd, PathBuf::from("/left/other"));
+    let (_, effects) = update(state, Command::SwitchTab(1));
+    assert!(without_git_info_effects(effects).is_empty(), "the stale flag must not persist past its one consuming activation");
+}
+
+#[test]
+fn close_tab_falling_back_to_stale_neighbor_issues_fresh_read() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab(); // tab 0 stashed at "/left" (background); tab 1 (active) also starts at "/left"
+    state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere
+    state.left.mark_background_tabs_stale(Path::new("/left"));
+
+    let (state, effects) = update(state, Command::CloseTab);
+    assert_eq!(state.left.tab_count(), 1, "closed the active tab, falling back to the one remaining tab");
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "fell back to the previously-stale background tab");
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }],
+        "falling back to a stale neighbor must issue a fresh read"
+    );
+}
+
+#[test]
+fn switch_tab_to_non_stale_tab_issues_no_listing_effects() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab();
+    state.left.begin_new_listing(PathBuf::from("/left/other"));
+    // No mark_background_tabs_stale call: tab 0 is not stale.
+
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+    assert!(without_git_info_effects(effects).is_empty(), "switching to a tab with no pending staleness must not re-read (unchanged behavior)");
 }
 
 #[test]
