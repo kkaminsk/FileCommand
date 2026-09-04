@@ -78,12 +78,7 @@ While type-ahead mode is active, the system SHALL remove the last character of t
 
 ### Requirement: Exiting type-ahead and restoring command-line routing
 
-The system SHALL exit type-ahead mode when the user presses Esc or any panel movement key, after which plain printable keys typed over the focused panel SHALL again be routed to the command line.
-
-#### Scenario: Esc exits type-ahead
-
-- **WHEN** type-ahead is active and the user presses Esc
-- **THEN** type-ahead mode ends and the mini-status reverts to its normal display
+The system SHALL exit type-ahead mode when the user presses any panel movement key, after which plain printable keys typed over the focused panel SHALL again be routed to the command line. Esc SHALL NOT exit type-ahead; over the panels it requests application quit, and cancelling that dialog leaves type-ahead active (application-shell "Quit request keys and confirmation").
 
 #### Scenario: A movement key exits type-ahead and is applied to the panel
 
@@ -91,8 +86,13 @@ The system SHALL exit type-ahead mode when the user presses Esc or any panel mov
 - **THEN** type-ahead mode ends
 - **AND** the movement key is applied to the panel cursor as a normal movement
 
+#### Scenario: Esc leaves type-ahead active
+
+- **WHEN** type-ahead is active and the user presses Esc, then cancels the quit-confirmation dialog
+- **THEN** type-ahead mode is still active with its pattern intact
+
 #### Scenario: Printable keys return to the command line after exit
 
-- **WHEN** type-ahead has exited via Esc or a movement key and the user then presses a plain printable key while the panel is focused
+- **WHEN** type-ahead has exited via a movement key and the user then presses a plain printable key while the panel is focused
 - **THEN** the key is appended to the command line and does not start or extend a search
 
