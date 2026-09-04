@@ -942,34 +942,35 @@ fn history_recall_with_empty_history_is_a_noop() {
     assert!(effects.is_empty());
 }
 
+// `running_a_command_records_history_clears_the_buffer_and_persists` and
+// `running_a_command_uses_the_configured_shell` used to assert that
+// arbitrary typed text (`dir`, `Get-ChildItem`) reached the shell — no
+// longer true now that the command line only recognizes `cd`/`del`/`rmdir`
+// (command-line "Command-line builtin whitelist"). The buffer-clearing
+// assertion moves to the rejection path below; `shell::build_command`
+// respecting the configured shell is still exercised, just through the F2
+// user menu, one of its two remaining (unaffected) call sites.
 #[test]
-fn running_a_command_records_history_clears_the_buffer_and_persists() {
+fn an_unrecognized_command_clears_the_buffer_and_is_rejected_without_touching_history() {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from(r"C:\NORTON");
     let state = type_line(state, "dir");
     let (state, effects) = update(state, Command::Enter);
 
-    assert!(state.command_line.is_empty(), "the buffer is cleared once the command is dispatched");
-    assert_eq!(state.history, vec!["dir".to_string()]);
-    assert_eq!(state.prompt(), format!("{}>", PathBuf::from(r"C:\NORTON").display()));
-
-    match effects.as_slice() {
-        [Effect::RunShellCommand(inv, side), Effect::PersistHistory(file)] => {
-            assert_eq!(inv.cwd, PathBuf::from(r"C:\NORTON"));
-            assert_eq!(inv.args.last().unwrap(), "dir");
-            assert_eq!(*side, PanelSide::Left, "the command ran in the active panel, so that panel is re-read");
-            assert_eq!(file.commands, vec!["dir".to_string()]);
-        }
-        other => panic!("expected a shell command plus a history write, got {other:?}"),
-    }
+    assert!(state.command_line.is_empty(), "the buffer is cleared even for a rejected line");
+    assert!(state.history.is_empty(), "a rejected command is not recorded in history");
+    assert!(effects.is_empty(), "nothing is spawned and nothing is persisted, got {effects:?}");
+    assert_eq!(state.left.last_error.as_deref(), Some("'dir' is not a recognized command"));
+    assert_eq!(state.prompt(), format!("{}>", PathBuf::from(r"C:\NORTON").display()), "the panel itself is untouched");
 }
 
 #[test]
-fn running_a_command_uses_the_configured_shell() {
+fn f2_user_menu_entry_uses_the_configured_shell() {
     let mut state = test_state(UiPhase::Panels);
     state.shell.shell = Some("powershell".to_string());
-    let state = type_line(state, "Get-ChildItem");
-    let (_, effects) = update(state, Command::Enter);
+    state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "List".to_string(), command: "Get-ChildItem".to_string() }];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let (_, effects) = update(state, Command::UserMenuConfirm);
     match effects.first() {
         Some(Effect::RunShellCommand(inv, _)) => {
             assert_eq!(inv.program, "powershell");
@@ -1077,10 +1078,11 @@ fn file_action_menu_does_not_open_when_the_command_buffer_is_non_empty() {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from(r"C:\NORTON");
     state.left.entries = vec![file_entry("readme.txt", 1)];
-    let state = type_line(state, "dir");
+    let state = type_line(state, "cd nosuchdir");
     let (state, effects) = update(state, Command::Enter);
     assert!(state.file_action_menu.is_none(), "a non-empty command buffer takes precedence over the menu");
-    assert!(matches!(effects.first(), Some(Effect::RunShellCommand(..))), "the typed command still runs, got {effects:?}");
+    assert!(effects.is_empty(), "the rejected cd spawns and starts nothing, got {effects:?}");
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the rejected cd leaves the panel untouched");
 }
 
 #[test]
@@ -1419,6 +1421,11 @@ fn ctrl_o_asks_the_tui_for_the_host_scrollback() {
 fn cd_navigates_the_panel_instead_of_spawning_a_shell() {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from("/left");
+    // The new synchronous existence check (command-line "cd navigates the
+    // active panel or rejects a nonexistent target") is satisfied here via
+    // the panel's own listing rather than real I/O — `sub` is a
+    // currently-visible directory entry.
+    state.left.entries = vec![dir_entry("sub")];
     let state = type_line(state, "cd sub");
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
@@ -1431,19 +1438,56 @@ fn cd_navigates_the_panel_instead_of_spawning_a_shell() {
 }
 
 #[test]
-fn cd_accepts_a_manually_entered_unc_path() {
-    let state = type_line(test_state(UiPhase::Panels), r"cd \\server\share");
+fn cd_to_a_nonexistent_directory_is_rejected_without_navigating() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"cd \NOSUCHDIR");
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(state.left.cwd, PathBuf::from(r"\\server\share"));
-    assert!(effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"\\server\share") }));
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the active panel's cwd is left completely unchanged");
+    assert!(effects.is_empty(), "no listing read is attempted, got {effects:?}");
+    assert!(state.left.last_error.is_some(), "the panel shows an error indicating the target was not found");
+    assert!(state.history.is_empty(), "a rejected cd is not recorded in history");
 }
 
 #[test]
-fn an_unreachable_cd_target_surfaces_the_panel_error_state() {
-    let state = type_line(test_state(UiPhase::Panels), r"cd \\nosuchserver\share");
-    let (state, _) = update(state, Command::Enter);
-    // The read itself happens on the worker thread; its failure comes back
-    // through the same event path as any other listing error.
+fn cd_to_a_file_is_rejected() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("readme.txt", 1)];
+    let state = type_line(state, "cd readme.txt");
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the active panel's cwd is left unchanged");
+    assert!(effects.is_empty(), "no listing read is attempted, got {effects:?}");
+    let expected = format!("{} is not a directory", PathBuf::from(r"C:\NORTON\readme.txt").display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn cd_accepts_a_manually_entered_unc_path() {
+    // A manually-typed UNC path resolves as absolute rather than being
+    // joined onto the panel's cwd (this is `dispatch_cd`'s pure path
+    // arithmetic, shared with `del`/`rmdir`); a fabricated share can't
+    // additionally satisfy the new existence check in a unit test (no real
+    // network I/O here), so that half is covered separately by the
+    // synchronous-rejection and race-scenario tests below.
+    assert_eq!(resolve_cd_target(Path::new(r"C:\NORTON"), r"\\server\share"), Some(PathBuf::from(r"\\server\share")));
+}
+
+#[test]
+fn a_cd_target_that_fails_asynchronously_after_passing_the_sync_check_surfaces_the_panel_error_state() {
+    // Different from `cd_to_a_nonexistent_directory_is_rejected_without_
+    // navigating`: this is the race where the target existed at
+    // synchronous-check time (so the check passed and a listing began) but
+    // became unreachable before the read completed — the read itself runs
+    // on a worker thread, and its failure comes back through the same
+    // event path as any other listing error (design.md "a race where a
+    // target existed at check time but became unreachable before the read
+    // completed").
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("share")];
+    let state = type_line(state, "cd share");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { .. })), "the sync check passed, so a listing began");
     let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "network path not found".into() });
     assert_eq!(state.left.last_error.as_deref(), Some("network path not found"));
 }
@@ -1455,6 +1499,105 @@ fn cd_dotdot_and_bare_drive_letters_resolve() {
     assert_eq!(resolve_cd_target(Path::new("/a"), "D:"), Some(PathBuf::from(r"D:\")));
     assert_eq!(parse_cd("dir"), None);
     assert_eq!(parse_cd("cd  \"C:\\Program Files\" "), Some(r"C:\Program Files".to_string()));
+    assert_eq!(parse_cd("CD sub"), Some("sub".to_string()), "builtin verbs are case-insensitive");
+}
+
+// ---------------------------------------------------------------------
+// command-line-builtin-whitelist: `del`/`rmdir` typed builtins
+// ---------------------------------------------------------------------
+
+#[test]
+fn del_on_a_file_opens_the_delete_confirm_dialog_naming_it() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("notes.txt", 1)];
+    let state = type_line(state, "del notes.txt");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty(), "nothing is deleted until the dialog is accepted, got {effects:?}");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, needs_second_confirm, confirmed_once, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("notes.txt"));
+            assert_eq!(sources[0].path, PathBuf::from(r"C:\NORTON\notes.txt"));
+            assert!(!sources[0].is_dir);
+            assert!(!needs_second_confirm, "a single file needs only one confirmation");
+            assert!(!confirmed_once);
+        }
+        other => panic!("expected the delete-confirm dialog to open, got {other:?}"),
+    }
+    assert!(state.history.is_empty(), "`del` is not recorded in command history");
+}
+
+#[test]
+fn rmdir_on_a_directory_opens_the_delete_confirm_dialog_and_needs_second_confirmation() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![dir_entry("docs")];
+    let state = type_line(state, "rmdir docs");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, needs_second_confirm, confirmed_once, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("docs"));
+            assert!(sources[0].is_dir);
+            assert!(needs_second_confirm, "a directory requires the existing second confirmation");
+            assert!(!confirmed_once);
+        }
+        other => panic!("expected the delete-confirm dialog to open, got {other:?}"),
+    }
+
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    assert!(effects.is_empty(), "first confirm just arms the second confirmation");
+    let (_, effects) = update(state, Command::FileOpConfirm);
+    assert!(matches!(effects.as_slice(), [Effect::RunJob(Job { kind: JobKind::Delete, .. })]), "nothing was deleted until the second confirm");
+}
+
+#[test]
+fn del_rejects_a_directory_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![dir_entry("docs")];
+    let state = type_line(state, "del docs");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels, "no dialog opens");
+    let expected = format!("{} is a directory", PathBuf::from(r"C:\NORTON\docs").display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn rmdir_rejects_a_file_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![file_entry("notes.txt", 1)];
+    let state = type_line(state, "rmdir notes.txt");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels, "no dialog opens");
+    let expected = format!("{} is not a directory", PathBuf::from(r"C:\NORTON\notes.txt").display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
+}
+
+#[test]
+fn del_and_rmdir_on_a_nonexistent_target_are_rejected() {
+    for verb in ["del", "rmdir"] {
+        let mut state = test_state(UiPhase::Panels);
+        state.left.cwd = PathBuf::from(r"C:\NORTON");
+        let state = type_line(state, &format!(r"{verb} \NOSUCHFILE.TXT"));
+        let (state, effects) = update(state, Command::Enter);
+        assert!(effects.is_empty(), "{verb}: nothing spawns and no dialog opens, got {effects:?}");
+        assert_eq!(state.phase, UiPhase::Panels, "{verb}: no dialog opens");
+        assert!(state.left.last_error.is_some(), "{verb}: the panel shows a not-found error");
+    }
+}
+
+#[test]
+fn del_and_rmdir_verbs_are_case_insensitive() {
+    assert_eq!(parse_del("DEL notes.txt"), Some("notes.txt".to_string()));
+    assert_eq!(parse_rmdir("RmDir docs"), Some("docs".to_string()));
+    assert_eq!(parse_del("delete notes.txt"), None, "`delete` must not falsely match the `del` verb");
+    assert_eq!(parse_rmdir("rd docs"), None, "`rd` is not an alias for `rmdir` (design.md non-goal)");
 }
 
 // ---------------------------------------------------------------------
