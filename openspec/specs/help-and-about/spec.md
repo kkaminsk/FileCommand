@@ -5,12 +5,17 @@ TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose af
 ## Requirements
 ### Requirement: F1 Help window frame and identity header
 
-The system SHALL open a Help window when F1 is pressed, rendered as a centered primary-style dialog (black text on cyan, black double-line frame) with the title `Help` set into the top border, and it SHALL begin with a header block of three centered black-on-cyan lines carrying the identity lines (name + version, copyright, tribute) — the exact same strings shared verbatim with the startup splash and the Info-panel version banner.
+The system SHALL open a Help window when F1 is pressed, rendered as a centered primary-style dialog (black text on cyan, black double-line frame) with the title `Help` set into the top border, and it SHALL begin with a header block of three centered black-on-cyan lines carrying the identity lines (name + version, copyright, tribute) — the exact same strings shared verbatim with the startup splash and the Info-panel version banner. The window's geometry SHALL come from the unified overlay geometry rule (`responsive-layout`) with a preferred size of 62×19 and a minimum of 40×10, so it renders 62×19 at the 80×24 nominal size and clamps smaller terminals down to the 60×16 floor.
 
 #### Scenario: F1 opens the centered Help window in primary style
 
 - **WHEN** the user presses F1 from the panels at terminal size 80×24
-- **THEN** a centered window (approximately 62×19, capped near that proportion) is drawn in the primary dialog style (black on cyan, black double-line frame) with the title `Help` set into its top border
+- **THEN** a centered window of 62×19 is drawn in the primary dialog style (black on cyan, black double-line frame) with the title `Help` set into its top border
+
+#### Scenario: Help window clamps below the nominal size
+
+- **WHEN** the user presses F1 at terminal size 60×16
+- **THEN** the Help window renders centered at 58×14 — clamped by the unified overlay rule — fully on-screen, with its content truncated with `…` where it no longer fits
 
 #### Scenario: Identity header matches the shared source of truth
 
@@ -20,11 +25,11 @@ The system SHALL open a Help window when F1 is pressed, rendered as a centered p
 #### Scenario: Help window re-centers on resize
 
 - **WHEN** the terminal is resized while the Help window is open
-- **THEN** the window re-centers within the new dimensions, scaling toward its capped proportion, and remains fully within the visible area
+- **THEN** the window's rectangle is recomputed by the unified overlay rule, re-centered within the new dimensions, and remains fully within the visible area
 
 ### Requirement: Help topic list
 
-The system SHALL render, below the identity header, a scrollable list of help topics whose first entry is `About FileCommand`, highlighted (white on black) as the initial cursor position, followed by the v1 topics `Keyboard reference`, `Panels and display modes`, `File operations`, `Menus`, `Viewer`, `Editor`, `Command line`, `Modern extras`, and `Configuration`, and it SHALL show `↑` / `↓` scroll arrows on the right border only when the list overflows the visible area.
+The system SHALL render, below the identity header, a scrollable list of help topics whose first entry is `About FileCommand`, highlighted (white on black) as the initial cursor position, followed by the v1 topics `Keyboard reference`, `Mouse`, `Panels and display modes`, `File operations`, `Menus`, `Viewer`, `Editor`, `Command line`, `Modern extras`, and `Configuration`, and it SHALL show `↑` / `↓` scroll arrows on the right border only when the list overflows the visible area.
 
 #### Scenario: List opens with About FileCommand highlighted first
 
@@ -40,6 +45,11 @@ The system SHALL render, below the identity header, a scrollable list of help to
 
 - **WHEN** the topic list is taller than the visible list area
 - **THEN** `↑` / `↓` scroll arrows render on the window's right border, and they are absent when the entire list fits
+
+#### Scenario: Mouse topic
+
+- **WHEN** the user opens the `Mouse` topic
+- **THEN** its page documents click, double-click, wheel, right-click, Ctrl+click, Shift+drag for native text selection, and the `[mouse]` / `--nomouse` off switches
 
 ### Requirement: Help window buttons
 
