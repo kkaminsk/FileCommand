@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change enter-file-action-menu. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Enter on a file opens the action menu
 
 When the command-line buffer is empty and the user presses Enter with the active panel's cursor on a file entry, the system SHALL open a modal file-action menu targeting that entry. The menu SHALL target the cursor entry only — it SHALL NOT consume or alter the multi-entry selection. Enter on a directory or the `..` entry SHALL continue to navigate, and Enter with a non-empty command-line buffer SHALL continue to run the typed command; neither is affected by this menu. Menu state SHALL live in `filecommand-core` with all mutations flowing through `core::update`.
@@ -32,17 +34,17 @@ When the command-line buffer is empty and the user presses Enter with the active
 
 ### Requirement: Menu contents, ordering, and navigation
 
-The file-action menu SHALL list the entries View, Edit, Copy, Rename, Move, Delete, Send to clipboard in that order, and SHALL additionally list Run as the first entry when the target is executable (PATHEXT match or `.lnk`). The menu SHALL render as a primary-style modal dialog (§4.4) with the first entry highlighted on open. Up/Down SHALL move the highlight, Enter SHALL activate the highlighted entry and close the menu, Esc SHALL close the menu with no action taken, and pressing an entry's first letter SHALL activate that entry directly (R resolves to Run when Run is listed, otherwise to Rename). Rendering SHALL use only ANSI-16 named color roles and CP437 glyphs.
+The file-action menu SHALL list the entries View, Edit, Send to clipboard, Copy, Rename, Move, Delete in that order, and SHALL additionally list Run as the first entry when the target is executable (PATHEXT match or `.lnk`). The menu SHALL render as a primary-style modal dialog (§4.4) with the first entry highlighted on open. Up/Down SHALL move the highlight, Enter SHALL activate the highlighted entry and close the menu, Esc SHALL close the menu with no action taken, and pressing an entry's first letter SHALL activate that entry directly (R resolves to Run when Run is listed, otherwise to Rename).  Rendering SHALL use only ANSI-16 named color roles and CP437 glyphs.
 
 #### Scenario: Non-executable menu contents
 
 - **WHEN** the menu opens for `notes.txt`
-- **THEN** it lists View, Edit, Copy, Rename, Move, Delete, Send to clipboard in that order with View highlighted
+- **THEN** it lists View, Edit, Send to clipboard, Copy, Rename, Move, Delete in that order with View highlighted
 
 #### Scenario: Executable gets Run first
 
 - **WHEN** the menu opens for `setup.exe`
-- **THEN** it lists Run, View, Edit, Copy, Rename, Move, Delete, Send to clipboard with Run highlighted
+- **THEN** it lists Run, View, Edit, Send to clipboard, Copy, Rename, Move, Delete with Run highlighted
 - **AND** pressing Enter immediately activates Run
 
 #### Scenario: Esc closes with no action
@@ -117,12 +119,12 @@ The Rename menu entry SHALL open an input dialog pre-filled with the target entr
 
 ### Requirement: Directory targets and selection-scoped invocation
 
-When the file-action menu is opened by a mouse right-click, the system SHALL allow a directory as the target, omitting View, Edit, and Run from the menu; and when the target entry is a member of the panel's selection set, Copy, Move, Delete, and Send to clipboard SHALL act on the whole selection set, with the resulting dialog naming the count. Enter-key invocation SHALL remain single-target and file-only as previously specified.
+When the file-action menu is opened by a mouse right-click, the system SHALL allow a directory as the target, omitting View, Edit, and Run from the menu; and when the target entry is a member of the panel's selection set, Copy, Move, Delete, and Send to clipboard SHALL act on the whole selection set, with the resulting dialog naming the count. Enter-key invocation SHALL remain single-target and file-only as previously specified. The directory menu SHALL list its entries as Send to clipboard, Copy, Rename, Move, Delete in that order, matching the file-target menu's placement of Send to clipboard immediately after the (here-omitted) View/Edit entries.
 
 #### Scenario: Directory menu contents
 
 - **WHEN** the menu opens by right-click on `src`
-- **THEN** it lists Copy, Rename, Move, Delete, Send to clipboard
+- **THEN** it lists Send to clipboard, Copy, Rename, Move, Delete in that order
 
 #### Scenario: Selection-scoped delete
 
@@ -133,8 +135,6 @@ When the file-action menu is opened by a mouse right-click, the system SHALL all
 
 - **WHEN** three entries are selected and the user presses Enter on one of them and activates Copy
 - **THEN** the destination-input dialog is scoped to that single entry
-
----
 
 ### Requirement: No mutation without an intervening dialog
 
@@ -154,4 +154,3 @@ No file-action menu entry SHALL mutate the filesystem directly upon activation: 
 
 - **WHEN** the user activates Send to clipboard for `notes.txt`
 - **THEN** the filesystem is unchanged and only the clipboard contents differ
-

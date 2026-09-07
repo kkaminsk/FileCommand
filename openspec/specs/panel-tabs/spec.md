@@ -2,7 +2,9 @@
 
 ## Purpose
 TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose after archive.
+
 ## Requirements
+
 ### Requirement: Per-panel tab list with independent state
 
 Each panel SHALL own a list of tabs and an active-tab index, where every tab holds a fully independent panel state — current directory, cursor position, selection set, sort mode, filter, and display mode. Switching, opening, or closing tabs SHALL only affect the active panel; the opposite panel's tab list is unaffected. On startup each panel SHALL have exactly one tab.
@@ -106,3 +108,18 @@ When the tabs do not all fit on the strip width, labels SHALL shrink stepwise �
 - **WHEN** the tabs overflow the strip even at minimum ` n ` form and the active tab is beyond the visible window
 - **THEN** the strip scrolls so the active tab is visible and an `◄` or `►` overflow marker is drawn at each end that has hidden tabs
 
+### Requirement: Stale background tab refresh on activation
+
+A tab marked stale by a completed file-operation job (see `file-operations` — "Automatic panel re-read on completion") SHALL be refreshed with a fresh directory read the moment it becomes the active tab — via Alt+1..9 switch, or via the neighbor activation that follows a Ctrl+W close — instead of displaying its previously cached entries. A tab that is not marked stale SHALL continue to activate from its cached state with no re-read, exactly as today.
+
+#### Scenario: Switching to a stale background tab triggers a fresh read
+- **WHEN** a background tab is browsing a directory affected by a completed job while it was inactive, and the user activates it with Alt+`n`
+- **THEN** the tab re-reads its directory instead of showing its stale cached entries
+
+#### Scenario: Closing a tab activates a neighbor that is stale
+- **WHEN** Ctrl+W closes the active tab and falls back to an adjacent tab that was marked stale
+- **THEN** the newly-active tab re-reads its directory instead of showing its stale cached entries
+
+#### Scenario: Switching to a tab with no pending staleness is unchanged
+- **WHEN** the user switches to a tab that was not affected by any completed job since it was last active
+- **THEN** the tab activates from its cached state with no re-read, as before
