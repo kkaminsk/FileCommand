@@ -8,6 +8,14 @@ Running a command through this mechanism SHALL leave raw mode and the alternate 
 
 Enter on an executable target (PATHEXT match or `.lnk`) SHALL NOT spawn the target directly; it SHALL open the file-action menu for that entry, whose Run entry uses this same suspended-spawn path.
 
+#### Scenario: Enter runs the typed command
+- **WHEN** the command buffer is `dir` (or any text that is not a recognized builtin) and the user presses Enter
+- **THEN** no shell process is spawned for it — typed command-line text no longer runs through a shell; it is rejected instead (superseded by "Command-line builtin whitelist")
+
+#### Scenario: Command buffer cleared after run
+- **WHEN** the user presses Enter with a non-empty command buffer
+- **THEN** the buffer is cleared immediately, before the line is dispatched — whether it is a recognized builtin, rejected as unrecognized, or (via the Run entry/F2 user menu, not typed Enter) a shell command that has yet to finish
+
 #### Scenario: Terminal restored after a failing child
 - **WHEN** a child spawned via the Run entry or F2 user menu exits with an error or the spawn fails
 - **THEN** the TUI is restored to the alternate screen and raw mode exactly once, and the app does not crash
