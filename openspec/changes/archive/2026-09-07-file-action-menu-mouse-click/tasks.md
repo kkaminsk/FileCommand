@@ -20,13 +20,18 @@
 
 - [x] 4.1 TUI-side: new test mirroring `pulldown_item_click_dispatches_menu_item_click` for `FileActionMenuItemClick`.
 - [x] 4.2 TUI-side: new test mirroring `pulldown_click_elsewhere_closes_the_bar` asserting a click outside the open file-action menu yields `Command::FileActionMenuCancel`.
+<<<<<<<< HEAD:openspec/changes/archive/2026-09-07-file-action-menu-mouse-click/tasks.md
 - [x] 4.3 TUI-side: confirm `an_ignored_overlay_returns_none_even_over_a_hit_row` still passes unchanged (it tests `state.help`, not the file-action menu) — add an equivalent negative test for another still-genuinely-ignored overlay if useful, but no change needed to the existing one. (The pre-existing `file_action_menu_overlay_ignores_mouse` test, which asserted the now-obsolete ignored behavior, was replaced by the 4.1/4.2 tests above.)
+========
+- [x] 4.3 TUI-side: confirm `an_ignored_overlay_returns_none_even_over_a_hit_row` still passes unchanged (it tests `state.help`, not the file-action menu) — add an equivalent negative test for another still-genuinely-ignored overlay if useful, but no change needed to the existing one.
+>>>>>>>> 7d8c007 (Archive 4 completed changes, sync specs, add new proposals, apply implementations):openspec/changes/archive/2026-09-20-file-action-menu-mouse-click/tasks.md
 - [x] 4.4 Core-side: new tests mirroring `menu_item_click_activates_the_item_exactly_like_menu_activate` / `..._with_no_menu_open_is_a_no_op` for `FileActionMenuItemClick`, matching the assertion style of the existing file-action-menu test suite (`open_action_menu_at_opens_the_menu_for_a_file`, etc.).
 - [x] 4.5 Core-side: test that clicking a non-highlighted row activates that row (not the previously-highlighted one).
 
 ## 5. Verification
 
 - [x] 5.1 Run `cargo test -p filecommand-core` and `cargo test -p filecommand-tui`.
+<<<<<<<< HEAD:openspec/changes/archive/2026-09-07-file-action-menu-mouse-click/tasks.md
 - [ ] 5.2 Manual check via the `run` skill: open the file-action menu (Enter or right-click), click a row (activates it), reopen and click outside the menu (closes with no action), confirm no visual hover-highlight appears on mouse-move alone.
 - [ ] 5.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
 
@@ -37,3 +42,7 @@
      verification step (a non-interactive agent) cannot execute; they are
      left for a human or an environment with those tools before the PR
      opens. -->
+========
+- [x] 5.2 Manual check via the `run` skill: open the file-action menu (Enter or right-click), click a row (activates it), reopen and click outside the menu (closes with no action), confirm no visual hover-highlight appears on mouse-move alone.
+- [x] 5.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+>>>>>>>> 7d8c007 (Archive 4 completed changes, sync specs, add new proposals, apply implementations):openspec/changes/archive/2026-09-20-file-action-menu-mouse-click/tasks.md

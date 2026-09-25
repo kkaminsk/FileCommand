@@ -17,5 +17,10 @@
 ## 4. Verification
 
 - [x] 4.1 Run `cargo test -p filecommand-core` and `cargo test -p filecommand-tui`.
+<<<<<<<< HEAD:openspec/changes/archive/2026-09-07-reorder-file-action-menu-clipboard/tasks.md
 - [ ] 4.2 Manual check via the `run` skill: open the menu (Enter) on a file and confirm order `View, Edit, Send to clipboard, Copy, Rename, Move, Delete`; right-click a directory and confirm order `Send to clipboard, Copy, Rename, Move, Delete`.
 - [ ] 4.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+========
+- [x] 4.2 Manual check via the `run` skill: open the menu (Enter) on a file and confirm order `View, Edit, Send to clipboard, Copy, Rename, Move, Delete`; right-click a directory and confirm order `Send to clipboard, Copy, Rename, Move, Delete`.
+- [x] 4.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+>>>>>>>> 7d8c007 (Archive 4 completed changes, sync specs, add new proposals, apply implementations):openspec/changes/archive/2026-09-20-reorder-file-action-menu-clipboard/tasks.md

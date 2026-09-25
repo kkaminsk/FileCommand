@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change m2-file-operations. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Cancellable file-operation jobs with progress events
 
 Copy, move, delete, and make-directory operations SHALL each execute as a `Job` on a worker thread so the UI thread never performs blocking I/O. While a job runs it SHALL emit progress events carrying the current file being processed, bytes done and bytes total, and files done and files total, folded into core state through `core::update`. A job SHALL observe a cancel signal at every file boundary and between chunk copies of a large file, stopping promptly when set. Selected directories SHALL contribute 0 bytes to `bytes_total` (no directory sizing in v1); their file contents contribute normally when a copy/move/delete recurses into them.
@@ -125,3 +123,4 @@ When a job finishes — including a cancellation after partial progress — ever
 #### Scenario: A background tab on the affected directory is marked stale, not eagerly re-read
 - **WHEN** a panel has a background tab (not the active tab) browsing a directory affected by a completed job
 - **THEN** that background tab is marked stale rather than re-read immediately, and its cached listing is left untouched until it becomes active
+
