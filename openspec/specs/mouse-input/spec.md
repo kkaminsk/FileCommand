@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change mouse-basics. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Mouse capture configuration
 
 The system SHALL enable terminal mouse capture by default and SHALL disable it when `config.toml` sets `[mouse] enabled = false` or the process is launched with `--nomouse`. When capture is disabled the application SHALL behave exactly as before this capability existed.
@@ -172,3 +170,4 @@ A left-click on an enabled file-action-menu row SHALL activate that entry exactl
 #### Scenario: No hover-highlight on mouse move
 - **WHEN** the file-action menu is open and the pointer moves over a row without a click
 - **THEN** the highlighted entry does not change
+

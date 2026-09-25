@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change m3-command-line-and-menus. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Command-line prompt and printable-key routing
 
 The system SHALL render a command line below the panels showing a shell prompt with the active panel's current path (e.g. `C:\NORTON>`), and while a panel is focused and no quick-search or dialog is active, printable keys SHALL be appended to the command-line buffer rather than the panel, matching classic NC behavior.
@@ -36,14 +34,6 @@ The command line's typed buffer SHALL NOT run arbitrary text through a shell. Th
 Running a command through this mechanism SHALL leave raw mode and the alternate screen, spawn the child inheriting stdio in the panel directory, wait for it to exit, prompt the user to press a key, then re-enter the alternate screen and raw mode and redraw. Terminal restore SHALL be idempotent so a failing or panicking child cannot leave the terminal in raw mode or the alternate screen.
 
 Enter on an executable target (PATHEXT match or `.lnk`) SHALL NOT spawn the target directly; it SHALL open the file-action menu for that entry, whose Run entry uses this same suspended-spawn path.
-
-#### Scenario: Enter runs the typed command
-- **WHEN** the command buffer is `dir` (or any text that is not a recognized builtin) and the user presses Enter
-- **THEN** no shell process is spawned for it — typed command-line text no longer runs through a shell; it is rejected instead (superseded by "Command-line builtin whitelist")
-
-#### Scenario: Command buffer cleared after run
-- **WHEN** the user presses Enter with a non-empty command buffer
-- **THEN** the buffer is cleared immediately, before the line is dispatched — whether it is a recognized builtin, rejected as unrecognized, or (via the Run entry/F2 user menu, not typed Enter) a shell command that has yet to finish
 
 #### Scenario: Terminal restored after a failing child
 - **WHEN** a child spawned via the Run entry or F2 user menu exits with an error or the spawn fails
@@ -169,3 +159,4 @@ When the user presses Enter with a non-empty command-line buffer, the system SHA
 #### Scenario: del/rmdir on a nonexistent target is rejected
 - **WHEN** the command buffer is `del \NOSUCHFILE.TXT`
 - **THEN** the command is rejected, no dialog opens, and the panel shows an error indicating the target was not found
+

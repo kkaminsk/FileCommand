@@ -21,5 +21,10 @@
 
 - [x] 4.1 Add/extend a same-directory dual-panel test: both panels' active tabs on the same directory, delete completes, both re-read immediately (covers the base case already confirmed working, guards against regression).
 - [x] 4.2 Run `cargo test -p filecommand-core` and `cargo test -p filecommand-tui`.
+<<<<<<<< HEAD:openspec/changes/archive/2026-09-07-refresh-inactive-panel-on-delete/tasks.md
 - [ ] 4.3 Manual check via the `run` skill: two tabs on one panel, background tab pointed at the same folder the active tab (or the opposite panel) deletes from; switch to the background tab and confirm the deleted entry is gone.
 - [ ] 4.4 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+========
+- [x] 4.3 Manual check via the `run` skill: two tabs on one panel, background tab pointed at the same folder the active tab (or the opposite panel) deletes from; switch to the background tab and confirm the deleted entry is gone.
+- [x] 4.4 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+>>>>>>>> 7d8c007 (Archive 4 completed changes, sync specs, add new proposals, apply implementations):openspec/changes/archive/2026-09-20-refresh-inactive-panel-on-delete/tasks.md

@@ -2,9 +2,7 @@
 
 ## Purpose
 TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose after archive.
-
 ## Requirements
-
 ### Requirement: Per-panel tab list with independent state
 
 Each panel SHALL own a list of tabs and an active-tab index, where every tab holds a fully independent panel state — current directory, cursor position, selection set, sort mode, filter, and display mode. Switching, opening, or closing tabs SHALL only affect the active panel; the opposite panel's tab list is unaffected. On startup each panel SHALL have exactly one tab.
@@ -123,3 +121,4 @@ A tab marked stale by a completed file-operation job (see `file-operations` — 
 #### Scenario: Switching to a tab with no pending staleness is unchanged
 - **WHEN** the user switches to a tab that was not affected by any completed job since it was last active
 - **THEN** the tab activates from its cached state with no re-read, as before
+

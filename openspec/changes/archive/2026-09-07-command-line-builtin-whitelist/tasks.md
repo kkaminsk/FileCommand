@@ -29,5 +29,10 @@
 ## 5. Verification
 
 - [x] 5.1 Run `cargo test -p filecommand-core` and `cargo test -p filecommand-tui`.
+<<<<<<<< HEAD:openspec/changes/archive/2026-09-07-command-line-builtin-whitelist/tasks.md
 - [ ] 5.2 Manual check via the `run` skill: `cd` to a real subdirectory (navigates); `cd` to a nonexistent path (rejected, panel unchanged); `del`/`rmdir` on real targets (opens confirm dialog, deletes only on accept); type a random command like `dir` or `notepad` (rejected, nothing spawns); confirm the file-action menu's Run entry and an F2 user-menu command still spawn normally.
 - [ ] 5.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+========
+- [x] 5.2 Manual check via the `run` skill: `cd` to a real subdirectory (navigates); `cd` to a nonexistent path (rejected, panel unchanged); `del`/`rmdir` on real targets (opens confirm dialog, deletes only on accept); type a random command like `dir` or `notepad` (rejected, nothing spawns); confirm the file-action menu's Run entry and an F2 user-menu command still spawn normally.
+- [x] 5.3 `detect_changes()` (GitNexus) against `main` to confirm only the expected symbols/flows are touched before opening the PR.
+>>>>>>>> 7d8c007 (Archive 4 completed changes, sync specs, add new proposals, apply implementations):openspec/changes/archive/2026-09-20-command-line-builtin-whitelist/tasks.md
