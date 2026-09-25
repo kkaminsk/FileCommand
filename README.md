@@ -140,7 +140,7 @@ key.clipboard_paths = "ctrl+shift+insert"
 |---|---|---|
 | `splash` | Show the startup splash screen. | `true` |
 | `theme` | Active theme name (built-in or a file in `themes/`). | `nc-classic` |
-| `shell` | Shell command line used for command-line passthrough. | `cmd.exe /C` on Windows, `/bin/sh -c` elsewhere |
+| `shell` | Shell command line used by the file-action menu's Run entry and the F2 user menu. | `cmd.exe /C` on Windows, `/bin/sh -c` elsewhere |
 | `editor` | External editor command for F4; unset means "use the built-in editor". | unset |
 | `panel_split` | Left-panel width as a percentage. | `50` |
 | `[mouse] enabled` | Whether mouse capture is enabled at all. | `true` |
@@ -204,8 +204,12 @@ atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
   inverse in its top border).
 - **The command line** always shows the active panel's path. Typing goes to
   the command line whenever no dialog, menu, or quick-search/quick-filter
-  input has claimed the keyboard; **Enter** runs it, spawning the configured
-  shell and suspending the TUI until it exits.
+  input has claimed the keyboard; **Enter** recognizes three built-in verbs —
+  `cd <dir>` navigates the panel (rejecting a target that doesn't exist),
+  and `del <file>` / `rmdir <dir>` open the delete-confirmation dialog for the
+  typed target. Anything else is rejected with an error, no process spawned;
+  use the file-action menu's **Run** entry or the **F2 user menu** to launch
+  programs.
 - Terminal is usable down to a minimum size; below that, panels are replaced
   with a "terminal too small" placeholder and the F-key bar degrades through
   progressively shorter forms as width shrinks.
@@ -220,7 +224,7 @@ atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
 |---|---|
 | ↑ / ↓ / PgUp / PgDn / Home / End | Move cursor (page size follows panel height) |
 | Tab | Switch active panel |
-| Enter | Directory: enter it. `..`: go to parent. File: opens the file-action menu (Run/View/Edit/Copy/Rename/Move/Delete/Send to clipboard). Command line non-empty: runs it. Tree mode: navigate/expand. |
+| Enter | Directory: enter it. `..`: go to parent. File: opens the file-action menu (Run/View/Edit/Send to clipboard/Copy/Rename/Move/Delete). Command line non-empty: dispatches the built-in verbs — `cd` navigates, `del`/`rmdir` open delete-confirmation, anything else is rejected. Tree mode: navigate/expand. |
 | Backspace (empty command line) | Parent directory |
 | Ctrl+PgUp | Parent directory |
 | Ins | Toggle selection at cursor, cursor advances |

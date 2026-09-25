@@ -109,7 +109,13 @@ fn pathspec_status(repo: &Repository, dir: &Path) -> HashMap<OsString, FileStatu
         // A bare repository has no working tree to report status for.
         return result;
     };
-    let Ok(rel_dir) = dir.strip_prefix(workdir) else {
+    // Compare canonical spellings below: `dir` may reach us in a different
+    // but equivalent form than the workdir libgit2 reports (Windows 8.3
+    // short-name vs long-name paths are the classic case), and a raw
+    // `strip_prefix` mismatch would silently drop every status entry.
+    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canon_workdir = std::fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+    let Ok(rel_dir) = canon_dir.strip_prefix(&canon_workdir) else {
         return result;
     };
 
@@ -128,10 +134,10 @@ fn pathspec_status(repo: &Repository, dir: &Path) -> HashMap<OsString, FileStatu
     };
     for entry in statuses.iter() {
         let Some(rel_path) = entry.path() else { continue };
-        let full = workdir.join(rel_path);
+        let full = canon_workdir.join(rel_path);
         // Fold a nested path down to the name of the entry directly inside
         // `dir` that the panel actually lists a row for.
-        let Ok(rel_to_dir) = full.strip_prefix(dir) else { continue };
+        let Ok(rel_to_dir) = full.strip_prefix(&canon_dir) else { continue };
         let Some(first) = rel_to_dir.components().next() else { continue };
         let name = OsString::from(first.as_os_str());
         let Some(status) = classify(entry.status()) else { continue };
