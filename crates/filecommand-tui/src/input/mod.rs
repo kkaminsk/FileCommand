@@ -374,6 +374,7 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::F(6) => Some(Command::RequestMove),
         KeyCode::F(7) => Some(Command::RequestMkdir),
         KeyCode::F(8) => Some(Command::RequestDelete),
+        KeyCode::Delete if key.modifiers == KeyModifiers::NONE => Some(Command::RequestDelete),
         KeyCode::F(9) => Some(Command::MenuOpen),
         KeyCode::F(10) => Some(Command::RequestQuit),
 
