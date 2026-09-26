@@ -1,6 +1,7 @@
 /target
 /history.json
 /usermenu.toml
+/crates/filecommand-tui/usermenu.toml
 /config.toml
 /installer/out
 /installer/.wix

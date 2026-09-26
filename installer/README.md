@@ -2,7 +2,7 @@
 
 This directory contains the WiX (v4/v5) sources that package FileCommand
 into a single bootstrapper executable, `FileCommandSetup.exe`, plus the
-winget manifest template used to distribute it.
+winget manifest template and Chocolatey package used to distribute it.
 
 - `PackagePerUser.wxs` — the per-user MSI (`Scope="perUser"`): installs
   with **no elevation**, user PATH integration, Start Menu shortcut,
@@ -162,3 +162,11 @@ signing certificate's role assignment.
 
 See `winget/` for the manifest template and its own notes. Submitting to
 `winget-pkgs` is a release-time step outside this repository.
+
+## Chocolatey
+
+See `chocolatey/` for the package template and its own notes. The package
+wraps the same `FileCommandSetup.exe` (downloaded at install time, checksum
+enforced), defaulting to a per-machine install per Chocolatey convention.
+Pushing to the Chocolatey community repository is a release-time step
+outside this repository.
