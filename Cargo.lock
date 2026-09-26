@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "filecommand-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "git2",
  "memmap2",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "filecommand-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "arboard",
  "clipboard-win",
