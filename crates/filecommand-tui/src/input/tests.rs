@@ -112,6 +112,13 @@ fn f5_through_f8_map_to_file_op_requests() {
     assert_eq!(map(plain(KeyCode::F(6)), &panels()), Some(Command::RequestMove));
     assert_eq!(map(plain(KeyCode::F(7)), &panels()), Some(Command::RequestMkdir));
     assert_eq!(map(plain(KeyCode::F(8)), &panels()), Some(Command::RequestDelete));
+    assert_eq!(map(plain(KeyCode::Delete), &panels()), Some(Command::RequestDelete));
+}
+
+#[test]
+fn delete_key_only_fires_unmodified() {
+    assert_eq!(map(key(KeyCode::Delete, KeyModifiers::CONTROL), &panels()), None);
+    assert_eq!(map(key(KeyCode::Delete, KeyModifiers::SHIFT), &panels()), None);
 }
 
 #[test]
