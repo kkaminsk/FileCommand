@@ -32,6 +32,7 @@ and supported.
 - [Project layout](#project-layout)
 - [Testing](#testing)
 - [Contributing](#contributing)
+- [Reporting issues](#reporting-issues)
 - [License](#license)
 
 ## Installing
@@ -389,6 +390,21 @@ workflow: research and proposals happen on `Spec`, get merged to `main`,
 then each approved proposal is implemented on its own `build/<name>` branch
 off `main`. Nothing lands on `main` without an explicit human go-ahead. See
 `CLAUDE.md` for the full rules.
+
+## Reporting issues
+
+Found a bug or want to request a feature? File it on GitHub:
+<https://github.com/kkaminsk/FileCommand/issues>
+
+A good report includes:
+
+- **What you did** — the keys pressed or command typed, step by step.
+- **What happened** versus what you expected.
+- **Environment** — Windows version, terminal (Windows Terminal, conhost,
+  PowerShell), and the FileCommand version shown on the startup splash.
+- **Error text** — anything shown on the panel's status line or in a job
+  dialog, copied verbatim. The UI is plain text, so pasting the screen
+  works as well as a screenshot.
 
 ## License
 
