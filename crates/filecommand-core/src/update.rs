@@ -6,7 +6,7 @@
 //! callers supply the current time via [`Command::Tick`].
 
 use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::config::{self, UserMenuEntry};
 use crate::dialogs::{FileActionMenuEntry, FileActionMenuState, HelpState, ThemePickerState, UserMenuState};
@@ -1715,11 +1715,25 @@ fn dispatch_cd(state: &mut State, text: &str, target: &str) -> Vec<Effect> {
 /// (`want_dir == true`): resolve `target` against the active panel's cwd
 /// and, for an existing target of the matching type, open the same F8
 /// delete-confirmation dialog `enter_delete_confirm` uses — never deleting
-/// directly. A missing target or a type mismatch (`del` on a directory,
+/// directly. `.` and `..` are never valid targets and are rejected before
+/// any lookup, so the dialog can never offer the panel's own or its parent
+/// directory. A missing target or a type mismatch (`del` on a directory,
 /// `rmdir` on a file) is rejected: no dialog opens (command-line "del and
 /// rmdir route into the existing delete-confirmation flow").
 fn dispatch_delete_builtin(state: &mut State, target: &str, want_dir: bool) -> Vec<Effect> {
     let side = state.active;
+    // Reject `.`/`..` up front: `components()` normalizes a trailing
+    // separator away (`..\` yields just `ParentDir`), so one check covers
+    // every spelling, while a multi-component target like `..\sibling` is
+    // untouched — its first component is not the whole path. Neither name
+    // ever denotes a deletable entry, so no listed-entry lookup or
+    // filesystem check is spent on them.
+    let mut components = Path::new(target).components();
+    if matches!(components.next(), Some(Component::CurDir | Component::ParentDir)) && components.next().is_none() {
+        let verb = if want_dir { "rmdir" } else { "del" };
+        state.panel_mut(side).last_error = Some(format!("{verb}: invalid target {target}"));
+        return vec![];
+    }
     let Some(path) = resolve_cd_target(&state.panel(side).cwd, target) else {
         state.panel_mut(side).last_error = Some(format!("{target} not found"));
         return vec![];

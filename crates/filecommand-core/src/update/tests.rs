@@ -1706,6 +1706,35 @@ fn rmdir_rejects_a_file_target() {
 }
 
 #[test]
+fn del_and_rmdir_reject_dot_targets() {
+    for verb in ["del", "rmdir"] {
+        for target in [".", "..", r".\", r"..\"] {
+            let mut state = test_state(UiPhase::Panels);
+            state.left.cwd = PathBuf::from(r"C:\NORTON");
+            state.left.entries = vec![dir_entry("docs")];
+            let state = type_line(state, &format!("{verb} {target}"));
+            let (state, effects) = update(state, Command::Enter);
+            assert!(effects.is_empty(), "{verb} {target}: no dialog and no effects, got {effects:?}");
+            assert_eq!(state.phase, UiPhase::Panels, "{verb} {target}: the delete-confirm dialog must never open on the current or parent directory");
+            let expected = format!("{verb}: invalid target {target}");
+            assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()), "{verb} {target}: invalid-target error");
+        }
+    }
+}
+
+#[test]
+fn del_dotdot_sibling_is_not_caught_by_the_dot_target_guard() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"del ..\sibling.txt");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels);
+    let err = state.left.last_error.unwrap();
+    assert!(err.ends_with("not found"), "a multi-component relative target follows the ordinary not-found path, got: {err}");
+}
+
+#[test]
 fn del_and_rmdir_on_a_nonexistent_target_are_rejected() {
     for verb in ["del", "rmdir"] {
         let mut state = test_state(UiPhase::Panels);
