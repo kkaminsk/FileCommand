@@ -1026,6 +1026,39 @@ fn switch_tab_to_non_stale_tab_issues_no_listing_effects() {
 }
 
 #[test]
+fn stale_tab_refresh_records_no_history_and_persists_nothing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab(); // tab 0 stashed at "/left" (background); tab 1 (active) also starts at "/left"
+    state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere
+    state.left.mark_background_tabs_stale(Path::new("/left"));
+    let history_before = state.dir_history.clone();
+
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })), "the fresh read still happens");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::PersistHistory(_))), "a stale-activation refresh persists nothing, got {effects:?}");
+    assert_eq!(state.dir_history, history_before, "a stale-activation refresh records no fuzzy-jump visit — the user switched tabs, not directories");
+}
+
+#[test]
+fn close_tab_stale_neighbor_refresh_records_no_history_and_persists_nothing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.cwd = PathBuf::from("/left");
+    state.left.open_tab();
+    state.left.begin_new_listing(PathBuf::from("/left/other"));
+    state.left.mark_background_tabs_stale(Path::new("/left"));
+    let history_before = state.dir_history.clone();
+
+    let (state, effects) = update(state, Command::CloseTab);
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "fell back to the stale neighbor");
+    assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })), "the fresh read still happens");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::PersistHistory(_))), "a stale-activation refresh persists nothing, got {effects:?}");
+    assert_eq!(state.dir_history, history_before, "a stale-activation refresh records no fuzzy-jump visit");
+}
+
+#[test]
 fn history_up_recalls_previous_commands_newest_first() {
     let mut state = test_state(UiPhase::Panels);
     state.history = vec!["first".to_string(), "second".to_string(), "third".to_string()];

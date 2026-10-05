@@ -1418,16 +1418,22 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::CloseTab => {
                 let side = state.active;
                 if state.panel_mut(side).close_tab() {
+                    // A stale-activation refresh is not a navigation (the
+                    // user changed tabs, not directories), so it goes
+                    // through `begin_listing_inner`: fresh read without the
+                    // frecency visit or history persist (panel-tabs "Stale
+                    // background tab refresh on activation").
                     let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing(&mut state, side, path));
+                    effects.extend(begin_listing_inner(&mut state, side, path));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
             Command::SwitchTab(n) => {
                 let side = state.active;
                 if state.panel_mut(side).switch_tab(n) {
+                    // Same non-navigation refresh as `CloseTab` above.
                     let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing(&mut state, side, path));
+                    effects.extend(begin_listing_inner(&mut state, side, path));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
@@ -3456,11 +3462,10 @@ fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// through — Enter into a directory, `..`, a typed `cd`, drive select,
 /// Tree's own Enter-to-return, and the M5 fuzzy-jump/find-file dialogs — so
 /// it is also where the Ctrl+J frecency history is recorded and persisted
-/// (fuzzy-jump "Navigation records history"; design D6). Tree's cursor-move
-/// preview of the *opposite* panel deliberately bypasses this (via
-/// [`begin_listing_inner`] directly) since that is the tree being browsed,
-/// not "the user navigating the active panel into a directory" the
-/// fuzzy-jump requirement describes.
+/// (fuzzy-jump "Navigation records history"; design D6). Re-reads that are
+/// not "the user navigating the active panel into a directory" bypass this
+/// via [`begin_listing_inner`] directly — see its doc comment for the two
+/// non-navigation callers.
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     quicksearch::record_visit(&mut state.dir_history, &path, state.clock_ms);
     let mut effects = begin_listing_inner(state, side, path);
@@ -3468,6 +3473,15 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
     effects
 }
 
+/// Everything [`begin_listing`] does except the navigation bookkeeping (the
+/// frecency visit and the history persist) — the entry point for re-reads
+/// that are not "the user navigating the active panel into a directory".
+/// Two callers qualify today: Tree mode's cursor-move preview of the
+/// *opposite* panel (that is the tree being browsed, not a navigation), and
+/// the stale-tab refresh on `SwitchTab`/`CloseTab` activation (the user
+/// changed tabs, not directories — panel-tabs "Stale background tab refresh
+/// on activation"). A third caller should prompt extracting a purpose-named
+/// helper rather than diluting this contract.
 fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     state.panel_mut(side).begin_new_listing(path.clone());
     let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
