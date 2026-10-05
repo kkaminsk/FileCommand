@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Chocolatey package spec for FileCommand (template).
+
+  Placeholders (<VERSION>, <REPO_URL>) are filled by ../build.ps1 at pack
+  time. Never `choco pack` this file directly from the source tree;
+  run ../build.ps1, which stages a substituted copy under installer/out.
+  (Note: XML comments may not contain double hyphens, keep it that way.)
+-->
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>filecommand</id>
+    <version><VERSION></version>
+    <title>FileCommand</title>
+    <authors>BigHatGroup</authors>
+    <owners>BigHatGroup</owners>
+    <projectUrl><REPO_URL></projectUrl>
+    <projectSourceUrl><REPO_URL></projectSourceUrl>
+    <packageSourceUrl><REPO_URL>/tree/main/installer/chocolatey</packageSourceUrl>
+    <licenseUrl><REPO_URL>/blob/main/LICENSE</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <summary>A keyboard-driven, dual-panel file manager for the terminal.</summary>
+    <description>FileCommand recreates the Norton Commander 5.5 workflow with modern extras: dual panels, tabbed browsing, fuzzy jump, a built-in viewer and editor, themes, and git info -- all keyboard-driven, in the terminal.
+
+The Chocolatey package wraps the signed FileCommandSetup.exe bootstrapper (a WiX Burn bundle embedding per-user and per-machine MSIs). It installs **per-machine** by default, following Chocolatey convention (requires elevation); pass a package parameter to install per-user instead.
+
+Package parameters:
+* `/Scope:machine` -- install for all users, machine PATH (default)
+* `/Scope:user` -- install for the current user only, user PATH (no elevation)
+
+Example: `choco install filecommand --params "'/Scope:user'"`</description>
+    <tags>filecommand file-manager terminal tui console norton-commander dual-panel admin</tags>
+    <copyright>Copyright (c) 2026 Kevin Kaminski MVP</copyright>
+    <releaseNotes><REPO_URL>/releases</releaseNotes>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>
