@@ -23,11 +23,13 @@ embedded in the `.nupkg`.
   the right hive on machines that carry both scopes at once; Burn also
   persists the original `InstallScope`, so the scope that was installed
   is the scope removed.
-- `template/tools/LICENSE.txt`, `template/tools/VERIFICATION.txt` — the
-  license and checksum-verification documentation the Chocolatey community
-  repository requires for packages that download installers.
 - `build.ps1` — stamps the placeholders, stages the package tree, and runs
   `choco pack`.
+
+`tools\LICENSE.txt` and `tools\VERIFICATION.txt` are not part of this
+package. Those files are only for packages that embed binaries. This
+package downloads `FileCommandSetup.exe` at install time, and the license
+is already linked via `licenseUrl` in the nuspec. Do not add them back.
 
 ## Scope semantics
 
@@ -88,5 +90,6 @@ performed by a maintainer, outside this repo (same as winget):
 3. `choco push filecommand.<version>.nupkg --source https://push.chocolatey.org/ --api-key <KEY>`
 
 The package then goes through automated moderation (virus scan, validator,
-verifier); `LICENSE.txt` and `VERIFICATION.txt` are already included for
-that review.
+verifier). The license is the nuspec `licenseUrl`; the installer checksum
+is enforced by `chocolateyInstall.ps1`. Do not add `tools\LICENSE.txt` or
+`tools\VERIFICATION.txt`.
