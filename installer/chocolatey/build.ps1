@@ -12,8 +12,8 @@
         1. Reads the version (and repository URL) from the workspace Cargo.toml.
         2. Computes the SHA-256 of the local FileCommandSetup.exe.
         3. Stages template\ into <OutDir>\pkg, substituting <VERSION>,
-           <REPO_URL>, <RELEASE_URL>, and <SHA256> in the nuspec,
-           chocolateyInstall.ps1, VERIFICATION.txt, and LICENSE.txt.
+           <REPO_URL>, <RELEASE_URL>, and <SHA256> in the nuspec and
+           chocolateyInstall.ps1.
         4. Verifies no placeholders remain, then runs `choco pack`, producing
            filecommand.<version>.nupkg in <OutDir>.
 
@@ -135,9 +135,7 @@ $replacements = @{
 }
 $substitutedFiles = @(
     (Join-Path $StageDir 'filecommand.nuspec'),
-    (Join-Path $StageDir 'tools\chocolateyInstall.ps1'),
-    (Join-Path $StageDir 'tools\VERIFICATION.txt'),
-    (Join-Path $StageDir 'tools\LICENSE.txt')
+    (Join-Path $StageDir 'tools\chocolateyInstall.ps1')
 )
 foreach ($file in $substitutedFiles) {
     $text = Get-Content -Raw -Path $file
