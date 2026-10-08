@@ -1606,8 +1606,9 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 /// Walk `history` by `delta` (-1 = older, +1 = newer) into the buffer.
 ///
 /// Stepping past the newest entry stops recalling but deliberately leaves
-/// the buffer as it is: Esc, not Down, is the documented way to release
-/// Up/Down back to the panel cursor.
+/// the buffer as it is: backspacing the buffer to empty, not Down, is the
+/// documented way to release Up/Down back to the panel cursor (Esc requests
+/// quit instead — command-line "Command history navigation").
 fn recall_history(state: &mut State, delta: isize) {
     if state.history.is_empty() {
         return;

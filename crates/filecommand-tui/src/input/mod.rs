@@ -383,8 +383,8 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Char('o') | KeyCode::Char('O') if ctrl => Some(Command::ShowScrollback),
 
         // Up/Down walk command history while something is typed, and move
-        // the panel cursor when the buffer is empty. Esc is the documented
-        // way to hand them back to the panel.
+        // the panel cursor when the buffer is empty. Backspacing the buffer
+        // to empty is the documented way to hand them back to the panel.
         KeyCode::Up if typing => Some(Command::CommandLineHistoryPrev),
         KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
