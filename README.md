@@ -22,6 +22,7 @@ and supported.
 - [Configuration](#configuration)
 - [Using FileCommand](#using-filecommand)
   - [Screen layout](#screen-layout)
+  - [Command line](#command-line)
   - [Keyboard reference](#keyboard-reference)
   - [Mouse reference](#mouse-reference)
   - [Pull-down menus (F9)](#pull-down-menus-f9)
@@ -203,19 +204,166 @@ atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
   sort mode, filter, and display mode.
 - **Tab** switches which panel is active (the active panel's path renders
   inverse in its top border).
-- **The command line** always shows the active panel's path. Typing goes to
-  the command line whenever no dialog, menu, or quick-search/quick-filter
-  input has claimed the keyboard; **Enter** recognizes three built-in verbs —
-  `cd <dir>` navigates the panel (rejecting a target that doesn't exist),
-  and `del <file>` / `rmdir <dir>` open the delete-confirmation dialog for the
-  typed target. Anything else is rejected with an error, no process spawned;
-  use the file-action menu's **Run** entry or the **F2 user menu** to launch
-  programs.
+- **The command line** sits below the panels and always shows the active
+  panel's path as its prompt. It understands three built-in verbs (`cd`,
+  `del`, `rmdir`) and nothing else — see [Command line](#command-line).
 - Terminal is usable down to a minimum size; below that, panels are replaced
   with a "terminal too small" placeholder and the F-key bar degrades through
   progressively shorter forms as width shrinks.
 - The startup splash (product name/version banner) is the very first frame
   unless `--nosplash`/`splash = false`; any key dismisses it early.
+
+### Command line
+
+The line just above the F-key bar is an NC-style command line. Its prompt is
+the active panel's current directory (e.g. `C:\Projects\app>`), and it
+follows the active panel: press Tab or change directory and the prompt
+updates.
+
+The command line is a quick way to navigate and to delete a single item by
+name. **It is not a shell**: it never passes text to `cmd.exe`/PowerShell,
+and anything other than the three built-in verbs below is rejected. To run
+programs, see [Running programs](#running-programs).
+
+#### Typing
+
+You don't need to focus the command line. While the panels have the
+keyboard (no dialog, menu, type-ahead jump, or Ctrl+P quick filter open),
+every plain printable key is added to the command line and the panel cursor
+stays put. Text is only ever added at the end; there is no cursor to move
+within the line.
+
+Some keys mean different things depending on whether the line is empty:
+
+| Key | Line empty | Line has text |
+|---|---|---|
+| Printable character | Starts the line | Added to the end |
+| `+` / `-` / `*` | Select / deselect by wildcard, invert selection | Typed as text |
+| Backspace | Go to the parent directory | Delete the last character |
+| ↑ / ↓ | Move the panel cursor | Recall older / newer history |
+| Enter | Act on the cursor entry (open a directory, file-action menu for a file) | Run the line |
+| Ctrl+Enter / Ctrl+] | Paste the cursor entry's name / full path | Same, after a separating space |
+| Esc | Ask to quit | Ask to quit (cancelling keeps your text) |
+
+All other keys keep their panel meaning while you type. Home/End and
+PgUp/PgDn move the panel cursor, and Tab switches panels without clearing the
+line. **Delete opens the delete confirmation for the cursor entry; it does
+not delete a character.** To clear the line, backspace it until it's empty.
+
+#### Built-in commands
+
+| Command | What it does |
+|---|---|
+| `cd <path>` | Navigates the active panel to `<path>`. If the target doesn't exist or isn't a directory, the command is rejected and the panel stays where it is. |
+| `del <file>` | Opens the normal F8 delete confirmation for that one file. Rejected if the target is a directory. |
+| `rmdir <dir>` | Opens the normal F8 delete confirmation for that one directory, including the second confirmation if it isn't empty. Rejected if the target is a file. |
+
+Rules that apply to all three:
+
+- **Verbs ignore case.** `CD`, `Cd`, and `cd` are the same command.
+- **Everything after the verb is one argument**, so a name with spaces
+  doesn't need quotes. Surrounding double quotes are removed, so
+  `cd Program Files` and `cd "Program Files"` both work.
+- **Paths resolve against the active panel's directory.** These forms are
+  accepted:
+
+  | Form | Example | Resolves to |
+  |---|---|---|
+  | Relative | `cd src\core`, `cd ..\other` | Below or beside the current directory |
+  | Current / parent | `cd .`, `cd ..` | Current directory / its parent (`cd ..` at a drive root is rejected) |
+  | Drive-rooted | `cd \Temp` | `\Temp` on the current drive |
+  | Absolute | `cd C:\Windows\System32` | That exact path |
+  | Bare drive letter | `cd D:` | The **root** of `D:` (cmd would use D:'s last directory) |
+  | UNC | `cd \\server\share\dir` | The network path (this is how you enter a UNC location by hand) |
+
+- **One target, no wildcards.** `del *.tmp` looks for a file literally
+  named `*.tmp`. To delete several items, select them with Ins or `+`
+  (select by wildcard), then press F8.
+- **`del`/`rmdir` never delete on their own.** They only open the same
+  confirmation dialog as F8, and nothing is removed until you accept it.
+  Deletes are permanent (there's no recycle bin). `.` and `..` are always
+  rejected as targets, so the dialog can never offer to delete the panel's
+  own directory or its parent.
+- **A verb needs an argument.** A bare `cd` (no "print current directory"
+  form) is rejected as unrecognized.
+
+#### Errors
+
+Pressing Enter always clears the line. A rejected command shows its reason
+in the active panel's bottom-border status line, where it stays until the
+panel next lists a directory successfully:
+
+| Message | Cause |
+|---|---|
+| `'dir' is not a recognized command` | Anything other than `cd` / `del` / `rmdir` with an argument |
+| `C:\Projects\nosuch not found` | The target doesn't exist |
+| `C:\Projects\readme.txt is not a directory` | `cd` or `rmdir` on a file |
+| `C:\Projects\docs is a directory` | `del` on a directory |
+| `rmdir: invalid target ..` | `.` or `..` given to `del` / `rmdir` |
+
+#### History
+
+Each `cd` that succeeds is saved to the command history in `history.json`,
+which keeps the most recent 200 entries. Running a command that's already
+saved moves it to the newest position. Rejected lines and `del`/`rmdir`
+aren't saved.
+
+Up/Down only recall history while the line has text (on an empty line they
+move the panel cursor). To browse history from an empty line, type a space
+and press ↑:
+
+- Each ↑ steps to an older entry, and each ↓ steps to a newer one.
+- A recalled entry replaces the whole line. History isn't filtered by what
+  you've typed.
+- Pressing ↓ past the newest entry stops recalling and leaves the text as it
+  is.
+- Press Enter to run the recalled entry, or Backspace to edit it.
+
+#### Pasting names and paths
+
+To fill in a command from the panel instead of typing names:
+
+- **Ctrl+Enter** adds the cursor entry's file name to the end of the line.
+- **Ctrl+]** adds the cursor entry's full path.
+
+If the line doesn't already end in a space, one is added first. For example,
+to delete the file under the cursor in the *other* panel's directory:
+
+1. Type `del`.
+2. Press Tab, then Ctrl+] to paste the file's full path.
+3. Press Enter.
+
+Ctrl+] works in every terminal. Ctrl+Enter works on Windows, and elsewhere
+only when the terminal supports the kitty keyboard protocol. You can rebind
+both with `key.paste_name` and `key.paste_path` in
+[`config.toml`](#configtoml).
+
+#### Running programs
+
+The command line can't run programs, so `dir`, `notepad notes.txt`, and
+`git status` are all rejected. There are two ways to launch something:
+
+- **The file-action menu.** Press Enter (or right-click) on an executable
+  (any `PATHEXT` extension, or a `.lnk`) and choose **Run**. Enter never
+  starts an executable directly.
+- **The F2 user menu.** Add an entry to [`usermenu.toml`](#usermenutoml):
+
+  ```toml
+  [[entry]]
+  label = "git status"
+  command = "git status"
+  ```
+
+  The command string goes to the configured `shell` exactly as written,
+  with no placeholder substitution.
+
+Either way, FileCommand suspends its screen and runs the command in the
+active panel's directory using the `shell` from `config.toml` (`cmd.exe /C`
+by default; PowerShell adds about 200 ms or more of startup per command).
+When the command finishes, press a key to return. Afterwards, **Ctrl+O**
+hides the panels so you can read the output in your terminal's scrollback,
+and any key brings the panels back. FileCommand doesn't keep its own copy of
+command output; only your terminal's scrollback does.
 
 ### Keyboard reference
 
