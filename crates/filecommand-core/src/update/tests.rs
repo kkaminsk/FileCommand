@@ -5116,3 +5116,262 @@ mod drag_proptests {
         }
     }
 }
+
+// ---------------------------------------------------------------------
+// ui-animations: the reducer only records *when* things opened
+// ---------------------------------------------------------------------
+
+/// A state whose clock reads `ms`, as if a `Tick(ms)` had just landed.
+fn clocked(phase: UiPhase, ms: u64) -> State {
+    State { clock_ms: ms, ..test_state(phase) }
+}
+
+#[test]
+fn opening_the_bar_stamps_every_clock_from_the_reducer_clock() {
+    let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
+    let menu = state.menu.expect("the bar opens");
+    assert_eq!(menu.opened_at_ms, 1_000);
+    assert_eq!(menu.pulldown_opened_at_ms, 1_000);
+    assert_eq!(menu.selected_at_ms, None, "opening is the unfold's job, not a highlight flash");
+}
+
+#[test]
+fn stamps_come_from_the_last_tick_reading_not_a_live_clock() {
+    // Same inputs, same outputs: the stamp depends on `clock_ms` alone.
+    let a = update(clocked(UiPhase::Panels, 42), Command::MenuOpen).0;
+    let b = update(clocked(UiPhase::Panels, 42), Command::MenuOpen).0;
+    assert_eq!(a, b);
+    let later = update(clocked(UiPhase::Panels, 43), Command::MenuOpen).0;
+    assert_eq!(later.menu.unwrap().opened_at_ms, 43);
+}
+
+#[test]
+fn horizontal_traversal_restamps_the_pulldown_but_not_the_bar() {
+    let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
+    let (state, _) = update(state, Command::Tick(1_040));
+    let (state, _) = update(state, Command::MenuNextMenu);
+    let menu = state.menu.expect("still open");
+    assert_eq!(menu.active, MenuId::Files);
+    assert!(menu.pulldown_open, "traversal never shows a closed intermediate state");
+    assert_eq!(menu.opened_at_ms, 1_000, "the bar itself did not reopen");
+    assert_eq!(menu.pulldown_opened_at_ms, 1_040, "the adjacent pull-down unfolds afresh");
+    assert_eq!(menu.selected_at_ms, None);
+}
+
+#[test]
+fn hotkey_jump_and_title_click_restamp_the_pulldown_and_keep_the_bar_stamp() {
+    let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
+    let (state, _) = update(state, Command::Tick(1_030));
+    let (jumped, _) = update(state.clone(), Command::MenuHotkey('c'));
+    let menu = jumped.menu.expect("open");
+    assert_eq!(menu.active, MenuId::Commands);
+    assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_030));
+
+    // A title click rebuilds the whole `MenuState`; the bar stamp must survive.
+    let (clicked, _) = update(state, Command::MenuTitleClick(MenuId::Options));
+    let menu = clicked.menu.expect("open");
+    assert_eq!(menu.active, MenuId::Options);
+    assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_030));
+}
+
+#[test]
+fn moving_the_highlight_stamps_only_the_highlight() {
+    let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
+    let (state, _) = update(state, Command::Tick(1_200));
+    let (state, _) = update(state, Command::MenuSelectNext);
+    let menu = state.menu.clone().expect("open");
+    assert_eq!(menu.selected_at_ms, Some(1_200));
+    assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_000));
+
+    // A later tick with no selection change leaves the stamp alone.
+    let (state, _) = update(state, Command::Tick(1_500));
+    assert_eq!(state.menu.unwrap().selected_at_ms, Some(1_200));
+}
+
+#[test]
+fn reopening_a_collapsed_pulldown_unfolds_it_again() {
+    let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuCollapse);
+    assert!(!state.menu.as_ref().unwrap().pulldown_open);
+    let (state, _) = update(state, Command::Tick(1_300));
+    // The hotkey of the *same* menu (`Left`) reopens its pull-down.
+    let (state, _) = update(state, Command::MenuHotkey('l'));
+    let menu = state.menu.expect("open");
+    assert_eq!(menu.active, MenuId::Left);
+    assert!(menu.pulldown_open, "the hotkey reopens the collapsed pull-down");
+    assert_eq!(menu.pulldown_opened_at_ms, 1_300);
+    assert_eq!(menu.opened_at_ms, 1_000, "the bar stayed open throughout");
+}
+
+#[test]
+fn user_menu_stamps_open_and_highlight_moves() {
+    let mut state = clocked(UiPhase::Panels, 2_000);
+    state.user_menu_entries = vec![
+        UserMenuEntry { label: "A".to_string(), command: "a".to_string() },
+        UserMenuEntry { label: "B".to_string(), command: "b".to_string() },
+    ];
+    let (state, _) = update(state, Command::UserMenuOpen);
+    let menu = state.user_menu.expect("opens");
+    assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (2_000, None));
+
+    let (state, _) = update(State { clock_ms: 2_080, ..state }, Command::UserMenuMove(1));
+    let menu = state.user_menu.expect("open");
+    assert_eq!(menu.cursor, 1);
+    assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (2_000, Some(2_080)));
+}
+
+#[test]
+fn file_action_menu_stamps_open_and_highlight_moves() {
+    let mut state = clocked(UiPhase::Panels, 3_000);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::Enter);
+    let menu = state.file_action_menu.clone().expect("Enter on a file opens the action menu");
+    assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (3_000, None));
+
+    let (state, _) = update(State { clock_ms: 3_060, ..state }, Command::FileActionMenuMove(1));
+    let menu = state.file_action_menu.expect("open");
+    assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (3_000, Some(3_060)));
+}
+
+#[test]
+fn dialogs_stamp_when_they_open() {
+    let (state, _) = update(clocked(UiPhase::Panels, 500), Command::RequestMkdir);
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(_)));
+    assert_eq!(state.dialog_opened_at_ms, 500);
+
+    let (state, _) = update(clocked(UiPhase::Panels, 700), Command::HelpOpen);
+    assert!(state.help.is_some());
+    assert_eq!(state.dialog_opened_at_ms, 700);
+
+    let (state, _) = update(clocked(UiPhase::Panels, 900), Command::FuzzyJumpOpen);
+    assert!(state.fuzzy_jump.is_some());
+    assert_eq!(state.dialog_opened_at_ms, 900);
+
+    let (state, _) = update(clocked(UiPhase::Panels, 1_100), Command::ThemePickerOpen);
+    assert!(state.theme_picker.is_some());
+    assert_eq!(state.dialog_opened_at_ms, 1_100);
+}
+
+#[test]
+fn typing_into_a_dialog_does_not_restamp_it() {
+    let (state, _) = update(clocked(UiPhase::Panels, 500), Command::RequestMkdir);
+    let (state, _) = update(State { clock_ms: 640, ..state }, Command::FileOpInputChar('x'));
+    assert_eq!(state.dialog_opened_at_ms, 500, "same dialog, no new iris");
+}
+
+#[test]
+fn a_replacement_dialog_restamps_but_progress_updates_do_not() {
+    let state = State { clock_ms: 100, ..running_progress_state(JobKind::Copy, "/left", "/right") };
+    let info = ProgressInfo { files_done: 1, files_total: 3, bytes_done: 10, bytes_total: 30, current_file: OsString::from("a.txt") };
+    let (state, _) = update(State { clock_ms: 200, ..state }, Command::JobProgress(info));
+    assert_eq!(state.dialog_opened_at_ms, 0, "progress counters ticking is not a new dialog");
+
+    // Progress -> conflict: a different dialog in the same slot irises again.
+    let (state, _) = update(State { clock_ms: 300, ..state }, Command::JobConflict(sample_conflict()));
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }));
+    assert_eq!(state.dialog_opened_at_ms, 300);
+}
+
+#[test]
+fn closing_a_dialog_stamps_nothing() {
+    let (state, _) = update(clocked(UiPhase::Panels, 700), Command::HelpOpen);
+    let (state, _) = update(State { clock_ms: 900, ..state }, Command::HelpCancel);
+    assert!(state.help.is_none());
+    assert_eq!(state.dialog_opened_at_ms, 700);
+}
+
+#[test]
+fn the_quit_dialog_has_its_own_stamp_and_never_restamps_the_dialog_beneath() {
+    let (state, _) = update(clocked(UiPhase::Panels, 700), Command::HelpOpen);
+    let (state, _) = update(State { clock_ms: 950, ..state }, Command::RequestQuit);
+    assert!(state.quit_confirm);
+    assert_eq!(state.quit_opened_at_ms, 950);
+    assert_eq!(state.dialog_opened_at_ms, 700, "the dialog under the quit prompt does not re-animate");
+
+    // Cancelling restores the context exactly and leaves both stamps alone.
+    let (state, _) = update(State { clock_ms: 1_200, ..state }, Command::CancelQuit);
+    assert!(!state.quit_confirm && state.help.is_some());
+    assert_eq!((state.quit_opened_at_ms, state.dialog_opened_at_ms), (950, 700));
+}
+
+#[test]
+fn leaving_the_splash_for_the_panels_stamps_the_reveal() {
+    // By the hold elapsing on a Tick...
+    let state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
+    let (state, _) = update(state, Command::Tick(1_799));
+    assert_eq!(state.panels_revealed_at_ms, None, "still on the splash");
+    let (state, _) = update(state, Command::Tick(1_800));
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.panels_revealed_at_ms, Some(1_800));
+
+    // ...or by a dismissing key.
+    let (state, _) = update(State { clock_ms: 1_250, ..test_state(UiPhase::Splash { started_at_ms: 1_000 }) }, Command::ToggleActivePanel);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.panels_revealed_at_ms, Some(1_250));
+}
+
+#[test]
+fn a_key_during_the_splash_still_dismisses_it_entirely_and_is_consumed() {
+    // startup-splash "Key mid-animation dismisses entirely": with animations
+    // on, a key 150 ms in goes straight to the panels and is not forwarded.
+    let mut state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
+    state.animations = true;
+    state.clock_ms = 1_150;
+    let (state, effects) = update(state, Command::ToggleActivePanel);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.active, PanelSide::Left, "the dismissing key was consumed, not applied");
+    assert!(effects.is_empty());
+}
+
+#[test]
+fn no_reveal_is_recorded_when_the_splash_never_showed() {
+    // --nosplash / splash = false: frame 1 is the complete panel screen.
+    let (state, _) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/"), PathBuf::from("/"), false);
+    assert_eq!(state.panels_revealed_at_ms, None);
+    let (state, _) = update(state, Command::Tick(5_000));
+    assert_eq!(state.panels_revealed_at_ms, None, "later ticks never invent a reveal");
+
+    // Below the floor the splash is skipped for the placeholder; growing
+    // back to Panels is not a Splash -> Panels transition either.
+    let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/"), PathBuf::from("/"), true);
+    assert_eq!(state.phase, UiPhase::Placeholder);
+    let (state, _) = update(state, Command::Resize(80, 24));
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.panels_revealed_at_ms, None);
+}
+
+#[test]
+fn leaving_the_splash_via_the_placeholder_records_no_reveal() {
+    let state = test_state(UiPhase::Splash { started_at_ms: 0 });
+    let (state, _) = update(state, Command::Resize(40, 10));
+    let (state, _) = update(state, Command::Resize(80, 24));
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.panels_revealed_at_ms, None);
+}
+
+#[test]
+fn input_during_an_animation_applies_to_the_final_state() {
+    // ui-animations "Input during an animation applies to the final state":
+    // 30 ms into the unfold, Down moves the selection exactly as it does
+    // with animations disabled; the animation flag never changes a transition.
+    let open = |animations: bool| {
+        let mut state = clocked(UiPhase::Panels, 1_000);
+        state.animations = animations;
+        let (state, _) = update(state, Command::MenuOpen);
+        let (state, _) = update(State { clock_ms: 1_030, ..state }, Command::MenuSelectNext);
+        state
+    };
+    let (on, off) = (open(true), open(false));
+    assert_eq!(on.menu.as_ref().map(|m| (m.active, m.pulldown_open, m.selected)), off.menu.as_ref().map(|m| (m.active, m.pulldown_open, m.selected)));
+    assert_ne!(on.menu.unwrap().selected, MenuState::opened().selected, "Down really moved the highlight");
+}
+
+#[test]
+fn animations_flag_is_off_in_empty_states_and_exposes_the_clock_only_when_on() {
+    let mut state = State::empty(Theme::classic());
+    state.clock_ms = 77;
+    assert!(!state.animations, "States built without config never animate");
+    assert_eq!(state.anim_now(), None);
+    state.animations = true;
+    assert_eq!(state.anim_now(), Some(77));
+}

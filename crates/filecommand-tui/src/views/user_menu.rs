@@ -3,6 +3,7 @@
 //! a separator and a compiled-in `Themes` row that is always present
 //! (user-menu "Open the F2 user menu").
 
+use filecommand_core::anim;
 use filecommand_core::config::UserMenuEntry;
 use filecommand_core::dialogs::{overlay_rect, UserMenuState};
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
@@ -25,9 +26,19 @@ const THEMES_LABEL: &str = "Themes";
 /// `Themes` row (user-menu "Open the F2 user menu"). `dialog.cursor ==
 /// entries.len()` highlights the built-in row; the separator row is never
 /// highlighted (design D2/D3).
-pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry]) {
+///
+/// `now` is the reducer clock when animations are on (`State::anim_now`) and
+/// `None` for the final frame: the box unfolds top-down on open and a newly
+/// highlighted row flashes in the hotkey accent before settling
+/// (ui-animations "Pop-up menus unfold and highlights settle").
+pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry], now: Option<u64>) {
+    super::unfold(buf, now, dialog.opened_at_ms, |b| draw_user_menu(b, area, theme, depth, dialog, entries, now));
+}
+
+fn draw_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry], now: Option<u64>) {
     let body = role_style(theme, Role::DialogPrimary, depth);
-    let highlight = role_style(theme, Role::MenuHighlight, depth);
+    let settling = matches!((now, dialog.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
+    let highlight = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
 
     let widest_label = entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER)).max(display_width(THEMES_LABEL));
     let preferred_inner_w = (widest_label + 2).clamp(MIN_INNER_W, MAX_INNER_W).max(display_width(TITLE));
@@ -89,7 +100,7 @@ mod tests {
     fn render(dialog: &UserMenuState, entries: &[UserMenuEntry]) -> Vec<String> {
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut buf = Buffer::empty(area);
-        render_user_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, dialog, entries);
+        render_user_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, dialog, entries, None);
         (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
     }
 
@@ -116,7 +127,7 @@ mod tests {
         dialog.cursor = 1;
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut buf = Buffer::empty(area);
-        render_user_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &dialog, &entries);
+        render_user_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &dialog, &entries, None);
         let theme = Theme::classic();
         let highlight = role_style(&theme, Role::MenuHighlight, ColorDepth::Ansi16);
         for y in 0..area.height {

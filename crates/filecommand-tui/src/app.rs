@@ -72,6 +72,11 @@ pub struct LaunchOptions {
     /// `[mouse] enabled` key, mirroring `--nosplash` (mouse-input "Mouse
     /// capture configuration").
     pub no_mouse: bool,
+    /// `--noanimations`: run with every decorative animation off regardless
+    /// of `config.toml`'s `animations` key, mirroring `--nosplash`
+    /// (ui-animations "Animations are disabled by config or launch flag" —
+    /// the flag wins when the two disagree).
+    pub no_animations: bool,
     /// `--theme <name>` or `--theme=<name>`: `None` when the switch was not
     /// passed at all; `Some(String::new())` when it was passed with no
     /// following value (e.g. as the final argument); `Some(name)` otherwise,
@@ -97,6 +102,8 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
             opts.no_splash = true;
         } else if arg == "--nomouse" {
             opts.no_mouse = true;
+        } else if arg == "--noanimations" {
+            opts.no_animations = true;
         } else if arg == "--theme" {
             // A missing value (switch is the final argument) is recorded as
             // an empty string rather than `None`, so `resolve_startup_theme`
@@ -136,6 +143,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
+    apply_launch_options(&mut state, &launch);
     // Session-only: this only ever sets `state.startup_warning` in memory,
     // never touches `config.toml` (theme-selection "Override is
     // session-only"; design D4). `apply_user_menu` below may overwrite this
@@ -149,6 +157,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     state.dir_history = history_file.directories;
     let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
     apply_user_menu(&mut state, user_menu);
+    stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
     let mut rt = Runtime {
@@ -487,6 +496,26 @@ fn apply_config(state: &mut State, config: &config::Config) {
     state.shell = ShellConfig::from_env(config.shell.clone());
     state.editor = config.editor.clone();
     state.split_percent = config.panel_split;
+    state.animations = config.animations;
+}
+
+/// Apply launch switches that override a config-driven `State` value:
+/// `--noanimations` forces animations off even when `animations = true`
+/// (ui-animations "Flag overrides config"). Run after [`apply_config`], which
+/// copies the config's value, so the flag always has the last word.
+fn apply_launch_options(state: &mut State, launch: &LaunchOptions) {
+    if launch.no_animations {
+        state.animations = false;
+    }
+}
+
+/// Stamp the startup-warning dialog's open time so it irises in like every
+/// other modal. It is raised here, in `run`, rather than by a reducer
+/// command, so the reducer's own stamping post-condition never sees it open.
+fn stamp_startup_warning(state: &mut State) {
+    if state.startup_warning.is_some() {
+        state.dialog_opened_at_ms = state.clock_ms;
+    }
 }
 
 /// Snapshot the F2 user menu into `State` at startup, factored out of `run`
@@ -957,6 +986,65 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
+    }
+
+    /// ui-animations "Animations are disabled by config or launch flag":
+    /// `State::empty` starts with animations off (so existing tests are
+    /// unaffected); a real launch turns them on from the default config.
+    #[test]
+    fn apply_config_turns_animations_on_by_default_and_off_when_configured() {
+        let mut state = State::empty(Theme::classic());
+        assert!(!state.animations, "sanity: a state built without config does not animate");
+        apply_config(&mut state, &config::parse(""));
+        assert!(state.animations, "default is animated");
+        apply_config(&mut state, &config::parse("animations = false\n"));
+        assert!(!state.animations, "animations = false disables them");
+    }
+
+    /// ui-animations "Flag overrides config": `--noanimations` wins over
+    /// `animations = true`, and without the flag the config value stands.
+    #[test]
+    fn noanimations_flag_overrides_the_config_value() {
+        let on = config::parse("animations = true\n");
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &on);
+        apply_launch_options(&mut state, &parse_launch_args(["--noanimations".to_string()]));
+        assert!(!state.animations, "the flag wins over animations = true");
+
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &on);
+        apply_launch_options(&mut state, &parse_launch_args(Vec::<String>::new()));
+        assert!(state.animations, "no flag leaves the config value alone");
+
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &config::parse("animations = false\n"));
+        apply_launch_options(&mut state, &parse_launch_args(Vec::<String>::new()));
+        assert!(!state.animations, "the flag never turns animations on");
+    }
+
+    #[test]
+    fn parse_launch_args_reads_noanimations_alongside_other_switches() {
+        let opts = parse_launch_args(["--noanimations".to_string()]);
+        assert!(opts.no_animations);
+        assert!(!opts.no_splash && !opts.no_mouse);
+        assert!(!parse_launch_args(["--nosplash".to_string()]).no_animations, "absent switch leaves it off");
+
+        let mixed = parse_launch_args(["--theme=terminal-green".to_string(), "--noanimations".to_string(), "--nosplash".to_string()]);
+        assert!(mixed.no_animations && mixed.no_splash);
+        assert_eq!(mixed.theme.as_deref(), Some("terminal-green"));
+    }
+
+    /// The startup warning is raised outside the reducer, so `run` stamps its
+    /// open time explicitly for the iris; with no warning nothing is stamped.
+    #[test]
+    fn stamp_startup_warning_records_the_clock_only_when_a_warning_is_up() {
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 1234;
+        stamp_startup_warning(&mut state);
+        assert_eq!(state.dialog_opened_at_ms, 0, "no warning: nothing to stamp");
+        state.startup_warning = Some("usermenu.toml is malformed".to_string());
+        stamp_startup_warning(&mut state);
+        assert_eq!(state.dialog_opened_at_ms, 1234);
     }
 
     /// theme-selection "Applied theme persists to configuration" scenario

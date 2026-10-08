@@ -26,17 +26,178 @@ pub mod theme_picker;
 pub mod user_menu;
 pub mod viewer;
 
+use filecommand_core::anim;
+use filecommand_core::dialogs::OverlayRect;
 use filecommand_core::fs_ops::dialog::RunningDialog;
 use filecommand_core::listing::display_width;
 use filecommand_core::panel::PanelState;
-use filecommand_core::theme::ColorDepth;
+use filecommand_core::theme::{ColorDepth, Role};
 use filecommand_core::viewer::ByteSource;
 use filecommand_core::{PanelSide, State, UiPhase};
-use ratatui::buffer::Buffer;
+use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 
 use crate::hitmap::HitMap;
 use crate::layout;
+use crate::style::role_style;
+
+// ---------------------------------------------------------------------
+// Reveal helpers (ui-animations; design D3)
+//
+// Every animated surface is drawn *finished* by its ordinary view function;
+// these helpers only decide how much of that finished drawing is on screen
+// this frame. The surface is rendered into a scratch buffer pre-filled with
+// a sentinel cell, so the cells the view actually touched — and therefore
+// the surface's exact bounding rectangle — are known without any per-view
+// geometry code, and only the revealed part is copied onto the real buffer.
+// Content under the window is the real finished surface, never placeholder
+// art, and hit-maps (built from final geometry in `build_hitmap`) are
+// unaffected. With `now == None` (animations off) or once the duration has
+// elapsed, the view draws straight onto the buffer: byte-identical to the
+// pre-animation rendering.
+// ---------------------------------------------------------------------
+
+/// The marker a scratch buffer starts filled with: a cell still equal to it
+/// after a view ran was never touched. No view draws U+0001.
+fn sentinel() -> Cell {
+    Cell::new("\u{1}")
+}
+
+/// The bounding rectangle of the cells `scratch` holds that differ from the
+/// sentinel — i.e. everything the view drew — or `None` if it drew nothing.
+fn touched_bounds(scratch: &Buffer) -> Option<Rect> {
+    let sentinel = sentinel();
+    let area = *scratch.area();
+    let (mut min_x, mut min_y, mut max_x, mut max_y) = (u16::MAX, u16::MAX, 0u16, 0u16);
+    let mut any = false;
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if scratch[(x, y)] != sentinel {
+                any = true;
+                min_x = min_x.min(x);
+                min_y = min_y.min(y);
+                max_x = max_x.max(x);
+                max_y = max_y.max(y);
+            }
+        }
+    }
+    any.then(|| Rect { x: min_x, y: min_y, width: max_x - min_x + 1, height: max_y - min_y + 1 })
+}
+
+/// Copy the cells of `src` inside `rect` that the view touched onto `dst`.
+fn blit(dst: &mut Buffer, src: &Buffer, rect: Rect) {
+    let sentinel = sentinel();
+    let rect = rect.intersection(*dst.area());
+    for y in rect.top()..rect.bottom() {
+        for x in rect.left()..rect.right() {
+            let cell = &src[(x, y)];
+            if *cell != sentinel {
+                dst[(x, y)] = cell.clone();
+            }
+        }
+    }
+}
+
+/// Run `draw` for a surface stamped at `stamp` and last-ticked at `now`.
+/// While the animation is in flight, `draw` renders into a scratch buffer
+/// and `reveal` copies the visible part onto `buf`, given the surface's
+/// bounding rectangle and the per-mille progress; otherwise `draw` paints
+/// `buf` directly.
+fn staged(
+    buf: &mut Buffer,
+    now: Option<u64>,
+    stamp: u64,
+    duration_ms: u64,
+    draw: impl FnOnce(&mut Buffer),
+    reveal: impl FnOnce(&mut Buffer, &Buffer, Rect, u16),
+) {
+    let Some(now) = now else { return draw(buf) };
+    let elapsed = now.saturating_sub(stamp);
+    if elapsed >= duration_ms {
+        return draw(buf);
+    }
+    let mut scratch = Buffer::filled(*buf.area(), sentinel());
+    draw(&mut scratch);
+    if let Some(bounds) = touched_bounds(&scratch) {
+        reveal(buf, &scratch, bounds, anim::progress(elapsed, duration_ms));
+    }
+}
+
+/// Modal dialog entrance: a centered window grows from 2x1 to the dialog's
+/// full rectangle over `DIALOG_IRIS_MS`, showing the finished dialog through
+/// it (ui-animations "Modal dialogs open with an iris").
+fn iris(buf: &mut Buffer, now: Option<u64>, stamp: u64, draw: impl FnOnce(&mut Buffer)) {
+    staged(buf, now, stamp, anim::DIALOG_IRIS_MS, draw, |dst, src, bounds, progress| {
+        let finish = OverlayRect { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height };
+        let w = anim::iris_rect(finish, progress);
+        blit(dst, src, Rect { x: w.x, y: w.y, width: w.width, height: w.height });
+    });
+}
+
+/// Pop-up menu entrance: the frame's top row first, item rows added
+/// downward, the bottom frame edge tracking the last revealed row so the box
+/// is never taller than its final rectangle (ui-animations "Pop-up menus
+/// unfold and highlights settle").
+fn unfold(buf: &mut Buffer, now: Option<u64>, stamp: u64, draw: impl FnOnce(&mut Buffer)) {
+    staged(buf, now, stamp, anim::POPUP_UNFOLD_MS, draw, |dst, src, bounds, progress| {
+        if bounds.height < 3 {
+            return blit(dst, src, bounds);
+        }
+        let interior = (bounds.height - 2) as usize;
+        let shown = anim::reveal_count(progress, interior) as u16;
+        // Top frame row plus the first `shown` item rows, in place.
+        blit(dst, src, Rect { height: shown + 1, ..bounds });
+        // The bottom frame edge, moved up to sit just under the last row.
+        let src_y = bounds.y + bounds.height - 1;
+        let dst_y = bounds.y + 1 + shown;
+        let sentinel = sentinel();
+        for x in bounds.left()..bounds.right() {
+            let cell = &src[(x, src_y)];
+            if *cell != sentinel {
+                dst[(x, dst_y)] = cell.clone();
+            }
+        }
+    });
+}
+
+/// F9 bar entrance: columns of the bar row are painted from the left edge
+/// (pulldown-menus "Menu bar entrance sweep").
+fn sweep(buf: &mut Buffer, now: Option<u64>, stamp: u64, draw: impl FnOnce(&mut Buffer)) {
+    staged(buf, now, stamp, anim::MENU_BAR_SWEEP_MS, draw, |dst, src, bounds, progress| {
+        let columns = anim::reveal_count(progress, bounds.width as usize) as u16;
+        blit(dst, src, Rect { width: columns, ..bounds });
+    });
+}
+
+/// Elapsed time since `stamp` while animations are on, else `None` (render
+/// the final frame). Used by the surfaces that animate per-element rather
+/// than through a reveal window (the splash entrance).
+fn elapsed_since(now: Option<u64>, stamp: u64) -> Option<u64> {
+    now.map(|n| n.saturating_sub(stamp))
+}
+
+/// Post-splash panel entrance: the finished screen is revealed top-to-bottom
+/// over `PANEL_WIPE_MS`, unrevealed rows drawn in `screen.backdrop`.
+/// `stamp == None` means the splash was skipped, so there is no wipe.
+fn wipe(
+    buf: &mut Buffer,
+    now: Option<u64>,
+    stamp: Option<u64>,
+    theme: &filecommand_core::theme::Theme,
+    depth: ColorDepth,
+    draw: impl FnOnce(&mut Buffer),
+) {
+    let Some(stamp) = stamp else { return draw(buf) };
+    let area = *buf.area();
+    staged(buf, now, stamp, anim::PANEL_WIPE_MS, draw, |dst, src, _bounds, progress| {
+        let rows = anim::reveal_count(progress, area.height as usize) as u16;
+        let backdrop = role_style(theme, Role::ScreenBackdrop, depth);
+        for y in area.top() + rows..area.bottom() {
+            dst.set_string(area.x, y, " ".repeat(area.width as usize), backdrop);
+        }
+        blit(dst, src, Rect { height: rows, ..area });
+    });
+}
 
 /// `views::render`'s full result: the terminal-cursor position it already
 /// returned, plus the [`HitMap`] `input::map_mouse` needs for the *next*
@@ -92,8 +253,12 @@ pub fn render(
     // dialog/overlay — since it lives beside the phase rather than inside
     // it and can open over any of them (application-shell "Quit request
     // keys and confirmation"; design D5).
+    // Its iris keys on its own stamp, so it opens over a dialog without
+    // making that dialog re-animate (ui-animations "Modal dialogs open with
+    // an iris").
+    let now = state.anim_now();
     if state.quit_confirm {
-        quit_dialog::render_quit_dialog(buf, area, &render_theme, depth);
+        iris(buf, now, state.quit_opened_at_ms, |b| quit_dialog::render_quit_dialog(b, area, &render_theme, depth));
     }
     // The startup-warning modal is drawn last, over whatever the current
     // phase already painted — it can only ever be raised at the very start
@@ -102,7 +267,7 @@ pub fn render(
     // be on screen underneath it (user-menu "Malformed file warns and falls
     // back without overwriting").
     if let Some(message) = &state.startup_warning {
-        startup_warning::render_startup_warning(buf, area, &render_theme, depth, message);
+        iris(buf, now, state.dialog_opened_at_ms, |b| startup_warning::render_startup_warning(b, area, &render_theme, depth, message));
     }
     RenderOutput { cursor, hitmap: build_hitmap(area, state) }
 }
@@ -179,8 +344,9 @@ fn render_phase(
     viewer_source: Option<&ByteSource>,
 ) -> Option<(u16, u16)> {
     match &state.phase {
-        UiPhase::Splash { .. } => {
-            splash::render_splash(buf, area, theme, depth, identity_lines);
+        UiPhase::Splash { started_at_ms } => {
+            let elapsed = elapsed_since(state.anim_now(), *started_at_ms);
+            splash::render_splash(buf, area, theme, depth, identity_lines, elapsed);
             None
         }
         UiPhase::Placeholder => {
@@ -199,61 +365,75 @@ fn render_phase(
             let l = layout::compute((area.width, area.height), state.split_percent);
             let left_type_ahead = (state.active == PanelSide::Left).then_some(state.quick_search.as_deref()).flatten();
             let right_type_ahead = (state.active == PanelSide::Right).then_some(state.quick_search.as_deref()).flatten();
-            panel::render_panel(
-                buf,
-                l.left,
-                &state.left,
-                theme,
-                depth,
-                state.active == PanelSide::Left,
-                identity_lines,
-                &state.right,
-                left_type_ahead,
-                PanelSide::Left,
-                state.drag.as_ref(),
-            );
-            panel::render_panel(
-                buf,
-                l.right,
-                &state.right,
-                theme,
-                depth,
-                state.active == PanelSide::Right,
-                identity_lines,
-                &state.left,
-                right_type_ahead,
-                PanelSide::Right,
-                state.drag.as_ref(),
-            );
-            // Drawn unconditionally, before the F9 overlay below — the menu
-            // bar (when open) paints over the whole top row including this,
-            // which is what "hides" it; closing the bar simply stops that
-            // overwrite from happening on the next frame. The clock itself
-            // is skipped entirely (never partially drawn) when it would
-            // collide with the right panel's centered path title
-            // (responsive-layout "Chrome degradation").
-            if clock_fits_without_colliding(l.right, &state.right, state.active == PanelSide::Right, clock_text) {
-                clock::render_clock(buf, l.right, theme, depth, clock_text);
-            }
-            command_line::render_command_line(buf, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
-            keybar::render_keybar(buf, l.keybar, theme, depth, state.drag.is_some());
+            // The base screen (panels, clock, command line, key bar) is the
+            // surface the post-splash wipe reveals; every overlay below is
+            // drawn over it directly (ui-animations "Panels wipe in after
+            // the splash").
+            let now = state.anim_now();
+            wipe(buf, now, state.panels_revealed_at_ms, theme, depth, |b| {
+                panel::render_panel(
+                    b,
+                    l.left,
+                    &state.left,
+                    theme,
+                    depth,
+                    state.active == PanelSide::Left,
+                    identity_lines,
+                    &state.right,
+                    left_type_ahead,
+                    PanelSide::Left,
+                    state.drag.as_ref(),
+                );
+                panel::render_panel(
+                    b,
+                    l.right,
+                    &state.right,
+                    theme,
+                    depth,
+                    state.active == PanelSide::Right,
+                    identity_lines,
+                    &state.left,
+                    right_type_ahead,
+                    PanelSide::Right,
+                    state.drag.as_ref(),
+                );
+                // Drawn unconditionally, before the F9 overlay below — the
+                // menu bar (when open) paints over the whole top row
+                // including this, which is what "hides" it; closing the bar
+                // simply stops that overwrite from happening on the next
+                // frame. The clock itself is skipped entirely (never
+                // partially drawn) when it would collide with the right
+                // panel's centered path title (responsive-layout "Chrome
+                // degradation").
+                if clock_fits_without_colliding(l.right, &state.right, state.active == PanelSide::Right, clock_text) {
+                    clock::render_clock(b, l.right, theme, depth, clock_text);
+                }
+                command_line::render_command_line(b, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
+                keybar::render_keybar(b, l.keybar, theme, depth, state.drag.is_some());
+            });
 
             // The F9 bar overlays the panels' top borders (and the clock)
-            // rather than reserving a row of its own.
+            // rather than reserving a row of its own. It sweeps in and its
+            // pull-down unfolds inside `render_menu_bar`.
             if let Some(menu) = &state.menu {
-                menubar::render_menu_bar(buf, area, theme, depth, menu);
+                menubar::render_menu_bar(buf, area, theme, depth, menu, now);
             }
+            // Every modal dialog below opens through the same iris, keyed on
+            // the single `dialog_opened_at_ms` stamp — only one of them is
+            // ever visible at a time (ui-animations "Modal dialogs open with
+            // an iris").
+            let opened = state.dialog_opened_at_ms;
             if let Some(dialog) = &state.drive_select {
-                drive_select::render_drive_select(buf, area, theme, depth, dialog);
+                iris(buf, now, opened, |b| drive_select::render_drive_select(b, area, theme, depth, dialog));
             }
             if let Some(dialog) = &state.fuzzy_jump {
-                fuzzy_jump::render_fuzzy_jump(buf, area, theme, depth, dialog, &state.dir_history, state.clock_ms);
+                iris(buf, now, opened, |b| fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.clock_ms));
             }
             if let Some(dialog) = &state.find_file {
-                find_file::render_find_file(buf, area, theme, depth, dialog);
+                iris(buf, now, opened, |b| find_file::render_find_file(b, area, theme, depth, dialog));
             }
             if let Some(dialog) = &state.user_menu {
-                user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries);
+                user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries, now);
             }
             if let Some(dialog) = &state.theme_picker {
                 // The dialog itself styles from the previewed `theme`, but
@@ -261,33 +441,33 @@ fn render_phase(
                 // — the applied theme — even while a different theme is
                 // being previewed (design D2; theme-selection "Live theme
                 // preview while the picker is open").
-                theme_picker::render_theme_picker(buf, area, theme, depth, dialog, &state.theme.name);
+                iris(buf, now, opened, |b| theme_picker::render_theme_picker(b, area, theme, depth, dialog, &state.theme.name));
             }
             if let Some(dialog) = &state.help {
-                help::render_help(buf, area, theme, depth, dialog, identity_lines);
+                iris(buf, now, opened, |b| help::render_help(b, area, theme, depth, dialog, identity_lines));
             }
             if let Some(dialog) = &state.file_action_menu {
-                file_action_menu::render_file_action_menu(buf, area, theme, depth, dialog);
+                file_action_menu::render_file_action_menu(buf, area, theme, depth, dialog, now);
             }
 
             match &state.phase {
-                UiPhase::FileOpSetup(setup) => {
-                    destination_input::render_destination_input(buf, area, theme, depth, setup);
-                    delete_confirm::render_delete_confirm(buf, area, theme, depth, setup);
-                }
+                UiPhase::FileOpSetup(setup) => iris(buf, now, opened, |b| {
+                    destination_input::render_destination_input(b, area, theme, depth, setup);
+                    delete_confirm::render_delete_confirm(b, area, theme, depth, setup);
+                }),
                 UiPhase::FileOpRunning { dialog, .. } => match dialog {
                     RunningDialog::Progress { kind, progress } => {
-                        progress_dialog::render_progress(buf, area, theme, depth, *kind, progress);
+                        iris(buf, now, opened, |b| progress_dialog::render_progress(b, area, theme, depth, *kind, progress));
                     }
                     RunningDialog::Conflict { info, rename_input, .. } => {
-                        conflict_dialog::render_conflict(buf, area, theme, depth, info, rename_input);
+                        iris(buf, now, opened, |b| conflict_dialog::render_conflict(b, area, theme, depth, info, rename_input));
                     }
                     RunningDialog::Error { info, .. } => {
-                        error_dialog::render_error(buf, area, theme, depth, info);
+                        iris(buf, now, opened, |b| error_dialog::render_error(b, area, theme, depth, info));
                     }
                 },
                 UiPhase::FileOpSummary(skipped) => {
-                    skipped_summary::render_skipped_summary(buf, area, theme, depth, skipped);
+                    iris(buf, now, opened, |b| skipped_summary::render_skipped_summary(b, area, theme, depth, skipped));
                 }
                 _ => {}
             }

@@ -227,6 +227,19 @@ pub struct MenuState {
     /// Esc-from-a-pull-down leaves behind.
     pub pulldown_open: bool,
     pub selected: usize,
+    /// `State::clock_ms` when the bar opened. Stamped by the reducer (the
+    /// constructors below leave it `0`), read only by the renderer to drive
+    /// the bar's entrance sweep (ui-animations "Render-only motion model
+    /// driven by the reducer clock").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the current pull-down began unfolding —
+    /// re-stamped on Left/Right traversal and hotkey jumps, since the new
+    /// pull-down unfolds while already open and interactive (design D4).
+    pub pulldown_opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved within the current
+    /// pull-down, or `None` if it has not moved since the pull-down opened
+    /// (opening is the unfold's job, not a highlight flash).
+    pub selected_at_ms: Option<u64>,
 }
 
 impl MenuState {
@@ -237,7 +250,14 @@ impl MenuState {
 
     /// Open `id`'s pull-down with the first selectable item highlighted.
     pub fn for_menu(id: MenuId) -> MenuState {
-        MenuState { active: id, pulldown_open: true, selected: first_selectable(id).unwrap_or(0) }
+        MenuState {
+            active: id,
+            pulldown_open: true,
+            selected: first_selectable(id).unwrap_or(0),
+            opened_at_ms: 0,
+            pulldown_opened_at_ms: 0,
+            selected_at_ms: None,
+        }
     }
 
     pub fn items(&self) -> &'static [MenuEntry] {
