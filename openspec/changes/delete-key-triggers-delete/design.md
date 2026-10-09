@@ -24,14 +24,14 @@ The bug shipped without detection because `input/tests.rs` asserts `F(8) → Req
 The Delete key is a hard-coded alias for F8, mirroring the existing fixed `Ctrl+Ins` → clipboard-Files alias in the same function (which is deliberately not rebindable). This is the smallest possible surface and matches Norton Commander, where Del maps to the F8 action. Rejected: adding a `delete` field to the `Keys` config struct — more surface (schema, defaults, docs) for no requested benefit.
 
 ### D2 — Plain Delete only
-The new arm is guarded by the existing `is_plain(&key)` helper so that only an unmodified Delete triggers deletion; a modified Delete press falls through, keeping `Shift+Delete` and `Ctrl+Delete` available for any future meaning. This matches how the plain F8 arm and the other unmodified panel keys behave.
+The new arm is guarded by an exact no-modifier check (`key.modifiers == KeyModifiers::NONE`, deliberately stricter than `is_plain`, which still admits Shift) so that only an unmodified Delete triggers deletion; a modified Delete press falls through, keeping `Shift+Delete` and `Ctrl+Delete` available for any future meaning. This matches how the plain F8 arm and the other unmodified panel keys behave.
 
 ### D3 — Placement in the match
 The arm is added among the unmodified navigation/function keys near the `KeyCode::F(8)` arm, i.e. after the ctrl/alt-guarded arms earlier in the function, preserving the file's existing "guarded chords first, then plain keys" ordering.
 
 ## Risks / Tradeoffs
 
-Negligible — the change is purely additive and reuses an already-tested command path. The only conceivable risk is shadowing a future modified-Delete chord, which the `is_plain` guard prevents.
+Negligible — the change is purely additive and reuses an already-tested command path. The only conceivable risk is shadowing a future modified-Delete chord, which the no-modifier guard prevents.
 
 ## Open Questions
 

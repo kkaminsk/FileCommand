@@ -4,7 +4,7 @@ Users expect `-h`, `-?`, and `--help` to print usage information and exit immedi
 
 ## What Changes
 
-- Recognise `-h`, `-?`, and `--help` as the first argument on the command line
+- Recognise `-h`, `-?`, and `--help` anywhere on the command line
 - Print a short usage block to stdout (synopsis, flags, and a pointer to F1 in-app help)
 - Exit with code 0 before acquiring the terminal, alternate screen, or mouse capture
 

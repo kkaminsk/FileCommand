@@ -4,7 +4,7 @@
 
 Every directory read in `filecommand-core` goes through `update::begin_listing` → `begin_listing_inner` → `Panel::begin_new_listing(cwd)` (`crates/filecommand-core/src/panel.rs`). That method resets `cursor = 0`, `scroll_offset = 0`, and `cursor_user_moved = false`, then the worker streams `Command::ListingChunk` events whose `insert_streamed` keeps the cursor pinned to 0 until the user moves (panel-navigation "Streamed listing keeps the top pinned until the user moves"). `Command::ListingComplete` clamps the cursor, reconciles the selection, consumes find-file's `pending_cursor_target` (if any) to settle the cursor on a named entry, and calls `reconcile_panel_viewport` to re-clamp the offset.
 
-That reset is right when the panel navigates into a different directory. It is wrong for the three callers that re-read the directory the panel is already showing, all of which reach `begin_listing_inner` today:
+That reset is right when the panel navigates into a different directory. It is wrong for the three callers that re-read the directory the panel is already showing, all of which reach `begin_listing_inner` today (a fourth caller, the Tree-mode cursor-move preview of the opposite panel, also reaches it and is deliberately excluded — see D5):
 
 - `Command::JobDone` — re-reads every active tab whose `cwd` matches the job's source or destination directory (file-operations "Automatic panel re-read on completion").
 - `Command::RereadPanel` — Ctrl+R and the Left/Right menu's Re-read item.
@@ -44,7 +44,7 @@ Find-file's `pending_cursor_target` is checked first on `ListingComplete` and wi
 
 ### D3: Restore the scroll offset, then clamp to the new list
 
-On apply, `scroll_offset` is restored from the anchor and then clamped to `visible_len.saturating_sub(rows)` so a list that shrank at the bottom does not leave blank trailing rows (deleting the last visible entry at the end of a long listing pulls the window up by one, as Norton Commander does). The existing `reconcile_panel_viewport` then runs as it does for every other list mutation, so if the panel's body height differs from when the anchor was captured, the cursor-visibility clamp wins — the same rule panel-navigation already applies to tab restore. In Brief mode the restored offset is passed through `ensure_cursor_visible_brief`, which keeps it on a whole-column multiple.
+On apply, `scroll_offset` is restored from the anchor and then clamped to `visible_len.saturating_sub(rows)` so a list that shrank at the bottom does not leave blank trailing rows (deleting the last visible entry at the end of a long listing pulls the window up by one, as Norton Commander does). The existing `reconcile_panel_viewport` then runs as it does for every other list mutation, so if the panel's body height differs from when the anchor was captured, the cursor-visibility clamp wins — the same rule panel-navigation already applies to tab restore. In Brief mode the offset is a column position, not a row position, so the rows-based clamp is not applied; the restored offset is passed through `ensure_cursor_visible_brief`, which keeps it on a whole-column multiple and clamps by columns. The offset counts rows of the quick-filter-narrowed list, and `begin_new_listing` clears the filter, so when a quick filter was active at capture the scroll offset is **not** restored (it resets to 0); the cursor entry still is, and `reconcile_panel_viewport` scrolls it into view.
 
 ### D4: The anchor lives on `Panel` and is cleared by any different-directory navigation
 
@@ -52,7 +52,7 @@ On apply, `scroll_offset` is restored from the anchor and then clamped to `visib
 
 ### D5: Capture in `begin_listing_inner`, so every caller benefits without plumbing
 
-`begin_listing_inner` is the single funnel for all three re-read callers and for ordinary navigation. It captures the anchor (via `Panel::capture_reread_anchor`) only when the target path equals the panel's current `cwd` **and** the current listing is `Complete`; a re-read issued while the previous listing is still streaming captures nothing and keeps today's behavior rather than anchoring to a half-loaded list. `JobDone`, `RereadPanel`, and the stale-tab path need no changes of their own.
+`begin_listing_inner` is the single funnel for all three re-read callers, for ordinary navigation, and for the Tree-mode preview. The preview is a navigation of the *opposite* panel, not a re-read the user asked for, so it never captures an anchor: the capture is skipped when the caller is the Tree preview (an explicit `capture_anchor: bool` parameter on `begin_listing_inner`, `true` only from `begin_listing`'s re-read paths). It captures the anchor (via `Panel::capture_reread_anchor`) only when the target path equals the panel's current `cwd` **and** the current listing is `Complete`; a re-read issued while the previous listing is still streaming captures nothing and keeps today's behavior rather than anchoring to a half-loaded list. `JobDone`, `RereadPanel`, and the stale-tab path need no changes of their own.
 
 ## Risks / Trade-offs
 

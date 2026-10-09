@@ -3,14 +3,14 @@
 ## 1. Core panel state (`crates/filecommand-core/src/panel.rs`)
 
 - [ ] 1.1 Add `RereadAnchor { names: Vec<OsString>, cursor: usize, scroll_offset: usize }` and `Panel::reread_anchor: Option<RereadAnchor>`, initialized to `None` (design D1, D4)
-- [ ] 1.2 Include `reread_anchor` in the per-tab stash/restore data beside `pending_cursor_target` so a tab switched away mid-re-read keeps it (design D4)
+- [ ] 1.2 Add `reread_anchor` to the `TabData` struct and to `to_tab_data` and its restore counterpart beside `pending_cursor_target`, so a tab switched away mid-re-read keeps it (design D4)
 - [ ] 1.3 Add `Panel::capture_reread_anchor()` — records entry names in display order, cursor, and scroll offset only when `progress` is `Complete`; otherwise leaves the anchor `None` (design D5)
-- [ ] 1.4 Add `Panel::apply_reread_anchor(rows)` — resolves the cursor in the order `names[cursor]`, `names[cursor + 1..]`, `names[..cursor]` reversed; on a hit sets `cursor` and `cursor_user_moved = true`, restores `scroll_offset` and clamps it to `visible_len.saturating_sub(rows)`; returns whether a name resolved (panel-navigation: "Same-directory re-read preserves cursor and scroll position"; design D1, D3)
+- [ ] 1.4 Add `Panel::apply_reread_anchor(rows)` — resolves the cursor in the order `names[cursor]`, `names[cursor + 1..]`, `names[..cursor]` reversed; on a hit sets `cursor` and `cursor_user_moved = true`, restores `scroll_offset` (skipped when a quick filter was active at capture; in Brief mode clamped by columns via `ensure_cursor_visible_brief`, otherwise to `visible_len.saturating_sub(rows)`); returns whether a name resolved (panel-navigation: "Same-directory re-read preserves cursor and scroll position"; design D1, D3)
 - [ ] 1.5 In `begin_new_listing(cwd)`, clear `reread_anchor` when `cwd != self.cwd` so a navigation never inherits a stale anchor (design D4)
 
 ## 2. Reducer (`crates/filecommand-core/src/update.rs`)
 
-- [ ] 2.1 In `begin_listing_inner`, call `capture_reread_anchor()` before `begin_new_listing` when `path == panel.cwd` (design D5)
+- [ ] 2.1 In `begin_listing_inner`, call `capture_reread_anchor()` before `begin_new_listing` when `path == panel.cwd` and the caller is not the Tree-mode preview at update.rs `begin_listing_inner(state, side.toggle(), target)` (design D5)
 - [ ] 2.2 In `apply_listing_event`, on `ListingChunk` call `apply_reread_anchor(rows)` after the chunk is inserted and before `reconcile_panel_viewport` (panel-navigation: "No jump while the re-read streams"; design D2)
 - [ ] 2.3 In `apply_listing_event`, on `ListingComplete` apply `pending_cursor_target` first (unchanged), then `apply_reread_anchor(rows)` if no find-file target was consumed, then take the anchor so it is consumed, then `reconcile_panel_viewport` (design D2)
 - [ ] 2.4 Route the Brief-mode offset restore through `ensure_cursor_visible_brief` so the restored offset stays on a whole-column multiple (design D3)
