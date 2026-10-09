@@ -10,5 +10,5 @@
 ## 3. Verify
 
 - [x] 3.1 Run `cargo test -p filecommand-tui` (and the workspace test suite) — all green.
-- [ ] 3.2 Run `openspec validate delete-key-triggers-delete --strict` — clean.
-- [ ] 3.3 Manually confirm in the running app: cursor on a file, press Delete → the delete-confirmation dialog appears; accept it → the file is deleted; press Delete then Esc → nothing is deleted.
+- [x] 3.2 Run `openspec validate delete-key-triggers-delete --strict` — clean.
+- [x] 3.3 Manually confirm in the running app: cursor on a file, press Delete → the delete-confirmation dialog appears; accept it → the file is deleted; press Delete then Esc → nothing is deleted.
