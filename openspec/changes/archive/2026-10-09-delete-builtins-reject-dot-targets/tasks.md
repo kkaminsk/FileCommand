@@ -1,6 +1,6 @@
 ## 1. Core: reject `.`/`..` delete targets
 
-- [x] 1.1 In `crates/filecommand-core/src/update.rs`, add an early guard at the top of `run_delete_builtin`: a target whose `Path::components()` is exactly `CurDir` or `ParentDir` sets `last_error` to `"{verb}: invalid target {target}"` and returns — before any listed-entry lookup, filesystem check, or dialog.
+- [x] 1.1 In `crates/filecommand-core/src/update.rs`, add an early guard at the top of `dispatch_delete_builtin`: a target whose `Path::components()` is exactly `CurDir` or `ParentDir` sets `last_error` to `"{verb}: invalid target {target}"` and returns — before any listed-entry lookup, filesystem check, or dialog.
 - [x] 1.2 The guard must cover trailing-separator spellings (`..`, `..\`, `.`, `.\`) via the components normalization, and must not reject multi-component relative paths like `..\sibling`.
 
 ## 2. Tests

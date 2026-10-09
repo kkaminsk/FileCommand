@@ -5,12 +5,12 @@
 - [ ] 1.1 Add `filecommand-core::anim` with per-mille `progress`, `reveal_count`, `sweep_pos`, iris-rect helper, and the named duration constants from design D6 (ui-animations: "Render-only motion model driven by the reducer clock")
 - [ ] 1.2 Add `State::animations`, `State::dialog_opened_at_ms`, `State::quit_opened_at_ms`, `State::panels_revealed_at_ms`; `State::empty` sets `animations = false` (ui-animations: "Animations are disabled by config or launch flag")
 - [ ] 1.3 Stamp `MenuState` (`opened_at_ms`, `pulldown_opened_at_ms`, `selected_at_ms`), `UserMenuState` and `FileActionMenuState` (`opened_at_ms`, `selected_at_ms`) from `state.clock_ms` in the reducer on open, traversal, and selection change (ui-animations: "Pop-up menus unfold and highlights settle")
-- [ ] 1.4 Stamp `dialog_opened_at_ms` where each modal dialog becomes visible and `quit_opened_at_ms` where `quit_confirm` is set; stamp `panels_revealed_at_ms` on the Splash → Panels transition only (ui-animations: "Modal dialogs open with an iris"; "Panels wipe in after the splash")
+- [ ] 1.4 Stamp `dialog_opened_at_ms` where each modal dialog becomes visible (including the About dialog and the startup warning, stamped on the first `Tick` when set before it) and `quit_opened_at_ms` where `quit_confirm` is set; stamp `panels_revealed_at_ms` on the Splash → Panels transition only (ui-animations: "Modal dialogs open with an iris"; "Panels wipe in after the splash")
 
 ## 2. Configuration and launch flag
 
 - [ ] 2.1 Parse `animations = <bool>` in `config::parse` (general options; default `true`) (ui-animations: "Animations are disabled by config or launch flag")
-- [ ] 2.2 Parse `--noanimations` in `parse_launch_args`; flag overrides config in `run`/`apply_config` (ui-animations: "Animations are disabled by config or launch flag")
+- [ ] 2.2 Parse `--noanimations` in `parse_launch_args`; flag overrides config in `run` (alongside the existing `config.splash && !launch.no_splash` computation, since `apply_config` takes no launch options) (ui-animations: "Animations are disabled by config or launch flag")
 - [ ] 2.3 Add `--noanimations` to `main.rs` `print_usage` and to the README flag table; add `animations` to the README config key table (ui-animations: "Animations are disabled by config or launch flag")
 
 ## 3. Splash and panel reveal

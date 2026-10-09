@@ -1,6 +1,6 @@
 ## 1. Wire the Delete key
 
-- [x] 1.1 In `crates/filecommand-tui/src/input/mod.rs`, add a `KeyCode::Delete if is_plain(&key) => Some(Command::RequestDelete)` arm to `map_panel_key`, placed among the unmodified keys near the existing `KeyCode::F(8)` arm.
+- [x] 1.1 In `crates/filecommand-tui/src/input/mod.rs`, add a `KeyCode::Delete if key.modifiers == KeyModifiers::NONE => Some(Command::RequestDelete)` arm to `map_panel_key`, placed among the unmodified keys near the existing `KeyCode::F(8)` arm.
 
 ## 2. Regression test
 

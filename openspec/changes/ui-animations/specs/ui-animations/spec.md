@@ -23,7 +23,7 @@ The system SHALL implement every animation as a pure function of the elapsed tim
 
 ### Requirement: Animations are disabled by config or launch flag
 
-The system SHALL animate by default and SHALL render every surface in its final form immediately — identical to the pre-animation rendering — when `animations = false` is set in `config.toml` general options or the `--noanimations` launch flag is passed. When the flag and config disagree, `--noanimations` SHALL win. The `--noanimations` flag SHALL appear in the `--help` usage block's flag table. A `State` constructed without configuration (`State::empty`) SHALL have animations disabled so that existing snapshot and reducer tests are unaffected.
+The system SHALL animate by default and SHALL render every surface in its final form immediately — identical to the pre-animation rendering — when `animations = false` is set as a top-level key in `config.toml` or the `--noanimations` launch flag is passed. When the flag and config disagree, `--noanimations` SHALL win. The `--noanimations` flag SHALL appear in the `--help` usage block's OPTIONS list. A `State` constructed without configuration (`State::empty`) SHALL have animations disabled so that existing snapshot and reducer tests are unaffected.
 
 #### Scenario: Default is animated
 
@@ -43,7 +43,7 @@ The system SHALL animate by default and SHALL render every surface in its final 
 #### Scenario: Flag is documented in usage
 
 - **WHEN** the user runs `filecommand --help`
-- **THEN** the flag table includes `--noanimations`
+- **THEN** the OPTIONS list includes `--noanimations`
 
 #### Scenario: States built without config do not animate
 
@@ -116,7 +116,7 @@ The system SHALL, when the splash is replaced by the panels (minimum hold elapse
 
 ### Requirement: Loading feedback stays static
 
-The system SHALL NOT animate loading or progress feedback: streaming directory listings, the `Reading… N` mini-status, Info-panel `…` placeholders, drive-select volume-label fill-in, and the progress dialog's counters and byte gauge SHALL continue to render as static text updated in place. Decorative chrome (splash, menus, dialogs) is the only animated surface; this scoping supersedes design doc §4.10's blanket "never uses animation" statement for decorative chrome only.
+The system SHALL NOT animate loading or progress feedback: streaming directory listings, the `Reading… N` mini-status, Info-panel `…` placeholders, drive-select volume-label fill-in, and the progress dialog's counters and byte gauge SHALL continue to render as static text updated in place. Decorative chrome (splash, menus, dialogs) is the only animated surface; this scoping supersedes design doc §4.10's blanket "never uses spinners or animation glyphs" statement for decorative chrome only.
 
 #### Scenario: Streaming listing has no spinner
 

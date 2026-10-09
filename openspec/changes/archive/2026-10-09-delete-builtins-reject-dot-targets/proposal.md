@@ -22,5 +22,5 @@ Both go through the confirmation dialog, so nothing deletes instantly — but a 
 
 ## Impact
 
-- `crates/filecommand-core/src/update.rs`: `run_delete_builtin` gains one early guard rejecting `.`/`..` targets before resolution; everything after is untouched.
+- `crates/filecommand-core/src/update.rs`: `dispatch_delete_builtin` gains one early guard rejecting `.`/`..` targets before resolution; everything after is untouched.
 - New unit tests cover both verbs against `.` and `..` (no dialog, error set, no deletion).

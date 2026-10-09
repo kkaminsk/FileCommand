@@ -12,7 +12,7 @@ The design doc (§4.10) says FileCommand "never uses spinners or animation glyph
 - **Startup splash entrance**: the double-line frame traces itself clockwise from the top-left corner, the four identity lines reveal outward from their centers (appearing first in the frame color, then settling to their final role), and a single highlight sweep crosses the product name — all inside the existing 800 ms minimum hold. After the splash, the panels wipe in top-to-bottom over 150 ms.
 - **Menus**: on F9 the menu bar sweeps in left-to-right; every pop-up menu (F9 pull-downs, F2 user menu, Enter file-action menu) unfolds top-down from its frame; when the highlighted item changes, the new highlight row renders one frame in the hotkey accent before settling to the normal highlight style.
 - **Modal dialogs**: every modal dialog opens with a 100 ms "iris" — a growing centered window onto the finished dialog — instead of appearing fully formed.
-- **Configuration**: `animations = true` (default) in `config.toml` general options; `--noanimations` launch flag; flag wins. When disabled, every surface renders its final frame immediately — pixel-identical to today.
+- **Configuration**: `animations = true` (default) as a top-level key in `config.toml`; `--noanimations` launch flag; flag wins. When disabled, every surface renders its final frame immediately — pixel-identical to today.
 - **No new theme roles**: all animation colors come from roles that already exist (`splash.frame`, `splash.version`, `menu.hotkey`, `screen.backdrop`), so user `themes/*.toml` files keep validating.
 - **Determinism**: animation progress is derived from `State::clock_ms`, so `insta` snapshot tests pin a clock and capture mid-animation frames; states built without config keep animations off, so existing snapshots are unchanged.
 
@@ -30,6 +30,6 @@ The design doc (§4.10) says FileCommand "never uses spinners or animation glyph
 ## Impact
 
 - **Crates:** `filecommand-core` — new `anim` module (progress/easing helpers, duration constants); `opened_at_ms`/`selected_at_ms` stamps on `MenuState`, `UserMenuState`, `FileActionMenuState`; `State::animations` flag, `State::dialog_opened_at_ms`, `State::quit_opened_at_ms`, `State::panels_revealed_at_ms`; reducer sets stamps from `state.clock_ms` where overlays open; `config.rs` `animations` key. `filecommand-tui` — `--noanimations` in `parse_launch_args`, `apply_config` wiring, `print_usage` line; `splash.rs`, `menubar.rs`, `user_menu.rs`, `file_action_menu.rs` interpolated rendering; a shared scratch-buffer "reveal" helper in `views/mod.rs` used by the dialog iris and the panel wipe; new snapshot tests.
-- **Docs:** README flag table and `config.toml` key table gain `--noanimations` / `animations`.
+- **Docs:** README flag table and `config.toml` key table (the `--help` usage block lists it in its OPTIONS list) gain `--noanimations` / `animations`.
 - **Depends on:** `startup-splash` (clock + hold), `pulldown-menus`, `user-menu`, `file-action-menu`, `responsive-layout` (overlay geometry), `theme-system` (role-only colors). The `help-flags` change's usage block gains the new flag.
 - **Out of scope:** animating loading feedback (listings, Info panel, drive select, progress counters); a reduced-motion/"subtle" intermediate level; a runtime Options toggle; sound; ASCII-art logo; per-theme animation overrides.

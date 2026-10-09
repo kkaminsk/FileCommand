@@ -39,14 +39,14 @@ For the dialog iris and the panel wipe, the view renders the finished surface in
 
 - `MenuState { opened_at_ms, pulldown_opened_at_ms, selected_at_ms }` — `pulldown_opened_at_ms` is re-stamped on Left/Right traversal and hotkey jumps (the new pull-down unfolds while open and interactive); `selected_at_ms` on every selection change.
 - `UserMenuState { opened_at_ms, selected_at_ms }`, `FileActionMenuState { opened_at_ms, selected_at_ms }` — same unfold/settle treatment via one shared pop-up helper.
-- `State::dialog_opened_at_ms` — set whenever a modal dialog becomes visible (phase enters `FileOpSetup`/`FileOpRunning`/`FileOpSummary`, or `help`/`theme_picker`/`drive_select`/`fuzzy_jump`/`find_file` become `Some`). Only one of these is visible at a time, so one stamp suffices; a replacement dialog (e.g. progress → conflict) re-stamps and irises again.
+- `State::dialog_opened_at_ms` — set whenever a modal dialog becomes visible (phase enters `FileOpSetup`/`FileOpRunning`/`FileOpSummary`, or `help` (including its About dialog)/`theme_picker`/`drive_select`/`fuzzy_jump`/`find_file` become `Some`, or the startup warning becomes visible). The startup warning is set before the first `Tick`, so it is stamped from the first clock reading the reducer sees rather than at construction, and `MenuState::opened`/`for_menu`/`go_to` take the clock reading as an argument (or are stamped by the reducer immediately after construction). Only one of these is visible at a time, so one stamp suffices; a replacement dialog (e.g. progress → conflict) re-stamps and irises again.
 - `State::quit_opened_at_ms` — the quit dialog layers over others, so it has its own stamp and the underlying dialog does not re-animate.
 - `State::panels_revealed_at_ms: Option<u64>` — set on the `Splash → Panels` transition only (hold elapsed or key). `None` when the splash was skipped, so frame 1 with `--nosplash` is still the complete panels.
 - `UiPhase::Splash { started_at_ms }` already exists and drives the splash entrance.
 
 ### D5: `State::animations` defaults off in `State::empty`, on in `Config::default`
 
-`Config::default().animations = true` so real launches animate; `apply_config` copies it into `State::animations`; `State::empty` sets `false`. Every view checks `state.animations` first and short-circuits to the final frame when off. Result: all existing snapshot and reducer tests (which construct `State::empty`) are unchanged; animation snapshots opt in by setting the flag and pinning `clock_ms`.
+`Config::default().animations = true` so real launches animate; `apply_config` copies the config value into `State::animations`, and `run` applies the `--noanimations` override (alongside the existing `config.splash && !launch.no_splash` computation) because `apply_config` takes no launch options; `State::empty` sets `false`. Every view checks `state.animations` first and short-circuits to the final frame when off. Result: all existing snapshot and reducer tests (which construct `State::empty`) are unchanged; animation snapshots opt in by setting the flag and pinning `clock_ms`.
 
 ### D6: Fixed timing budget, all ≤ the existing splash hold
 
@@ -65,7 +65,7 @@ Durations are constants in `core::anim` so tests reference them by name. Everyth
 
 ### D7: Disable precedence mirrors `splash`/`mouse`
 
-`animations = false` in the general options of `config.toml`, or `--noanimations` at launch; the flag wins when they disagree. Parsed in `config::parse` next to `splash` and in `parse_launch_args` next to `--nosplash`; listed in `print_usage` and the README. The design doc §4.10 sentence is superseded for decorative chrome only; this change is the normative record of that.
+`animations = false` as a top-level key of `config.toml`, or `--noanimations` at launch; the flag wins when they disagree. Parsed in `config::parse` next to `splash` and in `parse_launch_args` next to `--nosplash`; listed in `print_usage` and the README. The design doc §4.10 sentence is superseded for decorative chrome only; this change is the normative record of that.
 
 ## Risks / Trade-offs
 

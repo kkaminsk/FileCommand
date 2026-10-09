@@ -19,7 +19,7 @@
 
 **D1 — Manual argv check, no parsing library**
 
-Check `std::env::args().nth(1)` for the three flag strings (`-h`, `-?`, `--help`). The binary has no other flags today, so pulling in a full parser crate would be disproportionate. If flags grow in future the decision can be revisited.
+Check `std::env::args().skip(1)` for any occurrence of the three flag strings (`-h`, `-?`, `--help`). The binary has no other flags today, so pulling in a full parser crate would be disproportionate. If flags grow in future the decision can be revisited.
 
 *Alternatives considered:* `clap` — rejected (heavy dependency for a one-flag check); `pico-args` — still a new dep, not justified yet.
 
