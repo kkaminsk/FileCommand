@@ -5,6 +5,7 @@
 //! ordering, and navigation": "render as a primary-style modal dialog
 //! (§4.4)").
 
+use filecommand_core::anim;
 use filecommand_core::dialogs::{overlay_rect, FileActionMenuState};
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
@@ -16,9 +17,19 @@ use crate::style::role_style;
 const MIN_INNER_W: usize = 16;
 const MAX_INNER_W: usize = 50;
 
-pub fn render_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState) {
+/// Draws the Enter-on-file action menu. `now` is the reducer clock when
+/// animations are on (`State::anim_now`) and `None` for the final frame: the
+/// box unfolds top-down on open and a newly highlighted row flashes in the
+/// hotkey accent before settling, exactly as the F9 pull-downs and the F2
+/// user menu do (ui-animations "Pop-up menus unfold and highlights settle").
+pub fn render_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState, now: Option<u64>) {
+    super::unfold(buf, now, dialog.opened_at_ms, |b| draw_file_action_menu(b, area, theme, depth, dialog, now));
+}
+
+fn draw_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState, now: Option<u64>) {
     let body = role_style(theme, Role::DialogPrimary, depth);
-    let highlight = role_style(theme, Role::MenuHighlight, depth);
+    let settling = matches!((now, dialog.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
+    let highlight = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
 
     let title = format!(" {} ", dialog.target_name.to_string_lossy());
     let widest_label = dialog.entries.iter().map(|e| display_width(e.label())).max().unwrap_or(0);
@@ -82,7 +93,7 @@ mod tests {
     fn render(dialog: &FileActionMenuState) -> Vec<String> {
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut buf = Buffer::empty(area);
-        render_file_action_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, dialog);
+        render_file_action_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, dialog, None);
         (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect()).collect()
     }
 
@@ -117,7 +128,7 @@ mod tests {
         dialog.cursor = 1;
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut buf = Buffer::empty(area);
-        render_file_action_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &dialog);
+        render_file_action_menu(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &dialog, None);
         let theme = Theme::classic();
         let highlight = role_style(&theme, Role::MenuHighlight, ColorDepth::Ansi16);
         let expected_label = dialog.entries[1].label();

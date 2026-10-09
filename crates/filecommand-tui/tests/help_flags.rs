@@ -52,3 +52,11 @@ fn help_long_prints_version() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(VERSION), "--help stdout should contain version {VERSION}:\n{stdout}");
 }
+
+#[test]
+fn help_lists_the_noanimations_flag() {
+    // ui-animations "Flag is documented in usage".
+    let out = run("--help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--noanimations"), "--help should list --noanimations:\n{stdout}");
+}

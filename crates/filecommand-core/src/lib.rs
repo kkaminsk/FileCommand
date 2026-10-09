@@ -5,6 +5,7 @@
 //! ([`update::update`]) plus the panel, listing, theme, config, clock, and
 //! identity data types that model drives.
 
+pub mod anim;
 pub mod clock;
 pub mod config;
 pub mod dialogs;
@@ -23,6 +24,7 @@ pub mod panel;
 pub mod panel_split;
 pub mod quicksearch;
 pub mod shell;
+mod stamps;
 pub mod theme;
 pub mod update;
 pub mod viewer;

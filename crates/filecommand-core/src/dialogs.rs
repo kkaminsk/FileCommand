@@ -72,6 +72,13 @@ pub fn overlay_rect(preferred: (u16, u16), minimum: (u16, u16), terminal: (u16, 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UserMenuState {
     pub cursor: usize,
+    /// `State::clock_ms` when the menu opened, stamped by the reducer (left
+    /// `0` by [`UserMenuState::new`]); drives the top-down unfold
+    /// (ui-animations "Pop-up menus unfold and highlights settle").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does, so opening the menu unfolds without also flashing row 0.
+    pub selected_at_ms: Option<u64>,
 }
 
 impl UserMenuState {
@@ -186,6 +193,13 @@ pub struct FileActionMenuState {
     /// requirement ("Enter-key invocation SHALL remain single-target and
     /// file-only").
     pub selection_scoped: bool,
+    /// `State::clock_ms` when the menu opened, stamped by the reducer (left
+    /// `0` by the constructors); drives the top-down unfold (ui-animations
+    /// "Pop-up menus unfold and highlights settle").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does.
+    pub selected_at_ms: Option<u64>,
 }
 
 impl FileActionMenuState {
@@ -220,7 +234,7 @@ impl FileActionMenuState {
             FileActionMenuEntry::Move,
             FileActionMenuEntry::Delete,
         ]);
-        FileActionMenuState { target_name, entries, cursor: 0, selection_scoped }
+        FileActionMenuState { target_name, entries, cursor: 0, selection_scoped, opened_at_ms: 0, selected_at_ms: None }
     }
 
     /// Move the highlight by `delta`, clamped within the entry list — same

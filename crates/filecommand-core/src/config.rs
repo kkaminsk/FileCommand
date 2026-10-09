@@ -1,6 +1,7 @@
 //! Minimal `config.toml` reader plus the on-disk persistence helpers.
 //!
-//! Recognized keys: `splash` (bool), `theme` (string), `shell` (string),
+//! Recognized keys: `splash` (bool), `animations` (bool, default true;
+//! ui-animations), `theme` (string), `shell` (string),
 //! `editor` (string, the F4 external-editor command), `panel_split`
 //! (integer left-panel percentage; panel-split), and the overridable
 //! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
@@ -118,6 +119,11 @@ impl Default for Keys {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub splash: bool,
+    /// Whether the decorative UI animations run (ui-animations "Animations
+    /// are disabled by config or launch flag"). Defaults to `true`;
+    /// `animations = false` here or `--noanimations` at launch turns every
+    /// surface back into its final frame.
+    pub animations: bool,
     pub theme: String,
     /// `shell = ` verbatim. `None` means "use the platform default"; see
     /// [`crate::shell::resolve_shell`].
@@ -144,6 +150,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             splash: true,
+            animations: true,
             theme: DEFAULT_THEME_NAME.to_string(),
             shell: None,
             editor: None,
@@ -215,6 +222,11 @@ pub fn parse(input: &str) -> Config {
             "splash" => {
                 if let Some(b) = parse_bool(value) {
                     config.splash = b;
+                }
+            }
+            "animations" => {
+                if let Some(b) = parse_bool(value) {
+                    config.animations = b;
                 }
             }
             "theme" => {
@@ -1106,6 +1118,31 @@ mod tests {
         let config = parse("splash = false\ntheme = \"nc-mono\"\n");
         assert!(!config.splash);
         assert_eq!(config.theme, "nc-mono");
+    }
+
+    #[test]
+    fn animations_default_to_on() {
+        assert!(parse("").animations, "ui-animations: the default is animated");
+        assert!(Config::default().animations);
+        assert!(parse("splash = false\n").animations, "unrelated keys leave it on");
+    }
+
+    #[test]
+    fn animations_can_be_disabled_in_config() {
+        assert!(!parse("animations = false\n").animations);
+        assert!(parse("animations = true\n").animations);
+    }
+
+    #[test]
+    fn animations_unparsable_value_falls_back_to_the_default() {
+        assert!(parse("animations = maybe\n").animations);
+    }
+
+    #[test]
+    fn animations_key_inside_the_mouse_table_is_not_a_general_option() {
+        // Only `enabled` is read under `[mouse]`; a stray `animations` line
+        // there must not flip the general option.
+        assert!(parse("[mouse]\nanimations = false\n").animations);
     }
 
     #[test]

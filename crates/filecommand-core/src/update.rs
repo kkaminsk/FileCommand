@@ -268,9 +268,40 @@ pub struct State {
     /// so it can never survive into a context where a drop could complete
     /// (mouse-drag "Cancel and phase-change clear the drag"; design D5).
     pub drag: Option<DragState>,
+    /// Whether the decorative UI animations (splash entrance, menu sweeps
+    /// and unfolds, dialog iris, panel wipe) run at all. Copied from
+    /// `config.toml`'s `animations` key / `--noanimations` by the TUI at
+    /// startup; `false` in [`State::empty`] so states built without
+    /// configuration — every existing reducer and snapshot test — render
+    /// their final frame regardless of `clock_ms` (ui-animations
+    /// "Animations are disabled by config or launch flag"; design D5).
+    pub animations: bool,
+    /// `clock_ms` when the currently visible modal dialog opened — or was
+    /// replaced by a different one in the same slot (progress → conflict).
+    /// Only one of these dialogs is ever visible at a time, so one stamp
+    /// suffices; set by the reducer's animation post-condition in [`update`]
+    /// and read only by the renderer's iris (design D4).
+    pub dialog_opened_at_ms: u64,
+    /// `clock_ms` when `quit_confirm` last became `true`. Separate from
+    /// `dialog_opened_at_ms` because the quit dialog layers over whichever
+    /// dialog is open without making that one re-animate.
+    pub quit_opened_at_ms: u64,
+    /// `clock_ms` when the splash gave way to the panels — `Some` only on
+    /// that transition, so a skipped splash (`--nosplash`, below-floor
+    /// placeholder) leaves frame 1 as the complete panel screen with no
+    /// wipe.
+    pub panels_revealed_at_ms: Option<u64>,
 }
 
 impl State {
+    /// The clock reading animated surfaces should interpolate against:
+    /// `Some(clock_ms)` when animations are on, `None` when every surface
+    /// must render its final frame. The one place views learn whether to
+    /// animate, so "disabled" is byte-identical to the pre-animation render.
+    pub fn anim_now(&self) -> Option<u64> {
+        self.animations.then_some(self.clock_ms)
+    }
+
     pub fn panel(&self, side: PanelSide) -> &PanelState {
         match side {
             PanelSide::Left => &self.left,
@@ -347,6 +378,10 @@ impl State {
             startup_warning: None,
             quit_confirm: false,
             drag: None,
+            animations: false,
+            dialog_opened_at_ms: 0,
+            quit_opened_at_ms: 0,
+            panels_revealed_at_ms: None,
         }
     }
 
@@ -1019,9 +1054,17 @@ pub enum Effect {
 /// phase-transition arms — is what makes it a true postcondition: every
 /// return path is covered by construction, including ones a future phase
 /// addition might add without remembering this rule.
+///
+/// The same wrapper records the animation stamps (`crate::stamps`): when an
+/// overlay opened or changed during the transition, it is stamped with
+/// `state.clock_ms`. That is all the reducer does for animations — it never
+/// delays a transition (ui-animations "Render-only motion model driven by the
+/// reducer clock").
 pub fn update(state: State, cmd: Command) -> (State, Vec<Effect>) {
     let listing_failed = matches!(cmd, Command::ListingFailed { .. });
+    let marks = crate::stamps::Snapshot::capture(&state);
     let (mut state, effects) = update_impl(state, cmd);
+    marks.apply(&mut state);
     // A listing failure doesn't change `state.phase` or open any overlay —
     // `drag_allowed` alone wouldn't catch it — but mouse-drag's "Cancel and
     // phase-change clear the drag" explicitly lists listing failure as a

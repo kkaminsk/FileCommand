@@ -4,6 +4,7 @@
 //! panels' top borders and the clock while it is open. Pull-downs are
 //! single-line CP437-framed boxes hanging directly below their title.
 
+use filecommand_core::anim;
 use filecommand_core::dialogs::clamp_overlay_dim;
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::menu::{entries, MenuEntry, MenuId, MenuState, ALL_MENUS};
@@ -40,10 +41,24 @@ pub fn title_positions() -> Vec<(MenuId, u16)> {
     out
 }
 
-pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState) {
+/// Draws the F9 bar and its open pull-down. `now` is the reducer clock when
+/// animations are on (`State::anim_now`) and `None` for the final frame: the
+/// bar sweeps in left-to-right and the pull-down unfolds top-down, both
+/// interpolated from the stamps on `menu` (pulldown-menus "Menu bar entrance
+/// sweep"; ui-animations "Pop-up menus unfold and highlights settle").
+pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>) {
     if area.height == 0 || area.width == 0 {
         return;
     }
+    super::sweep(buf, now, menu.opened_at_ms, |b| render_bar_row(b, area, theme, depth, menu));
+    if menu.pulldown_open {
+        super::unfold(buf, now, menu.pulldown_opened_at_ms, |b| render_pulldown(b, area, theme, depth, menu, now));
+    }
+}
+
+/// The bar row itself: the full-width bar with every title, the active one
+/// highlighted.
+fn render_bar_row(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState) {
     let bar_style = role_style(theme, Role::MenuBar, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);
     let hotkey_style = role_style(theme, Role::MenuHotkey, depth);
@@ -67,10 +82,6 @@ pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
             let letter = &title[..id.hotkey().len_utf8()];
             buf.set_string(x, y, letter, hotkey_style);
         }
-    }
-
-    if menu.pulldown_open {
-        render_pulldown(buf, area, theme, depth, menu);
     }
 }
 
@@ -116,9 +127,13 @@ fn pulldown_inner_width(id: MenuId) -> usize {
         .unwrap_or(4)
 }
 
-fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState) {
+fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>) {
     let body_style = role_style(theme, Role::MenuBody, depth);
-    let highlight_style = role_style(theme, Role::MenuHighlight, depth);
+    // A newly highlighted row renders in the hotkey accent for
+    // `HIGHLIGHT_SETTLE_MS`, then settles to the normal highlight
+    // (ui-animations "Highlight settles after moving").
+    let settling = matches!((now, menu.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
+    let highlight_style = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
     let disabled_style = role_style(theme, Role::MenuDisabled, depth);
 
     let id = menu.active;
@@ -260,7 +275,7 @@ mod tests {
     fn render(menu: &MenuState, width: u16, height: u16) -> Vec<String> {
         let area = Rect { x: 0, y: 0, width, height };
         let mut buf = Buffer::empty(area);
-        render_menu_bar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, menu);
+        render_menu_bar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, menu, None);
         (0..height).map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect()).collect()
     }
 

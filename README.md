@@ -101,6 +101,7 @@ The workspace has two crates:
 | `--theme <name>` or `--theme=<name>` | Launch with a specific theme for this session, overriding the saved `theme =` in `config.toml`. Built-in names: `nc-classic`, `nc-mono`, `terminal-green`, `purple-lights`, `yellow-storm`, `inverted`. |
 | `--nosplash` | Skip the startup splash screen, overriding `splash = true` in `config.toml`. |
 | `--nomouse` | Disable mouse capture for this session, overriding `[mouse] enabled` in `config.toml`. |
+| `--noanimations` | Disable the decorative UI animations (splash entrance, menu and dialog openings, panel reveal) for this session, overriding `animations = true` in `config.toml`. |
 
 Flags can be combined in any order, e.g. `filecommand --nosplash --theme=purple-lights`.
 
@@ -119,6 +120,7 @@ table below), one setting per line:
 
 ```toml
 splash = true
+animations = true
 theme = "nc-classic"
 shell = "cmd.exe /C"
 editor = "code -w"
@@ -141,6 +143,7 @@ key.clipboard_paths = "ctrl+shift+insert"
 | Key | Meaning | Default |
 |---|---|---|
 | `splash` | Show the startup splash screen. | `true` |
+| `animations` | Run the decorative ASCII animations: the splash entrance, the F9 bar sweep, pop-up menus unfolding, dialogs opening, and the panel reveal after the splash. `false` shows every surface in its final form immediately. Loading feedback (directory listings, progress counters) is never animated. | `true` |
 | `theme` | Active theme name (built-in or a file in `themes/`). | `nc-classic` |
 | `shell` | Shell command line used by the file-action menu's Run entry and the F2 user menu. | `cmd.exe /C` on Windows, `/bin/sh -c` elsewhere |
 | `editor` | External editor command for F4; unset means "use the built-in editor". | unset |
@@ -211,7 +214,9 @@ atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
   with a "terminal too small" placeholder and the F-key bar degrades through
   progressively shorter forms as width shrinks.
 - The startup splash (product name/version banner) is the very first frame
-  unless `--nosplash`/`splash = false`; any key dismisses it early.
+  unless `--nosplash`/`splash = false`; any key dismisses it early. Its box
+  traces in and its lines reveal within the 800 ms hold; turn that and the
+  menu/dialog motion off with `--noanimations`/`animations = false`.
 
 ### Command line
 

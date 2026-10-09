@@ -23,6 +23,7 @@ OPTIONS:
     --theme <name>      Override the active theme (built-in or custom)
     --nomouse           Disable mouse capture
     --nosplash          Skip the startup splash screen
+    --noanimations      Disable decorative UI animations
 
 Press F1 inside the application for the full keyboard reference.",
         version = env!("CARGO_PKG_VERSION")
