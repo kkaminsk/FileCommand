@@ -86,11 +86,11 @@ fn full_panel_active_and_inactive_nc_classic() {
 /// snapshots protect against — a plain `assert_eq!` against a literal
 /// golden string, which (unlike an `insta` snapshot) cannot be
 /// silently re-accepted with `cargo insta review`/`--accept` without a
-/// deliberate source edit. Pins the exact 80x24 nominal-size rendering
-/// the column-ladder (D3) and Brief-formula (D4) anchors both promise is
-/// byte-identical to the pre-responsive-layout output (panel-navigation
-/// "Full display mode layout"; additional-panel-modes "Brief display
-/// mode"; responsive-layout task 6.3).
+/// deliberate source edit. Pins the exact 80x24 nominal-size rendering of
+/// the Full-mode layout: the `│` separator directly followed by the Size
+/// column, every Size/Date/Time value complete (`▶UP--DIR◀`, `MM-DD-YY`,
+/// `HH:MM`), and the row filling the interior exactly (panel-navigation
+/// "Full display mode layout"; full-mode-column-widths design D1).
 #[test]
 fn full_panel_at_80x24_matches_the_pinned_golden_string() {
     let state = sample_state(Theme::classic());
@@ -99,13 +99,13 @@ fn full_panel_at_80x24_matches_the_pinned_golden_string() {
     let header_row = text.lines().nth(1).unwrap();
     assert_eq!(
         header_row,
-        "\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}",
-        "the Full-mode column header at the 80x24 nominal size changed (panel-navigation \"Full display mode layout\", D3 anchor)"
+        "\u{2551}Name\u{2193}        \u{2502}Size      Date     Time \u{2551}\u{2551}Name\u{2193}        \u{2502}Size      Date     Time \u{2551}",
+        "the Full-mode column header at the 80x24 nominal size changed (panel-navigation \"Full display mode layout\")"
     );
     let first_entry_row = text.lines().nth(2).unwrap();
     assert_eq!(
         first_entry_row,
-        "\u{2551}..           \u{2502} \u{25B6}UP--DI                \u{2551}\u{2551}                                      \u{2551}",
+        "\u{2551}..           \u{2502}\u{25B6}UP--DIR\u{25C4}               \u{2551}\u{2551}                                      \u{2551}",
         "the Full-mode entry row at the 80x24 nominal size changed"
     );
     let last_line = text.lines().last().unwrap().trim_end();

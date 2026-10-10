@@ -525,6 +525,10 @@ Esc, or a hotkey letter:
 | **Tree** | Lazily-expanded directory tree of the current drive; moving the cursor updates the *opposite* panel's listing |
 | **Quick view** | Live preview (text head) of the file under the *opposite* panel's cursor |
 
+In Full mode, numeric sizes are right-aligned in the Size column (the Norton
+Commander convention) and every value renders complete — `▶SUB-DIR◀`,
+`MM-DD-YY` dates, and `HH:MM` times are never truncated.
+
 ### File operations
 
 Copy (F5), Move/Rename (F6), Mkdir (F7), and Delete (F8) run as cancellable

@@ -36,6 +36,14 @@ const SIZE_COL_W: usize = 9;
 const DATE_COL_W: usize = 8;
 const TIME_COL_W: usize = 5;
 
+/// The rendered text widths inside those reserved cells — exactly the
+/// content's own widths (`▶SUB-DIR◀`/`▶UP--DIR◀` are 9 cells, `MM-DD-YY`
+/// is 8, `HH:MM` is 5), so no Full-mode Size/Date/Time value ever renders
+/// truncated (full-mode-column-widths; design D1).
+const SIZE_TEXT_W: usize = 9;
+const DATE_TEXT_W: usize = 8;
+const TIME_TEXT_W: usize = 5;
+
 /// The Name column never shrinks below this many display cells in Full
 /// mode — the anchor `MIN_NAME_W` for the column ladder (design D3).
 const MIN_NAME_W: usize = 12;
@@ -58,10 +66,11 @@ impl ColumnSet {
     /// Display cells consumed by the columns after Name (including the
     /// separator pipe and inter-column spaces), or 0 when only Name renders
     /// — in which case Name spans the full interior with no pipe or slack.
-    /// `SIZE_COL_W`/`DATE_COL_W`/`TIME_COL_W` are unchanged from the fixed
-    /// 80x24 layout, so the reserved width (and therefore the rendered
-    /// output) at the nominal size is byte-identical to before this change
-    /// (design D3's anchor).
+    /// The reserved widths (25 / 20 / 12 / 0) are unchanged from the fixed
+    /// 80x24 layout, so `choose_columns`, the Name-column ladder, and every
+    /// breakpoint are untouched by full-mode-column-widths — only
+    /// `format_full_row`'s text widths grew to fill the reservation exactly
+    /// (design D1).
     fn reserved_w(self) -> usize {
         if !self.size {
             return 0;
@@ -106,23 +115,42 @@ fn choose_columns(interior_w: usize, marker_w: usize) -> ColumnSet {
 /// Assembles a Full-mode row (or header row) string from its four fields,
 /// appending only the blocks `cols` selects — the same function backs both
 /// the header row and every entry row, so "the header row shows exactly the
-/// columns currently rendered" holds by construction.
+/// columns currently rendered" holds by construction. With all four columns
+/// present the row is exactly `name_w + 25` cells — the full interior — and
+/// every Size/Date/Time value renders at its content width, untruncated,
+/// with no slack left at the row's right edge; for the reduced column sets
+/// the row comes out shorter than the reservation and the difference stays
+/// trailing padding, as before (panel-navigation "Full display mode
+/// layout"; design D1). `size` arrives already right-aligned by the caller
+/// for entry rows, so header labels keep their left alignment here (design
+/// D2).
 fn format_full_row(name_w: usize, cols: ColumnSet, name: &str, size: &str, date: &str, time: &str) -> String {
     let mut s = pad_to_width(name, name_w);
     if cols.size {
         s.push('\u{2502}');
-        s.push(' ');
-        s.push_str(&pad_to_width(size, SIZE_COL_W - 2));
+        s.push_str(&pad_to_width(size, SIZE_TEXT_W));
     }
     if cols.date {
         s.push(' ');
-        s.push_str(&pad_to_width(date, DATE_COL_W - 1));
+        s.push_str(&pad_to_width(date, DATE_TEXT_W));
     }
     if cols.time {
         s.push(' ');
-        s.push_str(&pad_to_width(time, TIME_COL_W - 1));
+        s.push_str(&pad_to_width(time, TIME_TEXT_W));
     }
     s
+}
+
+/// Left-pads `s` to exactly `width` display columns so numeric values
+/// right-align in their column (the NC convention for Size; design D2).
+/// Values already at or over `width` pass through untouched —
+/// `▶SUB-DIR◀`/`▶UP--DIR◀` fill the Size column exactly.
+fn pad_left_to_width(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    format!("{}{}", " ".repeat(width - w), s)
 }
 
 /// A column header label, with the sort arrow appended when this column is
@@ -604,10 +632,13 @@ pub fn render_panel(
                 file_style
             };
             let name = display_name_lossy(entry);
+            // Numeric sizes right-align in the 9-cell Size column (the NC
+            // convention; design D2); the `..`/directory markers are
+            // already 9 cells wide and fill it.
             let size_col = match entry.kind {
                 EntryKind::ParentDir => "\u{25B6}UP--DIR\u{25C4}".to_string(),
                 EntryKind::Directory => "\u{25B6}SUB-DIR\u{25C4}".to_string(),
-                EntryKind::File => format_size(entry.size),
+                EntryKind::File => pad_left_to_width(&format_size(entry.size), SIZE_TEXT_W),
             };
             let (date_col, time_col) = match entry.modified {
                 Some(dt) => (format_date(dt), format_time(dt)),
@@ -972,7 +1003,7 @@ mod tests {
 
     use super::*;
     use filecommand_core::fs_ops::SourceItem;
-    use filecommand_core::listing::Entry;
+    use filecommand_core::listing::{DateTime, Entry};
     use filecommand_core::panel::TreeState;
 
     // -----------------------------------------------------------------
@@ -1208,6 +1239,77 @@ mod tests {
         let without_marker = choose_columns(28, 0);
         let with_marker = choose_columns(28, 1);
         assert!(with_marker != ColumnSet::FULL || without_marker == ColumnSet::FULL);
+    }
+
+    // -----------------------------------------------------------------
+    // full-mode-column-widths: untruncated values, right-aligned sizes
+    // (tasks.md 2.1, 2.2).
+    // -----------------------------------------------------------------
+
+    /// A `C:\left` panel holding `entries`, rendered Full-mode and active at
+    /// 40x10 (the 80x24 default-split panel width: a 38-cell interior),
+    /// returned as plain-text rows.
+    fn render_left_panel_rows(entries: Vec<Entry>) -> String {
+        let mut left = PanelState::new(PathBuf::from(r"C:\left"));
+        left.progress = ListingProgress::Complete { count: entries.len() };
+        left.entries = entries;
+        let right = PanelState::new(PathBuf::from(r"C:\right"));
+        let theme = Theme::classic();
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        buffer_to_text(&buf, area)
+    }
+
+    #[test]
+    fn full_mode_row_renders_size_date_and_time_untruncated_and_fills_the_interior() {
+        // panel-navigation "Values render untruncated at the nominal size":
+        // a directory modified 2026-06-27 23:30 renders `▶SUB-DIR◀`,
+        // `06-27-26`, and `23:30` complete, with no blank cells between the
+        // Time value and the right border.
+        let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
+        let text = render_left_panel_rows(vec![
+            Entry::parent_dir(),
+            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt) },
+        ]);
+        // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
+        let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
+        assert!(header_interior.contains("\u{2502}Size"), "header labels stay left-aligned after the separator: `{header_interior}`");
+
+        let up_interior: String = text.lines().nth(2).unwrap().chars().skip(1).take(38).collect();
+        assert!(up_interior.contains("\u{25B6}UP--DIR\u{25C4}"), "`▶UP--DIR◀` renders complete: `{up_interior}`");
+
+        let row = text.lines().nth(3).unwrap();
+        assert_eq!(row.chars().count(), 40, "the row spans the panel frame: `{row}`");
+        let interior: String = row.chars().skip(1).take(38).collect();
+        assert!(interior.contains("\u{25B6}SUB-DIR\u{25C4}"), "`▶SUB-DIR◀` renders complete: `{interior}`");
+        assert!(interior.contains("06-27-26"), "the date renders in full: `{interior}`");
+        assert!(interior.ends_with("23:30"), "the time renders in full and the row fills the interior exactly: `{interior}`");
+    }
+
+    #[test]
+    fn full_mode_file_sizes_are_right_aligned_in_the_size_column() {
+        // panel-navigation "Sizes are right-aligned": `87` and `35K` share
+        // their last-digit cell column.
+        let text = render_left_panel_rows(vec![
+            Entry::parent_dir(),
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None },
+            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None },
+        ]);
+        // Interior layout: 13-cell Name, `│`, then the 9-cell Size column —
+        // cells 15..24 of the 40-cell row.
+        let size_cells = |row: &str| row.chars().skip(15).take(9).collect::<String>();
+        let a_row = text.lines().nth(3).unwrap();
+        let b_row = text.lines().nth(4).unwrap();
+        assert_eq!(size_cells(a_row), "       87", "`87` right-aligns: `{a_row}`");
+        assert_eq!(size_cells(b_row), "      35K", "`35K` right-aligns: `{b_row}`");
+    }
+
+    #[test]
+    fn pad_left_to_width_right_aligns_and_leaves_full_width_values_untouched() {
+        assert_eq!(pad_left_to_width("87", SIZE_TEXT_W), "       87");
+        assert_eq!(pad_left_to_width("35K", SIZE_TEXT_W), "      35K");
+        assert_eq!(pad_left_to_width("\u{25B6}SUB-DIR\u{25C4}", SIZE_TEXT_W), "\u{25B6}SUB-DIR\u{25C4}");
     }
 
     #[test]

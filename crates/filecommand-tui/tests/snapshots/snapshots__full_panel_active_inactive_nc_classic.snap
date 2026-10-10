@@ -3,10 +3,10 @@ source: crates/filecommand-tui/tests/snapshots.rs
 expression: "render(&state, (80, 24))"
 ---
 ╔═══════════ C:\Users\demo ════════════╗╔══════ C:\Users\demo\Documents ═3:04 PM
-║Name↓        │ Size    Date    Time   ║║Name↓        │ Size    Date    Time   ║
-║..           │ ▶UP--DI                ║║                                      ║
-║Documents    │ ▶SUB-DI 08-07-2 14:3   ║║                                      ║
-║notes.txt    │ 2K      08-07-2 09:0   ║║                                      ║
+║Name↓        │Size      Date     Time ║║Name↓        │Size      Date     Time ║
+║..           │▶UP--DIR◄               ║║                                      ║
+║Documents    │▶SUB-DIR◄ 08-07-26 14:36║║                                      ║
+║notes.txt    │       2K 08-07-26 09:05║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
