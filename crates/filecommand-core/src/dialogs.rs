@@ -514,11 +514,15 @@ also offers copying just their names. All three act on the same
 selection scope as F5 Copy.";
 
 const CONFIGURATION: &str = "\
-config.toml (next to the executable) sets the theme, shell, F4
+config.toml in the profile directory sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
 and can remap the quick-filter, fuzzy-jump, panel-split, and
 clipboard (key.clipboard_files, key.clipboard_paths) keys.
-usermenu.toml defines the F2 user menu's entries. --nosplash skips
+usermenu.toml defines the F2 user menu's entries. Both live with
+history.json in one profile directory: %APPDATA%\\FileCommand on
+Windows, ~/.config/filecommand elsewhere, or beside the executable
+when a 'portable' file sits next to it; --config-dir <path>
+overrides that for a session. --nosplash skips
 the startup splash. --theme <name> (or --theme=<name>) starts the
 session in a built-in theme instead of the configured one, for this
 launch only: it never writes config.toml, so applying a theme from

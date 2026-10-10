@@ -102,16 +102,39 @@ The workspace has two crates:
 | `--nosplash` | Skip the startup splash screen, overriding `splash = true` in `config.toml`. |
 | `--nomouse` | Disable mouse capture for this session, overriding `[mouse] enabled` in `config.toml`. |
 | `--noanimations` | Disable the decorative UI animations (splash entrance, menu and dialog openings, panel reveal) for this session, overriding `animations = true` in `config.toml`. |
+| `--config-dir <path>` or `--config-dir=<path>` | Use `<path>` as the profile directory holding `config.toml`, `history.json`, and `usermenu.toml` for this session, overriding portable mode and the platform default (see [Configuration](#configuration)). |
 
 Flags can be combined in any order, e.g. `filecommand --nosplash --theme=purple-lights`.
 
 ## Configuration
 
-FileCommand reads and writes its files in the current working directory
-(the directory it's launched from), not a fixed profile directory. Missing
-files are created with defaults on first run; a malformed file produces a
-startup warning and falls back to defaults rather than being silently
-overwritten.
+FileCommand reads and writes all of its files in one **profile directory**,
+resolved once at startup in this order:
+
+1. `--config-dir <path>` — an explicit override for testing and scripting
+   (a relative path resolves against the launch directory).
+2. **Portable mode** — when a file named `portable` exists next to the
+   executable, the executable's own directory is the profile directory.
+3. The platform default — `%APPDATA%\FileCommand` on Windows,
+   `$XDG_CONFIG_HOME/filecommand` (falling back to
+   `~/.config/filecommand`) elsewhere. `--help` prints the resolved
+   default.
+
+The directory is created on first run. If it can't be created, the session
+runs on in-memory defaults with saving turned off, and a startup warning
+names the path and the error. Because `history.json` lives in one place,
+command history and the Ctrl+J fuzzy-jump frecency list are shared no
+matter which directory FileCommand is launched from.
+
+**Coming from a per-directory layout?** Earlier versions read and wrote
+these files in the launch directory. FileCommand never moves or deletes
+the old files: when the profile directory has no `config.toml` yet and the
+launch directory still holds any of the three, a startup notice says where
+FileCommand now reads from so you can move them yourself.
+
+Missing files are created with defaults on first run; a malformed file
+produces a startup warning and falls back to defaults rather than being
+silently overwritten.
 
 ### `config.toml`
 
@@ -144,7 +167,7 @@ key.clipboard_paths = "ctrl+shift+insert"
 |---|---|---|
 | `splash` | Show the startup splash screen. | `true` |
 | `animations` | Run the decorative ASCII animations: the splash entrance, the F9 bar sweep, pop-up menus unfolding, dialogs opening, and the panel reveal after the splash. `false` shows every surface in its final form immediately. Loading feedback (directory listings, progress counters) is never animated. | `true` |
-| `theme` | Active theme name (built-in or a file in `themes/`). | `nc-classic` |
+| `theme` | Active theme name (one of the six built-ins — see [Themes](#themes)). | `nc-classic` |
 | `shell` | Shell command line used by the file-action menu's Run entry and the F2 user menu. | `cmd.exe /C` on Windows, `/bin/sh -c` elsewhere |
 | `editor` | External editor command for F4; unset means "use the built-in editor". | unset |
 | `panel_split` | Left-panel width as a percentage. | `50` |
@@ -154,15 +177,6 @@ key.clipboard_paths = "ctrl+shift+insert"
 Only the bindings listed above are configurable; the rest of the key map
 (F-keys, Tab, arrows, Ctrl+T/W, etc.) is fixed. Unknown keys are ignored
 rather than rejected, and the schema tolerates missing/malformed lines.
-
-### `themes/*.toml`
-
-User-defined themes. Each theme maps the role names documented in the design
-spec (`panel.frame`, `panel.cursor`, `dialog.primary`, ...) to ANSI-16 color
-names (`black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`,
-and `bright-` variants), with an optional per-role `#RRGGBB` truecolor
-override. Switch themes at runtime via **Options → Themes**, or pin one at
-launch with `--theme`.
 
 ### `usermenu.toml`
 

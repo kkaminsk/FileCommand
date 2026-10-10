@@ -1046,6 +1046,32 @@ pub fn load_user_menu(path: &Path) -> UserMenuLoadResult {
     UserMenuLoadResult { entries: parsed.entries, warnings: parsed.warnings, created_default: false, malformed: false }
 }
 
+// ---------------------------------------------------------------------
+// Configuration profile directory (config-profile-directory)
+// ---------------------------------------------------------------------
+
+/// The three configuration files, in the order the legacy notice lists
+/// them (design D3). `"config.toml"` is also the file whose presence in
+/// the profile directory silences the notice.
+const PROFILE_FILE_NAMES: [&str; 3] = ["config.toml", HISTORY_FILE, USERMENU_FILE];
+
+/// Which of the three configuration files sit in `cwd` while the resolved
+/// `profile` directory has no `config.toml` — the pre-profile,
+/// per-launch-directory layout (config-profile-directory "Legacy files in
+/// the working directory produce a notice, not a migration"; design D3).
+/// The result is empty when the profile already has a `config.toml` (the
+/// user has moved their settings) or when `cwd` and `profile` are the same
+/// directory — portable mode and the last-resort cwd fallback, where those
+/// files are the live configuration, not legacy copies. Pure probing over
+/// two paths so the notice is unit-testable with temp dirs; nothing here
+/// copies, moves, or deletes anything.
+pub fn legacy_files_present(cwd: &Path, profile: &Path) -> Vec<&'static str> {
+    if cwd == profile || profile.join("config.toml").exists() {
+        return Vec::new();
+    }
+    PROFILE_FILE_NAMES.iter().copied().filter(|name| cwd.join(name).exists()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1612,6 +1638,73 @@ mod tests {
         assert!(!result.created_default);
         assert_eq!(result.entries, vec![UserMenuEntry { label: "Only".to_string(), command: "only-cmd".to_string() }]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------
+    // Configuration profile directory (config-profile-directory "Legacy
+    // files in the working directory produce a notice, not a migration";
+    // design D3)
+    // -------------------------------------------------------------------
+
+    /// A `cwd`/`profile` pair of empty directories under one uniquely
+    /// named temp root, returned with the root so the caller can clean up.
+    fn legacy_fixture(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("filecommand-legacy-{name}-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = root.join("cwd");
+        let profile = root.join("profile");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        (root, cwd, profile)
+    }
+
+    #[test]
+    fn legacy_files_present_reports_each_file_individually() {
+        for (name, file) in [("config", "config.toml"), ("history", HISTORY_FILE), ("usermenu", USERMENU_FILE)] {
+            let (root, cwd, profile) = legacy_fixture(name);
+            std::fs::write(cwd.join(file), "").unwrap();
+            assert_eq!(legacy_files_present(&cwd, &profile), vec![file], "{file} alone is reported");
+            let _ = std::fs::remove_dir_all(&root);
+        }
+    }
+
+    #[test]
+    fn legacy_files_present_lists_all_three_in_order() {
+        let (root, cwd, profile) = legacy_fixture("all");
+        for file in ["config.toml", HISTORY_FILE, USERMENU_FILE] {
+            std::fs::write(cwd.join(file), "").unwrap();
+        }
+        assert_eq!(legacy_files_present(&cwd, &profile), vec!["config.toml", HISTORY_FILE, USERMENU_FILE]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_files_present_is_empty_when_cwd_has_none_of_the_files() {
+        let (root, cwd, profile) = legacy_fixture("none");
+        std::fs::write(cwd.join("unrelated.txt"), "").unwrap();
+        assert_eq!(legacy_files_present(&cwd, &profile), Vec::<&'static str>::new());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_files_present_is_empty_when_the_profile_already_has_a_config() {
+        let (root, cwd, profile) = legacy_fixture("populated");
+        std::fs::write(cwd.join("config.toml"), "").unwrap();
+        std::fs::write(cwd.join(HISTORY_FILE), "").unwrap();
+        std::fs::write(profile.join("config.toml"), "").unwrap();
+        assert_eq!(legacy_files_present(&cwd, &profile), Vec::<&'static str>::new(), "a populated profile means the user already moved on");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn legacy_files_present_is_empty_when_cwd_is_the_profile() {
+        // Portable mode and the last-resort cwd fallback: the files in the
+        // profile directory itself are the live configuration, not legacy
+        // copies — a `history.json` there must not trigger the notice.
+        let (root, cwd, _profile) = legacy_fixture("samedir");
+        std::fs::write(cwd.join(HISTORY_FILE), "").unwrap();
+        assert_eq!(legacy_files_present(&cwd, &cwd), Vec::<&'static str>::new());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // -------------------------------------------------------------------

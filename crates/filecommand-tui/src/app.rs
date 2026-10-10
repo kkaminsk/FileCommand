@@ -43,6 +43,11 @@ struct Runtime {
     /// Where `Effect::PersistTheme` writes the `theme =` key back
     /// (theme-selection "Applied theme persists to configuration").
     config_path: PathBuf,
+    /// `false` when the profile directory could not be created at startup:
+    /// the three persist effects are then skipped for the whole session
+    /// (config-profile-directory "Unwritable profile falls back without
+    /// losing the session"; design D2).
+    persist_enabled: bool,
     /// The F3 viewer's open byte window, kept here rather than in
     /// `core::State` because `ByteSource` is an I/O handle, not application
     /// state (design D1). Set on `Effect::OpenViewer`, cleared on
@@ -84,6 +89,15 @@ pub struct LaunchOptions {
     /// resolution happens in `resolve_startup_theme`, not here
     /// (theme-selection "Launch-time theme override via --theme").
     pub theme: Option<String>,
+    /// `--config-dir <path>` or `--config-dir=<path>`: `None` when the
+    /// switch was not passed at all; `Some(String::new())` when it was
+    /// passed with no following value (a startup warning downstream, never
+    /// a crash); `Some(path)` otherwise, where `path` wins outright over
+    /// portable mode and the platform default — resolution happens in
+    /// `resolve_profile_dir`, not here (config-profile-directory
+    /// "Configuration profile directory": "Explicit --config-dir
+    /// override"). Same absent/empty/value convention as `theme` above.
+    pub config_dir: Option<String>,
 }
 
 /// Parse launch switches from an argument iterator (excluding the program
@@ -112,20 +126,141 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
             opts.theme = Some(iter.next().unwrap_or_default());
         } else if let Some(value) = arg.strip_prefix("--theme=") {
             opts.theme = Some(value.to_string());
+        } else if arg == "--config-dir" {
+            // Same missing-value convention as --theme above: recorded as
+            // an empty string so startup warns and falls through to normal
+            // profile resolution rather than crashing (task 1.1).
+            opts.config_dir = Some(iter.next().unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--config-dir=") {
+            opts.config_dir = Some(value.to_string());
         }
     }
     opts
 }
 
+/// The platform default profile directory: `%APPDATA%\FileCommand` on
+/// Windows, `$XDG_CONFIG_HOME/filecommand` (else `~/.config/filecommand`)
+/// elsewhere; `None` when no config-home environment variable is set
+/// (config-profile-directory "Configuration profile directory"; design D1).
+/// `pub` so `main.rs`'s usage text can name it (design D4) — nothing is
+/// created here.
+pub fn platform_default_profile_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("FileCommand"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("filecommand"))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("filecommand")))
+    }
+}
+
+/// Why the last-resort cwd fallback fired, named in its startup warning —
+/// the environment variable(s) that would normally resolve the platform
+/// default (design D1: "never silent").
+#[cfg(windows)]
+const CONFIG_HOME_UNSET_HINT: &str = "APPDATA is not set";
+#[cfg(not(windows))]
+const CONFIG_HOME_UNSET_HINT: &str = "neither XDG_CONFIG_HOME nor HOME is set";
+
+/// Resolve the one profile directory every configuration file lives in
+/// (config-profile-directory "Configuration profile directory"). Order
+/// (design D1): an explicit `--config-dir` flag wins outright — a relative
+/// value is resolved against the working directory at startup; else, when
+/// a file named `portable` exists beside the executable, the executable's
+/// own directory (portable mode); else the platform default. When no
+/// config-home variable resolves either, the working directory is the
+/// last-resort fallback and the returned warning says so — resolution is
+/// never silent.
+fn resolve_profile_dir(flag: Option<PathBuf>, exe_dir: Option<&Path>) -> (PathBuf, Option<String>) {
+    if let Some(path) = flag {
+        let path = if path.is_absolute() { path } else { std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path) };
+        return (path, None);
+    }
+    if let Some(dir) = exe_dir {
+        if dir.join("portable").exists() {
+            return (dir.to_path_buf(), None);
+        }
+    }
+    if let Some(default) = platform_default_profile_dir() {
+        return (default, None);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let warning = format!("{CONFIG_HOME_UNSET_HINT}; using the current directory {} for configuration files", cwd.display());
+    (cwd, Some(warning))
+}
+
+/// Interpret the raw `--config-dir` flag value the way
+/// `resolve_startup_theme` interprets `--theme`: `None` (switch absent) is
+/// no override; `Some(path)` wins outright; `Some("")` — the switch passed
+/// with no value — produces a startup warning, not a crash, and falls
+/// through to normal resolution (application-shell "Configuration profile
+/// directory": "Explicit --config-dir override"; task 1.1).
+fn config_dir_override(raw: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    match raw {
+        Some("") => (None, Some("--config-dir requires a value".to_string())),
+        Some(path) => (Some(PathBuf::from(path)), None),
+        None => (None, None),
+    }
+}
+
+/// Create the profile directory on first run. Failure is soft — the
+/// session runs on in-memory defaults with persistence skipped — and the
+/// returned warning names the path and the error (design D2; scenario
+/// "Unwritable profile falls back without losing the session").
+fn ensure_profile_dir(profile: &Path) -> Option<String> {
+    std::fs::create_dir_all(profile)
+        .err()
+        .map(|err| format!("Could not create {}: {err} — settings will not be saved this session", profile.display()))
+}
+
+/// The legacy-files startup notice (design D3; scenario "Legacy files in
+/// the working directory produce a notice, not a migration"): when the
+/// profile directory has no `config.toml` and the launch directory still
+/// holds pre-profile `config.toml`/`history.json`/`usermenu.toml` files,
+/// say where FileCommand now reads from and that the old files can be
+/// moved — nothing is copied or deleted. `None` when no notice applies.
+fn legacy_notice(cwd: &Path, profile: &Path) -> Option<String> {
+    let names = config::legacy_files_present(cwd, profile);
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Found {} in {}; FileCommand now reads {}. Move them there to keep your settings.",
+        names.join(", "),
+        cwd.display(),
+        profile.display()
+    ))
+}
+
 pub fn run(launch: LaunchOptions) -> io::Result<()> {
     crate::terminal::install_panic_hook();
+    // The profile directory is resolved before anything loads: every
+    // configuration file (config.toml, history.json, usermenu.toml) lives
+    // there now, never relative to the launch directory
+    // (config-profile-directory "Configuration profile directory").
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let (flag, flag_warning) = config_dir_override(launch.config_dir.as_deref());
+    let (profile_dir, resolve_warning) = resolve_profile_dir(flag, exe_dir.as_deref());
+    let create_warning = ensure_profile_dir(&profile_dir);
+    let persist_enabled = create_warning.is_none();
+    let config_path = profile_dir.join(CONFIG_FILE);
+    let history_path = profile_dir.join(config::HISTORY_FILE);
+    let usermenu_path = profile_dir.join(config::USERMENU_FILE);
+    // Probed before the loads below (none of which create a config.toml):
+    // legacy files left over from the per-launch-directory layout (design
+    // D3).
+    let legacy_warning = legacy_notice(&cwd, &profile_dir);
     // Loaded before the guard so the guard can enable mouse capture (or not)
     // on its very first frame rather than flipping it on a moment later
     // (application-shell "Terminal acquired on startup"; mouse-input "Mouse
     // capture configuration") — `config::load` is pure file I/O with no
     // terminal dependency, so this reorder ahead of `TerminalGuard::new` is
     // safe.
-    let config = config::load(Path::new(CONFIG_FILE));
+    let config = config::load(&config_path);
     let mouse_enabled = config.mouse_enabled && !launch.no_mouse;
     let mut guard = TerminalGuard::new(mouse_enabled)?;
 
@@ -137,13 +272,21 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
 
     let size = guard.terminal.size()?;
     let term_size = (size.width, size.height);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let year = DateTime::from_system_time(SystemTime::now()).year;
     let identity_lines = identity::identity_lines(year);
 
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
     apply_launch_options(&mut state, &launch);
+    // A `--config-dir` switch with no value and the last-resort cwd
+    // fallback are session-only, in-memory warnings — same convention as
+    // the theme override warning just below.
+    if let Some(warning) = flag_warning {
+        state.startup_warning = Some(warning);
+    }
+    if let Some(warning) = resolve_warning {
+        state.startup_warning = Some(warning);
+    }
     // Session-only: this only ever sets `state.startup_warning` in memory,
     // never touches `config.toml` (theme-selection "Override is
     // session-only"; design D4). `apply_user_menu` below may overwrite this
@@ -152,19 +295,30 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     if let Some(warning) = theme_warning {
         state.startup_warning = Some(warning);
     }
-    let history_file = config::load_history_file(Path::new(config::HISTORY_FILE));
+    let history_file = config::load_history_file(&history_path);
     state.history = history_file.commands;
     state.dir_history = history_file.directories;
-    let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
+    let user_menu = config::load_user_menu(&usermenu_path);
     apply_user_menu(&mut state, user_menu);
+    // The legacy notice and the unwritable-profile warning write last, so
+    // the persistence-breaking one (design D2) stays visible when several
+    // warnings fire at once; still the same single-field, last-writer-wins
+    // behavior (config-profile-directory design D3).
+    if let Some(warning) = legacy_warning {
+        state.startup_warning = Some(warning);
+    }
+    if let Some(warning) = create_warning {
+        state.startup_warning = Some(warning);
+    }
     stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
     let mut rt = Runtime {
         tx,
         active_job: None,
-        history_path: PathBuf::from(config::HISTORY_FILE),
-        config_path: PathBuf::from(CONFIG_FILE),
+        history_path,
+        config_path,
+        persist_enabled,
         viewer_source: None,
         clipboard: Box::new(PlatformClipboard::default()),
         mouse_tracker: MouseTracker::new(),
@@ -701,19 +855,28 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::PersistHistory(file) => {
                 // A history write failing (read-only directory, full disk)
-                // must never take the session down with it.
-                let _ = config::save_history_file_atomic(&rt.history_path, &file);
+                // must never take the session down with it. Skipped
+                // entirely when the profile directory is unwritable this
+                // session (config-profile-directory; design D2).
+                if rt.persist_enabled {
+                    let _ = config::save_history_file_atomic(&rt.history_path, &file);
+                }
             }
             Effect::PersistTheme(name) => {
                 // Same tolerance as history: a failed config write must
                 // never take the session down (the theme is already active
-                // in memory either way).
-                let _ = config::save_theme_atomic(&rt.config_path, &name);
+                // in memory either way); likewise skipped when persistence
+                // is off for the session (design D2).
+                if rt.persist_enabled {
+                    let _ = config::save_theme_atomic(&rt.config_path, &name);
+                }
             }
             Effect::PersistPanelSplit(percent) => {
                 // Same tolerance as the theme write above (panel-split
-                // "Split persistence to configuration").
-                let _ = config::save_panel_split_atomic(&rt.config_path, percent);
+                // "Split persistence to configuration"; design D2).
+                if rt.persist_enabled {
+                    let _ = config::save_panel_split_atomic(&rt.config_path, percent);
+                }
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -1163,6 +1326,179 @@ mod tests {
         assert!(nomouse_last.no_mouse);
         assert!(nomouse_last.no_splash);
         assert_eq!(nomouse_last.theme.as_deref(), Some("terminal-green"));
+    }
+
+    // -- config-profile-directory "Configuration profile directory" -------
+
+    /// Parser: `--config-dir <path>` (space-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_config_dir_with_a_space_separated_value() {
+        let opts = parse_launch_args(["--config-dir".to_string(), "D:\\fc-test".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some("D:\\fc-test"));
+        assert!(!opts.no_splash && !opts.no_mouse && !opts.no_animations);
+        assert_eq!(opts.theme, None);
+    }
+
+    /// Parser: `--config-dir=<path>` (equals-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_config_dir_with_an_equals_separated_value() {
+        let opts = parse_launch_args(["--config-dir=relative/dir".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some("relative/dir"));
+    }
+
+    /// Parser: `--config-dir` as the final argument has no value to
+    /// consume, recorded as an empty string (a startup warning downstream,
+    /// never a crash) — the same convention as `--theme` (task 1.1).
+    #[test]
+    fn parse_launch_args_records_an_empty_value_when_config_dir_has_no_following_argument() {
+        let opts = parse_launch_args(["--config-dir".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some(""));
+    }
+
+    /// Parser: no `--config-dir` switch at all leaves the field unset,
+    /// distinct from the missing-value case above.
+    #[test]
+    fn parse_launch_args_leaves_config_dir_unset_when_the_switch_is_absent() {
+        assert_eq!(parse_launch_args(["--nosplash".to_string()]).config_dir, None);
+    }
+
+    /// Task 1.1: a missing value becomes a warning and normal resolution
+    /// continues; a real value passes through untouched.
+    #[test]
+    fn config_dir_override_warns_on_a_missing_value_and_passes_a_real_one_through() {
+        let (flag, warning) = config_dir_override(Some(""));
+        assert_eq!(flag, None, "normal resolution continues after the warning");
+        assert!(warning.as_deref().is_some_and(|w| w.contains("--config-dir")), "the warning names the switch: {warning:?}");
+
+        let (flag, warning) = config_dir_override(Some("D:\\fc-test"));
+        assert_eq!(flag.as_deref(), Some(Path::new("D:\\fc-test")));
+        assert_eq!(warning, None);
+
+        assert_eq!(config_dir_override(None), (None, None), "no switch is neither an override nor a warning");
+    }
+
+    /// Design D1: an explicit flag wins outright — the portable marker and
+    /// the platform default are not even consulted — and a relative value
+    /// resolves against the working directory at startup.
+    #[test]
+    fn resolve_profile_dir_flag_wins_over_everything() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-flag-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("portable"), "").unwrap(); // would win, if consulted
+
+        let absolute = PathBuf::from(if cfg!(windows) { "D:\\fc-test" } else { "/tmp/fc-test" });
+        let (dir, warning) = resolve_profile_dir(Some(absolute.clone()), Some(&exe_dir));
+        assert_eq!(dir, absolute);
+        assert_eq!(warning, None);
+
+        let cwd = std::env::current_dir().unwrap();
+        let (dir, warning) = resolve_profile_dir(Some(PathBuf::from("fc-rel")), Some(&exe_dir));
+        assert_eq!(dir, cwd.join("fc-rel"), "a relative flag value resolves against the cwd");
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1 / scenario "Portable mode via marker file": with no flag,
+    /// a `portable` marker beside the executable makes the executable's
+    /// directory the profile, beating the platform default.
+    #[test]
+    fn resolve_profile_dir_portable_marker_wins_over_the_platform_default() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-portable-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("portable"), "").unwrap();
+
+        let (dir, warning) = resolve_profile_dir(None, Some(&exe_dir));
+        assert_eq!(dir, exe_dir);
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1 / scenario "Platform default is used when nothing
+    /// overrides it": no flag and no marker file means the platform
+    /// default applies (asserted per-platform just below).
+    #[test]
+    fn resolve_profile_dir_without_a_marker_uses_the_platform_default() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-nomarker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        let (dir, warning) = resolve_profile_dir(None, Some(&exe_dir));
+        assert_eq!(dir, platform_default_profile_dir().expect("a config home is set on this test host"));
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1: the platform default is `%APPDATA%\FileCommand`.
+    #[cfg(windows)]
+    #[test]
+    fn platform_default_profile_dir_is_appdata_filecommand() {
+        let appdata = std::env::var_os("APPDATA").expect("APPDATA is set on Windows hosts");
+        assert_eq!(platform_default_profile_dir(), Some(PathBuf::from(appdata).join("FileCommand")));
+    }
+
+    /// Design D1: the platform default is `$XDG_CONFIG_HOME/filecommand`,
+    /// else `~/.config/filecommand`.
+    #[cfg(not(windows))]
+    #[test]
+    fn platform_default_profile_dir_is_xdg_or_home_filecommand() {
+        let expected = std::env::var_os("XDG_CONFIG_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("filecommand"))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("filecommand")))
+            .expect("XDG_CONFIG_HOME or HOME is set on Unix hosts");
+        assert_eq!(platform_default_profile_dir(), Some(expected));
+    }
+
+    /// Design D2 / scenario "Unwritable profile falls back without losing
+    /// the session": an uncreatable profile yields the fail-soft warning
+    /// naming the path and the error; a creatable one yields none.
+    #[test]
+    fn ensure_profile_dir_warns_naming_path_and_error_when_creation_fails() {
+        let dir = std::env::temp_dir().join(format!("filecommand-profile-ensure-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+
+        let target = blocker.join("sub");
+        let warning = ensure_profile_dir(&target).expect("creating below a plain file must fail");
+        assert!(warning.contains(&target.display().to_string()), "the warning names the path: {warning}");
+        assert!(warning.contains("settings will not be saved this session"), "the warning says persistence is off: {warning}");
+
+        assert_eq!(ensure_profile_dir(&dir.join("fresh")), None, "a creatable directory is no warning");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Design D3 / scenario "Legacy files in the working directory produce
+    /// a notice, not a migration": the notice names the found files and
+    /// both directories, says they can be moved, and leaves them exactly
+    /// as they were.
+    #[test]
+    fn legacy_notice_names_the_files_and_both_directories() {
+        let root = std::env::temp_dir().join(format!("filecommand-profile-legacy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = root.join("cwd");
+        let profile = root.join("profile");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(cwd.join("config.toml"), "theme = \"nc-mono\"\n").unwrap();
+        std::fs::write(cwd.join("history.json"), "{}\n").unwrap();
+
+        let notice = legacy_notice(&cwd, &profile).expect("legacy files raise the notice");
+        assert!(notice.contains("config.toml, history.json"), "names the found files: {notice}");
+        assert!(notice.contains(&cwd.display().to_string()), "names the working directory: {notice}");
+        assert!(notice.contains(&profile.display().to_string()), "names the profile directory: {notice}");
+        assert!(notice.contains("Move them there"), "says the files can be moved: {notice}");
+
+        // Nothing was copied or moved: the old files are untouched and the
+        // profile stays empty.
+        assert!(cwd.join("config.toml").exists() && cwd.join("history.json").exists());
+        assert!(!profile.join("config.toml").exists());
+
+        std::fs::write(profile.join("config.toml"), "").unwrap();
+        assert_eq!(legacy_notice(&cwd, &profile), None, "a populated profile silences the notice");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// theme-selection "Valid override wins over configuration": a valid

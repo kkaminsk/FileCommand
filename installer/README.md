@@ -84,6 +84,11 @@ Per-user is the default for both the interactive bootstrapper UI and
 silent installs — the first-run experience never prompts for credentials
 unless per-machine is explicitly requested.
 
+The installer itself ships no configuration files: at runtime FileCommand
+keeps its per-user settings (`config.toml`, `history.json`,
+`usermenu.toml`) under `%APPDATA%\FileCommand`, regardless of install
+scope.
+
 ### Selecting scope
 
 - **Interactive**: `FileCommandSetup.exe` — installs per-user by default;
