@@ -15,6 +15,7 @@ use filecommand_core::editor::{EditorMove, EditorState};
 use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
+use filecommand_core::line_edit::TextEditOp;
 use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
 use filecommand_core::update::ClipboardPayloadKind;
@@ -345,6 +346,13 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         match key.code {
             KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
             KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
+            // Ctrl+V pastes the system clipboard's text into the command
+            // line (text-field-editing "Paste into a text field": "Over the
+            // panels, Ctrl+V SHALL paste into the command line"; design D4 —
+            // Shift+Ins stays the selection toggle here, so it is *not* a
+            // paste key over the panels, and Ctrl+Shift+Ins stays the
+            // clipboard-paths action, claimed above).
+            KeyCode::Char('v') | KeyCode::Char('V') => return Some(Command::RequestPaste),
             _ => {}
         }
     }
@@ -400,6 +408,22 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
         KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
+        // Left/Right move the command-line caret while the line is
+        // non-empty — mirroring the Up/Down history rule (command-line
+        // "Command-line prompt and printable-key routing": "while the
+        // buffer is empty, Left and Right SHALL have no command-line
+        // meaning"); on an empty line they stay unbound, exactly as before.
+        // Home/End/PgUp/PgDn/Delete/Ctrl+Left/Ctrl+Right keep their panel
+        // meanings even mid-composition (design D3), so this helper is
+        // *not* `map_text_edit_key`: the command line's editing set is
+        // deliberately narrower than a dialog field's.
+        KeyCode::Left if typing && is_plain(&key) => Some(Command::TextEdit(TextEditOp::Left)),
+        KeyCode::Right if typing && is_plain(&key) => Some(Command::TextEdit(TextEditOp::Right)),
+        // Ctrl+Backspace deletes the word before the caret while typing
+        // (design D3). Some terminals deliver it as Ctrl+H instead — both
+        // are mapped (design Risks).
+        KeyCode::Backspace if typing && ctrl => Some(Command::TextEdit(TextEditOp::DeleteWordBack)),
+        KeyCode::Char('h') | KeyCode::Char('H') if typing && ctrl && !alt => Some(Command::TextEdit(TextEditOp::DeleteWordBack)),
         // Esc is unconditional at panel level: it asks to quit regardless of
         // command-line content, replacing the old clear-the-buffer meaning
         // (backspacing to empty, or the clear-line chord, is now what hands
@@ -407,7 +431,7 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         // (application-shell "Quit request keys and confirmation";
         // command-line "Command history navigation").
         KeyCode::Esc => Some(Command::RequestQuit),
-        KeyCode::Backspace if typing => Some(Command::CommandLineBackspace),
+        KeyCode::Backspace if typing => Some(Command::TextEdit(TextEditOp::Backspace)),
         KeyCode::Backspace => Some(Command::ParentDir),
 
         KeyCode::PageUp if ctrl => Some(Command::ParentDir),
@@ -436,7 +460,7 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Char('-') if is_plain(&key) && !typing => Some(Command::GroupDeselectAll),
         KeyCode::Char('*') if is_plain(&key) && !typing => Some(Command::InvertSelection),
 
-        KeyCode::Char(c) if is_plain(&key) => Some(Command::CommandLineChar(c)),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::TextEdit(TextEditOp::Insert(c))),
         _ => None,
     }
 }
@@ -476,21 +500,21 @@ fn map_menu_key(key: KeyEvent) -> Option<Command> {
 }
 
 /// Ctrl+J fuzzy-jump dialog (fuzzy-jump "Fuzzy jump dialog invocation").
+/// The pattern is a shared text field per text-field-editing; Up/Down stay
+/// with the result list.
 fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
     match key.code {
         KeyCode::Esc => Some(Command::FuzzyJumpCancel),
         KeyCode::Enter => Some(Command::FuzzyJumpConfirm),
-        KeyCode::Backspace => Some(Command::FuzzyJumpBackspace),
         KeyCode::Up => Some(Command::FuzzyJumpMove(-1)),
         KeyCode::Down => Some(Command::FuzzyJumpMove(1)),
-        KeyCode::Char(c) if is_plain(&key) => Some(Command::FuzzyJumpChar(c)),
-        _ => None,
+        _ => map_text_edit_key(key),
     }
 }
 
 /// Alt+F7 find-file dialog. Its own precedence, highest first: the pattern
-/// input stage (no search submitted yet) claims printables/Backspace/Enter;
-/// once a search is in flight (or done), Up/Down/Enter move over and
+/// input stage (no search submitted yet) claims the text-field keys and
+/// Enter; once a search is in flight (or done), Up/Down/Enter move over and
 /// confirm a result instead (find-file "Find-file invocation", "Navigate to
 /// a chosen result").
 fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
@@ -498,9 +522,7 @@ fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
         return match key.code {
             KeyCode::Esc => Some(Command::FindFileCancel),
             KeyCode::Enter => Some(Command::FindFileSubmit),
-            KeyCode::Backspace => Some(Command::FindFileBackspace),
-            KeyCode::Char(c) if is_plain(&key) => Some(Command::FindFileChar(c)),
-            _ => None,
+            _ => map_text_edit_key(key),
         };
     }
     match key.code {
@@ -672,29 +694,76 @@ pub fn matches_binding(key: &KeyEvent, binding: &KeyBinding) -> bool {
         && (!binding.shift || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// The shared single-line text-field key set (text-field-editing "Caret
+/// model and editing keys"; design D2/D4): caret moves, word keys,
+/// Backspace/Delete, paste, and printables, used by every dialog text field
+/// — the destination/name input, the in-place Rename, the conflict dialog's
+/// rename input, the find-file pattern, and the fuzzy-jump pattern. (The
+/// command line deliberately does *not* use this helper: over the panels
+/// several of these keys keep their panel meanings — see `map_panel_key`
+/// and design D3.)
+///
+/// Returns `Option<Command>` rather than `Option<TextEditOp>` so the paste
+/// keys can emit `Command::RequestPaste` (design D4: the actual clipboard
+/// text is read TUI-side and comes back as `TextEdit(Paste(..))`).
+///
+/// Two terminals report Ctrl+Backspace differently: as `Backspace` with the
+/// Ctrl modifier, or as Ctrl+H — both are mapped to `DeleteWordBack`
+/// (design Risks). Plain printables are the only characters this helper
+/// inserts; the destination/Rename/conflict fields historically typed the
+/// base character of *any* `Char` event (their arm never filtered
+/// modifiers), so those arms keep an unguarded `Char` fallback of their own
+/// below — leaving Ctrl+V as the one Ctrl-combination whose behavior
+/// changes there, exactly as design D4 calls out.
+fn map_text_edit_key(key: KeyEvent) -> Option<Command> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let edit = |op| Some(Command::TextEdit(op));
+    match key.code {
+        KeyCode::Left if ctrl => edit(TextEditOp::WordLeft),
+        KeyCode::Right if ctrl => edit(TextEditOp::WordRight),
+        KeyCode::Backspace if ctrl => edit(TextEditOp::DeleteWordBack),
+        KeyCode::Char('h') | KeyCode::Char('H') if ctrl => edit(TextEditOp::DeleteWordBack),
+        KeyCode::Delete if ctrl => edit(TextEditOp::DeleteWordForward),
+        KeyCode::Left => edit(TextEditOp::Left),
+        KeyCode::Right => edit(TextEditOp::Right),
+        KeyCode::Home => edit(TextEditOp::Home),
+        KeyCode::End => edit(TextEditOp::End),
+        KeyCode::Backspace => edit(TextEditOp::Backspace),
+        KeyCode::Delete => edit(TextEditOp::Delete),
+        KeyCode::Insert if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Command::RequestPaste),
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl => Some(Command::RequestPaste),
+        KeyCode::Char(c) if is_plain(&key) => edit(TextEditOp::Insert(c)),
+        _ => None,
+    }
+}
+
 fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> {
     // Ctrl+C no longer requests quit from any file-op setup dialog
-    // (application-shell "Quit request keys and confirmation"). Unlike the
-    // Progress/Help cancel arms, `DestinationInput`/`RenameInput`'s
-    // `Char(c) => FileOpInputChar(c)` below needs no extra guard: it has
-    // never filtered by modifier (every other Ctrl-letter already types its
-    // base character there today), so Ctrl+C typing `c` is consistent with
-    // that existing behavior rather than a new special case.
+    // (application-shell "Quit request keys and confirmation"). The
+    // destination/Rename fields' text keys now run through
+    // `map_text_edit_key`, whose unguarded `Char(c)` arm keeps the
+    // pre-existing "Ctrl+C types a literal c" behavior of these fields
+    // intact (see that helper's doc comment).
     match setup {
         FileOpSetup::DeleteConfirm { .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::FileOpCancel),
             _ => None,
         },
-        // `RenameInput` reuses the same `FileOpInput*`/`FileOpConfirm`/
+        // `RenameInput` reuses the same `TextEdit`/`FileOpConfirm`/
         // `FileOpCancel` commands `DestinationInput` uses (fs_ops::dialog
-        // "Reuses the same ... commands `DestinationInput` uses").
+        // "Reuses the same ... commands `DestinationInput` uses"). The
+        // `or_else` fallback preserves these fields' historical unguarded
+        // `Char` arm — "Ctrl+letter types its base character" (so Ctrl+C
+        // still types `c`) — for every character the helper didn't claim
+        // (word keys, Ctrl+V, Ctrl+H, and Shift+Ins win first).
         FileOpSetup::DestinationInput { .. } | FileOpSetup::RenameInput { .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
-            KeyCode::Backspace => Some(Command::FileOpInputBackspace),
-            KeyCode::Char(c) => Some(Command::FileOpInputChar(c)),
-            _ => None,
+            _ => map_text_edit_key(key).or_else(|| match key.code {
+                KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
+                _ => None,
+            }),
         },
     }
 }
@@ -715,9 +784,13 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
         RunningDialog::Conflict { rename_input: Some(_), .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
-            KeyCode::Backspace => Some(Command::FileOpInputBackspace),
-            KeyCode::Char(c) => Some(Command::FileOpInputChar(c)),
-            _ => None,
+            // Same historical unguarded-`Char` fallback as the destination/
+            // rename fields (Ctrl+letter types its base character) behind
+            // the shared helper's claims.
+            _ => map_text_edit_key(key).or_else(|| match key.code {
+                KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
+                _ => None,
+            }),
         },
         RunningDialog::Conflict { rename_input: None, .. } => match key.code {
             KeyCode::Char('o') | KeyCode::Char('O') => Some(Command::FileOpConflictChoice(ConflictChoice::Overwrite)),

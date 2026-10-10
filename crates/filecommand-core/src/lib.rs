@@ -18,6 +18,7 @@ pub mod fuzzy;
 pub mod git_info;
 pub mod identity;
 pub mod info;
+pub mod line_edit;
 pub mod listing;
 pub mod menu;
 pub mod panel;

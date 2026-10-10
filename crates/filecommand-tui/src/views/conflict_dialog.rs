@@ -3,6 +3,7 @@
 
 use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::ConflictInfo;
+use filecommand_core::line_edit::LineEdit;
 use filecommand_core::listing::{display_width, format_date, format_size, format_time, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use filecommand_core::update::ButtonId;
@@ -14,7 +15,11 @@ use crate::style::role_style;
 const BOX_INNER_W: usize = 46;
 const MIN_INNER_W: usize = 30;
 
-pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, info: &ConflictInfo, rename_input: &Option<String>) {
+/// Renders the dialog. Returns the terminal cursor's `(x, y)` position
+/// while the in-place rename field is showing (it is a shared text field
+/// per text-field-editing, so the cursor sits at its caret), `None`
+/// otherwise.
+pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, info: &ConflictInfo, rename_input: &Option<LineEdit>) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
 
@@ -44,21 +49,36 @@ pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
     row(buf, 3, &format!("Target:  {}  {}", format_size(info.target_size), tgt_dt));
     row(buf, 4, "");
 
-    match rename_input {
-        Some(name) => {
-            let field = format!("[{name}_]");
+    let caret = match rename_input {
+        Some(edit) => {
+            // The rename field keeps its pre-editing `[name]` space-padded
+            // look (the drawn `_` caret is gone — the terminal cursor at the
+            // caret replaces it, design D5), scrolled via `window` like
+            // every other field.
+            let field_w = inner_w.saturating_sub(12).max(1);
+            let (start, caret_col) = edit.window(field_w);
+            let slice: String = edit.text().chars().skip(start).take(field_w).collect();
+            let pad = inner_w.saturating_sub(10).saturating_sub(2 + display_width(&slice));
             buf.set_string(x, y + 5, "\u{2551}", body);
             buf.set_string(x + 1, y + 5, "New name:", body);
-            buf.set_string(x + 11, y + 5, pad_to_width(&field, inner_w.saturating_sub(10)), field_style);
+            buf.set_string(x + 11, y + 5, "[", field_style);
+            buf.set_string(x + 12, y + 5, &slice, field_style);
+            buf.set_string(x + 12 + display_width(&slice) as u16, y + 5, &format!("]{}", " ".repeat(pad)), field_style);
             buf.set_string(x + 1 + inner_w as u16, y + 5, "\u{2551}", body);
+            let caret_cells = display_width(&slice.chars().take(caret_col).collect::<String>());
+            Some((x + 12 + caret_cells.min(field_w.saturating_sub(1)) as u16, y + 5))
         }
-        None => row(buf, 5, "(O)verwrite  (S)kip  (R)ename  Over(w)rite All  Skip (A)ll"),
-    }
+        None => {
+            row(buf, 5, "(O)verwrite  (S)kip  (R)ename  Over(w)rite All  Skip (A)ll");
+            None
+        }
+    };
 
     buf.set_string(x, y + 6, "\u{2551}", body);
     buf.set_string(x + 1, y + 6, " ".repeat(inner_w), body);
     buf.set_string(x + 1 + inner_w as u16, y + 6, "\u{2551}", body);
     buf.set_string(x, y + box_h - 1, &bottom, body);
+    caret
 }
 
 /// The hotkey-text button spans `render_conflict` currently draws at `area`
@@ -68,7 +88,7 @@ pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Color
 /// is showing instead of that row, mirroring the renderer exactly. Mirrors
 /// `render_conflict`'s own `overlay_rect` geometry so the rects can never
 /// drift from what's actually on screen.
-pub fn hit_buttons(area: Rect, rename_input: &Option<String>) -> Vec<(Rect, ButtonId)> {
+pub fn hit_buttons(area: Rect, rename_input: &Option<LineEdit>) -> Vec<(Rect, ButtonId)> {
     if rename_input.is_some() {
         return vec![];
     }

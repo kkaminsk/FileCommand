@@ -18,6 +18,7 @@ use crate::fs_ops::dialog::{DropButtons, FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
 use crate::git_info::GitInfo;
 use crate::info::InfoValues;
+use crate::line_edit::{LineEdit, TextEditOp};
 use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuEntry, MenuId, MenuState};
 use crate::panel::{ClipboardFeedback, CursorMove, DisplayMode, PanelState, TreeState};
@@ -174,9 +175,11 @@ pub struct State {
     pub left: PanelState,
     pub right: PanelState,
     pub active: PanelSide,
-    /// The live command-line buffer. Printable keys land here whenever a
-    /// panel is focused and no dialog or quick-search owns them.
-    pub command_line: String,
+    /// The live command-line buffer — a shared text field per
+    /// text-field-editing (the caret model and editing keys). Printable keys
+    /// land here whenever a panel is focused and no dialog or quick-search
+    /// owns them.
+    pub command_line: LineEdit,
     /// Executed commands, oldest first.
     pub history: Vec<String>,
     /// Where Up/Down recall currently sits in `history`; `None` means "not
@@ -353,7 +356,7 @@ impl State {
             left: PanelState::new(PathBuf::from("/")),
             right: PanelState::new(PathBuf::from("/")),
             active: PanelSide::Left,
-            command_line: String::new(),
+            command_line: LineEdit::default(),
             history: Vec::new(),
             history_cursor: None,
             quick_search: None,
@@ -481,8 +484,6 @@ pub enum Command {
     RequestDelete,
 
     // FileOpSetup dialog interaction.
-    FileOpInputChar(char),
-    FileOpInputBackspace,
     FileOpConfirm,
     FileOpCancel,
     /// The drop-initiated destination dialog's `[ Copy ]`/`[ Move ]` buttons:
@@ -501,8 +502,6 @@ pub enum Command {
     FileOpCancelJob,
 
     // Command line.
-    CommandLineChar(char),
-    CommandLineBackspace,
     /// Esc: clears the buffer, which is the explicit mechanism that hands
     /// Up/Down back to the panel cursor.
     CommandLineClear,
@@ -514,6 +513,18 @@ pub enum Command {
     PasteCursorPath,
     /// Ctrl+O — drop to the host terminal's scrollback.
     ShowScrollback,
+
+    // Shared single-line text-field editing (text-field-editing; design D2).
+    /// One editing operation routed to whichever field owns the keyboard:
+    /// the destination/name or Rename input in `FileOpSetup`, the conflict
+    /// dialog's rename input in `FileOpRunning`, the find-file pattern, the
+    /// fuzzy-jump pattern, else the command line. Replaces the six private
+    /// per-field char/backspace command pairs those fields used to have.
+    TextEdit(TextEditOp),
+    /// Shift+Ins/Ctrl+V in a dialog field, Ctrl+V over the panels: read the
+    /// system clipboard's text (via `Effect::ReadClipboardText`) and feed it
+    /// back as `TextEdit(TextEditOp::Paste)` (design D4).
+    RequestPaste,
 
     // Type-ahead quick search (§4.7), which competes with the command line
     // for printable keys.
@@ -715,8 +726,6 @@ pub enum Command {
     // Ctrl+J fuzzy jump (M5).
     /// Open the dialog (default binding, overridable via `config.toml`).
     FuzzyJumpOpen,
-    FuzzyJumpChar(char),
-    FuzzyJumpBackspace,
     FuzzyJumpMove(isize),
     /// Enter: navigate the active panel to the highlighted directory and
     /// close the dialog (fuzzy-jump "Enter navigates the active panel").
@@ -728,8 +737,6 @@ pub enum Command {
     /// Open the dialog, rooted at the active panel's current directory
     /// (find-file "Find-file invocation").
     FindFileOpen,
-    FindFileChar(char),
-    FindFileBackspace,
     /// Enter on the pattern input: kick off `Effect::FindInSubtree`.
     FindFileSubmit,
     /// Reply to `Effect::FindInSubtree`: one matched entry, streamed as the
@@ -1042,6 +1049,12 @@ pub enum Effect {
     /// thread is needed (design D3; clipboard-export "Clipboard payloads
     /// and scope").
     SetClipboard(ClipboardPayload),
+    /// Read the OS clipboard's text via the TUI's `Clipboard` trait and feed
+    /// it back as `Command::TextEdit(TextEditOp::Paste)` for whichever field
+    /// owns the keyboard when it arrives (text-field-editing "Paste into a
+    /// text field"; design D4). A clipboard holding no text feeds nothing
+    /// back — the key is then a no-op. Synchronous like `SetClipboard`.
+    ReadClipboardText,
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
@@ -1381,14 +1394,20 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 apply_clipboard_result(&mut state, payload, fell_back_to_paths, result)
             }
 
-            Command::CommandLineChar(c) => {
-                state.command_line.push(c);
-                state.history_cursor = None;
+            Command::TextEdit(op) => {
+                // The command line's own editing arm — `TextEdit` is routed
+                // by phase (design D2): the dialog/overlay arms above claim
+                // it first whenever one of their fields owns the keyboard,
+                // so reaching the Panels arm means the command line does. A
+                // text-mutating edit ends history recall, exactly as typing
+                // and backspace always have; a pure caret move leaves it.
+                let mutating = op.is_text_mutation();
+                state.command_line.apply(&op);
+                if mutating {
+                    state.history_cursor = None;
+                }
             }
-            Command::CommandLineBackspace => {
-                state.command_line.pop();
-                state.history_cursor = None;
-            }
+            Command::RequestPaste => effects.push(Effect::ReadClipboardText),
             Command::CommandLineClear => {
                 state.command_line.clear();
                 state.history_cursor = None;
@@ -1668,7 +1687,10 @@ fn recall_history(state: &mut State, delta: isize) {
     };
     match next {
         Some(i) => {
-            state.command_line = state.history[i].clone();
+            // History recall replaces the whole line and leaves the caret at
+            // its end (command-line "Paste filename and path to command
+            // line" — caret at end; design D3).
+            state.command_line.set_text_caret_end(state.history[i].clone());
             state.history_cursor = Some(i);
         }
         None => state.history_cursor = None,
@@ -1676,7 +1698,9 @@ fn recall_history(state: &mut State, delta: isize) {
 }
 
 /// Ctrl+Enter / Ctrl+]: append the cursor entry's name or full path,
-/// space-separating it from whatever is already typed.
+/// space-separating it from whatever is already typed, and leave the caret
+/// at the end (command-line "Paste filename and path to command line":
+/// "Paste after caret editing lands at the end").
 fn paste_cursor_entry(state: &mut State, full_path: bool) {
     let panel = state.active_panel();
     let Some(entry) = panel.selected() else { return };
@@ -1685,10 +1709,11 @@ fn paste_cursor_entry(state: &mut State, full_path: bool) {
     } else {
         entry.name.to_string_lossy().into_owned()
     };
-    if !state.command_line.is_empty() && !state.command_line.ends_with(' ') {
-        state.command_line.push(' ');
+    state.command_line.end();
+    if !state.command_line.is_empty() && !state.command_line.text().ends_with(' ') {
+        state.command_line.insert(' ');
     }
-    state.command_line.push_str(&text);
+    state.command_line.insert_str(&text);
     state.history_cursor = None;
 }
 
@@ -1700,7 +1725,7 @@ fn paste_cursor_entry(state: &mut State, full_path: bool) {
 /// dispatch (design.md "`Effect::RunShellCommand` and `shell::
 /// build_command` are untouched").
 fn run_command_line(state: &mut State) -> Vec<Effect> {
-    let text = state.command_line.trim().to_string();
+    let text = state.command_line.text().trim().to_string();
     if text.is_empty() {
         return vec![];
     }
@@ -2579,7 +2604,7 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
         let side = state.active;
         let source_dir = state.panel(side).cwd.clone();
         state.phase =
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: String::new(), buttons: None });
+            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: LineEdit::default(), buttons: None });
         return;
     }
     let sources = active_selection_sources(state);
@@ -2613,7 +2638,10 @@ fn enter_file_op_setup_for_sources(
     buttons: Option<DropButtons>,
 ) {
     let source_dir = state.panel(source_side).cwd.clone();
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: prefill, buttons });
+    // A pre-filled destination opens with the caret at the end of the text,
+    // so Enter-to-accept is unchanged and editing starts from the tail
+    // (text-field-editing "Pre-filled field accepts unchanged with Enter").
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: LineEdit::from(prefill), buttons });
 }
 
 /// F8: enter the delete-confirmation dialog. A no-op when there is nothing
@@ -2636,12 +2664,14 @@ fn enter_delete_confirm_for_sources(state: &mut State, sources: Vec<SourceItem>)
 }
 
 /// The file-action menu's Rename: enter the in-place rename input dialog,
-/// pre-filled with the target's current name (file-action-menu "In-place
-/// Rename": "pre-filled with the target entry's current name").
+/// pre-filled with the target's current name and the caret at the end of
+/// the field (file-action-menu "In-place Rename": "an input dialog
+/// pre-filled with the target entry's current name, with the caret at the
+/// end of the field").
 fn enter_rename_input(state: &mut State, original_name: OsString, is_dir: bool) {
     let side = state.active;
     let source_dir = state.panel(side).cwd.clone();
-    let input = original_name.to_string_lossy().into_owned();
+    let input = LineEdit::from(original_name.to_string_lossy().into_owned());
     state.phase = UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
 }
 
@@ -2964,11 +2994,11 @@ fn confirm_destination_input(
     kind: JobKind,
     sources: Vec<SourceItem>,
     source_dir: PathBuf,
-    input: String,
+    input: LineEdit,
     buttons: Option<DropButtons>,
     effects: &mut Vec<Effect>,
 ) -> UiPhase {
-    let trimmed = input.trim();
+    let trimmed = input.text().trim();
     if trimmed.is_empty() {
         return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons });
     }
@@ -2990,12 +3020,12 @@ fn confirm_destination_input(
 fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effect>) -> UiPhase {
     match setup {
         FileOpSetup::DestinationInput { kind, sources, source_dir, mut input, buttons } => match cmd {
-            Command::FileOpInputChar(c) => {
-                input.push(c);
+            Command::TextEdit(op) => {
+                input.apply(&op);
                 UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
             }
-            Command::FileOpInputBackspace => {
-                input.pop();
+            Command::RequestPaste => {
+                effects.push(Effect::ReadClipboardText);
                 UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
             }
             Command::FileOpCancel => UiPhase::Panels,
@@ -3029,17 +3059,17 @@ fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effe
             _ => UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once }),
         },
         FileOpSetup::RenameInput { source_dir, original_name, is_dir, mut input } => match cmd {
-            Command::FileOpInputChar(c) => {
-                input.push(c);
+            Command::TextEdit(op) => {
+                input.apply(&op);
                 UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input })
             }
-            Command::FileOpInputBackspace => {
-                input.pop();
+            Command::RequestPaste => {
+                effects.push(Effect::ReadClipboardText);
                 UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input })
             }
             Command::FileOpCancel => UiPhase::Panels,
             Command::FileOpConfirm => {
-                let trimmed = input.trim();
+                let trimmed = input.text().trim();
                 if trimmed.is_empty() {
                     return UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
                 }
@@ -3089,27 +3119,27 @@ fn handle_file_op_running(
             RunningDialog::Conflict { kind, info, progress, .. } => UiPhase::FileOpRunning {
                 source_dir,
                 dest_dir,
-                dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(String::new()) },
+                dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(LineEdit::default()) },
             },
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
         },
-        Command::FileOpInputChar(c) => match dialog {
-            RunningDialog::Conflict { kind, info, progress, rename_input: Some(mut s) } => {
-                s.push(c);
-                UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(s) } }
+        Command::TextEdit(op) => match dialog {
+            RunningDialog::Conflict { kind, info, progress, rename_input: Some(mut edit) } => {
+                edit.apply(&op);
+                UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(edit) } }
             }
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
         },
-        Command::FileOpInputBackspace => match dialog {
-            RunningDialog::Conflict { kind, info, progress, rename_input: Some(mut s) } => {
-                s.pop();
-                UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(s) } }
+        Command::RequestPaste => match dialog {
+            RunningDialog::Conflict { kind, info, progress, rename_input: Some(edit) } => {
+                effects.push(Effect::ReadClipboardText);
+                UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Conflict { kind, info, progress, rename_input: Some(edit) } }
             }
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
         },
         Command::FileOpConfirm => match dialog {
-            RunningDialog::Conflict { kind, progress, rename_input: Some(name), .. } if !name.trim().is_empty() => {
-                effects.push(Effect::SendConflictReply(ConflictChoice::Rename(OsString::from(name))));
+            RunningDialog::Conflict { kind, progress, rename_input: Some(name), .. } if !name.text().trim().is_empty() => {
+                effects.push(Effect::SendConflictReply(ConflictChoice::Rename(OsString::from(name.text()))));
                 UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Progress { kind, progress } }
             }
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
@@ -3186,7 +3216,7 @@ fn handle_file_op_running(
 /// path (command-line: "Enter on an executable opens the menu instead of
 /// spawning").
 fn handle_enter(state: &mut State) -> Vec<Effect> {
-    if !state.command_line.trim().is_empty() {
+    if !state.command_line.text().trim().is_empty() {
         return run_command_line(state);
     }
     let side = state.active;
@@ -3290,7 +3320,7 @@ fn handle_tree_enter(state: &mut State, side: PanelSide) -> Vec<Effect> {
 fn is_fuzzy_jump_command(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::FuzzyJumpChar(_) | Command::FuzzyJumpBackspace | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel
+        Command::TextEdit(_) | Command::RequestPaste | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel
     )
 }
 
@@ -3305,17 +3335,19 @@ fn handle_fuzzy_jump(state: &mut State, cmd: Command) -> Vec<Effect> {
         return vec![];
     }
     match cmd {
-        Command::FuzzyJumpChar(c) => state.fuzzy_jump.as_mut().unwrap().push(c),
-        Command::FuzzyJumpBackspace => state.fuzzy_jump.as_mut().unwrap().backspace(),
+        Command::TextEdit(op) => state.fuzzy_jump.as_mut().unwrap().apply(&op),
+        Command::RequestPaste => return vec![Effect::ReadClipboardText],
         Command::FuzzyJumpMove(delta) => {
-            let pattern = state.fuzzy_jump.as_ref().unwrap().pattern.clone();
-            let len = quicksearch::rank_directories(&state.dir_history, &pattern, state.clock_ms).len();
+            let len = {
+                let fj = state.fuzzy_jump.as_ref().unwrap();
+                quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.clock_ms).len()
+            };
             state.fuzzy_jump.as_mut().unwrap().move_cursor(delta, len);
         }
         Command::FuzzyJumpCancel => state.fuzzy_jump = None,
         Command::FuzzyJumpConfirm => {
             let fj = state.fuzzy_jump.take().unwrap();
-            let ranked = quicksearch::rank_directories(&state.dir_history, &fj.pattern, state.clock_ms);
+            let ranked = quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.clock_ms);
             if let Some(path) = ranked.get(fj.cursor).map(|e| e.path.clone()) {
                 let side = state.active;
                 return begin_listing(state, side, path);
@@ -3333,8 +3365,8 @@ fn handle_fuzzy_jump(state: &mut State, cmd: Command) -> Vec<Effect> {
 fn is_find_file_command(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::FindFileChar(_)
-            | Command::FindFileBackspace
+        Command::TextEdit(_)
+            | Command::RequestPaste
             | Command::FindFileSubmit
             | Command::FindFileMatch { .. }
             | Command::FindFileSearchDone { .. }
@@ -3350,14 +3382,14 @@ fn handle_find_file(state: &mut State, cmd: Command) -> Vec<Effect> {
         return vec![];
     }
     match cmd {
-        Command::FindFileChar(c) => state.find_file.as_mut().unwrap().push(c),
-        Command::FindFileBackspace => state.find_file.as_mut().unwrap().backspace(),
+        Command::TextEdit(op) => state.find_file.as_mut().unwrap().apply(&op),
+        Command::RequestPaste => return vec![Effect::ReadClipboardText],
         Command::FindFileSubmit => {
             let request = state.next_request_id();
             let ff = state.find_file.as_mut().unwrap();
             ff.submit(request);
             let root = ff.root.clone();
-            let pattern = ff.pattern.clone();
+            let pattern = ff.pattern.text().to_string();
             return vec![Effect::FindInSubtree { root, pattern, request }];
         }
         Command::FindFileMatch { request, m } => state.find_file.as_mut().unwrap().push_match(request, m),

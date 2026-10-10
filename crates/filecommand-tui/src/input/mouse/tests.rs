@@ -482,7 +482,7 @@ fn file_op_setup_phase_honours_dialog_buttons_only() {
         source_dir: PathBuf::new(),
         original_name: OsString::from("a.txt"),
         is_dir: false,
-        input: String::new(),
+        input: filecommand_core::line_edit::LineEdit::default(),
     });
     let mut tracker = MouseTracker::new();
 

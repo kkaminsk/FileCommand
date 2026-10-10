@@ -6,6 +6,7 @@
 use filecommand_core::dialogs::overlay_rect;
 use filecommand_core::fs_ops::dialog::{DropButtons, FileOpSetup};
 use filecommand_core::fs_ops::JobKind;
+use filecommand_core::line_edit::LineEdit;
 use filecommand_core::listing::{display_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use filecommand_core::update::ButtonId;
@@ -85,14 +86,14 @@ fn prompt_for(kind: JobKind) -> &'static str {
     }
 }
 
-pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, setup: &FileOpSetup) {
+pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, setup: &FileOpSetup) -> Option<(u16, u16)> {
     match setup {
         FileOpSetup::DestinationInput { kind, sources, input, buttons, .. } => {
             let title = match buttons {
                 Some(db) => drop_dialog_title(db.focused, sources.len()),
                 None => title_for(*kind).to_string(),
             };
-            render_input_box(buf, area, theme, depth, &title, prompt_for(*kind), input, *buttons);
+            render_input_box(buf, area, theme, depth, &title, prompt_for(*kind), input, *buttons)
         }
         // The file-action menu's in-place Rename: same bracket-and-dots
         // input box, pre-filled with the target's current name (design D2;
@@ -100,7 +101,7 @@ pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, dep
         // with the target entry's current name"). Never a drop-initiated
         // dialog, so it always gets the plain 6-row box.
         FileOpSetup::RenameInput { input, .. } => render_input_box(buf, area, theme, depth, "Rename", "New name:", input, None),
-        FileOpSetup::DeleteConfirm { .. } => {}
+        FileOpSetup::DeleteConfirm { .. } => None,
     }
 }
 
@@ -108,9 +109,10 @@ pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, dep
 /// every row below is drawn at the same offset it always was, and the
 /// button row is only ever drawn when `buttons: Some` — so the F5/F6/F7/
 /// Rename dialogs stay byte-for-byte unchanged (operation-dialogs "F5
-/// dialog unchanged").
+/// dialog unchanged"). Returns the terminal cursor's position: the field's
+/// caret (text-field-editing "Field rendering keeps the caret visible").
 #[allow(clippy::too_many_arguments)]
-fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, title: &str, prompt: &str, input: &str, buttons: Option<DropButtons>) {
+fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, title: &str, prompt: &str, input: &LineEdit, buttons: Option<DropButtons>) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
 
@@ -136,16 +138,13 @@ fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDep
     buf.set_string(x + 2, y + 2, truncate_with_ellipsis(prompt, inner_w.saturating_sub(2)), body);
     buf.set_string(x + 1 + inner_w as u16, y + 2, "\u{2551}", body);
 
-    // Bracket-and-dots input field: `[text...........]`.
-    let mut field_text = input.to_string();
-    if display_width(&field_text) > field_w {
-        let excess = display_width(&field_text) - field_w;
-        field_text = field_text.chars().skip(excess).collect();
-    }
-    let pad = field_w - display_width(&field_text);
-    let field = format!("[{field_text}{}]", ".".repeat(pad));
+    // Bracket-and-dots input field: `[text...........]`, scrolled so the
+    // caret is always visible (text-field-editing "Field rendering keeps
+    // the caret visible"; design D5).
     buf.set_string(x, y + 3, "\u{2551}", body);
-    buf.set_string(x + 2, y + 3, &field, field_style);
+    buf.set_string(x + 2, y + 3, "[", field_style);
+    let caret_x = crate::views::draw_text_field(buf, x + 3, y + 3, field_w, input, field_style);
+    buf.set_string(x + 3 + field_w as u16, y + 3, "]", field_style);
     buf.set_string(x + 1 + inner_w as u16, y + 3, "\u{2551}", body);
 
     buf.set_string(x, y + 4, &blank, body);
@@ -153,6 +152,7 @@ fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDep
         render_button_row(buf, x, y + 5, inner_w, theme, depth, db.focused, body);
     }
     buf.set_string(x, y + box_h - 1, &bottom, body);
+    Some((caret_x, y + 3))
 }
 
 /// The drop dialog's `[ Copy ] [ Move ] [ Cancel ]` row, centered in
@@ -242,7 +242,7 @@ mod tests {
             kind: JobKind::Copy,
             sources: source_items(1),
             source_dir: PathBuf::from(r"C:\left"),
-            input: r"D:\BACKUP".to_string(),
+            input: LineEdit::from(r"D:\BACKUP"),
             buttons: None,
         };
         let mut buf = Buffer::empty(area());
@@ -262,7 +262,7 @@ mod tests {
             kind: JobKind::Copy,
             sources: source_items(3),
             source_dir: PathBuf::from(r"C:\left"),
-            input: r"D:\BACKUP\OLD".to_string(),
+            input: LineEdit::from(r"D:\BACKUP\OLD"),
             buttons: Some(DropButtons { focused: JobKind::Copy }),
         };
         let mut buf = Buffer::empty(area());
@@ -294,7 +294,7 @@ mod tests {
             kind: JobKind::Move,
             sources: source_items(1),
             source_dir: PathBuf::from(r"C:\left"),
-            input: r"D:\BACKUP".to_string(),
+            input: LineEdit::from(r"D:\BACKUP"),
             buttons: Some(DropButtons { focused: JobKind::Move }),
         };
         let mut buf = Buffer::empty(area());
@@ -314,7 +314,7 @@ mod tests {
     #[test]
     fn rename_input_never_gets_a_button_row() {
         let theme = Theme::classic();
-        let setup = FileOpSetup::RenameInput { source_dir: PathBuf::from(r"C:\left"), original_name: OsString::from("a.txt"), is_dir: false, input: "a.txt".to_string() };
+        let setup = FileOpSetup::RenameInput { source_dir: PathBuf::from(r"C:\left"), original_name: OsString::from("a.txt"), is_dir: false, input: LineEdit::from("a.txt") };
         let mut buf = Buffer::empty(area());
         render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
         let text = buffer_to_text(&buf, area());

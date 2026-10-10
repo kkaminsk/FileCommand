@@ -969,6 +969,22 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 let normalized_payload = update::ClipboardPayload { kind: payload.kind, items };
                 let _ = rt.tx.send(Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
             }
+            Effect::ReadClipboardText => {
+                // The read half of paste (text-field-editing "Paste into a
+                // text field"; design D4): clipboard text comes back as
+                // `TextEdit(Paste(..))` for whichever field owns the
+                // keyboard when it arrives. Line breaks flatten to a single
+                // space here (`LineEdit::insert_str` does the same again,
+                // so the core behavior never depends on this path), and a
+                // clipboard with no text feeds nothing back — the key is
+                // then a no-op ("Empty clipboard is a no-op").
+                if let Some(text) = rt.clipboard.get_text() {
+                    let text = text.replace("\r\n", " ").replace('\r', " ").replace('\n', " ");
+                    if !text.is_empty() {
+                        let _ = rt.tx.send(Command::TextEdit(filecommand_core::line_edit::TextEditOp::Paste(text)));
+                    }
+                }
+            }
         }
     }
     Ok(quit)

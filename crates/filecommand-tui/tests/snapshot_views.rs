@@ -185,7 +185,7 @@ fn drop_dialog_state(focused: JobKind) -> State {
         kind: focused,
         sources: vec![SourceItem { original_name: "readme.txt".into(), path: PathBuf::from(r"C:\Users\demo\left\readme.txt"), is_dir: false }],
         source_dir: PathBuf::from(r"C:\Users\demo\left"),
-        input: r"C:\Users\demo\right".to_string(),
+        input: filecommand_core::line_edit::LineEdit::from(r"C:\Users\demo\right"),
         buttons: Some(DropButtons { focused }),
     });
     state
@@ -305,7 +305,7 @@ fn command_line_row(text: &str) -> &str {
 #[test]
 fn snapshot_command_line_with_prompt_and_typed_text() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.command_line = "dir *.txt".to_string();
+    state.command_line = filecommand_core::line_edit::LineEdit::from("dir *.txt");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let row = command_line_row(&text);
     assert!(row.contains(r"C:\Users\demo\left>dir *.txt"), "prompt + buffer in `{row}`");
@@ -324,10 +324,77 @@ fn command_line_prompt_follows_the_active_panel() {
 fn snapshot_command_line_recalling_history() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.history = vec!["cd docs".to_string(), "type readme.txt".to_string()];
-    state.command_line = "type readme.txt".to_string();
+    state.command_line = filecommand_core::line_edit::LineEdit::from("type readme.txt");
     state.history_cursor = Some(1);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("command_line_history_recall", command_line_row(&text));
+}
+
+/// Full-frame render that also reports the terminal cursor position
+/// `views::render` computed (and applies it to the frame, exactly as
+/// `app.rs`'s `draw` does), for the text-field caret tests.
+fn render_with_cursor(width: u16, height: u16, state: &State) -> (String, Option<(u16, u16)>) {
+    let identity_lines = pinned_identity_lines();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    let mut cursor = None;
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let output = views::render(frame.buffer_mut(), area, state, ColorDepth::Ansi16, &identity_lines, FIXED_CLOCK_TEXT, None);
+            cursor = output.cursor;
+            if let Some(pos) = output.cursor {
+                frame.set_cursor_position(pos);
+            }
+        })
+        .expect("draw into TestBackend");
+    (buffer_to_text(terminal.backend().buffer()), cursor)
+}
+
+#[test]
+fn snapshot_destination_field_scrolled_so_the_caret_is_visible() {
+    // text-field-editing "Long destination scrolls to the caret": a
+    // 60-character path in the 40-cell field shows the last 40 characters
+    // with the caret at the end, and the terminal cursor sits at the
+    // field's last cell.
+    let long_path = r"D:\backup\2026\reports\archive\final\q3\old\verylong\name\xy";
+    assert_eq!(long_path.chars().count(), 60, "the fixture path must be 60 chars for the 40-cell field");
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+        kind: JobKind::Copy,
+        sources: vec![SourceItem { original_name: "readme.txt".into(), path: PathBuf::from(r"C:\Users\demo\left\readme.txt"), is_dir: false }],
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        input: filecommand_core::line_edit::LineEdit::from(long_path),
+        buttons: None,
+    });
+    let (text, cursor) = render_with_cursor(80, 24, &state);
+    assert!(text.contains(r"[ts\archive\final\q3\old\verylong\name\xy]"), "the window scrolled to the last 40 chars:\n{text}");
+    // Dialog centered at (17, 9): the field's text starts at column 20 and
+    // the caret (at the end of a full window) clamps onto its last cell.
+    assert_eq!(cursor, Some((20 + 39, 9 + 3)), "the terminal cursor sits at the field's last cell");
+    insta::assert_snapshot!("destination_field_scrolled_to_caret", text);
+}
+
+#[test]
+fn snapshot_command_line_with_the_caret_mid_text() {
+    // command-line "Caret editing mid-line": `cd srv`, Left x2, `c` ->
+    // `cd scrv` — the row shows the whole line and the terminal cursor sits
+    // at the caret (the drawn `_` is gone).
+    let mut line = filecommand_core::line_edit::LineEdit::from("cd srv");
+    line.left();
+    line.left();
+    line.insert('c');
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.command_line = line;
+    let (text, cursor) = render_with_cursor(80, 24, &state);
+    let row = command_line_row(&text);
+    assert!(row.contains(r"C:\Users\demo\left>cd scrv"), "`{row}`");
+    assert!(!row.contains('_'), "the drawn caret is replaced by the terminal cursor: `{row}`");
+    // Prompt `C:\Users\demo\left>` is 19 cells; the caret is after the
+    // inserted `c` at char 5; the command-line row is second from the
+    // bottom.
+    assert_eq!(cursor, Some((19 + 5, 22)), "the terminal cursor sits at the caret");
+    insta::assert_snapshot!("command_line_caret_mid_text", row);
 }
 
 #[test]
@@ -1093,8 +1160,8 @@ fn snapshot_fuzzy_jump_dialog() {
 fn snapshot_find_file_dialog_with_streamed_results() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
-    dialog.push('r');
-    dialog.push('e');
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('r'));
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('e'));
     dialog.submit(1);
     dialog.push_match(
         1,
@@ -1115,7 +1182,7 @@ fn snapshot_find_file_dialog_with_streamed_results() {
 fn snapshot_find_file_dialog_no_matches() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
-    dialog.push('z');
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('z'));
     dialog.submit(1);
     dialog.mark_done(1);
     state.find_file = Some(dialog);

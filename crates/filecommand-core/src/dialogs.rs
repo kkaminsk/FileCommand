@@ -473,7 +473,12 @@ const FILE_OPERATIONS: &str = "\
 F5 copies, F6 moves/renames, F7 creates a directory, and F8 deletes
 the selected entries (or the entry under the cursor when nothing is
 selected). Ins toggles selection on one entry; +, -, and * select,
-deselect, and invert a wildcard group.";
+deselect, and invert a wildcard group.
+
+The destination, name, and Rename fields are full editing lines: the
+caret moves with Left/Right/Home/End (by words with Ctrl held),
+Backspace/Delete remove single characters (whole words with Ctrl held),
+and Shift+Ins or Ctrl+V pastes the clipboard's text at the caret.";
 
 const MENUS: &str = "\
 F9 opens the menu bar. Left/Right/Files/Commands/Options each drop
@@ -494,7 +499,11 @@ if the buffer is modified. Undo is a single level.";
 
 const COMMAND_LINE: &str = "\
 Typing over a panel with nothing else active enters text on the
-command line. Enter runs it in the active panel's directory; `cd`
+command line at the caret. Left/Right move the caret while the line
+has text (on an empty line they do nothing); Ctrl+Backspace deletes
+the word before it; Ctrl+V pastes the clipboard's text. Home/End,
+PgUp/PgDn, Delete, and Shift+Ins keep their panel meanings.
+Enter runs the line in the active panel's directory; `cd`
 navigates the panel instead of spawning a shell. Up/Down recall
 history while something is typed. Ctrl+Y clears the whole line,
 ending any history recall (rebindable via key.clear_line); Esc asks

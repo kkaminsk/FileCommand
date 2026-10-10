@@ -10,6 +10,7 @@
 
 use std::path::PathBuf;
 
+use crate::line_edit::{LineEdit, TextEditOp};
 use crate::listing::FindMatch;
 
 /// The open find-file dialog.
@@ -18,7 +19,9 @@ pub struct FindFileState {
     /// The subtree root the walk searches — the active panel's directory at
     /// the moment the dialog opened.
     pub root: PathBuf,
-    pub pattern: String,
+    /// The name pattern — a shared text field per text-field-editing ("the
+    /// pattern field is a shared text field").
+    pub pattern: LineEdit,
     /// Results streamed in so far, in arrival order.
     pub results: Vec<FindMatch>,
     pub cursor: usize,
@@ -39,21 +42,16 @@ impl FindFileState {
     /// A freshly opened dialog rooted at `root`, with an empty pattern and
     /// no search yet submitted (find-file "Find-file invocation").
     pub fn new(root: PathBuf) -> FindFileState {
-        FindFileState { root, pattern: String::new(), results: Vec::new(), cursor: 0, request: None, done: false }
+        FindFileState { root, pattern: LineEdit::default(), results: Vec::new(), cursor: 0, request: None, done: false }
     }
 
-    /// Append `c` to the pattern while still in the input stage. A no-op
-    /// once a search is in flight — the pattern is fixed for that search;
-    /// Esc-then-reopen is how the user starts over.
-    pub fn push(&mut self, c: char) {
+    /// Apply one editing op to the pattern while still in the input stage
+    /// (find-file "Pattern is editable mid-string"). A no-op once a search
+    /// is in flight — the pattern is fixed for that search; Esc-then-reopen
+    /// is how the user starts over.
+    pub fn apply(&mut self, op: &TextEditOp) {
         if self.request.is_none() {
-            self.pattern.push(c);
-        }
-    }
-
-    pub fn backspace(&mut self) {
-        if self.request.is_none() {
-            self.pattern.pop();
+            self.pattern.apply(op);
         }
     }
 
@@ -115,18 +113,32 @@ mod tests {
     #[test]
     fn typing_is_ignored_once_a_search_is_submitted() {
         let mut f = FindFileState::new(PathBuf::from("/root"));
-        f.push('a');
-        f.push('b');
-        assert_eq!(f.pattern, "ab");
+        f.apply(&TextEditOp::Insert('a'));
+        f.apply(&TextEditOp::Insert('b'));
+        assert_eq!(f.pattern.text(), "ab");
         f.submit(1);
-        f.push('c');
-        assert_eq!(f.pattern, "ab", "the pattern is fixed once the walk is submitted");
+        f.apply(&TextEditOp::Insert('c'));
+        assert_eq!(f.pattern.text(), "ab", "the pattern is fixed once the walk is submitted");
+    }
+
+    #[test]
+    fn the_pattern_is_editable_mid_string_until_submitted() {
+        // find-file "Pattern is editable mid-string": `reprt`, Left x2, `o`
+        // -> `report`.
+        let mut f = FindFileState::new(PathBuf::from("/root"));
+        for c in "reprt".chars() {
+            f.apply(&TextEditOp::Insert(c));
+        }
+        f.apply(&TextEditOp::Left);
+        f.apply(&TextEditOp::Left);
+        f.apply(&TextEditOp::Insert('o'));
+        assert_eq!(f.pattern.text(), "report");
     }
 
     #[test]
     fn submit_clears_prior_results_and_marks_in_flight() {
         let mut f = FindFileState::new(PathBuf::from("/root"));
-        f.push('x');
+        f.apply(&TextEditOp::Insert('x'));
         f.submit(1);
         f.push_match(1, a_match("x1"));
         assert_eq!(f.results.len(), 1);

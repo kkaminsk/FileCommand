@@ -193,7 +193,7 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     state = step(state, Command::FindFileOpen, &tx, &rx);
     assert_eq!(state.find_file.as_ref().unwrap().root, fx.left());
     for c in "nested".chars() {
-        state = step(state, Command::FindFileChar(c), &tx, &rx);
+        state = step(state, Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert(c)), &tx, &rx);
     }
     state = step(state, Command::FindFileSubmit, &tx, &rx);
     {

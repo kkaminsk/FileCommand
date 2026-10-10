@@ -249,29 +249,42 @@ programs, see [Running programs](#running-programs).
 
 You don't need to focus the command line. While the panels have the
 keyboard (no dialog, menu, type-ahead jump, or Ctrl+P quick filter open),
-every plain printable key is added to the command line and the panel cursor
-stays put. Text is only ever added at the end; there is no cursor to move
-within the line.
+every plain printable key is inserted into the command line at the caret
+and the panel cursor stays put. The caret moves with ←/→ while the line
+has text, so fixing one character in the middle of a command never means
+retyping its tail.
 
 Some keys mean different things depending on whether the line is empty:
 
 | Key | Line empty | Line has text |
 |---|---|---|
-| Printable character | Starts the line | Added to the end |
+| Printable character | Starts the line | Inserted at the caret |
 | `+` / `-` / `*` | Select / deselect by wildcard, invert selection | Typed as text |
-| Backspace | Go to the parent directory | Delete the last character |
+| Backspace | Go to the parent directory | Delete the character before the caret |
+| ← / → | Nothing | Move the caret |
+| Ctrl+Backspace | Go to the parent directory | Delete the word before the caret |
 | ↑ / ↓ | Move the panel cursor | Recall older / newer history |
 | Enter | Act on the cursor entry (open a directory, file-action menu for a file) | Run the line |
-| Ctrl+Enter / Ctrl+] | Paste the cursor entry's name / full path | Same, after a separating space |
+| Ctrl+Enter / Ctrl+] | Paste the cursor entry's name / full path | Same, after a separating space; caret lands at the end |
+| Ctrl+V | Paste the clipboard's text at the caret | Same (line breaks become spaces) |
 | Ctrl+Y | Nothing | Clear the line (ends any history recall) |
 | Esc | Ask to quit | Ask to quit (cancelling keeps your text) |
 
 All other keys keep their panel meaning while you type. Home/End and
-PgUp/PgDn move the panel cursor, and Tab switches panels without clearing the
-line. **Delete opens the delete confirmation for the cursor entry; it does
-not delete a character.** To clear the line, press Ctrl+Y (rebindable via
+PgUp/PgDn move the panel cursor even mid-composition, Ctrl+←/→ adjust the
+panel split, and Tab switches panels without clearing the line. **Delete
+opens the delete confirmation for the cursor entry; it does not delete a
+character.** To clear the line, press Ctrl+Y (rebindable via
 `key.clear_line` in [`config.toml`](#configtoml)), or backspace it until
 it's empty.
+
+The same editing keys work in every text field — the F5/F6/F7 destination
+and name fields, the file-action menu's Rename, an overwrite-conflict's
+Rename, the Alt+F7 find pattern, and the Ctrl+J fuzzy-jump pattern. There
+Home/End and Delete *are* editing keys (jump the caret to the start/end,
+delete the character after it), Ctrl+←/→ move the caret by words,
+Ctrl+Backspace/Ctrl+Delete delete words, and both Shift+Ins and Ctrl+V
+paste the clipboard's text at the caret.
 
 #### Built-in commands
 
@@ -441,6 +454,20 @@ command output; only your terminal's scrollback does.
 | F10 or Esc | Request quit (Y/N confirmation) |
 | Esc (in a dialog/menu/overlay) | Cancel or close it |
 | Up / Down (command line non-empty) | Recall previous/next command-line history |
+| Left / Right (command line non-empty) | Move the command-line caret |
+| Ctrl+Backspace (command line non-empty) | Delete the word before the command-line caret |
+| Ctrl+V | Paste the clipboard's text into the command line (or the focused dialog field) |
+
+**Text fields** (destination/name dialogs, Rename, overwrite-conflict Rename,
+Alt+F7 find pattern, Ctrl+J fuzzy-jump pattern)
+
+| Key | Action |
+|---|---|
+| ← / → / Home / End | Move the caret one char / to the start / to the end |
+| Backspace / Delete | Delete the character before / after the caret |
+| Ctrl+← / Ctrl+→ | Move the caret one word back / forward |
+| Ctrl+Backspace / Ctrl+Delete | Delete the word before / after the caret |
+| Shift+Ins or Ctrl+V | Paste the clipboard's text at the caret (line breaks become spaces) |
 
 All of the bindings marked overridable in [Configuration](#configuration)
 (`paste_name`, `paste_path`, `quick_filter`, `fuzzy_jump`, `split_left`,

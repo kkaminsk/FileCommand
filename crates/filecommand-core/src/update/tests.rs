@@ -148,7 +148,7 @@ fn request_quit_opens_mid_command_line_and_cancel_restores_the_buffer() {
     let before = type_line(test_state(UiPhase::Panels), "dir");
     let (state, _) = update(before.clone(), Command::RequestQuit);
     assert!(state.quit_confirm);
-    assert_eq!(state.command_line, "dir", "the typed buffer must survive RequestQuit untouched");
+    assert_eq!(state.command_line.text(), "dir", "the typed buffer must survive RequestQuit untouched");
     let (state, _) = update(state, Command::CancelQuit);
     assert_eq!(state, before, "cancel must restore the typed command line bit-for-bit");
 }
@@ -438,7 +438,7 @@ fn request_copy_prefills_destination_with_opposite_panel_cwd() {
     let (state, _) = update(state, Command::RequestCopy);
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
-            assert_eq!(input, PathBuf::from("/right").display().to_string());
+            assert_eq!(input.text(), PathBuf::from("/right").display().to_string());
         }
         other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
     }
@@ -471,8 +471,8 @@ fn destination_input_typing_and_confirm_starts_job() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("a.txt", 1)];
     let (state, _) = update(state, Command::RequestCopy);
-    let (state, _) = update(state, Command::FileOpInputBackspace); // backspace on prefilled input
-    let (state, _) = update(state, Command::FileOpInputChar('X'));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Backspace)); // backspace on prefilled input
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('X')));
     let (state, effects) = update(state, Command::FileOpConfirm);
     match &state.phase {
         UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Progress { kind, .. } } => {
@@ -588,9 +588,9 @@ fn conflict_rename_flow_composes_a_name_then_replies() {
     let state = running_progress_state(JobKind::Copy, "/left", "/right");
     let (state, _) = update(state, Command::JobConflict(sample_conflict()));
     let (state, _) = update(state, Command::FileOpBeginRename);
-    let (state, _) = update(state, Command::FileOpInputChar('b'));
-    let (state, _) = update(state, Command::FileOpInputChar('.'));
-    let (state, _) = update(state, Command::FileOpInputChar('c'));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('b')));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('.')));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('c')));
     let (state, effects) = update(state, Command::FileOpConfirm);
     assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Rename(OsString::from("b.c")))]);
     assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
@@ -807,7 +807,7 @@ fn reread_reissues_start_listing_and_clears_the_error() {
 // ---------------------------------------------------------------------
 
 fn type_line(state: State, text: &str) -> State {
-    text.chars().fold(state, |s, c| update(s, Command::CommandLineChar(c)).0)
+    text.chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0)
 }
 
 #[test]
@@ -836,7 +836,7 @@ fn printable_keys_build_the_command_buffer_without_moving_the_cursor() {
     state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
     state.left.cursor = 1;
     let state = type_line(state, "dir");
-    assert_eq!(state.command_line, "dir");
+    assert_eq!(state.command_line.text(), "dir");
     assert_eq!(state.left.cursor, 1, "typing must not move the panel cursor");
 }
 
@@ -846,11 +846,11 @@ fn backspace_edits_the_buffer_and_clears_the_history_cursor() {
     state.history = vec!["old".to_string()];
     let state = type_line(state, "dir");
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "old");
+    assert_eq!(state.command_line.text(), "old");
     assert_eq!(state.history_cursor, Some(0));
 
-    let (state, _) = update(state, Command::CommandLineBackspace);
-    assert_eq!(state.command_line, "ol");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Backspace));
+    assert_eq!(state.command_line.text(), "ol");
     assert_eq!(state.history_cursor, None, "editing leaves history recall");
 }
 
@@ -879,7 +879,7 @@ fn command_line_clear_ends_history_recall_and_hands_up_down_back_to_the_panel() 
     state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
     let state = type_line(state, "dir");
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "old");
+    assert_eq!(state.command_line.text(), "old");
     assert_eq!(state.history_cursor, Some(0));
 
     let (state, _) = update(state, Command::CommandLineClear);
@@ -914,7 +914,7 @@ fn leaving_quick_search_hands_printables_back_to_the_command_line() {
     let (state, _) = update(state, Command::QuickSearchEnd);
     assert_eq!(state.quick_search, None);
     let state = type_line(state, "dir");
-    assert_eq!(state.command_line, "dir");
+    assert_eq!(state.command_line.text(), "dir");
 }
 
 #[test]
@@ -1123,11 +1123,11 @@ fn history_up_recalls_previous_commands_newest_first() {
     let state = type_line(state, "x");
 
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "third");
+    assert_eq!(state.command_line.text(), "third");
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "second");
+    assert_eq!(state.command_line.text(), "second");
     let (state, _) = update(state, Command::CommandLineHistoryNext);
-    assert_eq!(state.command_line, "third");
+    assert_eq!(state.command_line.text(), "third");
 }
 
 #[test]
@@ -1137,7 +1137,7 @@ fn history_up_stops_at_the_oldest_entry() {
     let state = type_line(state, "x");
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
     let (state, _) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "only");
+    assert_eq!(state.command_line.text(), "only");
 }
 
 #[test]
@@ -1155,8 +1155,250 @@ fn history_navigation_never_moves_the_panel_cursor() {
 fn history_recall_with_empty_history_is_a_noop() {
     let state = type_line(test_state(UiPhase::Panels), "x");
     let (state, effects) = update(state, Command::CommandLineHistoryPrev);
-    assert_eq!(state.command_line, "x");
+    assert_eq!(state.command_line.text(), "x");
     assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// line-editing-in-text-fields: the shared LineEdit backing (reducer-level,
+// tasks.md 2.5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn text_edit_inserts_at_the_caret_mid_command_line() {
+    // command-line "Caret editing mid-line": `cd srv`, Left x2, `c` ->
+    // `cd scrv`, with the panel cursor untouched.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
+    state.left.cursor = 1;
+    let state = type_line(state, "cd srv");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('c')));
+    assert_eq!(state.command_line.text(), "cd scrv");
+    assert_eq!(state.command_line.caret(), 5, "the caret sits after the inserted c");
+    assert_eq!(state.left.cursor, 1, "caret editing never moves the panel cursor");
+}
+
+#[test]
+fn caret_moves_are_the_only_non_mutating_edits() {
+    // A pure caret move leaves history recall alone; the next text change
+    // ends it, exactly as typing always has.
+    let mut state = test_state(UiPhase::Panels);
+    state.history = vec!["old".to_string()];
+    let state = type_line(state, "x");
+    let (state, _) = update(state, Command::CommandLineHistoryPrev);
+    assert_eq!(state.history_cursor, Some(0));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    assert_eq!(state.history_cursor, Some(0), "a caret move does not end recall");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::DeleteWordBack));
+    assert_eq!(state.history_cursor, None, "a text-mutating edit ends recall");
+    assert_eq!(state.command_line.text(), "d", "delete-word-back from mid-`old` removes `ol`");
+}
+
+#[test]
+fn home_still_moves_the_panel_cursor_mid_composition() {
+    // command-line "Home still moves the panel cursor while composing":
+    // Home is a panel key even with text on the line, and the buffer and
+    // its caret are unchanged by it.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
+    state.left.cursor = 1;
+    let state = type_line(state, "cd docs");
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Home));
+    assert_eq!(state.left.cursor, 0, "Home jumps the panel cursor to the first entry");
+    assert_eq!(state.command_line.text(), "cd docs");
+    assert_eq!(state.command_line.caret(), 7, "the caret is untouched");
+}
+
+#[test]
+fn history_recall_leaves_the_caret_at_the_end() {
+    let mut state = test_state(UiPhase::Panels);
+    state.history = vec!["cd somewhere".to_string()];
+    let state = type_line(state, "x");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Home));
+    let (state, _) = update(state, Command::CommandLineHistoryPrev);
+    assert_eq!(state.command_line.text(), "cd somewhere");
+    assert_eq!(state.command_line.caret(), state.command_line.len_chars(), "recall lands the caret at the end");
+}
+
+#[test]
+fn paste_flattens_line_breaks_and_inserts_at_the_caret() {
+    // text-field-editing "Multi-line clipboard text is flattened": the two
+    // clipboard lines land joined by one space, and the panel cursor does
+    // not move.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
+    state.left.cursor = 1;
+    let state = type_line(state, "cd ");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Paste("one\r\ntwo".to_string())));
+    assert_eq!(state.command_line.text(), "cd one two");
+    assert_eq!(state.command_line.caret(), state.command_line.len_chars());
+    assert_eq!(state.left.cursor, 1, "pasting never moves the panel cursor");
+}
+
+#[test]
+fn request_paste_asks_the_tui_for_clipboard_text() {
+    // design D4: the key map emits `RequestPaste`; the reducer turns it
+    // into the clipboard-read effect whose answer comes back as
+    // `TextEdit(Paste(..))`.
+    let state = type_line(test_state(UiPhase::Panels), "x");
+    let (state, effects) = update(state, Command::RequestPaste);
+    assert_eq!(effects, vec![Effect::ReadClipboardText]);
+    assert_eq!(state.command_line.text(), "x", "nothing changes until the clipboard text arrives");
+}
+
+#[test]
+fn paste_cursor_entry_after_caret_editing_lands_at_the_end() {
+    // command-line "Paste after caret editing lands at the end".
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("old.log", 1)];
+    let state = type_line(state, "del ");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Home));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Right));
+    let (state, _) = update(state, Command::PasteCursorName);
+    assert_eq!(state.command_line.text(), "del old.log");
+    assert_eq!(state.command_line.caret(), state.command_line.len_chars());
+}
+
+#[test]
+fn destination_field_edits_in_the_middle() {
+    // operation-dialogs "Editing the pre-filled destination in place":
+    // `D:\backup`, Home, Delete, `E` -> `E:\backup`.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.cwd = PathBuf::from(r"D:\backup");
+    let (state, _) = update(state, Command::RequestCopy);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Home));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Delete));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('E')));
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
+            assert_eq!(input.text(), r"E:\backup");
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn destination_field_word_keys_and_paste_work() {
+    // text-field-editing "Word delete" over the pre-filled path, then a
+    // paste flattened into the field at the caret.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.cwd = PathBuf::from(r"D:\backup\2026");
+    let (state, _) = update(state, Command::RequestCopy);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::DeleteWordBack));
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => assert_eq!(input.text(), r"D:\backup\"),
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+    let (state, effects) = update(state, Command::RequestPaste);
+    assert_eq!(effects, vec![Effect::ReadClipboardText]);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Paste("one\ntwo".to_string())));
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
+            assert_eq!(input.text(), r"D:\backup\one two");
+            assert_eq!(input.caret(), input.len_chars(), "the paste leaves the caret at the end");
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn pre_filled_destination_accepts_unchanged_with_enter() {
+    // text-field-editing "Pre-filled field accepts unchanged with Enter":
+    // the caret sits at the end of the pre-fill, so no editing key is
+    // needed before accepting exactly as before this capability existed.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestCopy);
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
+            assert_eq!(input.text(), "/right");
+            assert_eq!(input.caret(), input.len_chars(), "a pre-filled field opens with the caret at the end");
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+    let (_, effects) = update(state, Command::FileOpConfirm);
+    assert!(matches!(effects.as_slice(), [Effect::RunJob(Job { kind: JobKind::Copy, .. })]));
+}
+
+#[test]
+fn rename_edits_the_stem_without_retyping_the_extension() {
+    // text-field-editing "Insert in the middle of a pre-filled name":
+    // `draft.txt` -> `drift.txt` via Left, Backspace, `i`. (The spec
+    // scenario's "Left five times" is off by one — from the end of the
+    // 9-char name the `a` is six Lefts away; the stated result `drift.txt`
+    // is what the reducer must produce.)
+    let state = opened_menu_state(&["draft.txt"], "draft.txt");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::RenameInput { input, .. }) => {
+            assert_eq!(input.text(), "draft.txt");
+            assert_eq!(input.caret(), input.len_chars(), "the rename field opens with the caret at the end");
+        }
+        other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
+    }
+    let state = (0..6).fold(state, |s, _| update(s, Command::TextEdit(TextEditOp::Left)).0);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Backspace));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('i')));
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::RenameInput { input, .. }) => {
+            assert_eq!(input.text(), "drift.txt");
+            assert_eq!(input.caret(), 3, "the caret sits after the inserted i");
+        }
+        other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
+    }
+}
+
+#[test]
+fn conflict_rename_field_edits_in_the_middle() {
+    // The overwrite-conflict Rename field is the same shared text field:
+    // Home, then typing, prepends to the composed name.
+    let state = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (state, _) = update(state, Command::JobConflict(sample_conflict()));
+    let (state, _) = update(state, Command::FileOpBeginRename);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('b')));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Home));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('a')));
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Rename(OsString::from("ab")))]);
+}
+
+#[test]
+fn find_file_pattern_edits_mid_string_until_submitted() {
+    // find-file "Pattern is editable mid-string": `reprt`, Left x2, `o` ->
+    // `report`; once submitted, editing keys stop reaching the pattern.
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let state = "reprt".chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
+    assert_eq!(state.find_file.as_ref().unwrap().pattern.text(), "report");
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('x')));
+    assert_eq!(state.find_file.as_ref().unwrap().pattern.text(), "report", "the pattern is fixed once the walk is in flight");
+}
+
+#[test]
+fn fuzzy_jump_pattern_edited_mid_string_renarrows() {
+    // fuzzy-jump "Pattern edited mid-string re-narrows the list": `prj`,
+    // Left, `o` -> `proj`; a pure caret move keeps the highlight, the text
+    // change resets it to the top of the newly narrowed list.
+    let mut state = test_state(UiPhase::Panels);
+    state.dir_history = vec![history_entry(r"C:\proj", 1, 0), history_entry(r"C:\prj-other", 1, 0)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let state = "prj".chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0);
+    let (state, _) = update(state, Command::FuzzyJumpMove(1));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1, "a caret move never re-narrows");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
+    let fj = state.fuzzy_jump.as_ref().unwrap();
+    assert_eq!(fj.pattern.text(), "proj");
+    assert_eq!(fj.cursor, 0, "the list re-narrows against `proj` from the top");
 }
 
 // `running_a_command_records_history_clears_the_buffer_and_persists` and
@@ -1420,7 +1662,7 @@ fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_on
             assert_eq!(kind, JobKind::Copy);
             assert_eq!(sources.len(), 1, "scoped to the menu's target only, not the selection");
             assert_eq!(sources[0].original_name, OsString::from("report.txt"));
-            assert_eq!(input, PathBuf::from("/right").display().to_string(), "pre-filled with the opposite panel's path");
+            assert_eq!(input.text(), PathBuf::from("/right").display().to_string(), "pre-filled with the opposite panel's path");
         }
         other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
     }
@@ -1484,7 +1726,7 @@ fn rename_pre_fills_the_current_name() {
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::RenameInput { original_name, input, .. }) => {
             assert_eq!(original_name, OsString::from("draft.txt"));
-            assert_eq!(input, "draft.txt");
+            assert_eq!(input.text(), "draft.txt");
         }
         other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
     }
@@ -1501,10 +1743,10 @@ fn rename_confirm_dispatches_a_rename_job_scoped_to_the_target_in_its_own_direct
     // driven the same way a real edit of the input would be (file-action-menu
     // "Accepting the dialog SHALL rename the entry ... with the value
     // `final.txt`").
-    let state = (0.."draft.txt".len()).fold(state, |s, _| update(s, Command::FileOpInputBackspace).0);
-    let state = "final.txt".chars().fold(state, |s, c| update(s, Command::FileOpInputChar(c)).0);
+    let state = (0.."draft.txt".len()).fold(state, |s, _| update(s, Command::TextEdit(TextEditOp::Backspace)).0);
+    let state = "final.txt".chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0);
     match &state.phase {
-        UiPhase::FileOpSetup(FileOpSetup::RenameInput { input, .. }) => assert_eq!(input, "final.txt"),
+        UiPhase::FileOpSetup(FileOpSetup::RenameInput { input, .. }) => assert_eq!(input.text(), "final.txt"),
         other => panic!("expected FileOpSetup::RenameInput, got {other:?}"),
     }
     let (state, effects) = update(state, Command::FileOpConfirm);
@@ -1533,8 +1775,8 @@ fn rename_confirm_dispatches_a_rename_job_scoped_to_the_target_in_its_own_direct
 fn rename_case_only_edit_reaches_the_job_unchanged() {
     let state = opened_menu_state(&["readme.md"], "readme.md");
     let (state, _) = update(state, Command::FileActionMenuHotkey('R'));
-    let state = (0.."readme.md".len()).fold(state, |s, _| update(s, Command::FileOpInputBackspace).0);
-    let state = "README.md".chars().fold(state, |s, c| update(s, Command::FileOpInputChar(c)).0);
+    let state = (0.."readme.md".len()).fold(state, |s, _| update(s, Command::TextEdit(TextEditOp::Backspace)).0);
+    let state = "README.md".chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0);
     let (_, effects) = update(state, Command::FileOpConfirm);
     match effects.as_slice() {
         [Effect::RunJob(job)] => {
@@ -1606,10 +1848,10 @@ fn ctrl_enter_pastes_the_cursor_filename_and_ctrl_bracket_the_full_path() {
     state.left.entries = vec![file_entry("README.md", 1)];
 
     let (name_state, _) = update(state.clone(), Command::PasteCursorName);
-    assert_eq!(name_state.command_line, "README.md");
+    assert_eq!(name_state.command_line.text(), "README.md");
 
     let (path_state, _) = update(state, Command::PasteCursorPath);
-    assert_eq!(path_state.command_line, PathBuf::from(r"C:\NORTON").join("README.md").display().to_string());
+    assert_eq!(path_state.command_line.text(), PathBuf::from(r"C:\NORTON").join("README.md").display().to_string());
 }
 
 #[test]
@@ -1618,7 +1860,7 @@ fn pasting_onto_a_non_empty_buffer_separates_with_a_space() {
     state.left.entries = vec![file_entry("a.txt", 1)];
     let state = type_line(state, "type");
     let (state, _) = update(state, Command::PasteCursorName);
-    assert_eq!(state.command_line, "type a.txt");
+    assert_eq!(state.command_line.text(), "type a.txt");
 }
 
 #[test]
@@ -3354,11 +3596,11 @@ fn fuzzy_jump_open_and_esc_close_without_navigating() {
 fn fuzzy_jump_typing_and_backspace_edit_the_pattern() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FuzzyJumpOpen);
-    let (state, _) = update(state, Command::FuzzyJumpChar('d'));
-    let (state, _) = update(state, Command::FuzzyJumpChar('o'));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "do");
-    let (state, _) = update(state, Command::FuzzyJumpBackspace);
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern, "d");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('d')));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern.text(), "do");
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Backspace));
+    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern.text(), "d");
 }
 
 #[test]
@@ -3413,7 +3655,7 @@ fn find_file_submit_mints_a_request_and_dispatches_the_walk_effect() {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from(r"C:\proj");
     let (state, _) = update(state, Command::FindFileOpen);
-    let (state, _) = update(state, Command::FindFileChar('r'));
+    let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('r')));
     let (state, effects) = update(state, Command::FindFileSubmit);
     match effects.as_slice() {
         [Effect::FindInSubtree { root, pattern, request }] => {
@@ -5051,7 +5293,7 @@ fn drag_drop_opens_the_drop_dialog_prefilled_with_the_exact_target_path() {
             assert_eq!(kind, JobKind::Copy);
             assert_eq!(sources.len(), 1);
             assert_eq!(sources[0].original_name, OsString::from("a.txt"));
-            assert_eq!(input, PathBuf::from("/right").join("OLD").display().to_string());
+            assert_eq!(input.text(), PathBuf::from("/right").join("OLD").display().to_string());
             assert_eq!(buttons, Some(DropButtons { focused: JobKind::Copy }));
         }
         other => panic!("expected a drop-initiated DestinationInput dialog, got {other:?}"),
@@ -5106,7 +5348,7 @@ fn drag_over_accepts_a_subdirectory_row_in_the_same_panel_as_the_source() {
     let (state, effects) = update(state, Command::DragDrop { op: JobKind::Copy });
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
-            assert_eq!(input, PathBuf::from("/left").join("src").display().to_string());
+            assert_eq!(input.text(), PathBuf::from("/left").join("src").display().to_string());
         }
         other => panic!("expected the same-panel subdirectory drop dialog, got {other:?}"),
     }
@@ -5558,7 +5800,7 @@ fn dialogs_stamp_when_they_open() {
 #[test]
 fn typing_into_a_dialog_does_not_restamp_it() {
     let (state, _) = update(clocked(UiPhase::Panels, 500), Command::RequestMkdir);
-    let (state, _) = update(State { clock_ms: 640, ..state }, Command::FileOpInputChar('x'));
+    let (state, _) = update(State { clock_ms: 640, ..state }, Command::TextEdit(TextEditOp::Insert('x')));
     assert_eq!(state.dialog_opened_at_ms, 500, "same dialog, no new iris");
 }
 

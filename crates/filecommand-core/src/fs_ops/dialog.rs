@@ -4,6 +4,7 @@
 use super::conflict::ConflictInfo;
 use super::error::{ErrorInfo, SkippedItem};
 use super::job::{JobKind, ProgressInfo, SourceItem};
+use crate::line_edit::LineEdit;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -15,12 +16,14 @@ pub enum FileOpSetup {
     /// Text-input dialog. For Copy/Move, `input` is the destination path
     /// (pre-filled with the opposite panel's cwd, or — for a drop-initiated
     /// dialog — the exact drop path); for Mkdir, `input` is the new
-    /// directory's name. `buttons` is `None` for the plain keyboard-
+    /// directory's name. The field is a shared text field per
+    /// text-field-editing (a pre-filled `input` opens with the caret at its
+    /// end). `buttons` is `None` for the plain keyboard-
     /// initiated F5/F6/Mkdir dialog (no button row, Enter/Esc only, unchanged
     /// from before `mouse-panel-drag`) and `Some` for a drop-initiated dialog,
     /// which adds a `[ Copy ] [ Move ] [ Cancel ]` row (operation-dialogs
     /// "Drop-initiated destination dialog").
-    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: String, buttons: Option<DropButtons> },
+    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: LineEdit, buttons: Option<DropButtons> },
     DeleteConfirm {
         sources: Vec<SourceItem>,
         source_dir: PathBuf,
@@ -34,9 +37,9 @@ pub enum FileOpSetup {
     /// The file-action menu's in-place Rename: a text-input dialog
     /// pre-filled with `original_name`, renaming within `source_dir`
     /// (file-action-menu "In-place Rename"). Reuses the same
-    /// `Command::FileOpInputChar`/`FileOpInputBackspace`/`FileOpConfirm`/
-    /// `FileOpCancel` commands `DestinationInput` uses.
-    RenameInput { source_dir: PathBuf, original_name: OsString, is_dir: bool, input: String },
+    /// `Command::TextEdit`/`FileOpConfirm`/`FileOpCancel` commands
+    /// `DestinationInput` uses.
+    RenameInput { source_dir: PathBuf, original_name: OsString, is_dir: bool, input: LineEdit },
 }
 
 /// The drop-initiated destination dialog's button row (operation-dialogs
@@ -56,7 +59,9 @@ pub struct DropButtons {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunningDialog {
     Progress { kind: JobKind, progress: ProgressInfo },
-    Conflict { kind: JobKind, info: ConflictInfo, progress: ProgressInfo, rename_input: Option<String> },
+    /// `rename_input` is a shared text field per text-field-editing (`Some`
+    /// once the user picked Rename, starting empty).
+    Conflict { kind: JobKind, info: ConflictInfo, progress: ProgressInfo, rename_input: Option<LineEdit> },
     Error { kind: JobKind, info: ErrorInfo, progress: ProgressInfo },
 }
 

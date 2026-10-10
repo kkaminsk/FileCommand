@@ -97,7 +97,9 @@ pub fn rank_directories(history: &[FrecencyEntry], pattern: &str, now_ms: u64) -
 /// shows" (fuzzy-jump "Fuzzy jump dialog invocation").
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FuzzyJumpState {
-    pub pattern: String,
+    /// The fuzzy match pattern — a shared text field per text-field-editing
+    /// ("the pattern field is a shared text field").
+    pub pattern: crate::line_edit::LineEdit,
     pub cursor: usize,
 }
 
@@ -108,21 +110,17 @@ impl FuzzyJumpState {
         FuzzyJumpState::default()
     }
 
-    /// Append `c` to the pattern. The cursor resets to the top of the
-    /// newly narrowed list, mirroring how a fresh search naturally starts
-    /// from the best match (fuzzy-jump "Typing narrows to subsequence
-    /// matches").
-    pub fn push(&mut self, c: char) {
-        self.pattern.push(c);
-        self.cursor = 0;
-    }
-
-    /// Backspace: shorten the pattern by one character and reset the
-    /// cursor, mirroring [`Self::push`] (fuzzy-jump "Backspace re-widens
-    /// the list").
-    pub fn backspace(&mut self) {
-        self.pattern.pop();
-        self.cursor = 0;
+    /// Apply one editing op to the pattern (fuzzy-jump "Pattern edited
+    /// mid-string re-narrows the list"). A text-mutating op resets the
+    /// cursor to the top of the newly narrowed list, mirroring how a fresh
+    /// search naturally starts from the best match (fuzzy-jump "Typing
+    /// narrows to subsequence matches", "Backspace re-widens the list"); a
+    /// pure caret move leaves the highlight where it is.
+    pub fn apply(&mut self, op: &crate::line_edit::TextEditOp) {
+        self.pattern.apply(op);
+        if op.is_text_mutation() {
+            self.cursor = 0;
+        }
     }
 
     /// Move the highlighted row by `delta`, clamped to `[0, len)`. A no-op
@@ -140,19 +138,36 @@ impl FuzzyJumpState {
 #[cfg(test)]
 mod fuzzy_jump_state_tests {
     use super::*;
+    use crate::line_edit::TextEditOp;
 
     #[test]
     fn typing_and_backspace_reset_the_cursor_to_the_top() {
         let mut fj = FuzzyJumpState::new();
         fj.cursor = 2;
-        fj.push('a');
-        assert_eq!(fj.pattern, "a");
+        fj.apply(&TextEditOp::Insert('a'));
+        assert_eq!(fj.pattern.text(), "a");
         assert_eq!(fj.cursor, 0);
 
         fj.cursor = 3;
-        fj.backspace();
-        assert_eq!(fj.pattern, "");
+        fj.apply(&TextEditOp::Backspace);
+        assert_eq!(fj.pattern.text(), "");
         assert_eq!(fj.cursor, 0);
+    }
+
+    #[test]
+    fn a_caret_move_keeps_the_highlight_where_it_is() {
+        let mut fj = FuzzyJumpState::new();
+        fj.apply(&TextEditOp::Insert('p'));
+        fj.apply(&TextEditOp::Insert('r'));
+        fj.apply(&TextEditOp::Insert('j'));
+        fj.cursor = 2;
+        fj.apply(&TextEditOp::Left);
+        assert_eq!(fj.pattern.text(), "prj");
+        assert_eq!(fj.pattern.caret(), 2);
+        assert_eq!(fj.cursor, 2, "a pure caret move never re-narrows the list");
+        fj.apply(&TextEditOp::Insert('o'));
+        assert_eq!(fj.pattern.text(), "proj", "pattern edited mid-string re-narrows the list");
+        assert_eq!(fj.cursor, 0, "a text change resets the highlight to the top");
     }
 
     #[test]

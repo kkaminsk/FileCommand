@@ -1,6 +1,5 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 262
 expression: text
 ---
   Left     Files     Commands     Options     Right                             
@@ -25,5 +24,5 @@ expression: text
 ║│ Close tab        Ctrl-W │           ║║                                      ║
 ║└─────────────────────────┘           ║║                                      ║
 ╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
-C:\Users\demo\left>_                                                            
+C:\Users\demo\left>                                                             
 1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit

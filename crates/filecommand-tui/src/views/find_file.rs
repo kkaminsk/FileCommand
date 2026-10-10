@@ -19,7 +19,7 @@ const MAX_LIST_ROWS: usize = 10;
 /// + status row + bottom frame.
 const CHROME_ROWS: u16 = 4;
 
-pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FindFileState) {
+pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FindFileState) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);
@@ -47,16 +47,16 @@ pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Colo
 
     // Bracket-and-dots pattern field (§4.4), fixed once a search has begun.
     let field_w = FIELD_WIDTH.min(inner_w.saturating_sub(2));
-    let mut field_text = dialog.pattern.clone();
-    if display_width(&field_text) > field_w {
-        let excess = display_width(&field_text) - field_w;
-        field_text = field_text.chars().skip(excess).collect();
-    }
-    let pad = field_w.saturating_sub(display_width(&field_text));
-    let field = format!("[{field_text}{}]", ".".repeat(pad));
     buf.set_string(x, y + 1, "\u{2551}", body);
-    buf.set_string(x + 1, y + 1, pad_to_width(&field, inner_w), field_style);
+    buf.set_string(x + 1, y + 1, "[", field_style);
+    let caret_x = crate::views::draw_text_field(buf, x + 2, y + 1, field_w, &dialog.pattern, field_style);
+    let close = format!("]{}", " ".repeat(inner_w.saturating_sub(field_w + 2)));
+    buf.set_string(x + 2 + field_w as u16, y + 1, close, field_style);
     buf.set_string(x + 1 + inner_w as u16, y + 1, "\u{2551}", body);
+    // The terminal cursor sits at the pattern's caret only while the field
+    // is still editable — a submitted search fixes the pattern (find-file
+    // "Find-file invocation"), so there is no focused field to point at.
+    let caret = (!showing_results).then_some((caret_x, y + 1));
 
     // Static-text progress/status line — never a spinner (§4.10; find-file
     // "Progress is shown as static text").
@@ -86,6 +86,7 @@ pub fn render_find_file(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Colo
     }
 
     buf.set_string(x, y + box_h - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body);
+    caret
 }
 
 #[cfg(test)]
@@ -137,7 +138,7 @@ mod tests {
     #[test]
     fn only_cp437_heritage_glyphs_and_typed_text_are_emitted() {
         let mut d = FindFileState::new(PathBuf::from("/root"));
-        d.push('r');
+        d.apply(&filecommand_core::line_edit::TextEditOp::Insert('r'));
         let rows = render(&d).join("");
         for ch in rows.chars() {
             assert!(ch.is_ascii() || "\u{2554}\u{2557}\u{255A}\u{255D}\u{2551}\u{2550}".contains(ch), "non-CP437 glyph `{ch}`");

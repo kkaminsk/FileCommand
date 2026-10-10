@@ -1,6 +1,5 @@
 ---
 source: crates/filecommand-tui/tests/snapshot_views.rs
-assertion_line: 979
 expression: text
 ---
 ╔═════════ C:\Users\demo\left ═════════╗╔════════ C:\Users\demo\right ═══3:04 PM
@@ -25,5 +24,5 @@ expression: text
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
-C:\Users\demo\left>_                                                            
+C:\Users\demo\left>                                                             
 1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit

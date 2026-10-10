@@ -29,6 +29,7 @@ pub mod viewer;
 use filecommand_core::anim;
 use filecommand_core::dialogs::OverlayRect;
 use filecommand_core::fs_ops::dialog::RunningDialog;
+use filecommand_core::line_edit::LineEdit;
 use filecommand_core::listing::display_width;
 use filecommand_core::panel::PanelState;
 use filecommand_core::theme::{ColorDepth, Role};
@@ -40,6 +41,32 @@ use ratatui::layout::Rect;
 use crate::hitmap::HitMap;
 use crate::layout;
 use crate::style::role_style;
+
+// ---------------------------------------------------------------------
+// Shared single-line text field (text-field-editing; design D5)
+// ---------------------------------------------------------------------
+
+/// Draw one [`LineEdit`]'s visible window at `(x, y)`: `window(width)`
+/// chars of text followed by dot padding out to `width` cells — the
+/// bracket-and-dots field body used by the destination/name input, the
+/// find-file pattern, and the fuzzy-jump pattern (callers draw any `[` `]`
+/// brackets themselves). Returns the screen column the terminal cursor
+/// should sit on: the caret's column within the window, clamped onto the
+/// last cell when the caret is at the end of a full window (`window`'s
+/// `caret_col == width` case — the cursor can never land past the field).
+pub fn draw_text_field(buf: &mut Buffer, x: u16, y: u16, width: usize, edit: &LineEdit, style: ratatui::style::Style) -> u16 {
+    if width == 0 {
+        return x;
+    }
+    let (start, caret_col) = edit.window(width);
+    let slice: String = edit.text().chars().skip(start).take(width).collect();
+    let pad = width.saturating_sub(display_width(&slice));
+    buf.set_string(x, y, format!("{slice}{}", ".".repeat(pad)), style);
+    // `caret_col` counts window chars; the cursor column is the display
+    // width of the chars before it (the two differ only for wide chars).
+    let caret_cells = display_width(&slice.chars().take(caret_col).collect::<String>());
+    x + caret_cells.min(width - 1) as u16
+}
 
 // ---------------------------------------------------------------------
 // Reveal helpers (ui-animations; design D3)
@@ -207,9 +234,10 @@ fn wipe(
 #[derive(Debug, Clone, Default)]
 pub struct RenderOutput {
     /// The real terminal cursor's `(x, y)` position when the current phase
-    /// wants one shown (only `UiPhase::Editor`, for the caret) — `None`
-    /// otherwise. See `render`'s own doc comment for why a stale position
-    /// must not linger.
+    /// wants one shown (`UiPhase::Editor`, for its caret, or any focused
+    /// single-line text field per text-field-editing — the command line
+    /// included) — `None` otherwise. See `render`'s own doc comment for why
+    /// a stale position must not linger.
     pub cursor: Option<(u16, u16)>,
     pub hitmap: HitMap,
 }
@@ -224,10 +252,11 @@ pub struct RenderOutput {
 /// phase.
 ///
 /// Returns [`RenderOutput`]: the real terminal cursor's `(x, y)` position
-/// when the current phase wants one shown (only `UiPhase::Editor`, for the
-/// caret) — `None` otherwise, which the caller must treat as "leave the
-/// cursor hidden" since a stale position from a previous frame's phase
-/// would otherwise linger — alongside the [`HitMap`] `input::map_mouse`
+/// when the current phase wants one shown (`UiPhase::Editor`, for the
+/// caret, or a focused single-line text field per text-field-editing) —
+/// `None` otherwise, which the caller must treat as "leave the cursor
+/// hidden" since a stale position from a previous frame's phase would
+/// otherwise linger — alongside the [`HitMap`] `input::map_mouse`
 /// needs for the next frame's mouse events (design D2; this is the same
 /// return value the M4 caret position already was, just extended rather
 /// than replaced).
@@ -269,6 +298,11 @@ pub fn render(
     if let Some(message) = &state.startup_warning {
         iris(buf, now, state.dialog_opened_at_ms, |b| startup_warning::render_startup_warning(b, area, &render_theme, depth, message));
     }
+    // While either of those topmost modals is up, it — not any text field
+    // underneath — owns the keyboard, so the terminal cursor hides
+    // (text-field-editing "Field rendering keeps the caret visible": the
+    // cursor shows only while a field is focused).
+    let cursor = if state.quit_confirm || state.startup_warning.is_some() { None } else { cursor };
     RenderOutput { cursor, hitmap: build_hitmap(area, state) }
 }
 
@@ -370,6 +404,14 @@ fn render_phase(
             // drawn over it directly (ui-animations "Panels wipe in after
             // the splash").
             let now = state.anim_now();
+            // The terminal cursor shows whenever a single-line text field
+            // owns the keyboard (text-field-editing "Field rendering keeps
+            // the caret visible"): the command line by default, or a
+            // dialog's field while one is open. Each text-field view
+            // reports its caret position as it draws; the overlays below
+            // override the command line's, and an overlay with no field
+            // hides the cursor again.
+            let mut cmdline_caret = None;
             wipe(buf, now, state.panels_revealed_at_ms, theme, depth, |b| {
                 panel::render_panel(
                     b,
@@ -408,7 +450,7 @@ fn render_phase(
                 if clock_fits_without_colliding(l.right, &state.right, state.active == PanelSide::Right, clock_text) {
                     clock::render_clock(b, l.right, theme, depth, clock_text);
                 }
-                command_line::render_command_line(b, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
+                cmdline_caret = command_line::render_command_line(b, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
                 keybar::render_keybar(b, l.keybar, theme, depth, state.drag.is_some());
             });
 
@@ -426,11 +468,13 @@ fn render_phase(
             if let Some(dialog) = &state.drive_select {
                 iris(buf, now, opened, |b| drive_select::render_drive_select(b, area, theme, depth, dialog));
             }
+            let mut fuzzy_caret = None;
             if let Some(dialog) = &state.fuzzy_jump {
-                iris(buf, now, opened, |b| fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.clock_ms));
+                iris(buf, now, opened, |b| fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.clock_ms));
             }
+            let mut find_caret = None;
             if let Some(dialog) = &state.find_file {
-                iris(buf, now, opened, |b| find_file::render_find_file(b, area, theme, depth, dialog));
+                iris(buf, now, opened, |b| find_caret = find_file::render_find_file(b, area, theme, depth, dialog));
             }
             if let Some(dialog) = &state.user_menu {
                 user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries, now);
@@ -450,9 +494,10 @@ fn render_phase(
                 file_action_menu::render_file_action_menu(buf, area, theme, depth, dialog, now);
             }
 
+            let mut file_op_caret = None;
             match &state.phase {
                 UiPhase::FileOpSetup(setup) => iris(buf, now, opened, |b| {
-                    destination_input::render_destination_input(b, area, theme, depth, setup);
+                    file_op_caret = destination_input::render_destination_input(b, area, theme, depth, setup);
                     delete_confirm::render_delete_confirm(b, area, theme, depth, setup);
                 }),
                 UiPhase::FileOpRunning { dialog, .. } => match dialog {
@@ -460,7 +505,7 @@ fn render_phase(
                         iris(buf, now, opened, |b| progress_dialog::render_progress(b, area, theme, depth, *kind, progress));
                     }
                     RunningDialog::Conflict { info, rename_input, .. } => {
-                        iris(buf, now, opened, |b| conflict_dialog::render_conflict(b, area, theme, depth, info, rename_input));
+                        iris(buf, now, opened, |b| file_op_caret = conflict_dialog::render_conflict(b, area, theme, depth, info, rename_input));
                     }
                     RunningDialog::Error { info, .. } => {
                         iris(buf, now, opened, |b| error_dialog::render_error(b, area, theme, depth, info));
@@ -471,7 +516,33 @@ fn render_phase(
                 }
                 _ => {}
             }
-            None
+
+            // The command line's caret is the default; any overlay above
+            // either hands the cursor to its own text field or hides it
+            // (text-field-editing "Field rendering keeps the caret
+            // visible": "SHALL show the terminal cursor at the caret's
+            // screen position while the field is focused" — and only then).
+            let mut cursor = cmdline_caret;
+            if state.menu.is_some()
+                || state.drive_select.is_some()
+                || state.user_menu.is_some()
+                || state.theme_picker.is_some()
+                || state.help.is_some()
+                || state.file_action_menu.is_some()
+            {
+                cursor = None;
+            }
+            if state.fuzzy_jump.is_some() {
+                cursor = fuzzy_caret;
+            }
+            if state.find_file.is_some() {
+                cursor = find_caret;
+            }
+            match &state.phase {
+                UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => cursor = file_op_caret,
+                _ => {}
+            }
+            cursor
         }
     }
 }
