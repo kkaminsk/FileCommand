@@ -49,9 +49,9 @@ fn fixed_date() -> DateTime {
 fn fixed_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()) },
-        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()) },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false },
+        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false },
+        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false },
     ]
 }
 
@@ -850,7 +850,7 @@ fn snapshot_brief_mode_three_name_columns() {
     let mut panel = complete_panel(r"C:\Users\demo\left", 0);
     panel.display_mode = DisplayMode::Brief;
     panel.entries = std::iter::once(Entry::parent_dir())
-        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None }))
+        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false }))
         .collect();
     state.left = panel;
     // A short panel (6 body rows, after the command line and F-key bar
@@ -872,8 +872,8 @@ fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
     tree.insert_children(
         &PathBuf::from(r"C:\"),
         vec![
-            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None },
-            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None },
+            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
+            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
         ],
     );
     tree.cursor = cursor;
@@ -928,7 +928,7 @@ fn quick_view_previews_the_opposite_cursor_file() {
     state.left = left;
 
     let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
-    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None }];
+    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None, hidden: false }];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -950,7 +950,7 @@ fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
     state.left = left;
 
     let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
-    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None }];
+    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -996,6 +996,85 @@ fn snapshot_git_info_absent_reserves_no_marker_column() {
     let plain = render_to_text(80, 24, &base_state(UiPhase::Panels, Theme::classic()), ColorDepth::Ansi16);
     assert_eq!(with_no_git, plain);
     assert!(!with_no_git.lines().next().unwrap().contains('('), "no branch suffix outside a repo");
+}
+
+// ---------------------------------------------------------------------
+// hidden-entry-styling: hidden/system entries render dimmed, in Full and
+// Brief alike (task 3.2)
+// ---------------------------------------------------------------------
+
+/// The task-3.2 fixture: a hidden directory (`.git`, under the cursor), a
+/// plain directory, a hidden file, a *selected* hidden file, and a plain
+/// file — one row per precedence tier of design D3.
+fn hidden_entries_fixture() -> Vec<Entry> {
+    vec![
+        Entry::parent_dir(),
+        Entry { name: ".git".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: true },
+        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false },
+        Entry { name: "desktop.ini".into(), kind: EntryKind::File, size: 87, modified: Some(fixed_date()), hidden: true },
+        Entry { name: "secret.txt".into(), kind: EntryKind::File, size: 35_840, modified: Some(fixed_date()), hidden: true },
+        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false },
+    ]
+}
+
+fn hidden_entries_panel(cwd: &str, mode: DisplayMode) -> PanelState {
+    let mut panel = complete_panel(cwd, 1); // cursor on the hidden `.git`
+    panel.display_mode = mode;
+    panel.entries = hidden_entries_fixture();
+    panel.progress = ListingProgress::Complete { count: panel.entries.len() };
+    panel.selected.insert("secret.txt".into());
+    panel
+}
+
+#[test]
+fn snapshot_hidden_entries_dimmed_in_full_and_brief() {
+    use filecommand_core::theme::Role;
+    use filecommand_tui::style::role_style;
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = hidden_entries_panel(r"C:\Users\demo\left", DisplayMode::Full);
+    state.right = hidden_entries_panel(r"C:\Users\demo\right", DisplayMode::Brief);
+
+    // The cursor bar only renders on the active panel, so each mode's
+    // precedence is asserted against a render with that panel active.
+    let theme = Theme::classic();
+    let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+    let hidden = style_of(Role::PanelHidden);
+    let selected = style_of(Role::PanelSelected);
+    let cursor = style_of(Role::PanelCursor);
+    let directory = style_of(Role::PanelDirectory);
+    let file = style_of(Role::PanelFile);
+    assert_ne!(hidden, file, "sanity: the hidden role differs from the file role");
+
+    // Full (left) panel, active: entry rows start at y = 2, names at x = 1.
+    let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+    let full_cell = |y: u16| buf[(1, y)].style();
+    assert_eq!(full_cell(3).fg, cursor.fg, "cursor bar wins over hidden (.git)");
+    assert_eq!(full_cell(4).fg, directory.fg, "plain directory unchanged");
+    assert_eq!(full_cell(5).fg, hidden.fg, "hidden file dimmed (desktop.ini)");
+    assert_eq!(full_cell(5).bg, hidden.bg);
+    assert_eq!(full_cell(6).fg, selected.fg, "selected beats hidden (secret.txt)");
+    assert_eq!(full_cell(7).fg, file.fg, "plain file unchanged");
+
+    // Brief (right) panel, active: six entries fit in the first of the
+    // three columns, rows y = 1..6 at x = 41 (right panel starts at x = 40
+    // in the default 50/50 split at 80 columns).
+    state.active = PanelSide::Right;
+    let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+    let brief_cell = |y: u16| buf[(41, y)].style();
+    assert_eq!(brief_cell(1).fg, directory.fg, ".. keeps the directory style");
+    assert_eq!(brief_cell(2).fg, cursor.fg, "cursor bar wins over hidden (.git)");
+    assert_eq!(brief_cell(3).fg, directory.fg, "plain directory unchanged");
+    assert_eq!(brief_cell(4).fg, hidden.fg, "hidden file dimmed in Brief too (desktop.ini)");
+    assert_eq!(brief_cell(5).fg, selected.fg, "selected beats hidden (secret.txt)");
+    assert_eq!(brief_cell(6).fg, file.fg, "plain file unchanged");
+
+    // The snapshot itself pins the glyph grid: hidden styling changes only
+    // colors, and the hidden directory keeps its ▶SUB-DIR◀ marker.
+    state.active = PanelSide::Left;
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("desktop.ini") && text.contains(".git"), "hidden entries still list:\n{text}");
+    insta::assert_snapshot!("hidden_entries_full_and_brief", text);
 }
 
 // ---------------------------------------------------------------------
@@ -1167,7 +1246,7 @@ fn snapshot_find_file_dialog_with_streamed_results() {
         1,
         filecommand_core::listing::FindMatch {
             relative_path: PathBuf::from(r"docs\readme.txt"),
-            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false },
         },
     );
     dialog.mark_done(1);

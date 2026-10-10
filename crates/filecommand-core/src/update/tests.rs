@@ -14,11 +14,11 @@ fn test_state(phase: UiPhase) -> State {
 }
 
 fn file_entry(name: &str, size: u64) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None }
+    Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false }
 }
 
 fn dir_entry(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
 }
 
 /// Every navigation/re-read now also issues `Effect::QueryGitInfo`
@@ -2910,7 +2910,7 @@ fn f4_passes_the_original_os_string_file_name_through_without_lossy_conversion()
         let raw = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).to_os_string();
         let mut state = test_state(UiPhase::Panels);
         state.editor = Some("notepad".to_string());
-        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None }];
+        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None, hidden: false }];
         let (_, effects) = update(state, Command::RequestExternalEditor);
         match effects.as_slice() {
             [Effect::RunExternalEditor(inv, _)] => assert_eq!(inv.file_arg, raw),
@@ -3638,7 +3638,7 @@ fn find_match(rel: &str, name: &str) -> FindMatch {
 }
 
 fn dir_entry_named(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None }
+    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false }
 }
 
 #[test]
@@ -4838,7 +4838,7 @@ fn ctrl_click_toggles_selection_and_moves_the_cursor() {
 #[test]
 fn ctrl_click_on_parent_entry_never_selects_it() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None }];
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }];
     let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from(".."), mods: ClickMods::Ctrl });
     assert!(state.left.selected.is_empty());
     assert_eq!(state.left.cursor, 0, "the cursor still moves to `..`");
@@ -5057,7 +5057,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
 #[test]
 fn open_action_menu_at_on_the_parent_entry_is_a_no_op() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None }];
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("..") });
     assert!(state.file_action_menu.is_none(), "`..` is never a valid action-menu target");
 }

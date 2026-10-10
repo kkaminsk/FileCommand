@@ -457,6 +457,8 @@ pub fn render_panel(
     let header_style = role_style(theme, Role::PanelHeader, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
+    let hidden_style = role_style(theme, Role::PanelHidden, depth);
+    let selected_style = role_style(theme, Role::PanelSelected, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
     let button_focused_style = role_style(theme, Role::ButtonFocused, depth);
     // A clipboard action's feedback (clipboard-export "Clipboard feedback")
@@ -615,17 +617,26 @@ pub fn render_panel(
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
         draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
-        if let Some((entry, is_selected)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
+        if let Some((entry, is_cursor)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
             // The drag's target row (mouse-panel-drag "Drag feedback")
             // outranks the ordinary selected/dir/file styling — but never a
             // *source* row, since a dragged item's own directory/descendant
             // is already rejected as a target by core (design D7), so this
             // can never coincide with one of the rows the drag is dragging.
             let is_drag_target = is_target_row(&row_highlight, &entry.name);
+            // Entry style precedence (panel-navigation "Entry row
+            // rendering"; hidden-entry-styling design D3): drag-target
+            // highlight, then the cursor bar, then Ins-selection, then the
+            // hidden dimming (which covers hidden directories too), then the
+            // ordinary directory/file styles.
             let style = if is_drag_target {
                 button_focused_style
-            } else if is_selected {
+            } else if is_cursor {
                 cursor_style
+            } else if entry.kind != EntryKind::ParentDir && panel.selected.contains(&entry.name) {
+                selected_style
+            } else if entry.hidden {
+                hidden_style
             } else if entry.is_dir_like() {
                 dir_style
             } else {
@@ -649,7 +660,7 @@ pub fn render_panel(
                 let marker = git_marker(panel, entry);
                 let marker_style = if is_drag_target {
                     button_focused_style
-                } else if is_selected {
+                } else if is_cursor {
                     cursor_style
                 } else if let Some((_, role)) = marker {
                     role_style(theme, role, depth)
@@ -682,8 +693,10 @@ fn draw_side_borders(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, body
 
 /// Brief mode's body: entry names only, laid out across three columns in
 /// column-major order, using `unicode-width` for alignment and preserving
-/// the standard directory/file/selected/cursor styling and the `..`
-/// up-dir marker (additional-panel-modes "Brief display mode").
+/// the standard directory/file/hidden/selected/cursor styling and the `..`
+/// up-dir marker, with the same style precedence as Full mode
+/// (additional-panel-modes "Brief display mode"; hidden-entry-styling
+/// design D3).
 #[allow(clippy::too_many_arguments)]
 fn render_brief_body(
     buf: &mut Buffer,
@@ -701,6 +714,7 @@ fn render_brief_body(
 ) {
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
+    let hidden_style = role_style(theme, Role::PanelHidden, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
     let selected_style = role_style(theme, Role::PanelSelected, depth);
     let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
@@ -737,12 +751,17 @@ fn render_brief_body(
             let pos = panel.scroll_offset + c * rows_h + row;
             if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
+                // Same precedence as Full mode (hidden-entry-styling design
+                // D3): drag target, cursor bar, Ins-selection, hidden
+                // dimming, then directory/file.
                 let style = if is_target_row(row_highlight, &entry.name) {
                     button_focused_style
                 } else if is_cursor {
                     cursor_style
                 } else if entry.kind != EntryKind::ParentDir && panel.selected.contains(&entry.name) {
                     selected_style
+                } else if entry.hidden {
+                    hidden_style
                 } else if entry.is_dir_like() {
                     dir_style
                 } else {
@@ -1032,8 +1051,8 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None },
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None },
+            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None, hidden: false },
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         let mut right = PanelState::new(PathBuf::from(r"C:\right"));
@@ -1270,7 +1289,7 @@ mod tests {
         let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt) },
+            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt), hidden: false },
         ]);
         // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
         let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
@@ -1293,8 +1312,8 @@ mod tests {
         // their last-digit cell column.
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None },
-            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None },
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None, hidden: false },
+            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None, hidden: false },
         ]);
         // Interior layout: 13-cell Name, `│`, then the 9-cell Size column —
         // cells 15..24 of the 40-cell row.
@@ -1310,6 +1329,87 @@ mod tests {
         assert_eq!(pad_left_to_width("87", SIZE_TEXT_W), "       87");
         assert_eq!(pad_left_to_width("35K", SIZE_TEXT_W), "      35K");
         assert_eq!(pad_left_to_width("\u{25B6}SUB-DIR\u{25C4}", SIZE_TEXT_W), "\u{25B6}SUB-DIR\u{25C4}");
+    }
+
+    // -----------------------------------------------------------------
+    // hidden-entry-styling: hidden dimming and its precedence (tasks.md
+    // 3.1).
+    // -----------------------------------------------------------------
+
+    /// The hidden-styling fixture: `..`, a hidden directory (`.git`, under
+    /// the cursor), a plain directory, a hidden file, a *selected* hidden
+    /// file, and a plain file — one row per precedence tier of design D3.
+    fn hidden_fixture_panel() -> PanelState {
+        let mut left = PanelState::new(PathBuf::from(r"C:\left"));
+        left.entries = vec![
+            Entry::parent_dir(),
+            Entry { name: OsString::from(".git"), kind: EntryKind::Directory, size: 0, modified: None, hidden: true },
+            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
+            Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
+            Entry { name: OsString::from("secret.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
+            Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: false },
+        ];
+        left.progress = ListingProgress::Complete { count: left.entries.len() };
+        left.cursor = 1; // on the hidden `.git` directory
+        left.selected.insert(OsString::from("secret.txt"));
+        left
+    }
+
+    /// Renders `panel` active at 40x10 and returns the raw buffer (for style
+    /// assertions) plus the plain-text grid.
+    fn render_fixture(panel: &PanelState) -> (Buffer, String) {
+        let right = PanelState::new(PathBuf::from(r"C:\right"));
+        let theme = Theme::classic();
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, panel, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        let text = buffer_to_text(&buf, area);
+        (buf, text)
+    }
+
+    #[test]
+    fn full_mode_styles_hidden_entries_with_cursor_and_selection_precedence() {
+        let theme = Theme::classic();
+        let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+        let (buf, text) = render_fixture(&hidden_fixture_panel());
+
+        // Rows: 0 = border, 1 = header, then `..`, `.git`, `docs`,
+        // `desktop.ini`, `secret.txt`, `readme.txt`.
+        let cell = |y: u16| buf[(1, y)].style();
+        assert_eq!(cell(2).fg, style_of(Role::PanelDirectory).fg, "`..` keeps the directory style");
+        assert_eq!(cell(3).fg, style_of(Role::PanelCursor).fg, "cursor bar wins over hidden (scenario \"Cursor bar wins\")");
+        assert_eq!(cell(3).bg, style_of(Role::PanelCursor).bg, "the cursor bar spans the hidden row");
+        assert_eq!(cell(4).fg, style_of(Role::PanelDirectory).fg, "a plain directory is unchanged");
+        assert_eq!(cell(5).fg, style_of(Role::PanelHidden).fg, "a hidden file renders dimmed (scenario \"Hidden entries render dimmed\")");
+        assert_eq!(cell(5).bg, style_of(Role::PanelHidden).bg);
+        assert_eq!(cell(6).fg, style_of(Role::PanelSelected).fg, "selected beats hidden (scenario \"Selected hidden entry shows selected style\")");
+        assert_eq!(cell(6).bg, style_of(Role::PanelSelected).bg);
+        assert_eq!(cell(7).fg, style_of(Role::PanelFile).fg, "a plain file is unchanged");
+
+        // The hidden directory keeps its directory marker in the Size
+        // column even though its name is dimmed.
+        let git_row = text.lines().nth(3).unwrap();
+        assert!(git_row.contains("\u{25B6}SUB-DIR\u{25C4}"), "`.git` still shows ▶SUB-DIR◀: `{git_row}`");
+    }
+
+    #[test]
+    fn brief_mode_dims_hidden_entries_with_the_same_precedence() {
+        // additional-panel-modes "Brief mode dims hidden entries".
+        let mut panel = hidden_fixture_panel();
+        panel.display_mode = DisplayMode::Brief;
+        let theme = Theme::classic();
+        let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+        let (buf, _) = render_fixture(&panel);
+
+        // Six entries fit in the first of the three 12/12/14 columns
+        // (rows_h = 8), at rows 1..6, x = 1.
+        let cell = |y: u16| buf[(1, y)].style();
+        assert_eq!(cell(1).fg, style_of(Role::PanelDirectory).fg, "`..` keeps the directory style");
+        assert_eq!(cell(2).fg, style_of(Role::PanelCursor).fg, "cursor bar wins (.git)");
+        assert_eq!(cell(3).fg, style_of(Role::PanelDirectory).fg, "docs");
+        assert_eq!(cell(4).fg, style_of(Role::PanelHidden).fg, "desktop.ini dimmed");
+        assert_eq!(cell(5).fg, style_of(Role::PanelSelected).fg, "secret.txt: selected beats hidden");
+        assert_eq!(cell(6).fg, style_of(Role::PanelFile).fg, "readme.txt plain");
     }
 
     #[test]

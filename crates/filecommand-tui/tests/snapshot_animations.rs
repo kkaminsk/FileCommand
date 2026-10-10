@@ -40,9 +40,9 @@ fn complete_panel(cwd: &str, cursor: usize) -> PanelState {
     let mut panel = PanelState::new(PathBuf::from(cwd));
     panel.entries = vec![
         Entry::parent_dir(),
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(date) },
-        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(date) },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(date) },
+        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(date), hidden: false },
+        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(date), hidden: false },
+        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(date), hidden: false },
     ];
     panel.progress = ListingProgress::Complete { count: panel.entries.len() };
     panel.sort_direction = SortDirection::Asc;

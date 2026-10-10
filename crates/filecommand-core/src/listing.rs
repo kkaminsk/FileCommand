@@ -69,11 +69,16 @@ pub struct Entry {
     pub kind: EntryKind,
     pub size: u64,
     pub modified: Option<DateTime>,
+    /// The entry carries the Windows hidden/system attribute, or — on other
+    /// platforms — a dot-prefixed name (hidden-entry-styling; design D1).
+    /// The renderer dims such entries via the `panel.hidden` role. The
+    /// synthetic `..` entry is never hidden.
+    pub hidden: bool,
 }
 
 impl Entry {
     pub fn parent_dir() -> Entry {
-        Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None }
+        Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }
     }
 
     pub fn is_dir_like(&self) -> bool {
@@ -195,7 +200,7 @@ mod sort_tests {
     use super::*;
 
     fn f(name: &str, size: u64, modified: Option<DateTime>) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified, hidden: false }
     }
 
     fn dt(day: u8) -> DateTime {
@@ -421,6 +426,11 @@ pub struct RawDirEntry {
     pub is_dir: bool,
     pub size: u64,
     pub modified: Option<SystemTime>,
+    /// The hidden/system flag, computed once by the reader (hidden-entry-
+    /// styling; design D1): on Windows from the `FILE_ATTRIBUTE_HIDDEN`
+    /// (0x2) / `FILE_ATTRIBUTE_SYSTEM` (0x4) bits in the enumeration's own
+    /// metadata, elsewhere from a leading `.` in the name.
+    pub hidden: bool,
 }
 
 /// A narrow seam over directory reads. Exists so later milestones can inject
@@ -434,6 +444,24 @@ pub trait FsReader {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StdFsReader;
 
+/// The hidden/system flag for one enumerated entry, computed from the
+/// enumeration's own metadata — never a per-file stat (hidden-entry-styling;
+/// design D1). The synthetic `..` entry never passes through here; it is
+/// built by [`Entry::parent_dir`] with `hidden: false`.
+#[cfg(windows)]
+fn is_hidden(_name: &std::ffi::OsStr, metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    metadata.file_attributes() & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM) != 0
+}
+
+/// The non-Windows rule: a leading `.` in the name (design D1).
+#[cfg(not(windows))]
+fn is_hidden(name: &std::ffi::OsStr, _metadata: &std::fs::Metadata) -> bool {
+    name.to_string_lossy().starts_with('.')
+}
+
 impl FsReader for StdFsReader {
     fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
         let long = to_long_path(path);
@@ -446,6 +474,7 @@ impl FsReader for StdFsReader {
                 is_dir: metadata.is_dir(),
                 size: if metadata.is_dir() { 0 } else { metadata.len() },
                 modified: metadata.modified().ok(),
+                hidden: is_hidden(&entry.file_name(), &metadata),
             });
         }
         Ok(out)
@@ -459,6 +488,7 @@ impl From<RawDirEntry> for Entry {
             kind: if raw.is_dir { EntryKind::Directory } else { EntryKind::File },
             size: raw.size,
             modified: raw.modified.map(DateTime::from_system_time),
+            hidden: raw.hidden,
         }
     }
 }
@@ -598,7 +628,7 @@ mod tests {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
             let raw = OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]); // "fo\x80o", invalid utf8
-            let entry = Entry { name: raw.to_os_string(), kind: EntryKind::File, size: 0, modified: None };
+            let entry = Entry { name: raw.to_os_string(), kind: EntryKind::File, size: 0, modified: None, hidden: false };
             let shown = display_name_lossy(&entry);
             assert!(shown.contains('\u{FFFD}'));
             assert_eq!(display_width(&shown), shown.chars().count());
@@ -618,7 +648,7 @@ mod tests {
 
     #[test]
     fn entry_status_line_marks_dirs_and_parent() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None };
+        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false };
         assert_eq!(entry_status_line(&dir), "sub  SUB-DIR");
         assert_eq!(entry_status_line(&Entry::parent_dir()), "..  UP--DIR");
     }
@@ -626,7 +656,7 @@ mod tests {
     #[test]
     fn entry_status_parts_splits_file_fields() {
         let dt = DateTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4 };
-        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt) };
+        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt), hidden: false };
         let (name, size, date, time) = entry_status_parts(&file);
         assert_eq!(name, "a.txt");
         assert_eq!(size.as_deref(), Some("100"));
@@ -636,7 +666,7 @@ mod tests {
 
     #[test]
     fn entry_status_parts_marks_dirs_and_parent_with_no_date_or_time() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None };
+        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false };
         assert_eq!(entry_status_parts(&dir), ("sub".to_string(), Some("SUB-DIR".to_string()), None, None));
         assert_eq!(entry_status_parts(&Entry::parent_dir()), ("..".to_string(), Some("UP--DIR".to_string()), None, None));
     }
@@ -691,13 +721,54 @@ mod tests {
     #[test]
     fn list_dir_chunked_delivers_chunks_and_total() {
         let entries: Vec<RawDirEntry> = (0..10)
-            .map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None })
+            .map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None, hidden: false })
             .collect();
         let reader = FakeReader(entries);
         let mut chunks = Vec::new();
         let total = list_dir_chunked(&reader, Path::new("."), 3, |c| chunks.push(c.len())).unwrap();
         assert_eq!(total, 10);
         assert_eq!(chunks, vec![3, 3, 3, 1]);
+    }
+
+    // -----------------------------------------------------------------
+    // hidden-entry-styling: the hidden flag (tasks.md 1.3)
+    // -----------------------------------------------------------------
+
+    fn raw_hidden(name: &str, is_dir: bool) -> RawDirEntry {
+        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: true }
+    }
+
+    #[test]
+    fn from_raw_entry_copies_the_hidden_flag() {
+        let file = Entry::from(raw_hidden("desktop.ini", false));
+        assert!(file.hidden && file.kind == EntryKind::File);
+        let dir = Entry::from(raw_hidden("System Volume Information", true));
+        assert!(dir.hidden && dir.kind == EntryKind::Directory);
+        assert!(!Entry::from(raw_file("readme.txt")).hidden);
+    }
+
+    #[test]
+    fn parent_dir_is_never_hidden() {
+        // panel-navigation "Entry row rendering": "the `..` entry is never
+        // hidden" — the synthetic parent carries no attributes at all.
+        assert!(!Entry::parent_dir().hidden);
+    }
+
+    #[test]
+    fn hidden_flags_survive_enumeration_and_sorting() {
+        // Entries read through the FsReader seam carry the flag into
+        // `Entry`, and sorting reorders whole entries without dropping it
+        // (hidden-entry-styling tasks.md 1.3).
+        let reader = FakeReader(vec![raw_file("zeta.txt"), raw_hidden("desktop.ini", false), raw_hidden(".git", true), raw_dir("alpha")]);
+        let mut entries = Vec::new();
+        let total = list_dir_chunked(&reader, Path::new("."), 100, |chunk| entries.extend(chunk)).unwrap();
+        assert_eq!(total, 4);
+        let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
+        assert_eq!(flags, vec![("zeta.txt", false), ("desktop.ini", true), (".git", true), ("alpha", false)], "enumeration order");
+
+        entries.sort_by(|a, b| cmp_by_mode(a, b, SortMode::Name));
+        let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
+        assert_eq!(flags, vec![(".git", true), ("alpha", false), ("desktop.ini", true), ("zeta.txt", false)], "the flag follows its entry through the sort");
     }
 
     // -----------------------------------------------------------------
@@ -716,10 +787,10 @@ mod tests {
     }
 
     fn raw_dir(name: &str) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None }
+        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None, hidden: false }
     }
     fn raw_file(name: &str) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir: false, size: 0, modified: None }
+        RawDirEntry { name: name.into(), is_dir: false, size: 0, modified: None, hidden: false }
     }
 
     #[test]
@@ -831,7 +902,7 @@ mod tests {
         let mut raw_name = vec![0x66, 0x6f, 0x80];
         raw_name.extend_from_slice(b"report.txt");
         let name = std::ffi::OsStr::from_bytes(&raw_name).to_os_string();
-        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None }]);
+        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None, hidden: false }]);
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();

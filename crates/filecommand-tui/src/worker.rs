@@ -329,7 +329,7 @@ mod tests {
     }
 
     fn raw(name: &str, is_dir: bool) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None }
+        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: false }
     }
 
     #[test]

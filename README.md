@@ -529,6 +529,11 @@ In Full mode, numeric sizes are right-aligned in the Size column (the Norton
 Commander convention) and every value renders complete — `▶SUB-DIR◀`,
 `MM-DD-YY` dates, and `HH:MM` times are never truncated.
 
+Hidden and system entries are still listed — there is no show/hide toggle —
+but render dimmed in both Full and Brief modes: on Windows, entries carrying
+the hidden or system attribute; on other platforms, names beginning with
+`.`. Selection and the cursor bar take precedence over the dimming.
+
 ### File operations
 
 Copy (F5), Move/Rename (F6), Mkdir (F7), and Delete (F8) run as cancellable
@@ -558,7 +563,9 @@ Six built-in themes: `nc-classic` (default, the authentic NC palette),
 and `inverted`. Switch live via **Options → Themes** (arrow keys preview
 each theme before you commit) or the F2 user menu; the choice persists to
 `config.toml`. Pin a theme for a single session with `--theme <name>`
-without touching the saved default.
+without touching the saved default. Every theme defines the full role set,
+including a dedicated `panel.hidden` role — a visibly dimmer variant of the
+theme's file color, used for hidden/system entries in the panels.
 
 ## Project layout
 

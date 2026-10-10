@@ -197,7 +197,7 @@ mod tests {
     use std::ffi::OsString;
 
     fn entry(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false }
     }
 
     fn dir_entry(path: &str) -> FrecencyEntry {

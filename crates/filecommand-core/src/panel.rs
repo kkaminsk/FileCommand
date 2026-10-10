@@ -1016,10 +1016,10 @@ mod tests {
     use std::ffi::OsString;
 
     fn file(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false }
     }
     fn dir(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
     }
 
     #[test]
@@ -1181,8 +1181,8 @@ mod tests {
     fn selection_status_counts_files_and_zeros_directories() {
         let mut p = PanelState::new(PathBuf::from("/"));
         p.entries = vec![
-            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None },
-            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None },
+            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None, hidden: false },
+            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
         ];
         assert_eq!(p.selection_status(), None);
         p.select_matching("*");
@@ -1250,7 +1250,7 @@ mod tests {
     }
 
     fn sized(name: &str, size: u64) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false }
     }
 
     fn timed(name: &str, day: u8) -> Entry {
@@ -1259,6 +1259,7 @@ mod tests {
             kind: EntryKind::File,
             size: 0,
             modified: Some(DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }),
+            hidden: false,
         }
     }
 
@@ -1391,6 +1392,7 @@ mod tests {
                 kind: if is_dir { EntryKind::Directory } else { EntryKind::File },
                 size: 0,
                 modified: None,
+                hidden: false,
             })
         }
 
@@ -1406,7 +1408,7 @@ mod tests {
             fn insert_sorted_preserves_sorted_order(names in prop::collection::vec(arb_name(), 0..15)) {
                 let mut entries: Vec<Entry> = Vec::new();
                 for name in names {
-                    let e = Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None };
+                    let e = Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false };
                     insert_sorted(&mut entries, e, SortMode::Name, SortDirection::Asc);
                 }
                 for w in entries.windows(2) {
@@ -1443,6 +1445,7 @@ mod tests {
                 kind: if is_dir { EntryKind::Directory } else { EntryKind::File },
                 size,
                 modified: day.map(|d| DateTime { year: 2026, month: 1, day: d, hour: 0, minute: 0 }),
+                hidden: false,
             })
         }
 
@@ -1604,6 +1607,27 @@ mod tests {
             p.quick_filter_push('c'); // only "cherry" (+ "..") remain
             let cursor_name = p.entries[p.cursor].name.to_string_lossy().into_owned();
             assert_eq!(cursor_name, "cherry", "cursor must land on a still-visible entry, not a hidden one");
+        }
+
+        #[test]
+        fn narrowing_keeps_the_hidden_flag_on_matching_entries() {
+            // hidden-entry-styling tasks.md 1.3: the quick filter narrows by
+            // index into the same `Entry` values, so a hidden entry that
+            // matches keeps its flag (and `..` never carries it).
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.entries = vec![
+                Entry::parent_dir(),
+                Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
+                Entry { name: OsString::from("readme.md"), kind: EntryKind::File, size: 0, modified: None, hidden: false },
+            ];
+            p.activate_quick_filter();
+            for c in "desktop".chars() {
+                p.quick_filter_push(c);
+            }
+            let visible: Vec<&Entry> = p.visible_indices().into_iter().map(|i| &p.entries[i]).collect();
+            assert_eq!(visible.len(), 2, "`..` plus the one matching entry");
+            assert!(!visible[0].hidden, "`..` is never hidden");
+            assert!(visible[1].hidden, "the flag survives quick-filter narrowing");
         }
 
         #[test]
@@ -1785,7 +1809,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
         }
 
         #[test]
@@ -2360,7 +2384,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None }
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
         }
 
         /// A flattened tree of `n` top-level directories under `C:\`.

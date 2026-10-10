@@ -118,6 +118,10 @@ pub enum Role {
     PanelHeader,
     PanelFile,
     PanelDirectory,
+    /// Hidden/system entries' names, visibly dimmer than `PanelFile` on the
+    /// same background in every built-in theme (hidden-entry-styling;
+    /// design D2). Applied to hidden files and hidden directories alike.
+    PanelHidden,
     PanelCursor,
     PanelSelected,
     PanelMinistatus,
@@ -187,6 +191,7 @@ pub const ALL_ROLES: &[Role] = &[
     Role::PanelHeader,
     Role::PanelFile,
     Role::PanelDirectory,
+    Role::PanelHidden,
     Role::PanelCursor,
     Role::PanelSelected,
     Role::PanelMinistatus,
@@ -239,6 +244,7 @@ impl Role {
             Role::PanelHeader => "panel.header",
             Role::PanelFile => "panel.file",
             Role::PanelDirectory => "panel.directory",
+            Role::PanelHidden => "panel.hidden",
             Role::PanelCursor => "panel.cursor",
             Role::PanelSelected => "panel.selected",
             Role::PanelMinistatus => "panel.ministatus",
@@ -393,6 +399,9 @@ impl Theme {
         set(Role::PanelHeader, A(BrightYellow), A(Blue));
         set(Role::PanelFile, A(Cyan), A(Blue));
         set(Role::PanelDirectory, A(BrightWhite), A(Blue));
+        // Bright-black on blue is deliberately low-contrast — hidden/system
+        // entries recede against ordinary files (hidden-entry-styling D2).
+        set(Role::PanelHidden, A(BrightBlack), A(Blue));
         set(Role::PanelCursor, A(Black), A(Cyan));
         set(Role::PanelSelected, A(BrightYellow), A(Blue));
         set(Role::PanelMinistatus, A(Cyan), A(Blue));
@@ -458,6 +467,9 @@ impl Theme {
         set(Role::PanelHeader, A(White), A(Black));
         set(Role::PanelFile, A(White), A(Black));
         set(Role::PanelDirectory, A(BrightWhite), A(Black));
+        // The one dimmer tier mono has below White on its black base
+        // (design D2).
+        set(Role::PanelHidden, A(BrightBlack), A(Black));
         set(Role::PanelCursor, A(Black), A(White));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(White), A(Black));
@@ -536,6 +548,7 @@ impl Theme {
         set(Role::PanelHeader, A(Green), A(Black));
         set(Role::PanelFile, A(Green), A(Black));
         set(Role::PanelDirectory, A(BrightGreen), A(Black));
+        set(Role::PanelHidden, A(BrightBlack), A(Black));
         set(Role::PanelCursor, A(Black), A(Green));
         set(Role::PanelSelected, A(BrightGreen), A(Black));
         set(Role::PanelMinistatus, A(Green), A(Black));
@@ -581,6 +594,9 @@ impl Theme {
                 (Role::PanelScrollbar, None, Some(Rgb(0, 40, 0))),
                 (Role::PanelFile, Some(Rgb(51, 204, 51)), Some(Rgb(0, 40, 0))),
                 (Role::PanelDirectory, Some(Rgb(102, 255, 102)), Some(Rgb(0, 40, 0))),
+                // A darker phosphor green on the file background — the
+                // truecolor rendering of "dimmed" (design D2).
+                (Role::PanelHidden, Some(Rgb(30, 122, 30)), Some(Rgb(0, 40, 0))),
                 (Role::PanelCursor, None, Some(Rgb(51, 204, 51))),
                 (Role::ScreenBackdrop, None, Some(Rgb(0, 40, 0))),
             ])
@@ -606,6 +622,9 @@ impl Theme {
         set(Role::PanelHeader, A(BrightYellow), A(Magenta));
         set(Role::PanelFile, A(BrightBlack), A(Magenta));
         set(Role::PanelDirectory, A(BrightWhite), A(Magenta));
+        // Blue on magenta is this palette's subdued tier — dimmer than the
+        // grey file text, within the theme's own family (design D2).
+        set(Role::PanelHidden, A(Blue), A(Magenta));
         set(Role::PanelCursor, A(Black), A(BrightMagenta));
         set(Role::PanelSelected, A(BrightYellow), A(Magenta));
         set(Role::PanelMinistatus, A(BrightMagenta), A(Magenta));
@@ -649,6 +668,7 @@ impl Theme {
                 (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
                 (Role::PanelScrollbar, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
                 (Role::PanelFile, Some(Rgb(169, 169, 169)), Some(Rgb(48, 0, 64))),
+                (Role::PanelHidden, Some(Rgb(110, 90, 128)), Some(Rgb(48, 0, 64))),
                 (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
             ])
     }
@@ -674,6 +694,7 @@ impl Theme {
         set(Role::PanelHeader, A(Yellow), A(Black));
         set(Role::PanelFile, A(Yellow), A(Black));
         set(Role::PanelDirectory, A(BrightYellow), A(Black));
+        set(Role::PanelHidden, A(BrightBlack), A(Black));
         set(Role::PanelCursor, A(Black), A(Yellow));
         // Selected entries are bright-white, distinct from both the base
         // yellow (normal files) and bright-yellow (directories).
@@ -723,6 +744,9 @@ impl Theme {
                 (Role::PanelScrollbar, Some(Rgb(255, 191, 0)), None),
                 (Role::PanelFile, Some(Rgb(255, 191, 0)), None),
                 (Role::PanelDirectory, Some(Rgb(255, 214, 51)), None),
+                // A darker amber on the unchanged black background (design
+                // D2).
+                (Role::PanelHidden, Some(Rgb(128, 96, 0)), None),
                 (Role::PanelCursor, None, Some(Rgb(255, 191, 0))),
             ])
     }
@@ -754,6 +778,9 @@ impl Theme {
         // them from body text by inversion instead: bright-white on black,
         // the same treatment as the cursor bar.
         set(Role::PanelDirectory, A(BrightWhite), A(Black));
+        // A lighter black on the bright-white base — the only "dimmed" tier
+        // available in a no-hue light theme (design D2).
+        set(Role::PanelHidden, A(BrightBlack), A(BrightWhite));
         set(Role::PanelCursor, A(BrightWhite), A(Black));
         set(Role::PanelSelected, A(BrightWhite), A(Black));
         set(Role::PanelMinistatus, A(Black), A(BrightWhite));
@@ -850,6 +877,74 @@ mod tests {
             m.insert(*role, ColorSpecInput::new(ColorValue::Inherit, ColorValue::Ansi16(Ansi16::Black)));
         }
         assert!(Theme::build("ok", m).is_ok());
+    }
+
+    // -----------------------------------------------------------------
+    // hidden-entry-styling: the `panel.hidden` role (tasks.md 2.2)
+    // -----------------------------------------------------------------
+
+    /// theme-system "`panel.hidden` role" ("Built-in themes define the
+    /// role"): every built-in theme resolves it to a defined pair that
+    /// differs from `panel.file` on the same background.
+    #[test]
+    fn every_builtin_theme_defines_panel_hidden_distinct_from_panel_file() {
+        for theme in all_builtin_themes() {
+            let hidden = theme.get(Role::PanelHidden);
+            let file = theme.get(Role::PanelFile);
+            assert_ne!(hidden, file, "{}: panel.hidden must be visibly distinct from panel.file", theme.name);
+            assert_eq!(hidden.bg, file.bg, "{}: panel.hidden sits on the same background as panel.file", theme.name);
+            assert_eq!(hidden.bg_truecolor, file.bg_truecolor, "{}: panel.hidden keeps panel.file's truecolor background", theme.name);
+        }
+    }
+
+    /// The design D2 per-theme values: the mandatory ANSI-16 pair for every
+    /// built-in theme (covering scenario "nc-classic hidden color"), plus
+    /// the three truecolor overrides.
+    #[test]
+    fn panel_hidden_matches_design_d2_in_every_builtin_theme() {
+        use Ansi16::*;
+        let cases: &[(&str, Ansi16, Ansi16)] = &[
+            ("nc-classic", BrightBlack, Blue),
+            ("nc-mono", BrightBlack, Black),
+            ("terminal-green", BrightBlack, Black),
+            ("purple-lights", Blue, Magenta),
+            ("yellow-storm", BrightBlack, Black),
+            ("inverted", BrightBlack, BrightWhite),
+        ];
+        for (name, fg, bg) in cases {
+            let theme = Theme::by_name(name).expect("builtin theme name resolves");
+            let spec = theme.get(Role::PanelHidden);
+            assert_eq!(spec.fg, ColorValue::Ansi16(*fg), "{name} panel.hidden fg");
+            assert_eq!(spec.bg, ColorValue::Ansi16(*bg), "{name} panel.hidden bg");
+        }
+        // Truecolor overrides (bg is always the theme's file background).
+        let hidden = Theme::terminal_green().get(Role::PanelHidden);
+        assert_eq!(hidden.fg_truecolor, Some(Rgb(30, 122, 30)));
+        assert_eq!(hidden.bg_truecolor, Some(Rgb(0, 40, 0)));
+        let hidden = Theme::purple_lights().get(Role::PanelHidden);
+        assert_eq!(hidden.fg_truecolor, Some(Rgb(110, 90, 128)));
+        assert_eq!(hidden.bg_truecolor, Some(Rgb(48, 0, 64)));
+        let hidden = Theme::yellow_storm().get(Role::PanelHidden);
+        assert_eq!(hidden.fg_truecolor, Some(Rgb(128, 96, 0)));
+        assert_eq!(hidden.bg_truecolor, None);
+    }
+
+    /// theme-system "`panel.hidden` role" ("Missing role is rejected"): a
+    /// table omitting it fails validation naming `panel.hidden`, like any
+    /// other missing role.
+    #[test]
+    fn build_rejects_a_table_missing_panel_hidden_naming_the_role() {
+        let mut m: BTreeMap<Role, ColorSpecInput> = Theme::classic()
+            .roles
+            .iter()
+            .map(|(role, spec)| {
+                (*role, ColorSpecInput { fg: Some(spec.fg), bg: Some(spec.bg), fg_truecolor: spec.fg_truecolor, bg_truecolor: spec.bg_truecolor })
+            })
+            .collect();
+        m.remove(&Role::PanelHidden);
+        let err = Theme::build("no-hidden", m).unwrap_err();
+        assert_eq!(err, ThemeError::MissingRole(Role::PanelHidden));
+        assert!(err.to_string().contains("panel.hidden"), "the error names the role: {err}");
     }
 
     #[test]

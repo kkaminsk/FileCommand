@@ -2,12 +2,12 @@
 
 ### Requirement: Entry row rendering
 
-The system SHALL render entry rows so directories appear in the bright-white directory style and files in the file style, with `▶UP--DIR◀` shown for the `..` entry and `▶SUB-DIR◀` shown in the Size column for directories. Entries flagged hidden — on Windows those carrying the hidden or system attribute, elsewhere names beginning with `.` — SHALL render their name with the `panel.hidden` role instead of the file or directory style; the `..` entry is never hidden. Style precedence SHALL be: drag-target highlight, then cursor bar, then selected, then hidden, then directory/file. The entry under the cursor SHALL render as a full-width inverse bar using the `panel.cursor` role. Rendering SHALL use only ANSI-16 named color roles and CP437 box-drawing/geometric glyphs, with no emoji, Nerd Font, or file-type icons.
+The system SHALL render entry rows so directories appear in the bright-white directory style and files in the file style, with `▶UP--DIR◀` shown for the `..` entry and `▶SUB-DIR◀` shown complete in the Size column for directories; numeric sizes SHALL be right-aligned in that column. Entries flagged hidden — on Windows those carrying the hidden or system attribute, elsewhere names beginning with `.` — SHALL render their name with the `panel.hidden` role instead of the file or directory style; the `..` entry is never hidden. Style precedence SHALL be: drag-target highlight, then cursor bar, then selected, then hidden, then directory/file. The entry under the cursor SHALL render as a full-width inverse bar using the `panel.cursor` role. Rendering SHALL use only ANSI-16 named color roles and CP437 box-drawing/geometric glyphs, with no emoji, Nerd Font, or file-type icons.
 
 #### Scenario: Directory entry styling
 
 - **WHEN** an entry is a directory
-- **THEN** its name SHALL render in the `panel.directory` style and its Size column SHALL read `▶SUB-DIR◀`
+- **THEN** its name SHALL render in the `panel.directory` style and its Size column SHALL read `▶SUB-DIR◀` in full
 
 #### Scenario: Parent entry styling
 

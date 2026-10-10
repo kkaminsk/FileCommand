@@ -43,12 +43,14 @@ fn sample_entries() -> Vec<Entry> {
             kind: EntryKind::Directory,
             size: 0,
             modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }),
+            hidden: false,
         },
         Entry {
             name: OsString::from("notes.txt"),
             kind: EntryKind::File,
             size: 2048,
             modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }),
+            hidden: false,
         },
     ]
 }
