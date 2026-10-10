@@ -10,6 +10,7 @@ expression: text
 ║readme.txt   │      12K 01-02-26 03:04║║readme.txt   │      12K 01-02-26 03:04║
 ║                                      ║║                                      ║
 ║                            ╔═══ readme.txt ════╗                             ║
+║                            ║ Open              ║                             ║
 ║                            ║ View              ║                             ║
 ║                            ║ Edit              ║                             ║
 ║                            ║ Send to clipboard ║                             ║
@@ -18,7 +19,6 @@ expression: text
 ║                            ║ Move              ║                             ║
 ║                            ║ Delete            ║                             ║
 ║                            ╚═══════════════════╝                             ║
-║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║
 ║                                      ║║                                      ║

@@ -21,6 +21,9 @@ unicode-width = { workspace = true }
 # Windows clipboard: CF_HDROP file objects + "Preferred DropEffect" for the
 # clipboard-export Files action (design D3).
 clipboard-win = "5.4"
+# Open with the associated application: ShellExecuteW with the `open` verb
+# (open-with-associated-app; design D1).
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # Non-Windows fallback: text-only clipboard (Paths/Names; Files falls back

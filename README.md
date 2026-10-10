@@ -377,11 +377,22 @@ both with `key.paste_name` and `key.paste_path` in
 #### Running programs
 
 The command line can't run programs, so `dir`, `notepad notes.txt`, and
-`git status` are all rejected. There are two ways to launch something:
+`git status` are all rejected. There are three ways to launch something:
 
-- **The file-action menu.** Press Enter (or right-click) on an executable
-  (any `PATHEXT` extension, or a `.lnk`) and choose **Run**. Enter never
-  starts an executable directly.
+- **Open.** Press Enter on a file and choose **Open** — the first,
+  highlighted entry for a non-executable (so Enter, Enter opens a
+  document), second under **Run** for an executable; on a directory
+  (right-click menu) Open shows the directory in the system file browser.
+  Open launches the target through the platform's file association
+  (`ShellExecute` with the `open` verb on Windows, `xdg-open`/`open`
+  elsewhere) **without suspending FileCommand and without waiting** — a GUI
+  program simply appears beside the terminal, and a launch failure (no
+  association for the extension, a missing target) is reported on the
+  panel's status line.
+- **The file-action menu's Run.** Press Enter (or right-click) on an
+  executable (any `PATHEXT` extension, or a `.lnk`) and choose **Run** —
+  the first entry for executables. Enter never starts an executable
+  directly.
 - **The F2 user menu.** Add an entry to [`usermenu.toml`](#usermenutoml):
 
   ```toml
@@ -393,10 +404,15 @@ The command line can't run programs, so `dir`, `notepad notes.txt`, and
   The command string goes to the configured `shell` exactly as written,
   with no placeholder substitution.
 
-Either way, FileCommand suspends its screen and runs the command in the
-active panel's directory using the `shell` from `config.toml` (`cmd.exe /C`
-by default; PowerShell adds about 200 ms or more of startup per command).
-When the command finishes, press a key to return. Afterwards, **Ctrl+O**
+Run and the user menu suspend FileCommand's screen and run the command in
+the active panel's directory using the `shell` from `config.toml`
+(`cmd.exe /C` by default; PowerShell adds about 200 ms or more of startup
+per command) — the suspension is what makes a console program's output
+visible, so Run remains the right choice for console tools. (Open on a file
+type associated with a *console* program — say `.py` → `python.exe` —
+attaches it to FileCommand's console instead, and its output interleaves
+with the panels.) When the command finishes, press a key to return.
+Afterwards, **Ctrl+O**
 hides the panels so you can read the output in your terminal's scrollback,
 and any key brings the panels back. FileCommand doesn't keep its own copy of
 command output; only your terminal's scrollback does.
@@ -409,7 +425,7 @@ command output; only your terminal's scrollback does.
 |---|---|
 | ↑ / ↓ / PgUp / PgDn / Home / End | Move cursor (page size follows panel height) |
 | Tab | Switch active panel |
-| Enter | Directory: enter it. `..`: go to parent. File: opens the file-action menu (Run/View/Edit/Send to clipboard/Copy/Rename/Move/Delete). Command line non-empty: dispatches the built-in verbs — `cd` navigates, `del`/`rmdir` open delete-confirmation, anything else is rejected. Tree mode: navigate/expand. |
+| Enter | Directory: enter it. `..`: go to parent. File: opens the file-action menu (Open/View/Edit/Send to clipboard/Copy/Rename/Move/Delete; executables list Run first, then Open). Command line non-empty: dispatches the built-in verbs — `cd` navigates, `del`/`rmdir` open delete-confirmation, anything else is rejected. Tree mode: navigate/expand. |
 | Backspace (empty command line) | Parent directory |
 | Ctrl+PgUp | Parent directory |
 | Ins | Toggle selection at cursor, cursor advances |
@@ -490,7 +506,7 @@ picker, help, startup warning) is open.
 | Ctrl+left click on an entry | Toggle that entry's selection in place |
 | Double left click on an entry | Same as Enter |
 | Left click on empty panel area / title | Focus that panel |
-| Right click on an entry | Open the file-action menu for it |
+| Right click on an entry | Open the file-action menu for it (same entries as Enter for a file; a directory lists Open/Send to clipboard/Copy/Rename/Move/Delete, with Open showing it in the system file browser) |
 | Left-drag from an entry onto a target | Propose a **Copy** |
 | Right-drag, or Shift+drag, from an entry | Propose a **Move** |
 | Esc during a drag | Cancel the drag |

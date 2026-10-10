@@ -1,6 +1,7 @@
 //! The Enter-on-file action menu: a primary-style modal list of the
-//! target entry's available actions (Run when executable, then View, Edit,
-//! Copy, Rename, Move, Delete), mirroring `user_menu`'s double-line frame
+//! target entry's available actions (Open first — or Run then Open when
+//! executable — then View, Edit, Send to clipboard, Copy, Rename, Move,
+//! Delete), mirroring `user_menu`'s double-line frame
 //! and highlighted-row conventions (file-action-menu "Menu contents,
 //! ordering, and navigation": "render as a primary-style modal dialog
 //! (§4.4)").
@@ -98,9 +99,10 @@ mod tests {
     }
 
     #[test]
-    fn non_executable_lists_view_first_without_run() {
+    fn non_executable_lists_open_first_without_run() {
         let dialog = FileActionMenuState::new(OsString::from("notes.txt"), false);
         let rows = render(&dialog).join("\n");
+        assert!(rows.contains("Open"));
         assert!(rows.contains("View"));
         assert!(rows.contains("Edit"));
         assert!(rows.contains("Copy"));
@@ -108,18 +110,22 @@ mod tests {
         assert!(rows.contains("Move"));
         assert!(rows.contains("Delete"));
         assert!(!rows.contains("Run"), "non-executable target must not list Run");
+        let open_pos = rows.find("Open").unwrap();
         let view_pos = rows.find("View").unwrap();
         let edit_pos = rows.find("Edit").unwrap();
+        assert!(open_pos < view_pos, "Open must render first (open-with-associated-app design D2)");
         assert!(view_pos < edit_pos, "entries must render in menu order");
     }
 
     #[test]
-    fn executable_lists_run_first() {
+    fn executable_lists_run_then_open_first() {
         let dialog = FileActionMenuState::new(OsString::from("setup.exe"), true);
         let rows = render(&dialog).join("\n");
         let run_pos = rows.find("Run").unwrap();
+        let open_pos = rows.find("Open").unwrap();
         let view_pos = rows.find("View").unwrap();
-        assert!(run_pos < view_pos, "Run must render before View when the target is executable");
+        assert!(run_pos < open_pos, "Run must render before Open when the target is executable");
+        assert!(open_pos < view_pos, "Open must render before View");
     }
 
     #[test]

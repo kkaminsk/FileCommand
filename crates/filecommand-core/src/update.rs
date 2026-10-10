@@ -822,6 +822,12 @@ pub enum Command {
     /// highlight is there (mouse-input "File-action menu entries are
     /// clickable"). `input::map_mouse` is the only source of this.
     FileActionMenuItemClick(usize),
+    /// Reply to `Effect::OpenWithAssociation` when the launch failed: the
+    /// message lands on the active panel's status line (`last_error`),
+    /// exactly as `Command::EditorOpenFailed` reports a failed editor open
+    /// (file-action-menu "Open with the associated application": "No
+    /// association is reported inline").
+    OpenWithAssociationFailed { message: String },
 
     // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
     // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
@@ -961,6 +967,15 @@ pub enum Effect {
     /// re-read command has to travel with it rather than reaching `update`
     /// on its own (§ "Run command" — "the active panel is re-read").
     RunShellCommand(shell::Invocation, PanelSide),
+    /// Launch `path` through the platform's file association —
+    /// `ShellExecuteW` with the `open` verb on Windows, detached
+    /// `xdg-open`/`open` elsewhere — with `cwd` (the menu's panel directory)
+    /// as the working directory. Fire-and-forget: the TUI is never
+    /// suspended, the launched program is never waited on, and no panel
+    /// re-read is scheduled (open-with-associated-app design D1/D3;
+    /// file-action-menu "Open with the associated application"). A launch
+    /// failure comes back as `Command::OpenWithAssociationFailed`.
+    OpenWithAssociation { path: PathBuf, cwd: PathBuf },
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
@@ -1573,6 +1588,10 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 effects.push(Effect::OpenViewer { path });
             }
             Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+            // file-action-menu "Open with the associated application": a
+            // failed launch is reported inline, on the status line of the
+            // panel the menu acted on — no dialog opens.
+            Command::OpenWithAssociationFailed { message } => state.panel_mut(state.active).last_error = Some(message),
 
             Command::SplitGrow => effects.extend(adjust_split(&mut state, panel_split::SPLIT_STEP as i32)),
             Command::SplitShrink => effects.extend(adjust_split(&mut state, -(panel_split::SPLIT_STEP as i32))),
@@ -2758,6 +2777,17 @@ fn handle_file_action_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
 fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_name: OsString, selection_scoped: bool) -> Vec<Effect> {
     let side = state.active;
     match action {
+        // Open: hand the target to the platform's file association,
+        // fire-and-forget — the TUI stays live and nothing is waited on or
+        // re-read (open-with-associated-app design D1/D3; file-action-menu
+        // "Open with the associated application"). Always single-target,
+        // even when the target is selected: Open never widens to the
+        // selection (file-action-menu "Open ignores the selection").
+        FileActionMenuEntry::Open => {
+            let Some(source) = named_entry_source(state, side, &target_name) else { return vec![] };
+            let cwd = state.panel(side).cwd.clone();
+            vec![Effect::OpenWithAssociation { path: source.path, cwd }]
+        }
         // Run: the same suspended-shell spawn path a typed command line
         // uses, and the only way to reach it now that Enter no longer
         // spawns an executable directly (command-line: "Enter on an

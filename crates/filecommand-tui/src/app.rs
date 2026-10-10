@@ -849,6 +849,15 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // to its directory the moment the TUI repaints.
                 let _ = rt.tx.send(Command::RereadPanel(side));
             }
+            Effect::OpenWithAssociation { path, cwd } => {
+                // Fire-and-forget (open-with-associated-app design D1/D3):
+                // no suspend, no wait, no mouse-tracker reset, no panel
+                // re-read. Only a launch failure reports back, as the
+                // command that lands the message on the panel's status line.
+                if let Err(message) = open_with_association(&path, &cwd) {
+                    let _ = rt.tx.send(Command::OpenWithAssociationFailed { message });
+                }
+            }
             Effect::ShowScrollback => {
                 show_scrollback(guard)?;
                 rt.mouse_tracker.reset();
@@ -1010,6 +1019,85 @@ fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::
     }
     wait_for_key()?;
     guard.resume()
+}
+
+/// Open `path` with the application the platform associates it with
+/// (open-with-associated-app; design D1): `ShellExecuteW` with the `open`
+/// verb on Windows, a detached `xdg-open`/`open` elsewhere. Never suspends
+/// the TUI and never waits on the launched program; `Err(message)` is the
+/// user-facing failure text for the active panel's status line.
+#[cfg(windows)]
+fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    // ShellExecuteW predates long-path support, so the `\\?\` verbatim
+    // prefix must come off first — the same normalization the clipboard-
+    // export payload applies (its "Long-path prefix is stripped" scenario;
+    // file-action-menu "Open with the associated application": "Long path is
+    // passed without the verbatim prefix").
+    let path = clipboard::normalize_path(path);
+    let cwd = clipboard::normalize_path(cwd);
+    let verb = wide(std::ffi::OsStr::new("open"));
+    let file = wide(path.as_os_str());
+    let directory = wide(cwd.as_os_str());
+
+    // SAFETY: every pointer is to a null-terminated UTF-16 buffer that
+    // outlives the call; a null hwnd simply means no owner window.
+    let result = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), directory.as_ptr(), SW_SHOWNORMAL) };
+    // Per MSDN a return value greater than 32 is success; anything else is
+    // an error code (a SE_ERR_* / ERROR_* value).
+    let code = result as usize;
+    if code > 32 {
+        return Ok(());
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    Err(open_with_association_error(&name, code as u32))
+}
+
+/// The user-facing message for a failed `ShellExecuteW` return code,
+/// factored out pure so it is testable without touching the shell (design
+/// D1): `SE_ERR_NOASSOC` names the missing association,
+/// `ERROR_FILE_NOT_FOUND` the missing target, and anything else reports the
+/// raw code (file-action-menu "Open with the associated application").
+#[cfg(windows)]
+fn open_with_association_error(name: &str, code: u32) -> String {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::UI::Shell::SE_ERR_NOASSOC;
+
+    match code {
+        SE_ERR_NOASSOC => format!("No application is associated with {name}"),
+        ERROR_FILE_NOT_FOUND => format!("{name} not found"),
+        _ => format!("Could not open {name} (error {code})"),
+    }
+}
+
+/// The non-Windows half of the Open action (design D1): `xdg-open`
+/// (Linux/BSD) or `open` (macOS), spawned detached — all stdio to null, no
+/// wait — so the TUI stays live and the launched program's output can never
+/// interleave with it. A spawn error maps to the same failure message shape
+/// the Windows path produces.
+#[cfg(not(windows))]
+fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(program)
+        .arg(path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            format!("Could not open {name} ({e})")
+        })
 }
 
 /// Suspend the TUI, run the F4 external editor on the real terminal, and
@@ -1629,6 +1717,20 @@ mod tests {
         let result = spawn_editor_and_wait(&inv);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("filecommand-definitely-not-a-real-editor-binary"));
+    }
+
+    /// open-with-associated-app design D1 / file-action-menu "Open with the
+    /// associated application": the `ShellExecuteW` error-code mapping —
+    /// 31 (`SE_ERR_NOASSOC`) names the missing association, 2
+    /// (`ERROR_FILE_NOT_FOUND`) the missing target, anything else reports
+    /// the raw code. Pure-value test; the constants' values are pinned by
+    /// the Win32 API.
+    #[cfg(windows)]
+    #[test]
+    fn open_with_association_error_maps_the_known_shell_execute_codes() {
+        assert_eq!(open_with_association_error("report.xyz", 31), "No application is associated with report.xyz");
+        assert_eq!(open_with_association_error("report.xyz", 2), "report.xyz not found");
+        assert_eq!(open_with_association_error("report.xyz", 5), "Could not open report.xyz (error 5)");
     }
 
     #[test]

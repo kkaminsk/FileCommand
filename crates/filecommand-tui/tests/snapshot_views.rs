@@ -1465,30 +1465,62 @@ fn snapshot_fkey_bar_under_each_new_theme() {
 
 #[test]
 fn snapshot_file_action_menu_dialog_non_executable() {
-    // file-action-menu "Menu contents, ordering, and navigation":
-    // non-executable targets list View, Edit, Copy, Rename, Move, Delete
-    // with View highlighted first, and no Run entry.
+    // file-action-menu "Menu contents, ordering, and navigation"
+    // (open-with-associated-app design D2): non-executable targets list
+    // Open, View, Edit, Send to clipboard, Copy, Rename, Move, Delete with
+    // Open highlighted first, and no Run entry.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false));
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!text.contains("Run"), "a non-executable target must not list Run");
-    assert!(text.contains("View") && text.contains("Edit") && text.contains("Copy"));
+    assert!(text.contains("Open") && text.contains("View") && text.contains("Edit") && text.contains("Copy"));
     assert!(text.contains("Rename") && text.contains("Move") && text.contains("Delete"));
+    let open_pos = text.find("Open").unwrap();
+    let view_pos = text.find("View").unwrap();
+    assert!(open_pos < view_pos, "Open must render before View");
     insta::assert_snapshot!("file_action_menu_dialog_non_executable", text);
 }
 
 #[test]
 fn snapshot_file_action_menu_dialog_executable() {
-    // file-action-menu "Menu contents, ordering, and navigation": an
-    // executable target lists Run first (default-highlighted).
+    // file-action-menu "Menu contents, ordering, and navigation"
+    // (open-with-associated-app design D2): an executable target lists Run
+    // first (default-highlighted), then Open, then View.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true));
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Run, "Run stays highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Run"), "an executable target must list Run");
     let run_pos = text.find("Run").unwrap();
+    let open_pos = text.find("Open").unwrap();
     let view_pos = text.find("View").unwrap();
-    assert!(run_pos < view_pos, "Run must render before View");
+    assert!(run_pos < open_pos, "Run must render before Open");
+    assert!(open_pos < view_pos, "Open must render before View");
     insta::assert_snapshot!("file_action_menu_dialog_executable", text);
+}
+
+#[test]
+fn snapshot_file_action_menu_dialog_directory() {
+    // file-action-menu "Directory targets and selection-scoped invocation":
+    // a directory target lists Open, Send to clipboard, Copy, Rename, Move,
+    // Delete — Open first and highlighted, no View/Edit/Run — and Open
+    // shows the directory in the platform file browser.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.file_action_menu =
+        Some(filecommand_core::dialogs::FileActionMenuState::open(std::ffi::OsString::from("docs"), true, false, false));
+    let menu = state.file_action_menu.as_ref().unwrap();
+    assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!text.contains("Run"), "a directory target must not list Run");
+    let open_pos = text.find("Open").unwrap();
+    let clipboard_pos = text.find("Send to clipboard").unwrap();
+    assert!(open_pos < clipboard_pos, "Open must render before Send to clipboard");
+    insta::assert_snapshot!("file_action_menu_dialog_directory", text);
 }
 
 #[test]

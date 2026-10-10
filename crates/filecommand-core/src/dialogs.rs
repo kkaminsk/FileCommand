@@ -135,14 +135,17 @@ impl ThemePickerState {
 // Enter-on-file action menu (file-action-menu)
 // ---------------------------------------------------------------------
 
-/// One entry in the file-action menu, in menu order. `Run` is included only
-/// when the target is executable, and always sorts first (file-action-menu
-/// "Menu contents, ordering, and navigation"). `SendToClipboard` sits
-/// immediately after `Edit` (or first, for directory targets, which omit
+/// One entry in the file-action menu. `Open` launches the target through
+/// the platform's file association and always sorts first — except for
+/// executables, where `Run` (included only then) stays first and `Open`
+/// follows it (open-with-associated-app design D2; file-action-menu "Menu
+/// contents, ordering, and navigation"). `SendToClipboard` sits immediately
+/// after `Edit` (or right after `Open`, for directory targets, which omit
 /// `View`/`Edit`/`Run`) and never mutates the filesystem (file-action-menu
 /// "No mutation without an intervening dialog").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileActionMenuEntry {
+    Open,
     Run,
     View,
     Edit,
@@ -159,6 +162,7 @@ impl FileActionMenuEntry {
     /// activate that entry directly").
     pub fn label(self) -> &'static str {
         match self {
+            FileActionMenuEntry::Open => "Open",
             FileActionMenuEntry::Run => "Run",
             FileActionMenuEntry::View => "View",
             FileActionMenuEntry::Edit => "Edit",
@@ -205,8 +209,9 @@ pub struct FileActionMenuState {
 impl FileActionMenuState {
     /// The keyboard Enter path: file-only, never selection-scoped
     /// (file-action-menu "Enter stays single-target"). Opens with the
-    /// first entry highlighted — `Run` when `executable`, else `View`
-    /// (file-action-menu "Menu contents, ordering, and navigation").
+    /// first entry highlighted — `Run` when `executable`, else `Open`
+    /// (file-action-menu "Menu contents, ordering, and navigation";
+    /// open-with-associated-app design D2).
     pub fn new(target_name: OsString, executable: bool) -> FileActionMenuState {
         Self::open(target_name, false, executable, false)
     }
@@ -214,16 +219,18 @@ impl FileActionMenuState {
     /// The general constructor `new` delegates to, and mouse right-click
     /// uses directly (mouse-input "Right-click opens the action menu").
     /// `is_dir` omits View, Edit, and Run from the menu — they have no
-    /// meaning for a directory (file-action-menu "Directory targets and
-    /// selection-scoped invocation": "Directory menu contents").
+    /// meaning for a directory — leaving Open first to show the directory
+    /// in the platform file browser (file-action-menu "Directory targets
+    /// and selection-scoped invocation": "Directory menu contents").
     /// `selection_scoped` is recorded for `activate_file_action` to read
     /// later; it does not change which entries are listed.
     pub fn open(target_name: OsString, is_dir: bool, executable: bool, selection_scoped: bool) -> FileActionMenuState {
-        let mut entries = Vec::with_capacity(7);
+        let mut entries = Vec::with_capacity(9);
+        if !is_dir && executable {
+            entries.push(FileActionMenuEntry::Run);
+        }
+        entries.push(FileActionMenuEntry::Open);
         if !is_dir {
-            if executable {
-                entries.push(FileActionMenuEntry::Run);
-            }
             entries.push(FileActionMenuEntry::View);
             entries.push(FileActionMenuEntry::Edit);
         }
@@ -475,6 +482,15 @@ the selected entries (or the entry under the cursor when nothing is
 selected). Ins toggles selection on one entry; +, -, and * select,
 deselect, and invert a wildcard group.
 
+Enter on a file opens the action menu. Its Open entry — first and
+highlighted for a non-executable, so Enter, Enter opens a document —
+launches the target in the application associated with it, without
+leaving FileCommand; on a directory (right-click menu) Open shows it
+in the system file browser. Executables list Run first instead, which
+suspends FileCommand so a console program's output stays visible. A
+failed Open (no association for the extension) is reported on the
+panel's status line.
+
 The destination, name, and Rename fields are full editing lines: the
 caret moves with Left/Right/Home/End (by words with Ctrl held),
 Backspace/Delete remove single characters (whole words with Ctrl held),
@@ -582,19 +598,14 @@ mod tests {
     }
 
     #[test]
-    fn file_action_menu_lists_run_first_only_when_executable() {
+    fn file_action_menu_lists_open_first_unless_the_target_is_executable() {
+        // open-with-associated-app design D2 / file-action-menu "Non-
+        // executable menu contents": Open first and highlighted.
         let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
-        assert_eq!(m.entries[0], FileActionMenuEntry::View, "non-executable: View highlighted first");
-        assert!(!m.entries.contains(&FileActionMenuEntry::Run));
-        assert_eq!(m.selected(), FileActionMenuEntry::View);
-
-        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
-        assert_eq!(m.entries[0], FileActionMenuEntry::Run, "executable: Run highlighted first");
-        assert_eq!(m.selected(), FileActionMenuEntry::Run);
         assert_eq!(
             m.entries,
             vec![
-                FileActionMenuEntry::Run,
+                FileActionMenuEntry::Open,
                 FileActionMenuEntry::View,
                 FileActionMenuEntry::Edit,
                 FileActionMenuEntry::SendToClipboard,
@@ -604,14 +615,19 @@ mod tests {
                 FileActionMenuEntry::Delete,
             ]
         );
-    }
+        assert!(!m.entries.contains(&FileActionMenuEntry::Run));
+        assert_eq!(m.selected(), FileActionMenuEntry::Open, "non-executable: Open highlighted first");
 
-    #[test]
-    fn file_action_menu_directory_target_lists_send_to_clipboard_first() {
-        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        // "Executable gets Run first": Run stays first and highlighted,
+        // Open second.
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
         assert_eq!(
             m.entries,
             vec![
+                FileActionMenuEntry::Run,
+                FileActionMenuEntry::Open,
+                FileActionMenuEntry::View,
+                FileActionMenuEntry::Edit,
                 FileActionMenuEntry::SendToClipboard,
                 FileActionMenuEntry::Copy,
                 FileActionMenuEntry::Rename,
@@ -619,6 +635,26 @@ mod tests {
                 FileActionMenuEntry::Delete,
             ]
         );
+        assert_eq!(m.selected(), FileActionMenuEntry::Run, "executable: Run highlighted first");
+    }
+
+    #[test]
+    fn file_action_menu_directory_target_lists_open_first() {
+        // file-action-menu "Directory menu contents": Open, Send to
+        // clipboard, Copy, Rename, Move, Delete — Open highlighted.
+        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        assert_eq!(
+            m.entries,
+            vec![
+                FileActionMenuEntry::Open,
+                FileActionMenuEntry::SendToClipboard,
+                FileActionMenuEntry::Copy,
+                FileActionMenuEntry::Rename,
+                FileActionMenuEntry::Move,
+                FileActionMenuEntry::Delete,
+            ]
+        );
+        assert_eq!(m.selected(), FileActionMenuEntry::Open, "directory: Open highlighted first");
     }
 
     #[test]
@@ -645,6 +681,21 @@ mod tests {
 
         let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
         assert_eq!(m.hotkey_action('r'), Some(FileActionMenuEntry::Rename), "no Run entry: R falls through to Rename");
+    }
+
+    /// file-action-menu "O activates Open": `O` is unique to Open in every
+    /// menu layout (open-with-associated-app design D2).
+    #[test]
+    fn file_action_menu_hotkey_o_resolves_to_open_for_every_target_kind() {
+        let m = FileActionMenuState::new(OsString::from("report.pdf"), false);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
+        assert_eq!(m.hotkey_action('O'), Some(FileActionMenuEntry::Open));
+
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
+
+        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
     }
 
     #[test]

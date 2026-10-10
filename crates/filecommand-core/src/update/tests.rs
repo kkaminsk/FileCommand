@@ -1463,6 +1463,7 @@ fn enter_on_an_executable_target_opens_the_menu_with_run_first_and_does_not_spaw
     let menu = state.file_action_menu.as_ref().expect("Enter on a file opens the file-action menu");
     assert_eq!(menu.target_name, OsString::from("setup.exe"));
     assert_eq!(menu.entries[0], FileActionMenuEntry::Run, "an executable target lists Run first");
+    assert_eq!(menu.entries[1], FileActionMenuEntry::Open, "Open follows Run for an executable (open-with-associated-app design D2)");
     assert_eq!(menu.selected(), FileActionMenuEntry::Run, "Run is highlighted by default");
 }
 
@@ -1494,7 +1495,8 @@ fn enter_on_a_plain_file_opens_the_action_menu_without_spawning_anything() {
     let menu = state.file_action_menu.as_ref().expect("Enter on a non-executable file opens the file-action menu");
     assert_eq!(menu.target_name, OsString::from("readme.txt"));
     assert!(!menu.entries.contains(&FileActionMenuEntry::Run), "non-executable: no Run entry");
-    assert_eq!(menu.selected(), FileActionMenuEntry::View, "View is highlighted by default");
+    assert_eq!(menu.entries[0], FileActionMenuEntry::Open, "non-executable: Open is listed first (open-with-associated-app design D2)");
+    assert_eq!(menu.selected(), FileActionMenuEntry::Open, "Open is highlighted by default");
 }
 
 // ---------------------------------------------------------------------
@@ -1556,8 +1558,8 @@ fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
 #[test]
 fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    // Non-executable: View, Edit, Send to clipboard, Copy, Rename, Move,
-    // Delete (7 entries).
+    // Non-executable: Open, View, Edit, Send to clipboard, Copy, Rename,
+    // Move, Delete (8 entries).
     let (state, _) = update(state, Command::FileActionMenuMove(-5));
     assert_eq!(state.file_action_menu.as_ref().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
     let (state, _) = update(state, Command::FileActionMenuMove(100));
@@ -1632,7 +1634,8 @@ fn file_action_menu_targets_the_entry_it_opened_on_even_if_the_cursor_drifts_fro
 #[test]
 fn file_action_menu_view_routes_to_the_f3_viewer_path() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    let (state, effects) = update(state, Command::FileActionMenuConfirm); // View is highlighted first
+    let (state, _) = update(state, Command::FileActionMenuMove(1)); // Open is highlighted first; one Down lands on View
+    let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(state.file_action_menu.is_none());
     assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
     assert_eq!(state.phase, UiPhase::Panels, "opening is I/O; the phase flips only once ViewerOpened comes back");
@@ -1641,7 +1644,7 @@ fn file_action_menu_view_routes_to_the_f3_viewer_path() {
 #[test]
 fn file_action_menu_edit_routes_to_the_f4_edit_path() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    let (state, _) = update(state, Command::FileActionMenuMove(1)); // Edit
+    let (state, _) = update(state, Command::FileActionMenuMove(2)); // Open, View, Edit
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(state.file_action_menu.is_none());
     assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
@@ -1654,7 +1657,7 @@ fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_on
     state.left.selected.insert(OsString::from("a.txt")); // an unrelated selection must not leak in
     state.left.cursor = 1; // report.txt
     let (state, _) = update(state, Command::Enter);
-    let (state, _) = update(state, Command::FileActionMenuMove(3)); // View, Edit, SendToClipboard, Copy
+    let (state, _) = update(state, Command::FileActionMenuMove(4)); // Open, View, Edit, SendToClipboard, Copy
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(effects.is_empty(), "opening the destination dialog is not itself a mutation");
     match state.phase {
@@ -1671,7 +1674,7 @@ fn file_action_menu_copy_opens_the_f5_destination_dialog_scoped_to_the_target_on
 #[test]
 fn file_action_menu_move_opens_the_f6_destination_dialog_scoped_to_the_target_only() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    let (state, _) = update(state, Command::FileActionMenuMove(5)); // View, Edit, SendToClipboard, Copy, Rename, Move
+    let (state, _) = update(state, Command::FileActionMenuMove(6)); // Open, View, Edit, SendToClipboard, Copy, Rename, Move
     let (state, _) = update(state, Command::FileActionMenuConfirm);
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, .. }) => {
@@ -1713,6 +1716,96 @@ fn cancelling_the_interposed_destination_dialog_after_move_starts_no_job() {
     let (state, effects) = update(state, Command::FileOpCancel);
     assert_eq!(state.phase, UiPhase::Panels);
     assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// file-action-menu: Open with the associated application
+// (open-with-associated-app; design D1–D3)
+// ---------------------------------------------------------------------
+
+/// "Open launches the associated application": Enter, Enter on a document —
+/// Open is highlighted first, so the immediate Confirm activates it. The
+/// menu closes, the target goes out as one fire-and-forget launch effect,
+/// and the phase stays Panels (no dialog, no TUI suspension of any kind).
+#[test]
+fn enter_enter_on_a_document_emits_open_with_association_for_the_target() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("report.pdf", 1)];
+    let (state, _) = update(state, Command::Enter);
+    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition: Open highlighted");
+    let (state, effects) = update(state, Command::FileActionMenuConfirm);
+    assert!(state.file_action_menu.is_none(), "activating Open closes the menu");
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
+    assert_eq!(state.phase, UiPhase::Panels, "the panels stay interactive; no dialog opens");
+}
+
+/// "O activates Open": the hotkey activates Open exactly as if it had been
+/// highlighted and Enter pressed.
+#[test]
+fn file_action_menu_o_hotkey_activates_open() {
+    let state = opened_menu_state(&["report.pdf"], "report.pdf");
+    let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
+    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
+}
+
+/// "Open on a directory shows it in the file browser": the directory menu
+/// lists Open first and activating it hands the directory itself to the
+/// platform association (Explorer on Windows) — the panel does not
+/// navigate (no `StartListing`).
+#[test]
+fn open_on_a_directory_hands_the_directory_to_the_file_association_without_navigating() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("src")];
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("src") });
+    let (state, effects) = update(state, Command::FileActionMenuConfirm); // Open is highlighted first
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/src"), cwd: PathBuf::from("/left") }]);
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel does not navigate");
+}
+
+/// "Open ignores the selection": even opened selection-scoped (right-click
+/// on a member of the selection), Open emits exactly one launch effect for
+/// the menu's target and leaves the selection untouched (design D3).
+#[test]
+fn open_on_a_selected_target_emits_one_effect_for_that_target_only() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2), file_entry("c.txt", 3)];
+    for n in ["a.txt", "b.txt", "c.txt"] {
+        state.left.selected.insert(OsString::from(n));
+    }
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
+    assert!(state.file_action_menu.as_ref().unwrap().selection_scoped, "setup precondition: opened on a selection member");
+
+    let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
+    assert_eq!(
+        effects,
+        vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/b.txt"), cwd: PathBuf::from("/left") }],
+        "one launch effect, for the menu's target only"
+    );
+    assert_eq!(state.left.selected.len(), 3, "the selection is untouched");
+}
+
+/// "No association is reported inline": the effect's failure reply lands on
+/// the active panel's status line, verbatim, and opens no dialog.
+#[test]
+fn open_with_association_failed_lands_on_the_active_panels_last_error() {
+    let state = test_state(UiPhase::Panels);
+    let (state, effects) = update(state, Command::OpenWithAssociationFailed { message: "No application is associated with data.zzz".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.last_error.as_deref(), Some("No application is associated with data.zzz"));
+    assert_eq!(state.right.last_error, None);
+    assert_eq!(state.phase, UiPhase::Panels, "no dialog opens");
+}
+
+/// A launch failure reported while the right panel is active lands on the
+/// right panel — `state.active`, not a hard-coded side.
+#[test]
+fn open_with_association_failed_uses_the_active_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    let (state, _) = update(state, Command::OpenWithAssociationFailed { message: "boom".to_string() });
+    assert_eq!(state.right.last_error.as_deref(), Some("boom"));
+    assert_eq!(state.left.last_error, None);
 }
 
 // ---------------------------------------------------------------------
@@ -5045,6 +5138,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
     assert_eq!(
         menu.entries,
         vec![
+            FileActionMenuEntry::Open,
             FileActionMenuEntry::SendToClipboard,
             FileActionMenuEntry::Copy,
             FileActionMenuEntry::Rename,
@@ -5052,6 +5146,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
             FileActionMenuEntry::Delete,
         ]
     );
+    assert_eq!(menu.selected(), FileActionMenuEntry::Open, "Open is highlighted first for a directory target");
 }
 
 #[test]
@@ -5166,12 +5261,12 @@ fn file_action_menu_item_click_out_of_range_is_a_no_op() {
 /// row").
 #[test]
 fn file_action_menu_item_click_on_a_non_highlighted_row_activates_the_clicked_row() {
-    let state = opened_menu_state(&["notes.txt"], "notes.txt"); // View highlighted first
-    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::View, "setup precondition");
+    let state = opened_menu_state(&["notes.txt"], "notes.txt"); // Open highlighted first
+    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition");
     let delete_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Delete).unwrap();
     let (state, _) = update(state, Command::FileActionMenuItemClick(delete_index));
     assert!(state.file_action_menu.is_none());
-    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })), "Delete was activated, not View");
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })), "Delete was activated, not Open");
 }
 
 // ---------------------------------------------------------------------
