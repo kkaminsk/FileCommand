@@ -685,9 +685,24 @@ fn job_done_delete_rereads_both_panels_when_both_browse_the_same_directory() {
         dest_dir: PathBuf::from("/shared"),
         dialog: RunningDialog::Progress { kind: JobKind::Delete, progress: ProgressInfo::starting(1, 1) },
     });
+    state.term_size = (80, 24); // Full-mode body: 19 rows
     state.left.cwd = PathBuf::from("/shared");
     state.right.cwd = PathBuf::from("/shared");
-    let (state, effects) = update(
+    // Both panels sit partway down the same 30-entry listing; the delete
+    // removes "e10".
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let p = state.panel_mut(side);
+        p.sort_mode = SortMode::Unsorted;
+        p.entries = (0..30).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
+        p.progress = crate::panel::ListingProgress::Complete { count: 30 };
+        p.cursor_user_moved = true;
+    }
+    state.left.cursor = 10; // on the deleted "e10"
+    state.left.scroll_offset = 5;
+    state.right.cursor = 20; // on "e20", which survives
+    state.right.scroll_offset = 8;
+
+    let (mut state, effects) = update(
         state,
         Command::JobDone {
             outcome: JobOutcome::Completed { skipped: vec![] },
@@ -703,6 +718,24 @@ fn job_done_delete_rereads_both_panels_when_both_browse_the_same_directory() {
             Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/shared") },
         ]
     );
+
+    // Each panel's re-read streams back the same 29 survivors; each keeps
+    // its own place (file-operations "Post-delete re-read keeps the user's
+    // place" — on *both* panels browsing the affected directory).
+    let survivors: Vec<Entry> = (0..30).filter(|i| *i != 10).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let (next, _) = update(state, Command::ListingChunk { panel: side, entries: survivors.clone() });
+        state = next;
+        let (next, _) = update(state, Command::ListingComplete { panel: side, total: 29 });
+        state = next;
+    }
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e11"), "the active panel's cursor lands on the entry that followed the deleted one");
+    assert_eq!(state.left.cursor, 10);
+    assert_eq!(state.left.scroll_offset, 5, "the active panel's window stays put");
+    assert_eq!(state.right.entries[state.right.cursor].name, OsString::from("e20"), "the inactive panel's cursor stays on its own (surviving) entry");
+    assert_eq!(state.right.cursor, 19, "e20 shifted up one row in the 29-entry list");
+    assert_eq!(state.right.scroll_offset, 8, "the inactive panel's window stays put too");
 }
 
 #[test]
@@ -3940,6 +3973,251 @@ fn find_file_settle_on_listing_complete_lands_the_cursor_in_view() {
         state.left.scroll_offset, 7,
         "25 + 1 - 19 = 7: the settled cursor lands inside the window (panel-navigation \"Scroll offset is core panel state\" -- find-file's deferred cursor settle re-clamps)"
     );
+}
+
+// ---------------------------------------------------------------------
+// Same-directory re-read preserves cursor and scroll position
+// (reread-preserves-cursor; panel-navigation "Same-directory re-read
+// preserves cursor and scroll position")
+// ---------------------------------------------------------------------
+
+/// A panel mid-delete-job browsing `dir` with `names` as its completed
+/// listing, mirroring `running_progress_state` but with the opposite panel
+/// parked on an unaffected directory so only this one re-reads.
+fn deleting_state(dir: &str, names: &[String], cursor: usize, scroll_offset: usize) -> State {
+    let mut state = running_progress_state(JobKind::Delete, dir, dir);
+    state.term_size = (80, 25); // Full-mode body: 20 rows (25 - 2 panels frame - 2 reserved - 1 header)
+    assert_eq!(panel_viewport_rows((80, 25), DisplayMode::Full, 1), 20);
+    state.right.cwd = PathBuf::from("/right"); // unaffected panel: must not be re-read
+    let left = &mut state.left;
+    left.cwd = PathBuf::from(dir);
+    left.sort_mode = SortMode::Unsorted;
+    left.entries = names.iter().map(|n| file_entry(n, 0)).collect();
+    left.progress = crate::panel::ListingProgress::Complete { count: names.len() };
+    left.cursor = cursor;
+    left.cursor_user_moved = true;
+    left.scroll_offset = scroll_offset;
+    state
+}
+
+/// Finish the delete: `JobDone`, then stream the surviving `survivors` back
+/// as the automatic re-read (single chunk + completion).
+fn finish_delete(state: State, dir: &str, survivors: &[String]) -> State {
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from(dir), dest_dir: PathBuf::from(dir) },
+    );
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(dir) }],
+        "the deleted-from panel re-reads"
+    );
+    let entries: Vec<Entry> = survivors.iter().map(|n| file_entry(n, 0)).collect();
+    let total = entries.len();
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total });
+    state
+}
+
+fn names_of(prefix: &str, n: usize) -> Vec<String> {
+    (0..n).map(|i| format!("{prefix}{i:02}")).collect()
+}
+
+#[test]
+fn job_done_delete_of_the_cursored_entry_lands_on_the_following_entry() {
+    // panel-navigation "Deleting the cursored file lands on the next entry";
+    // file-operations "Post-delete re-read keeps the user's place".
+    let names: Vec<String> = ["a.txt", "b.txt", "c.txt"].iter().map(|s| s.to_string()).collect();
+    let state = deleting_state("/left", &names, 1, 0); // cursor on "b.txt"
+    let survivors: Vec<String> = ["a.txt", "c.txt"].iter().map(|s| s.to_string()).collect();
+
+    let state = finish_delete(state, "/left", &survivors);
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("c.txt"), "the cursor lands on the entry that followed the deleted one");
+    assert_eq!(state.left.cursor, 1);
+    assert_eq!(state.left.scroll_offset, 0, "the scroll offset is unchanged");
+    assert!(state.left.reread_anchor.is_none(), "the anchor is consumed on completion");
+}
+
+#[test]
+fn job_done_delete_of_the_last_entry_lands_on_the_previous_one() {
+    // panel-navigation "Deleting the last entry lands on the previous one".
+    let names: Vec<String> = ["a.txt", "b.txt", "c.txt"].iter().map(|s| s.to_string()).collect();
+    let state = deleting_state("/left", &names, 2, 0); // cursor on "c.txt", the last entry
+    let survivors: Vec<String> = ["a.txt", "b.txt"].iter().map(|s| s.to_string()).collect();
+
+    let state = finish_delete(state, "/left", &survivors);
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("b.txt"), "the cursor lands on the entry that preceded the deleted one, now the last");
+    assert_eq!(state.left.cursor, 1);
+}
+
+#[test]
+fn job_done_multi_selection_delete_lands_on_the_first_survivor_at_or_after_the_cursor() {
+    // panel-navigation "Multi-selection delete lands on the first survivor
+    // at or after the cursor": {b, c, d} selected with the cursor on c.
+    let names: Vec<String> = ["a", "b", "c", "d", "e"].iter().map(|s| s.to_string()).collect();
+    let mut state = deleting_state("/left", &names, 2, 0); // cursor on "c"
+    for n in ["b", "c", "d"] {
+        state.left.selected.insert(OsString::from(n));
+    }
+    let survivors: Vec<String> = ["a", "e"].iter().map(|s| s.to_string()).collect();
+
+    let state = finish_delete(state, "/left", &survivors);
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e"), "b, c, and d are all gone; the first survivor at or after the cursor's old row is e");
+}
+
+#[test]
+fn job_done_delete_in_a_scrolled_window_keeps_the_window_where_it_was() {
+    // panel-navigation "Scrolled window stays put": 60 entries in a 20-row
+    // body, offset 30, cursor at position 40.
+    let names = names_of("e", 60);
+    let state = deleting_state("/left", &names, 40, 30);
+    let survivors = names_of("e", 60).into_iter().filter(|n| n != "e40").collect::<Vec<_>>();
+
+    let state = finish_delete(state, "/left", &survivors);
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e41"), "the cursor lands on the entry that followed the deleted one");
+    assert_eq!(state.left.cursor, 40, "which is back at position 40 in the 59-entry list");
+    assert_eq!(state.left.scroll_offset, 30, "the scrolled window stays put");
+}
+
+#[test]
+fn job_done_delete_at_the_very_bottom_pulls_the_window_up_by_one() {
+    // panel-navigation "Deleting at the very bottom pulls the window up by
+    // one" and "Re-read anchor restore re-clamps against the shorter list".
+    let names = names_of("e", 60);
+    let state = deleting_state("/left", &names, 59, 40); // cursor on the last entry
+    let survivors = names_of("e", 59);
+
+    let state = finish_delete(state, "/left", &survivors);
+
+    assert_eq!(state.left.entries.len(), 59);
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e58"), "the cursor lands on the new last entry");
+    assert_eq!(state.left.cursor, 58);
+    assert_eq!(state.left.scroll_offset, 39, "the offset re-clamps to 59 - 20 so no blank trailing row shows");
+}
+
+#[test]
+fn reread_panel_keeps_the_cursors_entry_and_offset() {
+    // panel-navigation "Ctrl+R keeps the cursor's entry".
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    let mut names = names_of("e", 30);
+    names[15] = "report.txt".to_string();
+    state.left.entries = names.iter().map(|n| file_entry(n, 0)).collect();
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 30 };
+    state.left.cursor = 15; // "report.txt", partway down
+    state.left.cursor_user_moved = true;
+    state.left.scroll_offset = 5;
+
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert!(state.left.reread_anchor.is_some(), "a same-directory re-read captures the anchor before resetting");
+
+    // The unchanged directory streams back.
+    let entries: Vec<Entry> = names.iter().map(|n| file_entry(n, 0)).collect();
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("report.txt"));
+    assert_eq!(state.left.cursor, 15);
+    assert_eq!(state.left.scroll_offset, 5, "the scroll offset is unchanged");
+}
+
+#[test]
+fn the_first_chunk_containing_the_anchored_entry_already_places_the_cursor_on_it() {
+    // panel-navigation "No jump while the re-read streams".
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24); // Full-mode body: 19 rows
+    state.left.sort_mode = SortMode::Unsorted;
+    let names = names_of("e", 30);
+    state.left.entries = names.iter().map(|n| file_entry(n, 0)).collect();
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 30 };
+    state.left.cursor = 12; // "e12"
+    state.left.cursor_user_moved = true;
+    state.left.scroll_offset = 4;
+
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+
+    // First chunk: e00..e14 — it contains the anchored "e12".
+    let first: Vec<Entry> = names[..15].iter().map(|n| file_entry(n, 0)).collect();
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: first });
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e12"), "the cursor is on the anchored entry as soon as its chunk lands, not on the first entry");
+    assert_ne!(state.left.cursor, 0);
+
+    // The rest of the listing must not move it again.
+    let rest: Vec<Entry> = names[15..].iter().map(|n| file_entry(n, 0)).collect();
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: rest });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e12"));
+    assert_eq!(state.left.cursor, 12);
+    assert_eq!(state.left.scroll_offset, 4, "the offset is restored once the whole list is back");
+}
+
+#[test]
+fn navigating_into_a_subdirectory_after_a_reread_still_starts_at_the_top() {
+    // panel-navigation "Navigating to a different directory still starts at
+    // the top".
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24);
+    state.left.sort_mode = SortMode::Unsorted;
+    let mut entries: Vec<Entry> = names_of("e", 30).iter().map(|n| file_entry(n, 0)).collect();
+    entries.push(dir_entry("sub"));
+    state.left.entries = entries;
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 31 };
+    state.left.cursor = 20;
+    state.left.cursor_user_moved = true;
+    state.left.scroll_offset = 10;
+
+    // A re-read happens first (and its anchor is consumed on completion)...
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let mut again: Vec<Entry> = names_of("e", 30).iter().map(|n| file_entry(n, 0)).collect();
+    again.push(dir_entry("sub"));
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: again });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 31 });
+    assert_eq!(state.left.scroll_offset, 10, "the re-read kept the user's place");
+
+    // ...then Enter on "sub" navigates away: cursor and offset reset, and no
+    // anchor rides along into the new directory.
+    let mut state = state;
+    state.left.cursor = state.left.entries.iter().position(|e| e.name == "sub").unwrap();
+    let (state, _) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left/sub"));
+    assert_eq!(state.left.cursor, 0);
+    assert_eq!(state.left.scroll_offset, 0);
+    assert!(state.left.reread_anchor.is_none(), "navigation to a different directory clears any anchor");
+
+    // The streamed fresh listing stays pinned to the top.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("x", 1), file_entry("y", 2)] });
+    assert_eq!(state.left.cursor, 0);
+    assert_eq!(state.left.scroll_offset, 0);
+}
+
+#[test]
+fn reread_issued_while_the_previous_listing_is_still_streaming_captures_no_anchor() {
+    // reread-preserves-cursor design D5: anchoring to a half-loaded list is
+    // worse than keeping the old jump-to-top behavior.
+    let mut state = test_state(UiPhase::Panels);
+    state.term_size = (80, 24);
+    state.left.sort_mode = SortMode::Unsorted;
+    state.left.entries = names_of("e", 30).iter().map(|n| file_entry(n, 0)).collect();
+    state.left.progress = crate::panel::ListingProgress::Streaming { count: 30 }; // still streaming
+    state.left.cursor = 20;
+    state.left.cursor_user_moved = true;
+    state.left.scroll_offset = 10;
+
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    assert!(state.left.reread_anchor.is_none(), "no anchor is captured from an incomplete listing");
+    assert_eq!(state.left.cursor, 0, "the re-read resets exactly as it always has");
+    assert_eq!(state.left.scroll_offset, 0);
+
+    // ...and the fresh stream stays pinned to the top, as before.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a", 1), file_entry("b", 2)] });
+    assert_eq!(state.left.cursor, 0);
+    assert_eq!(state.left.scroll_offset, 0);
 }
 
 // ---------------------------------------------------------------------

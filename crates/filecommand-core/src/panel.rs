@@ -215,6 +215,27 @@ pub struct ClipboardFeedback {
     pub expires_at_ms: u64,
 }
 
+/// A position snapshot taken just before a same-directory re-read (a
+/// completed/cancelled file-operation job, Ctrl+R, or a stale background
+/// tab's activation refresh), so the streamed re-listing can restore the
+/// user's place instead of jumping back to the top (panel-navigation
+/// "Same-directory re-read preserves cursor and scroll position";
+/// reread-preserves-cursor design D1). The cursor is re-anchored by entry
+/// *name*, not by row index, so a re-read that added or removed entries
+/// still lands on the same entry or its nearest survivor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RereadAnchor {
+    /// The previous listing's entry names in display order — the resolution
+    /// domain for [`PanelState::apply_reread_anchor`]'s survivor fallback.
+    pub names: Vec<OsString>,
+    /// The cursor's index into `names` at capture time.
+    pub cursor: usize,
+    /// The scroll offset at capture time; 0 when a quick filter was active,
+    /// since that offset counted rows of the narrowed list that
+    /// `begin_new_listing` discards (design D3).
+    pub scroll_offset: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PanelState {
     pub cwd: PathBuf,
@@ -288,6 +309,13 @@ pub struct PanelState {
     /// settling the cursor there (find-file "Navigate to a chosen result").
     /// `None` for every ordinary navigation.
     pub pending_cursor_target: Option<OsString>,
+    /// The position snapshot a same-directory re-read captured so the
+    /// streamed re-listing can restore the user's place — applied on every
+    /// `ListingChunk` and consumed on `ListingComplete` (reread-preserves-
+    /// cursor design D2/D4). `None` for ordinary navigations (any move to a
+    /// different directory clears it), for a re-read issued while the
+    /// previous listing was still streaming, and outside a re-read entirely.
+    pub reread_anchor: Option<RereadAnchor>,
     /// The topmost visible position of the panel body's render window, in
     /// *visible-position* space — an index into `visible_indices()`, not a
     /// raw `entries` index (panel-navigation "Scroll offset is core panel
@@ -322,6 +350,7 @@ impl PanelState {
             git_request: None,
             tree: None,
             pending_cursor_target: None,
+            reread_anchor: None,
             scroll_offset: 0,
         }
     }
@@ -467,6 +496,13 @@ impl PanelState {
     }
 
     pub fn begin_new_listing(&mut self, cwd: PathBuf) {
+        // A navigation must never inherit a re-read anchor captured for an
+        // earlier re-read (reread-preserves-cursor design D4). A re-read of
+        // the directory already displayed keeps the anchor
+        // `begin_listing_inner` captured just before calling this.
+        if cwd != self.cwd {
+            self.reread_anchor = None;
+        }
         self.cwd = cwd;
         self.entries.clear();
         self.cursor = 0;
@@ -504,6 +540,73 @@ impl PanelState {
         // so an ordinary navigation must not inherit a stale target from an
         // earlier one.
         self.pending_cursor_target = None;
+    }
+
+    /// Snapshot the panel's position for a re-read of the directory it is
+    /// already showing: every entry's name in display order plus the cursor
+    /// index and scroll offset (reread-preserves-cursor design D1/D5). Only
+    /// a `Complete` listing is worth anchoring to — a re-read issued while
+    /// the previous listing is still streaming clears any anchor instead,
+    /// keeping the old jump-to-top behavior rather than anchoring to a
+    /// half-loaded list.
+    pub fn capture_reread_anchor(&mut self) {
+        self.reread_anchor = match self.progress {
+            ListingProgress::Complete { .. } => Some(RereadAnchor {
+                names: self.entries.iter().map(|e| e.name.clone()).collect(),
+                cursor: self.cursor,
+                // The offset counts rows of the quick-filter-narrowed list
+                // and `begin_new_listing` clears that filter, so with a
+                // filter active there is no meaningful offset to restore —
+                // capture 0 and let the post-restore reconcile scroll the
+                // re-anchored cursor into view (design D3).
+                scroll_offset: if self.quick_filter.is_some() { 0 } else { self.scroll_offset },
+            }),
+            ListingProgress::Streaming { .. } => None,
+        };
+    }
+
+    /// Re-anchor the cursor and scroll offset of a listing that is
+    /// re-reading the directory captured by [`Self::capture_reread_anchor`].
+    /// `core::update` runs this after every chunk of the fresh listing (and
+    /// once more on completion, which consumes the anchor) so the restored
+    /// position holds while the re-read streams in rather than sitting on
+    /// row 0 until the final event (panel-navigation "No jump while the
+    /// re-read streams"; design D2). The cursor resolves to the first
+    /// captured name still listed, tried in the order `names[cursor]`,
+    /// `names[cursor + 1..]`, `names[..cursor]` reversed: the same entry if
+    /// it survived, else the first survivor at or after its old row, else
+    /// the nearest survivor before it (design D1). A hit also sets
+    /// `cursor_user_moved` so `insert_streamed`'s pin-to-top stops competing
+    /// with the anchor, and restores the scroll offset — clamped to
+    /// `visible_len.saturating_sub(rows)` so a list that shrank at the
+    /// bottom shows no blank trailing rows; in Brief mode the offset is a
+    /// column position rather than a row position, so the rows-based clamp
+    /// does not apply and the raw offset is left for the caller's
+    /// `ensure_cursor_visible_brief` pass to re-align to a whole-column
+    /// multiple (design D3). Returns whether a name resolved; `false` (no
+    /// anchor, or no captured name present in the entries so far) leaves
+    /// the panel untouched.
+    pub fn apply_reread_anchor(&mut self, rows: usize) -> bool {
+        let Some(anchor) = &self.reread_anchor else { return false };
+        if anchor.names.is_empty() {
+            return false;
+        }
+        let at = anchor.cursor.min(anchor.names.len() - 1);
+        let resolved = std::iter::once(&anchor.names[at])
+            .chain(anchor.names[at + 1..].iter())
+            .chain(anchor.names[..at].iter().rev())
+            .find_map(|name| self.entries.iter().position(|e| &e.name == name));
+        let offset = anchor.scroll_offset;
+        let Some(idx) = resolved else { return false };
+        self.cursor = idx;
+        self.cursor_user_moved = true;
+        if self.display_mode == DisplayMode::Brief {
+            self.scroll_offset = offset;
+        } else {
+            let visible_len = self.visible_indices().len();
+            self.scroll_offset = offset.min(visible_len.saturating_sub(rows));
+        }
+        true
     }
 
     /// Drop any selected names that no longer appear in `entries` — used
@@ -678,6 +781,7 @@ impl PanelState {
             git_request: self.git_request,
             tree: self.tree.clone(),
             pending_cursor_target: self.pending_cursor_target.clone(),
+            reread_anchor: self.reread_anchor.clone(),
             scroll_offset: self.scroll_offset,
             stale: false,
         }
@@ -703,6 +807,10 @@ impl PanelState {
         self.git_request = data.git_request;
         self.tree = data.tree;
         self.pending_cursor_target = data.pending_cursor_target;
+        // A tab switched away mid-re-read keeps its anchor so the listing
+        // that completes after it is reactivated still restores its place
+        // (reread-preserves-cursor design D4).
+        self.reread_anchor = data.reread_anchor;
         // Restored as-is; it may no longer fit the current viewport height
         // (the panel may have been resized, or the split/tab-strip state
         // differs from when this tab was stashed) — `core::update` re-clamps
@@ -836,6 +944,9 @@ pub struct TabData {
     pub git_request: Option<u64>,
     pub tree: Option<TreeState>,
     pub pending_cursor_target: Option<OsString>,
+    /// See [`PanelState::reread_anchor`] — stashed alongside the rest of
+    /// the tab's state so a tab switched away mid-re-read keeps it.
+    pub reread_anchor: Option<RereadAnchor>,
     pub scroll_offset: usize,
     /// Set when a completed/cancelled-with-partial-changes file-operation
     /// job touched `cwd` while this tab was in the background, so its
@@ -1944,6 +2055,183 @@ mod tests {
             p.ensure_cursor_visible(3);
             assert!(p.scroll_offset <= p.cursor && p.cursor < p.scroll_offset + 3);
             assert_eq!(p.scroll_offset, 13, "15 + 1 - 3 = 13");
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Re-read anchor (reread-preserves-cursor tasks 1.3-1.5, design D1/D3)
+    // -----------------------------------------------------------------
+
+    mod reread_anchor_tests {
+        use super::*;
+
+        /// A panel of `n` plain files, `Unsorted` so position `i` is exactly
+        /// `e{i}`, with a `Complete` listing (anchors only capture from one).
+        fn complete_panel_of(n: usize) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from("/a"));
+            p.sort_mode = SortMode::Unsorted;
+            p.entries = (0..n).map(|i| file(&format!("e{i}"))).collect();
+            p.progress = ListingProgress::Complete { count: n };
+            p
+        }
+
+        #[test]
+        fn capture_records_names_cursor_and_offset_only_when_complete() {
+            let mut p = complete_panel_of(5);
+            p.cursor = 3;
+            p.scroll_offset = 2;
+            p.capture_reread_anchor();
+            let anchor = p.reread_anchor.as_ref().expect("a Complete listing captures");
+            assert_eq!(anchor.names, p.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>());
+            assert_eq!(anchor.cursor, 3);
+            assert_eq!(anchor.scroll_offset, 2);
+
+            // A still-streaming listing captures nothing — and clears any
+            // anchor an earlier re-read left behind (design D5).
+            p.progress = ListingProgress::Streaming { count: 5 };
+            p.capture_reread_anchor();
+            assert!(p.reread_anchor.is_none());
+        }
+
+        #[test]
+        fn capture_with_an_active_quick_filter_records_a_zero_offset() {
+            // The offset counts rows of the filter-narrowed list, which
+            // `begin_new_listing` discards — so only the cursor entry is
+            // restorable, not the offset (design D3).
+            let mut p = complete_panel_of(30);
+            p.quick_filter = Some("e1".to_string());
+            p.cursor = 10;
+            p.scroll_offset = 7;
+            p.capture_reread_anchor();
+            let anchor = p.reread_anchor.as_ref().unwrap();
+            assert_eq!(anchor.scroll_offset, 0);
+            assert_eq!(anchor.cursor, 10, "the cursor entry still anchors");
+        }
+
+        #[test]
+        fn apply_resolves_the_same_entry_when_it_survived() {
+            let mut p = complete_panel_of(30);
+            p.cursor = 12; // "e12"
+            p.scroll_offset = 5;
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p.entries = (0..30).map(|i| file(&format!("e{i}"))).collect();
+
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(p.cursor, 12);
+            assert!(p.cursor_user_moved, "a resolved anchor marks the cursor as user-placed so streaming stops pinning it to the top");
+            assert_eq!(p.scroll_offset, 5);
+        }
+
+        #[test]
+        fn apply_falls_forward_to_the_next_survivor_then_backward_to_the_nearest_previous() {
+            // Resolution order (design D1): names[cursor], then
+            // names[cursor + 1..], then names[..cursor] reversed — covering
+            // a multi-selection delete with no special casing.
+            let mut p = complete_panel_of(5); // e0..e4, cursor on e2
+            p.cursor = 2;
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            // {e1, e2, e3} deleted with the cursor on e2 -> land on e4.
+            p.entries = vec![file("e0"), file("e4")];
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("e4"));
+
+            // The whole tail from the cursor onward is gone -> nearest
+            // survivor *before* the old row.
+            let mut p = complete_panel_of(5);
+            p.cursor = 3; // "e3"
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p.entries = vec![file("e0"), file("e1")];
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("e1"));
+            assert_eq!(p.cursor, 1, "e1 is now the last entry");
+        }
+
+        #[test]
+        fn apply_returns_false_and_stays_put_when_no_captured_name_is_present_yet() {
+            // The anchored entries have not streamed in yet (or never will):
+            // the panel keeps whatever the stream did to it (design D2).
+            let mut p = complete_panel_of(5);
+            p.cursor = 2;
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p.entries = vec![file("zz")];
+            assert!(!p.apply_reread_anchor(10));
+            assert_eq!(p.cursor, 0);
+            assert!(!p.cursor_user_moved);
+        }
+
+        #[test]
+        fn apply_re_clamps_the_restored_offset_against_the_shorter_list() {
+            // 60 entries in a 20-row window, offset 40, cursor on the last;
+            // the re-read comes back one entry shorter (design D3).
+            let mut p = complete_panel_of(60);
+            p.cursor = 59;
+            p.scroll_offset = 40;
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p.entries = (0..59).map(|i| file(&format!("e{i}"))).collect();
+            assert!(p.apply_reread_anchor(20));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("e58"));
+            assert_eq!(p.scroll_offset, 39, "min(40, 59 - 20): the window must not extend past the end of the shorter list");
+        }
+
+        #[test]
+        fn brief_mode_restores_the_offset_through_the_column_aligned_clamp() {
+            // Brief's offset is a column position, so the rows-based clamp
+            // does not apply: the raw offset is restored and the caller's
+            // `ensure_cursor_visible_brief` pass keeps it on a whole-column
+            // multiple (design D3).
+            let mut p = complete_panel_of(60);
+            p.display_mode = DisplayMode::Brief;
+            p.cursor = 59;
+            p.scroll_offset = 40; // column 2 of a rows=20 grid
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p.entries = (0..59).map(|i| file(&format!("e{i}"))).collect();
+
+            assert!(p.apply_reread_anchor(20));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("e58"));
+            assert_eq!(p.scroll_offset, 40, "no rows-based clamp in Brief mode");
+
+            // The reducer's follow-up reconciliation re-aligns it (rows=20,
+            // cols=3): the cursor's column is already inside the window, so
+            // the offset stands — still on an exact column boundary.
+            p.ensure_cursor_visible_brief(20, 3);
+            assert_eq!(p.scroll_offset, 40);
+            assert_eq!(p.scroll_offset % 20, 0, "the restored offset stays on a whole-column multiple");
+        }
+
+        #[test]
+        fn begin_new_listing_keeps_the_anchor_on_a_same_directory_reread_and_clears_it_on_navigation() {
+            let mut p = complete_panel_of(5);
+            p.cursor = 2;
+            p.capture_reread_anchor();
+
+            p.begin_new_listing(PathBuf::from("/a"));
+            assert!(p.reread_anchor.is_some(), "a same-directory re-read keeps the freshly captured anchor (design D4)");
+
+            p.begin_new_listing(PathBuf::from("/b"));
+            assert!(p.reread_anchor.is_none(), "navigation to a different directory clears it (design D4)");
+        }
+
+        #[test]
+        fn the_anchor_round_trips_through_tab_stash_and_restore() {
+            // A tab switched away mid-re-read keeps its anchor for when its
+            // listing completes (design D4).
+            let mut p = complete_panel_of(5);
+            p.cursor = 2;
+            p.scroll_offset = 1;
+            p.capture_reread_anchor();
+
+            p.open_tab(); // the anchored tab is stashed; the new tab inherits a clone
+            p.switch_tab(1);
+            let anchor = p.reread_anchor.as_ref().expect("the stashed tab's anchor must round-trip");
+            assert_eq!(anchor.cursor, 2);
+            assert_eq!(anchor.scroll_offset, 1);
+            assert_eq!(anchor.names.len(), 5);
         }
     }
 

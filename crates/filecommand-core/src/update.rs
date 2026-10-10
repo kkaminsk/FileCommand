@@ -1465,9 +1465,11 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                     // user changed tabs, not directories), so it goes
                     // through `begin_listing_inner`: fresh read without the
                     // frecency visit or history persist (panel-tabs "Stale
-                    // background tab refresh on activation").
+                    // background tab refresh on activation"). It *is* a
+                    // same-directory re-read of the restored tab, so the
+                    // anchor capture stays on.
                     let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing_inner(&mut state, side, path));
+                    effects.extend(begin_listing_inner(&mut state, side, path, true));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
@@ -1476,7 +1478,7 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 if state.panel_mut(side).switch_tab(n) {
                     // Same non-navigation refresh as `CloseTab` above.
                     let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing_inner(&mut state, side, path));
+                    effects.extend(begin_listing_inner(&mut state, side, path, true));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
@@ -3259,7 +3261,7 @@ fn handle_tree_cursor_move(state: &mut State, side: PanelSide, m: CursorMove) ->
     // panel-modes "Tree mode scrolling") before the opposite panel's
     // re-listing kicks off below.
     reconcile_panel_viewport(state, side);
-    let mut effects = begin_listing_inner(state, side.toggle(), target.clone());
+    let mut effects = begin_listing_inner(state, side.toggle(), target.clone(), false);
     if needs_expand {
         effects.push(Effect::ExpandTreeNode { panel: side, path: target });
     }
@@ -3512,7 +3514,7 @@ fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// non-navigation callers.
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
     quicksearch::record_visit(&mut state.dir_history, &path, state.clock_ms);
-    let mut effects = begin_listing_inner(state, side, path);
+    let mut effects = begin_listing_inner(state, side, path, true);
     effects.push(Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }));
     effects
 }
@@ -3526,7 +3528,19 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
 /// changed tabs, not directories — panel-tabs "Stale background tab refresh
 /// on activation"). A third caller should prompt extracting a purpose-named
 /// helper rather than diluting this contract.
-fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
+///
+/// `capture_anchor` asks for the panel's cursor entry and scroll offset to
+/// be snapshotted before the listing resets — which happens only when
+/// `path` is the directory the panel is already showing, so the streamed
+/// re-listing can restore the user's place (panel-navigation "Same-
+/// directory re-read preserves cursor and scroll position"; reread-
+/// preserves-cursor design D5). Every caller passes `true` except the
+/// Tree-mode preview, whose opposite-panel re-listing is a navigation of
+/// that panel, not a re-read the user asked for.
+fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf, capture_anchor: bool) -> Vec<Effect> {
+    if capture_anchor && path == state.panel(side).cwd {
+        state.panel_mut(side).capture_reread_anchor();
+    }
     state.panel_mut(side).begin_new_listing(path.clone());
     let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
     // A panel sitting in Info mode needs its drive/directory figures
@@ -3559,6 +3573,7 @@ fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> E
 fn apply_listing_event(state: &mut State, cmd: Command) {
     match cmd {
         Command::ListingChunk { panel, entries } => {
+            let term_size = state.term_size;
             let p = state.panel_mut(panel);
             for e in entries {
                 p.insert_streamed(e);
@@ -3566,14 +3581,26 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             if let crate::panel::ListingProgress::Streaming { count } = &mut p.progress {
                 *count = p.entries.len();
             }
+            // A same-directory re-read re-anchors the cursor and offset as
+            // soon as a chunk containing the anchored entry lands, so the
+            // restored position holds while the listing streams instead of
+            // sitting on row 0 until completion (panel-navigation "No jump
+            // while the re-read streams"; reread-preserves-cursor design
+            // D2). A no-op when no anchor was captured.
+            let rows = panel_viewport_rows(term_size, p.display_mode, p.tab_count());
+            p.apply_reread_anchor(rows);
             // Keeps the pinned-to-top offset (0) while the user hasn't moved
             // the cursor, exactly as `insert_streamed` already pins the
             // cursor itself; re-clamps if the user had already moved it
             // (panel-navigation "Streamed listing keeps the top pinned until
-            // the user moves").
+            // the user moves"). In Brief mode this same call routes the
+            // restored offset through `ensure_cursor_visible_brief`, keeping
+            // it on a whole-column multiple (reread-preserves-cursor design
+            // D3).
             reconcile_panel_viewport(state, panel);
         }
         Command::ListingComplete { panel, total } => {
+            let term_size = state.term_size;
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: total };
             p.clamp_cursor();
@@ -3583,12 +3610,23 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             // this directory's listing has actually landed, settle the
             // cursor on it (find-file "Navigate to a chosen result" —
             // "cursor positioned on the matched entry").
+            let mut settled_on_target = false;
             if let Some(name) = p.pending_cursor_target.take() {
                 if let Some(idx) = p.entries.iter().position(|e| e.name == name) {
                     p.cursor = idx;
                     p.cursor_user_moved = true;
+                    settled_on_target = true;
                 }
             }
+            // Find-file's deferred settle keeps precedence when both are set
+            // on the same listing (reread-preserves-cursor design D2);
+            // either way the anchor is consumed here — until now chunk-time
+            // applications re-resolved against it.
+            if !settled_on_target {
+                let rows = panel_viewport_rows(term_size, p.display_mode, p.tab_count());
+                p.apply_reread_anchor(rows);
+            }
+            p.reread_anchor = None;
             reconcile_panel_viewport(state, panel);
         }
         Command::ListingFailed { panel, message } => {
