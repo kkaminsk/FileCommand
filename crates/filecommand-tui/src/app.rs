@@ -43,6 +43,12 @@ struct Runtime {
     /// Where `Effect::PersistTheme` writes the `theme =` key back
     /// (theme-selection "Applied theme persists to configuration").
     config_path: PathBuf,
+    /// Where the F2 user menu lives; `Command::EditUserMenuFile` opens it via
+    /// `State::user_menu_path`, and when the editor that had it open returns
+    /// (built-in close or external exit) the file is reloaded and fed back as
+    /// `Command::UserMenuReloaded` (user-menu "Edit the user menu file from
+    /// the Commands menu"; design D4).
+    usermenu_path: PathBuf,
     /// `false` when the profile directory could not be created at startup:
     /// the three persist effects are then skipped for the whole session
     /// (config-profile-directory "Unwritable profile falls back without
@@ -300,6 +306,9 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     state.dir_history = history_file.directories;
     let user_menu = config::load_user_menu(&usermenu_path);
     apply_user_menu(&mut state, user_menu);
+    // Commands → Menu file edit reads the path back out of `State`
+    // (pulldown-menu-completion design D4).
+    state.user_menu_path = usermenu_path.clone();
     // The legacy notice and the unwritable-profile warning write last, so
     // the persistence-breaking one (design D2) stays visible when several
     // warnings fire at once; still the same single-field, last-writer-wins
@@ -318,6 +327,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         active_job: None,
         history_path,
         config_path,
+        usermenu_path,
         persist_enabled,
         viewer_source: None,
         clipboard: Box::new(PlatformClipboard::default()),
@@ -791,9 +801,25 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     if matches!(cmd, Command::ViewerClose) {
         rt.viewer_source = None;
     }
+    // Commands → Menu file edit, built-in-editor leg: remember whether the
+    // editor currently has the user-menu file open, so the transition out of
+    // `UiPhase::Editor` (any of the quit paths, save-on-exit included)
+    // triggers the reload below (user-menu "Edit the user menu file from the
+    // Commands menu"; design D4).
+    let editing_user_menu = matches!(&state.phase, UiPhase::Editor(editor) if editor.path == rt.usermenu_path);
     let (state, effects) = update(state, cmd);
     let quit = run_effects(effects, guard, rt)?;
+    if editing_user_menu && !matches!(state.phase, UiPhase::Editor(_)) {
+        reload_user_menu(rt);
+    }
     Ok((state, quit))
+}
+
+/// Re-read `usermenu.toml` and feed the parse result back as
+/// `Command::UserMenuReloaded` (design D4) — drained before the next frame,
+/// exactly like the `RereadPanel` an external editor's return sends.
+fn reload_user_menu(rt: &Runtime) {
+    let _ = rt.tx.send(Command::UserMenuReloaded(config::load_user_menu(&rt.usermenu_path)));
 }
 
 /// Drain every queued worker event, including any command an effect fed
@@ -924,6 +950,14 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                         // `RunShellCommand` (external-editor: Synchronous wait
                         // and panel re-read — "Panel refreshed after edit").
                         let _ = rt.tx.send(Command::RereadPanel(side));
+                        // Commands → Menu file edit returns through here too:
+                        // reload the user menu when the file the editor had
+                        // open was `usermenu.toml` (design D4). A panel F4
+                        // edit's `file_arg` is a bare file name, never the
+                        // absolute menu path, so this never false-fires.
+                        if Path::new(&invocation.file_arg) == rt.usermenu_path.as_path() {
+                            reload_user_menu(rt);
+                        }
                     }
                     Err(message) => {
                         let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });

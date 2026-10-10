@@ -91,6 +91,7 @@ pub(crate) struct Snapshot {
     menu: Option<MenuMark>,
     user_menu: Option<PopupMark>,
     file_action_menu: Option<PopupMark>,
+    history_dialog: Option<PopupMark>,
     dialog: DialogMark,
     quit_confirm: bool,
     in_splash: bool,
@@ -117,6 +118,11 @@ impl Snapshot {
                 opened_at_ms: m.opened_at_ms,
                 selected_at_ms: m.selected_at_ms,
             }),
+            history_dialog: state.history_dialog.as_ref().map(|d| PopupMark {
+                cursor: d.cursor,
+                opened_at_ms: d.opened_at_ms,
+                selected_at_ms: d.selected_at_ms,
+            }),
             dialog: DialogMark::of(state),
             quit_confirm: state.quit_confirm,
             in_splash: matches!(state.phase, UiPhase::Splash { .. }),
@@ -140,6 +146,11 @@ impl Snapshot {
             let (opened, selected) = stamp_popup(self.file_action_menu.as_ref(), menu.cursor, now);
             menu.opened_at_ms = opened;
             menu.selected_at_ms = selected;
+        }
+        if let Some(dialog) = state.history_dialog.as_mut() {
+            let (opened, selected) = stamp_popup(self.history_dialog.as_ref(), dialog.cursor, now);
+            dialog.opened_at_ms = opened;
+            dialog.selected_at_ms = selected;
         }
 
         // A dialog opening, or a different one replacing it, irises; closing

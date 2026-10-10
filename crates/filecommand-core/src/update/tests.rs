@@ -949,7 +949,7 @@ fn quick_filter_start_char_and_end_are_scoped_to_the_active_panel() {
     state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
     state.right.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
 
-    let (state, _) = update(state, Command::QuickFilterStart);
+    let (state, _) = update(state, Command::QuickFilterStart(PanelSide::Left));
     assert_eq!(state.left.quick_filter.as_deref(), Some(""));
     assert_eq!(state.right.quick_filter, None, "the opposite panel must be unaffected");
 
@@ -996,11 +996,11 @@ fn tab_commands_are_scoped_to_the_active_panel() {
     let mut state = test_state(UiPhase::Panels);
     state.active = PanelSide::Left;
 
-    let (state, _) = update(state, Command::OpenTab);
+    let (state, _) = update(state, Command::OpenTab(PanelSide::Left));
     assert_eq!(state.left.tab_count(), 2);
     assert_eq!(state.right.tab_count(), 1, "the opposite panel's tabs must be untouched");
 
-    let (mut state, _) = update(state, Command::CloseTab);
+    let (mut state, _) = update(state, Command::CloseTab(PanelSide::Left));
     assert_eq!(state.left.tab_count(), 1);
 
     state.left.open_tab();
@@ -1059,7 +1059,7 @@ fn close_tab_falling_back_to_stale_neighbor_issues_fresh_read() {
     state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere
     state.left.mark_background_tabs_stale(Path::new("/left"));
 
-    let (state, effects) = update(state, Command::CloseTab);
+    let (state, effects) = update(state, Command::CloseTab(PanelSide::Left));
     assert_eq!(state.left.tab_count(), 1, "closed the active tab, falling back to the one remaining tab");
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "fell back to the previously-stale background tab");
     assert_eq!(
@@ -1109,7 +1109,7 @@ fn close_tab_stale_neighbor_refresh_records_no_history_and_persists_nothing() {
     state.left.mark_background_tabs_stale(Path::new("/left"));
     let history_before = state.dir_history.clone();
 
-    let (state, effects) = update(state, Command::CloseTab);
+    let (state, effects) = update(state, Command::CloseTab(PanelSide::Left));
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "fell back to the stale neighbor");
     assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })), "the fresh read still happens");
     assert!(effects.iter().all(|e| !matches!(e, Effect::PersistHistory(_))), "a stale-activation refresh persists nothing, got {effects:?}");
@@ -2279,15 +2279,16 @@ fn horizontal_movement_keeps_a_pulldown_open_and_wraps() {
 }
 
 #[test]
-fn vertical_selection_skips_disabled_items_and_separators() {
+fn vertical_selection_skips_separators() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('f'));
-    // Files opens on Copy (View/Edit are M4 and disabled).
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Copy"));
+    // Files opens on View, its first item; every shipped item is enabled
+    // (pulldown-menu-completion), so only separators are ever skipped.
+    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
     let (state, _) = update(state, Command::MenuSelectNext);
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Rename/Move"));
+    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Edit"));
     let (state, _) = update(state, Command::MenuSelectPrev);
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Copy"));
+    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
 }
 
 #[test]
@@ -2296,6 +2297,9 @@ fn enter_dispatches_the_selected_item_and_closes_the_overlay() {
     state.left.entries = vec![file_entry("a.txt", 1)];
     let (state, _) = update(state, Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('f'));
+    // Files opens on View; Copy is two rows down (View, Edit, Copy).
+    let (state, _) = update(state, Command::MenuSelectNext);
+    let (state, _) = update(state, Command::MenuSelectNext);
     let (state, _) = update(state, Command::MenuActivate); // Copy
 
     assert!(state.menu.is_none(), "activating an item closes the whole overlay");
@@ -2377,6 +2381,450 @@ fn every_menu_item_that_is_enabled_maps_to_a_command() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: every formerly-greyed item wired (task 2.5)
+// ---------------------------------------------------------------------
+
+/// pulldown-menus "Every listed item is wired": the exact `Command` each new
+/// `MenuAction` stands for. Left/Right-scoped actions carry the menu's own
+/// side; Files/Commands actions follow the active panel.
+#[test]
+fn menu_action_command_maps_the_newly_wired_actions() {
+    use crate::menu::MenuAction;
+    assert_eq!(menu_action_command(MenuAction::View, PanelSide::Left), Some(Command::RequestViewer));
+    assert_eq!(menu_action_command(MenuAction::Edit, PanelSide::Left), Some(Command::RequestEditor));
+    assert_eq!(menu_action_command(MenuAction::QuickFilter, PanelSide::Right), Some(Command::QuickFilterStart(PanelSide::Right)));
+    assert_eq!(menu_action_command(MenuAction::NewTab, PanelSide::Right), Some(Command::OpenTab(PanelSide::Right)));
+    assert_eq!(menu_action_command(MenuAction::CloseTab, PanelSide::Right), Some(Command::CloseTab(PanelSide::Right)));
+    assert_eq!(menu_action_command(MenuAction::History, PanelSide::Left), Some(Command::HistoryDialogOpen));
+    assert_eq!(menu_action_command(MenuAction::SwapPanels, PanelSide::Left), Some(Command::SwapPanels));
+    assert_eq!(menu_action_command(MenuAction::EditMenuFile, PanelSide::Left), Some(Command::EditUserMenuFile));
+}
+
+/// pulldown-menus "Files → View opens the viewer": activating Files → View
+/// closes the menu and opens the F3 viewer on the cursor entry, exactly as
+/// F3 would.
+#[test]
+fn files_menu_view_follows_the_f3_path() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 1)];
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('f'));
+    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
+    let (state, effects) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none(), "activating an item closes the whole overlay");
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+}
+
+/// Files → Edit follows the F4 path: with no external editor configured, the
+/// built-in editor opens on the cursor entry.
+#[test]
+fn files_menu_edit_follows_the_f4_path() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 1)];
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('f'));
+    let (state, _) = update(state, Command::MenuSelectNext); // Edit
+    let (state, effects) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+}
+
+/// pulldown-menus "Right → Filter on the inactive panel": the filter starts
+/// on the right panel, which becomes active so typed characters narrow it
+/// (design D1).
+#[test]
+fn right_menu_filter_activates_the_right_panel_with_its_quick_filter_open() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('r'));
+    let filter_index = crate::menu::entries(MenuId::Right).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Filter")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = filter_index;
+    let (state, _) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert_eq!(state.right.quick_filter.as_deref(), Some(""), "the right panel's quick filter opened");
+    assert_eq!(state.left.quick_filter, None, "the left panel is untouched");
+    assert_eq!(state.active, PanelSide::Right, "the filtered panel became active so typing reaches it");
+    // Subsequent typed characters narrow the right panel.
+    let (state, _) = update(state, Command::QuickFilterChar('x'));
+    assert_eq!(state.right.quick_filter.as_deref(), Some("x"));
+}
+
+/// pulldown-menus "Left → New tab on the inactive panel": the left panel
+/// gains the tab exactly as Ctrl+T with the left panel active would have
+/// created it, and focus stays put (design D1).
+#[test]
+fn left_menu_new_tab_opens_a_tab_on_the_left_without_moving_focus() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    let (state, _) = update(state, Command::MenuOpen); // the Left menu is first
+    let tab_index = crate::menu::entries(MenuId::Left).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "New tab")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = tab_index;
+    let (state, _) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert_eq!(state.left.tab_count(), 2, "the left panel gained a tab");
+    assert_eq!(state.right.tab_count(), 1, "the right panel is untouched");
+    assert_eq!(state.active, PanelSide::Right, "focus stays on the right panel");
+}
+
+/// Left → Close tab closes a tab on the left panel regardless of focus.
+#[test]
+fn left_menu_close_tab_closes_a_left_tab_without_moving_focus() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    state.left.open_tab();
+    let (state, _) = update(state, Command::MenuOpen);
+    let close_index = crate::menu::entries(MenuId::Left).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Close tab")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = close_index;
+    let (state, _) = update(state, Command::MenuActivate);
+    assert_eq!(state.left.tab_count(), 1, "the left panel's tab closed");
+    assert_eq!(state.active, PanelSide::Right, "focus stays on the right panel");
+}
+
+/// Commands → History opens the Alt+F8 command-history dialog.
+#[test]
+fn commands_menu_history_opens_the_history_dialog() {
+    let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('c'));
+    let history_index =
+        crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "History")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = history_index;
+    let (state, _) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert!(state.history_dialog.is_some(), "Commands -> History opens the dialog");
+}
+
+/// Commands → Swap panels issues the swap (see the swap tests below).
+#[test]
+fn commands_menu_swap_panels_swaps_the_panels() {
+    let mut state = test_state(UiPhase::Panels);
+    complete_panel_listings(&mut state);
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('c'));
+    let swap_index =
+        crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Swap panels")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = swap_index;
+    let (state, _) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert_eq!(state.left.cwd, PathBuf::from("/right"));
+    assert_eq!(state.right.cwd, PathBuf::from("/left"));
+}
+
+/// Commands → Menu file edit opens the user-menu file in the editor (see the
+/// menu-file edit tests below).
+#[test]
+fn commands_menu_menu_file_edit_opens_the_user_menu_file_in_the_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_path = PathBuf::from("/profile/usermenu.toml");
+    let (state, _) = update(state, Command::MenuOpen);
+    let (state, _) = update(state, Command::MenuHotkey('c'));
+    let edit_index =
+        crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Menu file edit")).unwrap();
+    let mut state = state;
+    state.menu.as_mut().unwrap().selected = edit_index;
+    let (state, effects) = update(state, Command::MenuActivate);
+    assert!(state.menu.is_none());
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/profile/usermenu.toml") }]);
+}
+
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: the Alt+F8 command-history dialog (task 2.5;
+// command-line "Command history dialog (Alt+F8)"; design D2)
+// ---------------------------------------------------------------------
+
+fn history_state(entries: &[&str]) -> State {
+    let mut state = test_state(UiPhase::Panels);
+    state.history = entries.iter().map(|s| s.to_string()).collect();
+    state
+}
+
+#[test]
+fn history_dialog_open_lists_history_newest_first() {
+    let state = history_state(&["cd C:\\work", "cd D:\\"]);
+    let (state, effects) = update(state, Command::HistoryDialogOpen);
+    assert!(effects.is_empty());
+    let dialog = state.history_dialog.expect("the dialog opens");
+    assert_eq!(dialog.cursor, 0, "the highlight starts on the newest entry");
+}
+
+#[test]
+fn history_dialog_confirm_places_the_entry_with_the_caret_at_the_end() {
+    // Spec scenario "Pick an entry": history `cd C:\work` then `cd D:\`;
+    // Alt+F8, Down, Enter -> the buffer reads `cd C:\work`, caret at end.
+    let state = history_state(&["cd C:\\work", "cd D:\\"]);
+    let (state, _) = update(state, Command::HistoryDialogOpen);
+    let (state, _) = update(state, Command::HistoryDialogMove(1));
+    let (state, effects) = update(state, Command::HistoryDialogConfirm);
+    assert!(state.history_dialog.is_none(), "Enter closes the dialog");
+    assert!(effects.is_empty(), "nothing runs — the entry is only placed");
+    assert_eq!(state.command_line.text(), "cd C:\\work");
+    assert_eq!(state.command_line.caret(), "cd C:\\work".chars().count(), "the caret sits at the end");
+    assert_eq!(state.history_cursor, None, "no history recall is in progress");
+}
+
+#[test]
+fn history_dialog_confirm_ends_an_up_down_recall_in_progress() {
+    let mut state = history_state(&["cd C:\\work", "cd D:\\"]);
+    state.command_line = LineEdit::from("cd D:\\");
+    state.history_cursor = Some(1);
+    let (state, _) = update(state, Command::HistoryDialogOpen);
+    let (state, _) = update(state, Command::HistoryDialogConfirm); // cursor 0 = newest = "cd D:\"
+    assert_eq!(state.command_line.text(), "cd D:\\");
+    assert_eq!(state.history_cursor, None);
+}
+
+#[test]
+fn history_dialog_cancel_leaves_the_buffer_alone() {
+    // Spec scenario "Esc leaves the buffer alone".
+    let mut state = history_state(&["cd C:\\work"]);
+    state.command_line = LineEdit::from("cd x");
+    let (state, _) = update(state, Command::HistoryDialogOpen);
+    let (state, effects) = update(state, Command::HistoryDialogCancel);
+    assert!(state.history_dialog.is_none(), "Esc closes the dialog");
+    assert!(effects.is_empty());
+    assert_eq!(state.command_line.text(), "cd x", "the buffer is unchanged");
+}
+
+#[test]
+fn history_dialog_empty_history_shows_no_history_and_enter_does_nothing() {
+    // Spec scenario "Empty history": Enter leaves the buffer unchanged with
+    // the dialog open until Esc.
+    let state = history_state(&[]);
+    let (state, _) = update(state, Command::HistoryDialogOpen);
+    let before = state.command_line.clone();
+    let (state, effects) = update(state, Command::HistoryDialogConfirm);
+    assert!(state.history_dialog.is_some(), "Enter on the empty history keeps the dialog open");
+    assert!(effects.is_empty());
+    assert_eq!(state.command_line, before, "the buffer is unchanged");
+    let (state, _) = update(state, Command::HistoryDialogCancel);
+    assert!(state.history_dialog.is_none(), "Esc still closes it");
+}
+
+#[test]
+fn history_dialog_move_clamps_at_both_ends() {
+    let state = history_state(&["one", "two", "three"]);
+    let (state, _) = update(state, Command::HistoryDialogOpen);
+    let (state, _) = update(state, Command::HistoryDialogMove(-1));
+    assert_eq!(state.history_dialog.unwrap().cursor, 0, "Up at the top stays put");
+    let (state, _) = update(state, Command::HistoryDialogMove(isize::MAX / 2)); // End/PgDn
+    assert_eq!(state.history_dialog.unwrap().cursor, 2, "End lands on the oldest entry");
+    let (state, _) = update(state, Command::HistoryDialogMove(1));
+    assert_eq!(state.history_dialog.unwrap().cursor, 2, "Down at the bottom stays put");
+}
+
+#[test]
+fn history_dialog_commands_without_an_open_dialog_are_no_ops() {
+    // The input mapper only emits these while the dialog is open; the
+    // reducer still never acts on them otherwise (same convention as the
+    // other overlay command families).
+    let state = history_state(&["cd C:\\work"]);
+    for cmd in [Command::HistoryDialogMove(1), Command::HistoryDialogConfirm, Command::HistoryDialogCancel] {
+        let before = state.clone();
+        let (after, effects) = update(before.clone(), cmd);
+        assert!(effects.is_empty());
+        assert_eq!(after, before);
+    }
+}
+
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: Swap panels (task 2.5; panel-navigation "Swap
+// panels (Ctrl+U)"; design D3)
+// ---------------------------------------------------------------------
+
+/// Both panels' listings marked Complete, the state every swap test starts
+/// from (a Streaming panel refuses the swap).
+fn complete_panel_listings(state: &mut State) {
+    state.left.progress = crate::panel::ListingProgress::Complete { count: state.left.entries.len() };
+    state.right.progress = crate::panel::ListingProgress::Complete { count: state.right.entries.len() };
+}
+
+#[test]
+fn swap_panels_exchanges_everything_and_keeps_focus_and_split() {
+    // Spec scenario "Swap keeps focus on the same side".
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from("C:\\a");
+    state.right.cwd = PathBuf::from("D:\\b");
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    state.right.entries = vec![file_entry("b.txt", 2), file_entry("c.txt", 3)];
+    state.right.cursor = 1;
+    state.right.scroll_offset = 0;
+    state.right.selected.insert(OsString::from("b.txt"));
+    state.left.sort_mode = SortMode::Size;
+    state.split_percent = 60;
+    complete_panel_listings(&mut state);
+
+    let (state, effects) = update(state, Command::SwapPanels);
+    assert_eq!(state.left.cwd, PathBuf::from("D:\\b"));
+    assert_eq!(state.right.cwd, PathBuf::from("C:\\a"));
+    assert_eq!(state.left.entries.len(), 2, "the listing moved with the panel");
+    assert_eq!(state.left.cursor, 1, "the cursor moved with the panel");
+    assert!(state.left.selected.contains(&OsString::from("b.txt")), "the selection moved with the panel");
+    assert_eq!(state.right.sort_mode, SortMode::Size, "the sort mode moved with the panel");
+    assert_eq!(state.active, PanelSide::Left, "the active side is unchanged");
+    assert_eq!(state.split_percent, 60, "the split is unchanged");
+    assert!(state.prompt().starts_with("D:\\b>"), "the command-line prompt follows: {}", state.prompt());
+    // No directory is re-read (design D3); both sides' git queries are
+    // re-issued with fresh ids so pre-swap replies drop as stale.
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "no re-read: {effects:?}");
+    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Left, path, .. } if *path == PathBuf::from("D:\\b"))));
+    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Right, path, .. } if *path == PathBuf::from("C:\\a"))));
+}
+
+#[test]
+fn swap_panels_carries_tabs_and_selection() {
+    // Spec scenario "Swap carries tabs and selection".
+    let mut state = test_state(UiPhase::Panels);
+    state.right.open_tab();
+    state.right.open_tab();
+    state.right.selected.insert(OsString::from("x"));
+    state.right.selected.insert(OsString::from("y"));
+    complete_panel_listings(&mut state);
+
+    let (state, _) = update(state, Command::SwapPanels);
+    assert_eq!(state.left.tab_count(), 3, "the tabs moved to the left panel");
+    assert_eq!(state.right.tab_count(), 1);
+    assert_eq!(state.left.selected.len(), 2, "the selection moved with them");
+}
+
+#[test]
+fn swap_panels_is_refused_while_either_listing_is_streaming() {
+    // Spec scenario "Swap refused while reading".
+    for streaming_side in [PanelSide::Left, PanelSide::Right] {
+        let mut state = test_state(UiPhase::Panels);
+        complete_panel_listings(&mut state);
+        state.panel_mut(streaming_side).progress = crate::panel::ListingProgress::Streaming { count: 0 };
+        let before = state.clone();
+        let (state, effects) = update(state, Command::SwapPanels);
+        assert!(effects.is_empty());
+        assert_eq!(state, before, "a streaming panel ({streaming_side:?}) refuses the swap");
+    }
+}
+
+#[test]
+fn swap_panels_is_ignored_during_a_drag() {
+    let mut state = test_state(UiPhase::Panels);
+    complete_panel_listings(&mut state);
+    state.drag = Some(DragState {
+        source: PanelSide::Left,
+        source_dir: state.left.cwd.clone(),
+        items: vec![SourceItem { original_name: OsString::from("a.txt"), path: PathBuf::from("/left/a.txt"), is_dir: false }],
+        op: JobKind::Copy,
+        target: None,
+    });
+    let (state, effects) = update(state, Command::SwapPanels);
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "nothing swapped");
+}
+
+#[test]
+fn swap_panels_re_issues_info_and_git_queries_with_fresh_ids() {
+    // Spec scenario "Git info follows the swap" + design D3: pending queries
+    // are re-issued under fresh request ids, so a reply from before the swap
+    // is discarded as stale.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from("C:\\repo");
+    state.left.display_mode = DisplayMode::Info;
+    state.left.info_request = Some(10);
+    state.left.git_request = Some(11);
+    state.right.git_request = Some(12);
+    state.request_seq = 100;
+    complete_panel_listings(&mut state);
+
+    let (state, effects) = update(state, Command::SwapPanels);
+    // The left panel (the old right, still in Info? no — Info moved right):
+    // Info mode moved with the panel, so the *right* panel is now in Info.
+    assert_eq!(state.right.display_mode, DisplayMode::Info, "display mode moved with the panel");
+    let info_query = effects.iter().find_map(|e| match e {
+        Effect::QueryInfo { panel, request, .. } => Some((*panel, *request)),
+        _ => None,
+    });
+    assert_eq!(info_query.map(|(p, _)| p), Some(PanelSide::Right), "QueryInfo is re-issued for the side now in Info mode");
+    let fresh: Vec<u64> = effects
+        .iter()
+        .filter_map(|e| match e {
+            Effect::QueryInfo { request, .. } | Effect::QueryGitInfo { request, .. } => Some(*request),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(fresh.len(), 3, "one Info query (right) plus two git queries");
+    assert!(fresh.iter().all(|id| *id > 100), "every re-issued query carries a fresh id: {fresh:?}");
+    assert!(state.right.info_request > Some(100) && state.left.git_request > Some(100) && state.right.git_request > Some(100));
+
+    // A reply to a pre-swap request id is stale and dropped.
+    let (state2, _) = update(
+        state.clone(),
+        Command::GitInfoResolved { panel: PanelSide::Right, path: PathBuf::from("C:\\repo"), request: 11, info: GitInfo::none() },
+    );
+    assert_eq!(state2, state, "a pre-swap git reply never applies");
+}
+
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: Commands → Menu file edit (task 2.5; user-menu
+// "Edit the user menu file from the Commands menu"; design D4)
+// ---------------------------------------------------------------------
+
+#[test]
+fn edit_user_menu_file_uses_the_builtin_editor_when_none_is_configured() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_path = PathBuf::from("/profile/usermenu.toml");
+    let (state, effects) = update(state, Command::EditUserMenuFile);
+    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/profile/usermenu.toml") }]);
+    assert_eq!(state.user_menu_path, PathBuf::from("/profile/usermenu.toml"));
+}
+
+#[test]
+fn edit_user_menu_file_uses_the_configured_external_editor() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.user_menu_path = PathBuf::from("/profile/usermenu.toml");
+    let (state, effects) = update(state, Command::EditUserMenuFile);
+    assert_eq!(effects.len(), 1);
+    match &effects[0] {
+        Effect::RunExternalEditor(invocation, side) => {
+            assert_eq!(*side, PanelSide::Left);
+            assert_eq!(invocation.file_arg, OsString::from("/profile/usermenu.toml"));
+            assert_eq!(invocation.program, "notepad");
+        }
+        other => panic!("expected RunExternalEditor, got {other:?}"),
+    }
+    assert!(state.user_menu.is_none(), "no overlay opened");
+}
+
+#[test]
+fn user_menu_reloaded_applies_a_wellformed_file() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![config::UserMenuEntry { label: "Old".to_string(), command: "old".to_string() }];
+    let result = config::UserMenuLoadResult {
+        entries: vec![config::UserMenuEntry { label: "New".to_string(), command: "new".to_string() }],
+        warnings: Vec::new(),
+        created_default: false,
+        malformed: false,
+    };
+    let (state, effects) = update(state, Command::UserMenuReloaded(result));
+    assert!(effects.is_empty());
+    assert_eq!(state.user_menu_entries.len(), 1);
+    assert_eq!(state.user_menu_entries[0].label, "New", "the reloaded entries replace the old ones");
+    assert_eq!(state.startup_warning, None);
+}
+
+#[test]
+fn user_menu_reloaded_malformed_warns_and_keeps_the_previous_entries() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![config::UserMenuEntry { label: "Previous".to_string(), command: "prev".to_string() }];
+    let result = config::UserMenuLoadResult { entries: config::default_user_menu_entries(), warnings: Vec::new(), created_default: false, malformed: true };
+    let (state, effects) = update(state, Command::UserMenuReloaded(result));
+    assert!(effects.is_empty());
+    assert_eq!(state.user_menu_entries[0].label, "Previous", "the previous entries are kept, not the defaults");
+    let warning = state.startup_warning.expect("the malformed reload raises the warning dialog");
+    assert!(warning.contains(config::USERMENU_FILE), "the warning names the file: {warning}");
 }
 
 // ---------------------------------------------------------------------
@@ -4203,7 +4651,7 @@ fn quick_filter_narrowing_re_clamps_the_offset_through_the_reducer() {
     state.left.cursor = 25; // "e25" -- one of only three entries containing "5"
     state.left.scroll_offset = 15; // a stale offset from before filtering narrowed the list
 
-    let (state, _) = update(state, Command::QuickFilterStart);
+    let (state, _) = update(state, Command::QuickFilterStart(PanelSide::Left));
     let (state, _) = update(state, Command::QuickFilterChar('5'));
 
     let visible: Vec<String> = state.left.visible_indices().into_iter().map(|i| state.left.entries[i].name.to_string_lossy().into_owned()).collect();
@@ -4259,7 +4707,7 @@ fn tab_restore_re_clamps_against_the_current_viewport_through_the_reducer() {
 
     // Stash this as tab 1; the new (now-active) tab inherits the same
     // cursor/offset and is left untouched from here on.
-    let (state, _) = update(state, Command::OpenTab);
+    let (state, _) = update(state, Command::OpenTab(PanelSide::Left));
     assert_eq!(state.left.tab_count(), 2);
 
     // Shrink drastically enough that the stashed tab's offset (10) will no
@@ -4608,7 +5056,7 @@ fn brief_mode_quick_filter_re_clamps_the_column_window_through_the_reducer() {
     state.left.cursor = 65; // column 3
     state.left.scroll_offset = 60; // window starts at column 3, matching the cursor
 
-    let (state, _) = update(state, Command::QuickFilterStart);
+    let (state, _) = update(state, Command::QuickFilterStart(PanelSide::Left));
     // Only "e6" and "e65"/"e6x" family remain a small handful of matches
     // near the front of the list, forcing the (now far too large) stale
     // offset to pull back.
@@ -5049,12 +5497,16 @@ fn menu_item_click_activates_the_item_exactly_like_menu_activate() {
 }
 
 #[test]
-fn menu_item_click_on_a_disabled_item_is_a_no_op() {
+fn menu_item_click_on_a_separator_is_a_no_op() {
+    // No shipped item is disabled any more (pulldown-menu-completion design
+    // D5), so the "unselectable row" click case is pinned via a separator —
+    // the disabled-item guard itself is covered by menu.rs's local-fixture
+    // tests.
     let mut state = test_state(UiPhase::Panels);
     state.menu = Some(MenuState::for_menu(MenuId::Files));
-    let disabled_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "View")).unwrap();
-    let (state, effects) = update(state, Command::MenuItemClick(disabled_index));
-    assert!(state.menu.is_some(), "a disabled item never closes the bar");
+    let separator_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Separator)).unwrap();
+    let (state, effects) = update(state, Command::MenuItemClick(separator_index));
+    assert!(state.menu.is_some(), "an unselectable row never closes the bar");
     assert!(effects.is_empty());
 }
 

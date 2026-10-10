@@ -127,14 +127,31 @@ fn pulldown_inner_width(id: MenuId) -> usize {
         .unwrap_or(4)
 }
 
+/// The role one pull-down row takes (pulldown-menus "Pull-down visuals with
+/// separators and disabled items"): the highlight only when both selected
+/// and enabled — a disabled row is unselectable, so it never highlights —
+/// the hotkey accent while a just-moved highlight settles, and the greyed
+/// disabled role otherwise. A free function so the disabled rule stays
+/// pinned by a local-fixture test now that no shipped item is disabled
+/// (pulldown-menu-completion design D5).
+fn item_role(selected: bool, enabled: bool, settling: bool) -> Role {
+    if !enabled {
+        Role::MenuDisabled
+    } else if selected && settling {
+        Role::MenuHotkey
+    } else if selected {
+        Role::MenuHighlight
+    } else {
+        Role::MenuBody
+    }
+}
+
 fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>) {
     let body_style = role_style(theme, Role::MenuBody, depth);
     // A newly highlighted row renders in the hotkey accent for
     // `HIGHLIGHT_SETTLE_MS`, then settles to the normal highlight
     // (ui-animations "Highlight settles after moving").
     let settling = matches!((now, menu.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
-    let highlight_style = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
-    let disabled_style = role_style(theme, Role::MenuDisabled, depth);
 
     let id = menu.active;
     let content_rows = entries(id).len() as u16;
@@ -179,13 +196,7 @@ fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
             Some(text) => {
                 buf.set_string(x, ry, "\u{2502}", body_style);
                 let enabled = matches!(entries(id).get(i), Some(MenuEntry::Item(item)) if item.is_enabled());
-                let style = if i == menu.selected && enabled {
-                    highlight_style
-                } else if enabled {
-                    body_style
-                } else {
-                    disabled_style
-                };
+                let style = role_style(theme, item_role(i == menu.selected, enabled, settling), depth);
                 buf.set_string(x + 1, ry, text, style);
                 buf.set_string(x + 1 + inner_w as u16, ry, "\u{2502}", body_style);
             }
@@ -324,7 +335,7 @@ mod tests {
     #[test]
     fn separator_rows_are_drawn_with_the_horizontal_rule_glyph() {
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 24);
-        // FILES_MENU puts a separator after "Attributes" (row index 7).
+        // FILES_MENU puts a separator after "Delete" (and two more below).
         assert!(
             rows.iter().any(|r| r.contains('\u{251C}') && r.contains('\u{2524}')),
             "expected a `├──┤` separator row in:\n{}",
@@ -335,10 +346,25 @@ mod tests {
     #[test]
     fn every_item_and_shortcut_is_listed() {
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 24).join("\n");
-        for label in ["View", "Edit", "Copy", "Rename/Move", "Make directory", "Delete", "Attributes", "Quit"] {
+        for label in ["View", "Edit", "Copy", "Rename/Move", "Make directory", "Delete", "Select group", "Quit"] {
             assert!(rows.contains(label), "`{label}` missing from the Files pull-down");
         }
         assert!(rows.contains("F5"), "shortcut hints are rendered");
+    }
+
+    /// pulldown-menus "Pull-down visuals with separators and disabled items":
+    /// the disabled rule stays available for future items, but no shipped
+    /// item uses it — pin it against the style-rule function with a local
+    /// fixture rather than a shipped row (pulldown-menu-completion design
+    /// D5).
+    #[test]
+    fn a_disabled_row_uses_the_disabled_role_and_never_the_highlight() {
+        assert_eq!(item_role(false, false, false), Role::MenuDisabled, "disabled rows render greyed");
+        assert_eq!(item_role(true, false, false), Role::MenuDisabled, "a disabled row is unselectable, so it never highlights");
+        assert_eq!(item_role(true, false, true), Role::MenuDisabled);
+        assert_eq!(item_role(false, true, false), Role::MenuBody);
+        assert_eq!(item_role(true, true, false), Role::MenuHighlight);
+        assert_eq!(item_role(true, true, true), Role::MenuHotkey, "a just-moved highlight flashes the hotkey accent");
     }
 
     #[test]
@@ -397,7 +423,7 @@ mod tests {
     #[test]
     fn pulldown_width_fits_the_widest_item() {
         let inner = pulldown_inner_width(MenuId::Commands);
-        let widest = display_width("Compare directories") + ITEM_PAD * 2;
-        assert!(inner >= widest, "inner width {inner} cannot fit `Compare directories` ({widest})");
+        let widest = display_width("Menu file edit") + ITEM_PAD * 2;
+        assert!(inner >= widest, "inner width {inner} cannot fit `Menu file edit` ({widest})");
     }
 }

@@ -152,7 +152,7 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
 
     // ---- Ctrl+T / Alt+<n> panel tabs -----------------------------------
     assert_eq!(state.left.tab_count(), 1);
-    state = step(state, Command::OpenTab, &tx, &rx);
+    state = step(state, Command::OpenTab(PanelSide::Left), &tx, &rx);
     assert_eq!(state.left.tab_count(), 2, "Ctrl+T opens a second tab");
     // Navigate the (now active) second tab into `sub` — this also records
     // the frecency visit Ctrl+J will read from later.
@@ -166,7 +166,7 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     assert!(state.left.entries.iter().any(|e| e.name == "report.txt"));
 
     // ---- Ctrl+P quick filter --------------------------------------------
-    state = step(state, Command::QuickFilterStart, &tx, &rx);
+    state = step(state, Command::QuickFilterStart(PanelSide::Left), &tx, &rx);
     state = step(state, Command::QuickFilterChar('r'), &tx, &rx);
     state = step(state, Command::QuickFilterChar('e'), &tx, &rx);
     let visible_names: Vec<String> =

@@ -438,6 +438,7 @@ command output; only your terminal's scrollback does.
 | Ctrl+L | Toggle Info display mode on the active panel |
 | Ctrl+O | Show terminal scrollback (leaves the alternate screen; any key returns) |
 | Ctrl+T / Ctrl+W | New tab / close tab on the active panel |
+| Ctrl+U | Swap the two panels' entire state (directories, tabs, listings, cursors, selections, modes); the active side and split stay put |
 | Alt+1..9 | Switch to tab *n* on the active panel |
 | Ctrl+←/→ | Shrink / grow the left panel (adjust the split) |
 | Ctrl+= | Reset the split to 50/50 |
@@ -470,6 +471,7 @@ command output; only your terminal's scrollback does.
 | F10 or Esc | Request quit (Y/N confirmation) |
 | Esc (in a dialog/menu/overlay) | Cancel or close it |
 | Up / Down (command line non-empty) | Recall previous/next command-line history |
+| Alt+F8 | Command-history dialog: newest first; Enter places the highlighted entry on the command line (it does not run it), Esc closes |
 | Left / Right (command line non-empty) | Move the command-line caret |
 | Ctrl+Backspace (command line non-empty) | Delete the word before the command-line caret |
 | Ctrl+V | Paste the clipboard's text into the command line (or the focused dialog field) |
@@ -497,8 +499,8 @@ Enabled by default; disable with `[mouse] enabled = false` or `--nomouse`.
 Mouse is only honored in contexts a key press would also reach (panels, the
 key bar, menu titles/items, and dialog buttons) — it does nothing in the
 viewer/editor beyond wheel scrolling, and nothing at all while an
-unsupported overlay (drive select, fuzzy jump, find file, user menu, theme
-picker, help, startup warning) is open.
+unsupported overlay (drive select, fuzzy jump, find file, user menu,
+command history, theme picker, help, startup warning) is open.
 
 | Gesture | Action |
 |---|---|
@@ -518,18 +520,17 @@ picker, help, startup warning) is open.
 ### Pull-down menus (F9)
 
 Five menus, navigated with ←/→ (between menus), ↑/↓ (within one), Enter,
-Esc, or a hotkey letter:
+Esc, or a hotkey letter. Every listed item works:
 
 - **Left / Right** (mirror each other, acting on their own panel): display
-  mode (Brief/Full/Tree/Quick view/Info), sort mode, re-read, drive select,
-  new/close tab.
+  mode (Brief/Full/Tree/Quick view/Info), sort mode, Filter (the panel's
+  quick filter), re-read, drive select, new/close tab.
 - **Files**: View, Edit, Copy, Rename/Move, Make directory, Delete, copy to
   clipboard (files/paths/names), Select/Deselect/Invert group, Quit.
-- **Commands**: Find file, Fuzzy jump, Panels on/off. (History, Swap panels,
-  Compare directories, and Menu file edit are listed but not yet
-  implemented — greyed out.)
-- **Options**: Themes (opens the live theme picker). (Configuration, Editor
-  selection, and Save setup are listed but not yet implemented.)
+- **Commands**: Find file, History (the Alt+F8 command-history dialog), Swap
+  panels (Ctrl+U), Panels on/off, Fuzzy jump, Menu file edit (opens
+  `usermenu.toml` in the F4 editor and reloads the F2 menu on return).
+- **Options**: Themes (opens the live theme picker).
 
 ### Panel display modes
 

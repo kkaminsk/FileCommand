@@ -147,9 +147,9 @@ enum Context {
     /// "File-action menu entries are clickable").
     FileActionMenuOpen,
     /// An overlay mouse-basics does not support yet (drive select, fuzzy
-    /// jump, find file, user menu, theme picker, help, the startup warning)
-    /// or a phase with nothing clickable (splash, placeholder) — every
-    /// event is ignored.
+    /// jump, find file, user menu, the Alt+F8 history dialog, theme picker,
+    /// help, the startup warning) or a phase with nothing clickable (splash,
+    /// placeholder) — every event is ignored.
     Ignored,
 }
 
@@ -166,6 +166,7 @@ fn context(state: &State) -> Context {
         || state.fuzzy_jump.is_some()
         || state.find_file.is_some()
         || state.user_menu.is_some()
+        || state.history_dialog.is_some()
         || state.theme_picker.is_some()
         || state.help.is_some()
     {

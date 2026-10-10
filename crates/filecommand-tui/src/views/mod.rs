@@ -11,6 +11,7 @@ pub mod find_file;
 pub mod fuzzy_jump;
 pub mod header;
 pub mod help;
+pub mod history_dialog;
 pub mod info_panel;
 pub mod keybar;
 pub mod menubar;
@@ -479,6 +480,9 @@ fn render_phase(
             if let Some(dialog) = &state.user_menu {
                 user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries, now);
             }
+            if let Some(dialog) = &state.history_dialog {
+                history_dialog::render_history_dialog(buf, area, theme, depth, dialog, &state.history, now);
+            }
             if let Some(dialog) = &state.theme_picker {
                 // The dialog itself styles from the previewed `theme`, but
                 // its active-theme marker stays bound to `state.theme.name`
@@ -526,6 +530,7 @@ fn render_phase(
             if state.menu.is_some()
                 || state.drive_select.is_some()
                 || state.user_menu.is_some()
+                || state.history_dialog.is_some()
                 || state.theme_picker.is_some()
                 || state.help.is_some()
                 || state.file_action_menu.is_some()

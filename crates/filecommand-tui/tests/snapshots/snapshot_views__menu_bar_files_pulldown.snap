@@ -15,14 +15,14 @@ expression: text
 ║         │ Copy path(s)  Ctrl-Sh-Ins │║║                                      ║
 ║         │ Copy name(s)              │║║                                      ║
 ║         ├───────────────────────────┤║║                                      ║
-║         │ Attributes                │║║                                      ║
-║         ├───────────────────────────┤║║                                      ║
 ║         │ Select group            + │║║                                      ║
 ║         │ Deselect group          - │║║                                      ║
 ║         │ Invert selection        * │║║                                      ║
 ║         ├───────────────────────────┤║║                                      ║
 ║         │ Quit                  F10 │║║                                      ║
 ║         └───────────────────────────┘║║                                      ║
+║                                      ║║                                      ║
+║                                      ║║                                      ║
 ╚═══════════ docs  SUB-DIR ════════════╝╚════════════ ..  UP--DIR ═════════════╝
 C:\Users\demo\left>                                                             
 1Help 2Menu 3View 4Edit 5Copy 6RenMov 7Mkdir 8Delete 9PullDn 10Quit

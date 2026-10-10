@@ -950,7 +950,7 @@ fn editor_quit_confirm_owns_y_n_and_esc_over_everything_else() {
 #[test]
 fn ctrl_p_and_ctrl_j_open_quick_filter_and_fuzzy_jump_by_default() {
     let state = panels();
-    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Left)));
     assert_eq!(map(key(KeyCode::Char('j'), KeyModifiers::CONTROL), &state), Some(Command::FuzzyJumpOpen));
 }
 
@@ -978,7 +978,7 @@ fn quick_filter_activation_key_toggles_the_filter_off_when_active() {
     // instead (quick-filter "Clearing the quick filter": "the activation
     // key toggles the filter").
     let mut state = panels();
-    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Left)));
     state.left.quick_filter = Some("re".to_string());
     assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterEnd));
 }
@@ -1148,10 +1148,41 @@ fn quick_search_treats_ctrl_c_as_an_unrecognized_key_and_ends_type_ahead() {
 #[test]
 fn ctrl_t_ctrl_w_and_alt_digit_map_to_tab_commands() {
     let state = panels();
-    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab));
-    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab));
+    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab(PanelSide::Left)));
+    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab(PanelSide::Left)));
     assert_eq!(map(key(KeyCode::Char('3'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(3)));
     assert_eq!(map(key(KeyCode::Char('9'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(9)));
+}
+
+#[test]
+fn tab_commands_carry_the_active_panel_side() {
+    // pulldown-menu-completion design D1: the keymap passes `state.active`;
+    // the Left/Right menus pass their own side instead.
+    let mut state = panels();
+    state.active = PanelSide::Right;
+    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab(PanelSide::Right)));
+    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab(PanelSide::Right)));
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Right)));
+}
+
+#[test]
+fn ctrl_u_maps_to_swap_panels() {
+    let state = panels();
+    assert_eq!(map(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state), Some(Command::SwapPanels));
+    assert_eq!(map(key(KeyCode::Char('U'), KeyModifiers::CONTROL), &state), Some(Command::SwapPanels));
+    // Alt+U / plain u are unaffected.
+    assert_eq!(map(key(KeyCode::Char('u'), KeyModifiers::ALT), &state), Some(Command::QuickSearchStart('u')));
+    assert_eq!(map(plain(KeyCode::Char('u')), &state), Some(Command::TextEdit(TextEditOp::Insert('u'))));
+}
+
+#[test]
+fn alt_f8_opens_the_history_dialog_plain_f8_still_deletes() {
+    let state = panels();
+    // The guarded Alt+F8 arm takes precedence over the unguarded F(8) arm,
+    // exactly as Alt+F7 does for find-file (command-line "Command history
+    // dialog (Alt+F8)").
+    assert_eq!(map(key(KeyCode::F(8), KeyModifiers::ALT), &state), Some(Command::HistoryDialogOpen));
+    assert_eq!(map(plain(KeyCode::F(8)), &state), Some(Command::RequestDelete));
 }
 
 #[test]
@@ -1205,6 +1236,27 @@ fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::UserMenuConfirm));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::UserMenuCancel));
     // Printables are not routed to the command line while the menu is open.
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), None);
+}
+
+#[test]
+fn history_dialog_owns_movement_confirm_and_dismissal() {
+    let mut state = panels();
+    state.history = vec!["cd C:\\work".to_string()];
+    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::HistoryDialogMove(-1)));
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HistoryDialogMove(1)));
+    // Home/End/PgUp/PgDn map to huge deltas, the same convention
+    // drive-select uses; the reducer's clamped cursor turns them into the
+    // exact ends (command-line "Command history dialog (Alt+F8)").
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::HistoryDialogMove(isize::MIN / 2)));
+    assert_eq!(map(plain(KeyCode::PageUp), &state), Some(Command::HistoryDialogMove(isize::MIN / 2)));
+    assert_eq!(map(plain(KeyCode::End), &state), Some(Command::HistoryDialogMove(isize::MAX / 2)));
+    assert_eq!(map(plain(KeyCode::PageDown), &state), Some(Command::HistoryDialogMove(isize::MAX / 2)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HistoryDialogConfirm));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HistoryDialogCancel));
+    // A list overlay, not a text field: printables never reach the command
+    // line while it is open.
     assert_eq!(map(plain(KeyCode::Char('a')), &state), None);
 }
 

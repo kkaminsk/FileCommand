@@ -12,7 +12,7 @@ expression: text
 ║        ║F-key bar modifier variants:                                ║        ║
 ║        ║  Ctrl+F3..F7  Sort by name/ext/time/size/unsorted          ║        ║
 ║        ║  Alt+F1/F2    Drive select (left/right panel)              ║        ║
-║        ║  Alt+F7       Find file                                    ║        ║
+║        ║  Alt+F7/F8    Find file / command history                  ║        ║
 ║        ║                                                            ║        ║
 ║        ║Plain F-keys: F1 Help  F2 User menu  F3 View  F4 Edit       ║        ║
 ║        ║F5 Copy  F6 Move/rename  F7 Mkdir  F8 Delete                ║        ║

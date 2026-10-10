@@ -61,6 +61,9 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     if state.user_menu.is_some() {
         return map_user_menu_key(key);
     }
+    if state.history_dialog.is_some() {
+        return map_history_dialog_key(key);
+    }
     if state.theme_picker.is_some() {
         return map_theme_picker_key(key);
     }
@@ -283,11 +286,13 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         // The activation key is a toggle: pressed again while a filter is
         // already active on this panel, it exits and clears the filter
         // instead of restarting one (quick-filter "Clearing the quick
-        // filter": "the activation key toggles the filter").
+        // filter": "the activation key toggles the filter"). The keymap
+        // passes the active side; the Left/Right menus pass their own
+        // (pulldown-menu-completion design D1).
         return Some(if state.active_panel().quick_filter.is_some() {
             Command::QuickFilterEnd
         } else {
-            Command::QuickFilterStart
+            Command::QuickFilterStart(active)
         });
     }
     if matches_binding(&key, &keys.fuzzy_jump) {
@@ -339,13 +344,17 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Ctrl+T/Ctrl+W/Alt+1..9 panel tabs (panel-tabs "New tab", "Close tab",
-    // "Switch tab"). Checked ahead of the general match below only because
+    // "Switch tab"), plus Ctrl+U swap panels (panel-navigation "Swap panels
+    // (Ctrl+U)"). Checked ahead of the general match below only because
     // Alt+<digit> would otherwise fall through to nothing (digits aren't
-    // claimed by any other alt-combination here).
+    // claimed by any other alt-combination here). The tab commands pass the
+    // active side; the Left/Right menus pass their own (design D1 of
+    // pulldown-menu-completion).
     if ctrl && !alt {
         match key.code {
-            KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
-            KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
+            KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab(active)),
+            KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab(active)),
+            KeyCode::Char('u') | KeyCode::Char('U') => return Some(Command::SwapPanels),
             // Ctrl+V pastes the system clipboard's text into the command
             // line (text-field-editing "Paste into a text field": "Over the
             // panels, Ctrl+V SHALL paste into the command line"; design D4 —
@@ -378,6 +387,10 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::F(1) if alt => Some(Command::OpenDriveSelect(PanelSide::Left)),
         KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
         KeyCode::F(7) if alt => Some(Command::FindFileOpen),
+        // Alt+F8 opens the command-history dialog; guarded so it takes
+        // precedence over the unguarded F(8) delete arm below (command-line
+        // "Command history dialog (Alt+F8)").
+        KeyCode::F(8) if alt => Some(Command::HistoryDialogOpen),
 
         KeyCode::F(1) => Some(Command::HelpOpen),
         KeyCode::F(2) => Some(Command::UserMenuOpen),
@@ -541,6 +554,22 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
         KeyCode::Enter => Some(Command::UserMenuConfirm),
         KeyCode::Up => Some(Command::UserMenuMove(-1)),
         KeyCode::Down => Some(Command::UserMenuMove(1)),
+        _ => None,
+    }
+}
+
+/// Alt+F8 command-history dialog (command-line "Command history dialog
+/// (Alt+F8)"): a list overlay, not a text field — Home/End/PgUp/PgDn map to
+/// huge deltas exactly as drive-select's own Home/End do, and printables do
+/// nothing (the dialog never types).
+fn map_history_dialog_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::HistoryDialogCancel),
+        KeyCode::Enter => Some(Command::HistoryDialogConfirm),
+        KeyCode::Up => Some(Command::HistoryDialogMove(-1)),
+        KeyCode::Down => Some(Command::HistoryDialogMove(1)),
+        KeyCode::Home | KeyCode::PageUp => Some(Command::HistoryDialogMove(isize::MIN / 2)),
+        KeyCode::End | KeyCode::PageDown => Some(Command::HistoryDialogMove(isize::MAX / 2)),
         _ => None,
     }
 }

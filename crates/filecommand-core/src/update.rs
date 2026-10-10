@@ -9,7 +9,7 @@ use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::{self, UserMenuEntry};
-use crate::dialogs::{FileActionMenuEntry, FileActionMenuState, HelpState, ThemePickerState, UserMenuState};
+use crate::dialogs::{FileActionMenuEntry, FileActionMenuState, HelpState, HistoryDialogState, ThemePickerState, UserMenuState};
 use crate::drives::{self, DriveSelect};
 use crate::editor::{EditorMove, EditorState, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
@@ -233,6 +233,16 @@ pub struct State {
     pub find_file: Option<FindFileState>,
     /// The F2 user-menu overlay, or `None` when closed.
     pub user_menu: Option<UserMenuState>,
+    /// The Alt+F8 command-history dialog, or `None` when closed
+    /// (command-line "Command history dialog (Alt+F8)"). Modeled the same
+    /// "one-shot `Option<T>` overlay" way as `user_menu` above.
+    pub history_dialog: Option<HistoryDialogState>,
+    /// The `usermenu.toml` path the application resolved at startup (the
+    /// profile directory's file — config-profile-directory), opened by
+    /// Commands → Menu file edit / `Command::EditUserMenuFile` and reloaded
+    /// via `Command::UserMenuReloaded` when the editor returns (user-menu
+    /// "Edit the user menu file from the Commands menu"; design D4).
+    pub user_menu_path: PathBuf,
     /// The Options → Themes picker overlay, or `None` when closed
     /// (theme-selection "Options menu opens the theme picker").
     pub theme_picker: Option<ThemePickerState>,
@@ -375,6 +385,8 @@ impl State {
             fuzzy_jump: None,
             find_file: None,
             user_menu: None,
+            history_dialog: None,
+            user_menu_path: PathBuf::new(),
             theme_picker: None,
             file_action_menu: None,
             help: None,
@@ -536,17 +548,23 @@ pub enum Command {
     // Sort modes (Ctrl+F3..Ctrl+F7).
     SetSortMode { side: PanelSide, mode: SortMode },
 
-    // Ctrl+P inline quick filter (§4.7), scoped to the active panel.
-    QuickFilterStart,
+    // Ctrl+P inline quick filter (§4.7). `QuickFilterStart` carries the
+    // panel side so the Left/Right pull-down's Filter item can start the
+    // filter on its own panel (design D1 of pulldown-menu-completion); the
+    // keymap passes the active side. Starting the filter also makes `side`
+    // the active panel, so typed characters reach it.
+    QuickFilterStart(PanelSide),
     QuickFilterChar(char),
     QuickFilterBackspace,
     QuickFilterEnd,
 
-    // Panel tabs (§4.1/§4.7), scoped to the active panel.
+    // Panel tabs (§4.1/§4.7). `OpenTab`/`CloseTab` carry the panel side for
+    // the same Left/Right-menu reason as `QuickFilterStart` (but never move
+    // focus — design D1); the keymap passes the active side.
     /// Ctrl+T.
-    OpenTab,
+    OpenTab(PanelSide),
     /// Ctrl+W.
-    CloseTab,
+    CloseTab(PanelSide),
     /// Alt+1..9 (one-based).
     SwitchTab(usize),
 
@@ -767,6 +785,37 @@ pub enum Command {
     UserMenuConfirm,
     /// Esc: close without running anything.
     UserMenuCancel,
+
+    // Alt+F8 command-history dialog (pulldown-menu-completion; command-line
+    // "Command history dialog (Alt+F8)"). Opened by Alt+F8 or Commands →
+    // History; a list overlay over `State::history`, newest first.
+    HistoryDialogOpen,
+    /// Up/Down/Home/End/PgUp/PgDn (the last four arrive as huge deltas, the
+    /// same convention as `DriveSelectMove`).
+    HistoryDialogMove(isize),
+    /// Enter: replace the command-line buffer with the highlighted entry
+    /// (caret at the end, no history recall in progress) and close — nothing
+    /// runs until the user presses Enter again. A no-op on an empty history,
+    /// leaving the dialog open.
+    HistoryDialogConfirm,
+    /// Esc: close, leaving the command line unchanged.
+    HistoryDialogCancel,
+
+    /// Ctrl+U / Commands → Swap panels: exchange the two panels' entire
+    /// state, keeping the active side and split unchanged (panel-navigation
+    /// "Swap panels (Ctrl+U)"; design D3).
+    SwapPanels,
+
+    // Commands → Menu file edit (user-menu "Edit the user menu file from the
+    // Commands menu"; design D4).
+    /// Open `State::user_menu_path` via the F4 editor path: the configured
+    /// external editor when `editor =` is set, else the built-in editor.
+    EditUserMenuFile,
+    /// Sent by the TUI once the editor that had the user-menu file open has
+    /// closed/returned, carrying the freshly re-loaded parse result. Applies
+    /// the entries, or — on malformed content — raises the warning dialog
+    /// and keeps the previous entries (never overwriting the file).
+    UserMenuReloaded(config::UserMenuLoadResult),
 
     // Options -> Themes picker (visual-themes).
     /// Opens the picker with the active theme's row pre-highlighted.
@@ -1119,6 +1168,7 @@ fn drag_allowed(state: &State) -> bool {
         && state.fuzzy_jump.is_none()
         && state.find_file.is_none()
         && state.user_menu.is_none()
+        && state.history_dialog.is_none()
         && state.theme_picker.is_none()
         && state.file_action_menu.is_none()
         && state.help.is_none()
@@ -1330,6 +1380,10 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         effects.extend(handle_user_menu(&mut state, cmd));
         return (state, effects);
     }
+    if state.history_dialog.is_some() && is_history_dialog_command(&cmd) {
+        effects.extend(handle_history_dialog(&mut state, cmd));
+        return (state, effects);
+    }
     if state.theme_picker.is_some() && is_theme_picker_command(&cmd) {
         effects.extend(handle_theme_picker(&mut state, cmd));
         return (state, effects);
@@ -1466,7 +1520,14 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 reconcile_panel_viewport(&mut state, side);
             }
 
-            Command::QuickFilterStart => state.panel_mut(state.active).activate_quick_filter(),
+            Command::QuickFilterStart(side) => {
+                // Starting the filter also makes `side` the active panel, so
+                // typed characters reach the filtered panel (design D1 — the
+                // Left/Right menus' Filter on an inactive panel; a visible
+                // but expected focus change, as with Left → Info).
+                state.active = side;
+                state.panel_mut(side).activate_quick_filter();
+            }
             Command::QuickFilterChar(c) => {
                 let side = state.active;
                 state.panel_mut(side).quick_filter_push(c);
@@ -1483,17 +1544,17 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 reconcile_panel_viewport(&mut state, side);
             }
 
-            Command::OpenTab => {
-                let side = state.active;
+            Command::OpenTab(side) => {
                 // The new tab inherits the active tab's own (never-stale)
                 // state, so it can never itself come up stale — no
                 // fresh-read check needed here (panel-tabs "Stale
-                // background tab refresh on activation").
+                // background tab refresh on activation"). Focus does not
+                // move: the Left/Right menus open a tab on their own panel
+                // (design D1).
                 state.panel_mut(side).open_tab();
                 reconcile_panel_viewport(&mut state, side);
             }
-            Command::CloseTab => {
-                let side = state.active;
+            Command::CloseTab(side) => {
                 if state.panel_mut(side).close_tab() {
                     // A stale-activation refresh is not a navigation (the
                     // user changed tabs, not directories), so it goes
@@ -1537,6 +1598,10 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 state.find_file = Some(FindFileState::new(root));
             }
             Command::UserMenuOpen => state.user_menu = Some(UserMenuState::new()),
+            Command::HistoryDialogOpen => state.history_dialog = Some(HistoryDialogState::new()),
+            Command::SwapPanels => effects.extend(handle_swap_panels(&mut state)),
+            Command::EditUserMenuFile => effects.extend(handle_edit_user_menu_file(&mut state)),
+            Command::UserMenuReloaded(result) => apply_user_menu_reload(&mut state, result),
             Command::ThemePickerOpen => state.theme_picker = Some(ThemePickerState::open(&state.theme.name)),
             Command::HelpOpen => state.help = Some(HelpState::new()),
 
@@ -2496,8 +2561,13 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::SetDisplayMode(mode) => Some(Command::SetDisplayMode { side, mode }),
         MenuAction::EnterTree => Some(Command::EnterTreeMode(side)),
         MenuAction::SortBy(mode) => Some(Command::SetSortMode { side, mode }),
+        MenuAction::QuickFilter => Some(Command::QuickFilterStart(side)),
         MenuAction::Reread => Some(Command::RereadPanel(side)),
         MenuAction::DriveSelect => Some(Command::OpenDriveSelect(side)),
+        MenuAction::NewTab => Some(Command::OpenTab(side)),
+        MenuAction::CloseTab => Some(Command::CloseTab(side)),
+        MenuAction::View => Some(Command::RequestViewer),
+        MenuAction::Edit => Some(Command::RequestEditor),
         MenuAction::Copy => Some(Command::RequestCopy),
         MenuAction::Move => Some(Command::RequestMove),
         MenuAction::Mkdir => Some(Command::RequestMkdir),
@@ -2510,7 +2580,10 @@ pub fn menu_action_command(action: MenuAction, side: PanelSide) -> Option<Comman
         MenuAction::InvertSelection => Some(Command::InvertSelection),
         MenuAction::PanelsOnOff => Some(Command::ShowScrollback),
         MenuAction::FindFile => Some(Command::FindFileOpen),
+        MenuAction::History => Some(Command::HistoryDialogOpen),
+        MenuAction::SwapPanels => Some(Command::SwapPanels),
         MenuAction::FuzzyJump => Some(Command::FuzzyJumpOpen),
+        MenuAction::EditMenuFile => Some(Command::EditUserMenuFile),
         MenuAction::Quit => Some(Command::RequestQuit),
         MenuAction::OpenThemes => Some(Command::ThemePickerOpen),
         MenuAction::Unimplemented => None,
@@ -3493,6 +3566,144 @@ fn handle_user_menu(state: &mut State, cmd: Command) -> Vec<Effect> {
         _ => {}
     }
     vec![]
+}
+
+// ---------------------------------------------------------------------
+// Alt+F8 command-history dialog (pulldown-menu-completion; design D2)
+// ---------------------------------------------------------------------
+
+fn is_history_dialog_command(cmd: &Command) -> bool {
+    matches!(cmd, Command::HistoryDialogMove(_) | Command::HistoryDialogConfirm | Command::HistoryDialogCancel)
+}
+
+/// Drive the Alt+F8 command-history dialog (gated in [`update`] by
+/// `state.history_dialog`). The list renders `state.history` newest first,
+/// so `cursor` counts from the end of the vector; Enter places the
+/// highlighted entry on the command line (caret at the end, recall cleared)
+/// and closes without running anything — the user presses Enter again to
+/// run it (design D2's non-goal). On an empty history the dialog shows a
+/// single `(no history)` row and Enter does nothing (the dialog stays open
+/// until Esc).
+fn handle_history_dialog(state: &mut State, cmd: Command) -> Vec<Effect> {
+    if state.history_dialog.is_none() {
+        return vec![];
+    }
+    match cmd {
+        Command::HistoryDialogMove(delta) => {
+            let len = state.history.len();
+            state.history_dialog.as_mut().unwrap().move_cursor(delta, len);
+        }
+        Command::HistoryDialogCancel => state.history_dialog = None,
+        Command::HistoryDialogConfirm => {
+            if state.history.is_empty() {
+                return vec![];
+            }
+            let dialog = state.history_dialog.take().unwrap();
+            let cursor = dialog.cursor.min(state.history.len() - 1);
+            let entry = state.history[state.history.len() - 1 - cursor].clone();
+            // Same placement as Up/Down recall: the whole line is replaced
+            // with the caret at its end, and any recall in progress ends
+            // (command-line "Command history navigation"; design D2).
+            state.command_line.set_text_caret_end(entry);
+            state.history_cursor = None;
+        }
+        _ => {}
+    }
+    vec![]
+}
+
+// ---------------------------------------------------------------------
+// Swap panels (Ctrl+U; panel-navigation "Swap panels (Ctrl+U)"; design D3)
+// ---------------------------------------------------------------------
+
+/// Exchange the two panels' entire state — directory, tabs, listing, cursor,
+/// scroll offset, selection, sort mode, filter, display mode, and git info —
+/// keeping the active side and the split percentage unchanged and without
+/// re-reading either directory.
+///
+/// Refused while either panel's listing is still streaming: listing chunks
+/// are addressed only by `PanelSide` with no request id, so a mid-stream
+/// swap would misdeliver them (the mini-status already shows `Reading…`).
+/// Info/git replies *do* carry request ids, so after the swap each side's
+/// pending Info-mode and git-info queries are re-issued with fresh ids and
+/// any reply from before the swap is discarded as stale. Ctrl+U during a
+/// mouse drag is ignored (a menu can never be open mid-drag, so the guard
+/// lives here rather than in the menu path).
+fn handle_swap_panels(state: &mut State) -> Vec<Effect> {
+    if state.drag.is_some()
+        || state.left.progress.is_streaming()
+        || state.right.progress.is_streaming()
+    {
+        return vec![];
+    }
+    std::mem::swap(&mut state.left, &mut state.right);
+    let mut effects = Vec::new();
+    for side in [PanelSide::Left, PanelSide::Right] {
+        let path = state.panel(side).cwd.clone();
+        // A panel in Info mode needs its figures re-gathered under a fresh
+        // request id; the values it carries over still describe its own
+        // (moved-with-it) directory, so they are kept while the re-query
+        // resolves.
+        if state.panel(side).display_mode == DisplayMode::Info {
+            let request = state.next_request_id();
+            state.panel_mut(side).info_request = Some(request);
+            effects.push(Effect::QueryInfo { panel: side, path: path.clone(), request });
+        }
+        effects.push(git_info_query_effect(state, side, path));
+    }
+    effects
+}
+
+// ---------------------------------------------------------------------
+// Commands → Menu file edit (user-menu "Edit the user menu file from the
+// Commands menu"; design D4)
+// ---------------------------------------------------------------------
+
+/// Open `usermenu.toml` (the path the app resolved at startup, kept in
+/// `State::user_menu_path`) via the F4 editor path: the configured external
+/// editor when `editor =` is set, else the built-in editor — the same branch
+/// [`handle_request_editor`] takes, with the menu file supplied instead of
+/// the cursor entry. The TUI reloads the menu when the editor returns and
+/// feeds the result back as `Command::UserMenuReloaded`.
+fn handle_edit_user_menu_file(state: &mut State) -> Vec<Effect> {
+    let path = state.user_menu_path.clone();
+    if state.editor.is_some() {
+        let side = state.active;
+        let cwd = state.panel(side).cwd.clone();
+        let file_arg = path.clone().into_os_string();
+        return match external_editor::resolve(state.editor.as_deref(), &cwd, &file_arg, false) {
+            Ok(invocation) => {
+                // Mirrors `handle_request_external_editor`'s clear: a stale
+                // mini-status must not outlive a successful dispatch.
+                state.panel_mut(side).last_error = None;
+                vec![Effect::RunExternalEditor(invocation, side)]
+            }
+            Err(external_editor::TargetError::Unconfigured) => {
+                state.panel_mut(side).last_error = Some(external_editor::NO_EDITOR_CONFIGURED_MESSAGE.to_string());
+                vec![]
+            }
+            // Unreachable (`is_dir` is `false`), kept explicit rather than
+            // `unreachable!` so the wildcard stays a silent no-op.
+            Err(external_editor::TargetError::IsDirectory) => vec![],
+        };
+    }
+    let side = state.active;
+    state.panel_mut(side).last_error = None;
+    vec![Effect::OpenEditor { path }]
+}
+
+/// `Command::UserMenuReloaded`: the editor over `usermenu.toml` has closed
+/// and the TUI re-read it. A well-formed file replaces the F2 entries
+/// immediately; a malformed one raises the existing dismissable warning
+/// dialog and keeps the previous entries — the on-disk file (the user's own
+/// edit) is never overwritten (user-menu "Malformed edit warns without
+/// overwriting"; design D4).
+fn apply_user_menu_reload(state: &mut State, result: config::UserMenuLoadResult) {
+    if result.malformed {
+        state.startup_warning = Some(format!("{} is malformed; keeping the previous user menu entries", config::USERMENU_FILE));
+    } else {
+        state.user_menu_entries = result.entries;
+    }
 }
 
 // ---------------------------------------------------------------------

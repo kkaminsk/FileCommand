@@ -1298,6 +1298,65 @@ fn snapshot_user_menu_dialog_empty_state() {
     insta::assert_snapshot!("user_menu_dialog_empty", text);
 }
 
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: the Alt+F8 command-history dialog and the
+// Ctrl+U swap (tasks 3.2; command-line "Command history dialog (Alt+F8)";
+// panel-navigation "Swap panels (Ctrl+U)")
+// ---------------------------------------------------------------------
+
+#[test]
+fn snapshot_history_dialog_populated() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.history = vec!["cd C:\\work".to_string(), "del old.log".to_string(), "cd D:\\".to_string()];
+    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("History"));
+    // Newest first: `cd D:\` renders above `del old.log`, above `cd C:\work`.
+    let newest = text.find("cd D:\\").unwrap();
+    let middle = text.find("del old.log").unwrap();
+    let oldest = text.find("cd C:\\work").unwrap();
+    assert!(newest < middle && middle < oldest, "newest entry renders first:\n{text}");
+    insta::assert_snapshot!("history_dialog_populated", text);
+}
+
+#[test]
+fn snapshot_history_dialog_empty() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("(no history)"));
+    insta::assert_snapshot!("history_dialog_empty", text);
+}
+
+#[test]
+fn snapshot_panels_after_ctrl_u_swap() {
+    // Through the real reducer: the two panels trade places, the active side
+    // (left) and its cursor bar stay put, and the command-line prompt follows
+    // the directory now shown on the left (panel-navigation "Swap keeps
+    // focus on the same side"). The git info moves with its panel, so the
+    // branch suffix/marker column the *inactive* right panel was holding
+    // invisibly surfaces on the left border once the swap brings it under
+    // the active panel ("Git info follows the swap").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.right.git_info = GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([(std::ffi::OsString::from("readme.txt"), FileStatus::Modified)]),
+    };
+    let (state, effects) = filecommand_core::update(state, filecommand_core::Command::SwapPanels);
+    assert!(effects.iter().all(|e| !matches!(e, filecommand_core::Effect::StartListing { .. })), "no directory is re-read");
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    let left_top: String = top.chars().take(40).collect();
+    let right_top: String = top.chars().skip(40).collect();
+    assert!(left_top.contains(r"C:\Users\demo\right (main)"), "the left border shows the right's directory and its branch: `{left_top}`");
+    assert!(right_top.contains(r"C:\Users\demo\left"), "the right panel now shows the left's directory: `{right_top}`");
+    assert!(!right_top.contains("(main)"), "no suffix on the inactive (repo-less) right border: `{right_top}`");
+    // The marker column came along too: `M` beside readme.txt on the left.
+    assert_eq!(text.lines().nth(5).unwrap().chars().nth(1), Some('M'), "the marker column moved with the panel");
+    assert!(command_line_row(&text).contains(r"C:\Users\demo\right>"), "the prompt follows the swap");
+    insta::assert_snapshot!("panels_after_swap", text);
+}
+
 #[test]
 fn snapshot_theme_picker_dialog_with_active_theme_marked() {
     let mut state = base_state(UiPhase::Panels, Theme::terminal_green());

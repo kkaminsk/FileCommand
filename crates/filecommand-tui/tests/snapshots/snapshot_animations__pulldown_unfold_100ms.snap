@@ -16,7 +16,7 @@ expression: "render_text(&at(&state, 100))"
 ║│ Size            Ctrl-F6 │           ║║                                      ║
 ║│ Unsorted        Ctrl-F7 │           ║║                                      ║
 ║├─────────────────────────┤           ║║                                      ║
-║│ Filter                  │           ║║                                      ║
+║│ Filter           Ctrl-P │           ║║                                      ║
 ║│ Re-read          Ctrl-R │           ║║                                      ║
 ║│ Drive select  Alt-F1/F2 │           ║║                                      ║
 ║├─────────────────────────┤           ║║                                      ║

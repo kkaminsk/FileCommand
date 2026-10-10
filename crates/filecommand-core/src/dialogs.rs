@@ -99,6 +99,45 @@ impl UserMenuState {
 }
 
 // ---------------------------------------------------------------------
+// Alt+F8 command-history dialog (pulldown-menu-completion; design D2)
+// ---------------------------------------------------------------------
+
+/// The open Alt+F8 command-history dialog: a cursor over `State::history`
+/// rendered newest-first — `cursor == 0` is the *newest* entry
+/// (command-line "Command history dialog (Alt+F8)"). The same "cursor over
+/// a list" shape as [`UserMenuState`], stamped by the reducer for the same
+/// unfold/highlight-settle animations (ui-animations "Pop-up menus unfold
+/// and highlights settle").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryDialogState {
+    pub cursor: usize,
+    /// `State::clock_ms` when the dialog opened, stamped by the reducer (left
+    /// `0` by [`HistoryDialogState::new`]).
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does, so opening the dialog unfolds without also flashing row 0.
+    pub selected_at_ms: Option<u64>,
+}
+
+impl HistoryDialogState {
+    pub fn new() -> HistoryDialogState {
+        HistoryDialogState::default()
+    }
+
+    /// Move the highlight by `delta`, clamped within `[0, len)` — the same
+    /// clamp-not-wrap convention as [`UserMenuState::move_cursor`]. A no-op
+    /// on an empty history (its single `(no history)` row never highlights).
+    pub fn move_cursor(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+// ---------------------------------------------------------------------
 // Options -> Themes picker
 // ---------------------------------------------------------------------
 
@@ -428,7 +467,7 @@ const KEYBOARD_REFERENCE: &str = "\
 F-key bar modifier variants:
   Ctrl+F3..F7  Sort by name/ext/time/size/unsorted
   Alt+F1/F2    Drive select (left/right panel)
-  Alt+F7       Find file
+  Alt+F7/F8    Find file / command history
 
 Plain F-keys: F1 Help  F2 User menu  F3 View  F4 Edit
 F5 Copy  F6 Move/rename  F7 Mkdir  F8 Delete
@@ -444,6 +483,7 @@ Other bindings:
   Ctrl+P       Quick filter
   Ctrl+J       Fuzzy directory jump
   Ctrl+T/W     New/close tab
+  Ctrl+U       Swap panels
   Alt+1..9     Switch to tab N
   Alt+letter   Type-ahead jump to entry
   Ctrl+Left/Right  Adjust the panel split
@@ -499,7 +539,15 @@ and Shift+Ins or Ctrl+V pastes the clipboard's text at the caret.";
 const MENUS: &str = "\
 F9 opens the menu bar. Left/Right/Files/Commands/Options each drop
 down a pull-down; Left and Right act on their own panel regardless
-of which one is focused. Esc closes a pull-down, then the bar.";
+of which one is focused. Esc closes a pull-down, then the bar.
+
+Every listed item works. Left/Right offer display modes, sort
+modes, Filter, Re-read, Drive select, and New/Close tab; Files
+mirrors the F-key file operations plus clipboard export; Commands
+holds Find file, History (the Alt+F8 command-history dialog),
+Swap panels (Ctrl+U), Panels on/off, Fuzzy jump, and Menu file
+edit, which opens usermenu.toml in the F4 editor and reloads the
+F2 menu on return; Options opens the theme picker.";
 
 const VIEWER: &str = "\
 F3 opens the read-only viewer. F4 toggles text/hex mode, F2 toggles
@@ -570,6 +618,23 @@ mod tests {
         m.cursor = 1;
         m.move_cursor(1, 0);
         assert_eq!(m.cursor, 0, "an empty menu holds the cursor at zero");
+    }
+
+    #[test]
+    fn history_dialog_move_cursor_clamps_and_holds_on_an_empty_history() {
+        let mut d = HistoryDialogState::new();
+        d.move_cursor(-3, 3);
+        assert_eq!(d.cursor, 0);
+        d.move_cursor(10, 3);
+        assert_eq!(d.cursor, 2, "clamped at the last row, not wrapped");
+        // Home/End/PgUp/PgDn arrive as huge deltas (input maps them the same
+        // way drive-select does) and land exactly on the ends.
+        d.move_cursor(isize::MIN / 2, 3);
+        assert_eq!(d.cursor, 0);
+        d.move_cursor(isize::MAX / 2, 3);
+        assert_eq!(d.cursor, 2);
+        d.move_cursor(1, 0);
+        assert_eq!(d.cursor, 0, "an empty history holds the cursor at zero");
     }
 
     #[test]

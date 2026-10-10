@@ -551,6 +551,15 @@ fn user_menu_overlay_ignores_mouse() {
     assert_ignores_mouse_over_a_hit_row(state);
 }
 
+/// command-line "Command history dialog (Alt+F8)": "The dialog SHALL NOT
+/// respond to the mouse (it joins the unsupported-overlay set)."
+#[test]
+fn history_dialog_overlay_ignores_mouse() {
+    let mut state = test_state();
+    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    assert_ignores_mouse_over_a_hit_row(state);
+}
+
 #[test]
 fn theme_picker_overlay_ignores_mouse() {
     let mut state = test_state();
