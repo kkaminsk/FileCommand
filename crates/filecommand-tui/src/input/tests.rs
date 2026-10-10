@@ -304,12 +304,12 @@ fn esc_cancels_an_in_progress_drag_instead_of_requesting_quit() {
 
 #[test]
 fn backspacing_to_empty_releases_up_down_to_the_panel() {
-    // Backspace is now the only way to hand Up/Down back to the panel
-    // cursor: it already pops the buffer in `core::update`, and the mapper
-    // recomputes `typing` fresh from the (now empty) buffer on the very
-    // next key (command-line "Command history navigation": "Backspacing the
-    // buffer to empty SHALL be the mechanism that hands Up/Down back to the
-    // panel").
+    // Backspace is one of the two ways to hand Up/Down back to the panel
+    // cursor (the clear-line chord is the other — see
+    // `ctrl_y_clears_a_composed_line`): it already pops the buffer in
+    // `core::update`, and the mapper recomputes `typing` fresh from the
+    // (now empty) buffer on the very next key (command-line "Command
+    // history navigation").
     assert_eq!(map(plain(KeyCode::Up), &typing("d")), Some(Command::CommandLineHistoryPrev));
     assert_eq!(map(plain(KeyCode::Backspace), &typing("d")), Some(Command::CommandLineBackspace));
     // Once the buffer is empty again, Up/Down move the panel cursor.
@@ -320,6 +320,82 @@ fn backspacing_to_empty_releases_up_down_to_the_panel() {
 #[test]
 fn backspace_edits_the_buffer_while_typing() {
     assert_eq!(map(plain(KeyCode::Backspace), &typing("dir")), Some(Command::CommandLineBackspace));
+}
+
+#[test]
+fn ctrl_y_clears_a_composed_line() {
+    // command-line "Clear the command line with a dedicated key": "Ctrl+Y
+    // clears a composed line".
+    assert_eq!(map(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &typing("cd Program Files")), Some(Command::CommandLineClear));
+}
+
+#[test]
+fn ctrl_y_on_an_empty_line_does_nothing() {
+    // command-line "Clear the command line with a dedicated key": "Ctrl+Y
+    // on an empty line does nothing" — no quit dialog, no cursor movement
+    // (design D2: a mistaken press never does anything surprising).
+    assert_eq!(map(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &panels()), None);
+}
+
+#[test]
+fn clear_line_binding_is_config_overridable() {
+    // command-line "Clear the command line with a dedicated key":
+    // "Rebinding the clear key" — `key.clear_line = "ctrl+k"` makes Ctrl+K
+    // the clear chord and leaves Ctrl+Y inert.
+    let keys = Keys { clear_line: filecommand_core::config::KeyBinding::new(true, false, false, "k"), ..Keys::default() };
+    let state = typing("dir");
+    assert_eq!(map_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL), &state, 5, &keys), Some(Command::CommandLineClear));
+    assert_eq!(map_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &state, 5, &keys), None, "the default chord no longer applies once rebound");
+}
+
+#[test]
+fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns_input() {
+    // The chord is bound only while the panels own input (command-line
+    // "Clear the command line with a dedicated key"): no overlay or
+    // full-screen phase ever emits `CommandLineClear`, and their existing
+    // handling — including the unguarded `y` arms that treat Ctrl+Y as a
+    // plain `y` (command-line-clear-key design, Context) — is unchanged.
+    // The buffer is non-empty throughout, so the outcomes below always
+    // reflect the overlay's own keymap, never the empty-line guard.
+    let ctrl_y = key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+
+    let mut state = typing("dir");
+    state.quit_confirm = true;
+    assert_eq!(map(ctrl_y, &state), Some(Command::ConfirmQuit), "the quit-confirm's unguarded y arm is unchanged");
+    assert_ne!(map(ctrl_y, &state), Some(Command::CommandLineClear));
+
+    let delete_confirm = state_with(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+    }));
+    assert_eq!(map(ctrl_y, &delete_confirm), Some(Command::FileOpConfirm), "the delete-confirm's unguarded y arm is unchanged");
+
+    let destination = destination_input_state();
+    assert_eq!(map(ctrl_y, &destination), Some(Command::FileOpInputChar('y')), "text fields still type a literal y");
+
+    let mut state = typing("dir");
+    state.menu = Some(MenuState::opened());
+    assert_eq!(map(ctrl_y, &state), None, "an open pull-down claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    assert_eq!(map(ctrl_y, &state), None, "the fuzzy-jump dialog claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    assert_eq!(map(ctrl_y, &state), None, "the user menu claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    assert_eq!(map(ctrl_y, &state), None, "the help window claims the key and ignores it");
+
+    let viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
+    assert_eq!(map(ctrl_y, &viewer), None, "the viewer owns its keys");
+
+    let editor = state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc")));
+    assert_eq!(map(ctrl_y, &editor), None, "the editor owns its keys");
 }
 
 #[test]

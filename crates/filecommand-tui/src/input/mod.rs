@@ -302,6 +302,16 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         return Some(Command::SplitReset);
     }
 
+    // The clear-line chord only claims the key while the buffer is
+    // non-empty; on an empty line it falls through to nothing, so a
+    // mistaken press never does anything surprising (command-line "Clear
+    // the command line with a dedicated key": "Ctrl+Y on an empty line
+    // does nothing"; design D2). `CommandLineClear` also resets the
+    // history cursor, ending any recall in progress (design D3).
+    if typing && matches_binding(&key, &keys.clear_line) {
+        return Some(Command::CommandLineClear);
+    }
+
     // Clipboard export (clipboard-export "Clipboard key bindings"). Checked
     // ahead of the ctrl/alt group and the general match below — in
     // particular ahead of the unguarded `Insert -> ToggleSelectAtCursor`
@@ -383,18 +393,19 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Char('o') | KeyCode::Char('O') if ctrl => Some(Command::ShowScrollback),
 
         // Up/Down walk command history while something is typed, and move
-        // the panel cursor when the buffer is empty. Backspacing the buffer
-        // to empty is the documented way to hand them back to the panel.
+        // the panel cursor when the buffer is empty. Backspacing the
+        // buffer to empty, or the clear-line chord above, is the
+        // documented way to hand them back to the panel.
         KeyCode::Up if typing => Some(Command::CommandLineHistoryPrev),
         KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
         KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
         // Esc is unconditional at panel level: it asks to quit regardless of
         // command-line content, replacing the old clear-the-buffer meaning
-        // (backspacing to empty is now what hands Up/Down back to the panel
-        // — see the Backspace arms just below) (application-shell "Quit
-        // request keys and confirmation"; command-line "Command history
-        // navigation").
+        // (backspacing to empty, or the clear-line chord, is now what hands
+        // Up/Down back to the panel — see the Backspace arms just below)
+        // (application-shell "Quit request keys and confirmation";
+        // command-line "Command history navigation").
         KeyCode::Esc => Some(Command::RequestQuit),
         KeyCode::Backspace if typing => Some(Command::CommandLineBackspace),
         KeyCode::Backspace => Some(Command::ParentDir),

@@ -496,7 +496,9 @@ const COMMAND_LINE: &str = "\
 Typing over a panel with nothing else active enters text on the
 command line. Enter runs it in the active panel's directory; `cd`
 navigates the panel instead of spawning a shell. Up/Down recall
-history while something is typed; Esc clears the line.";
+history while something is typed. Ctrl+Y clears the whole line,
+ending any history recall (rebindable via key.clear_line); Esc asks
+to quit.";
 
 const MODERN_EXTRAS: &str = "\
 Ctrl+P narrows the active panel to substring matches as you type;
@@ -516,8 +518,9 @@ selection scope as F5 Copy.";
 const CONFIGURATION: &str = "\
 config.toml in the profile directory sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
-and can remap the quick-filter, fuzzy-jump, panel-split, and
-clipboard (key.clipboard_files, key.clipboard_paths) keys.
+and can remap the quick-filter, fuzzy-jump, panel-split, clipboard
+(key.clipboard_files, key.clipboard_paths), and clear-line
+(key.clear_line) keys.
 usermenu.toml defines the F2 user menu's entries. Both live with
 history.json in one profile directory: %APPDATA%\\FileCommand on
 Windows, ~/.config/filecommand elsewhere, or beside the executable

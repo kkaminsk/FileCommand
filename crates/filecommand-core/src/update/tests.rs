@@ -823,16 +823,41 @@ fn backspace_edits_the_buffer_and_clears_the_history_cursor() {
 
 #[test]
 fn command_line_clear_command_still_clears_the_buffer() {
-    // `Command::CommandLineClear` still exists and still behaves as a plain
-    // "clear the buffer" reducer action — only its trigger changed: Esc no
-    // longer dispatches it (`input::map_panel_key` maps panel-level Esc to
-    // `RequestQuit` unconditionally instead), so nothing in the shipped
-    // key-mapping layer emits this command anymore (command-line "Command
-    // history navigation": "Esc SHALL NOT clear the buffer").
+    // `Command::CommandLineClear` behaves as a plain "clear the buffer"
+    // reducer action. Esc no longer dispatches it (`input::map_panel_key`
+    // maps panel-level Esc to `RequestQuit` unconditionally); the shipped
+    // trigger is the clear-line chord, Ctrl+Y by default (command-line
+    // "Clear the command line with a dedicated key").
     let state = type_line(test_state(UiPhase::Panels), "dir");
     let (state, _) = update(state, Command::CommandLineClear);
     assert!(state.command_line.is_empty());
     assert_eq!(state.history_cursor, None);
+}
+
+#[test]
+fn command_line_clear_ends_history_recall_and_hands_up_down_back_to_the_panel() {
+    // command-line "Clear the command line with a dedicated key" scenario
+    // "Clearing ends history recall": after the clear the buffer is empty,
+    // so the input layer routes Up/Down to the panel cursor again — the
+    // same release backspacing to empty performs (command-line "Command
+    // history navigation"; see input/tests.rs `ctrl_y_clears_a_composed_line`).
+    let mut state = test_state(UiPhase::Panels);
+    state.history = vec!["old".to_string()];
+    state.left.entries = vec![file_entry("a", 1), file_entry("b", 2)];
+    let state = type_line(state, "dir");
+    let (state, _) = update(state, Command::CommandLineHistoryPrev);
+    assert_eq!(state.command_line, "old");
+    assert_eq!(state.history_cursor, Some(0));
+
+    let (state, _) = update(state, Command::CommandLineClear);
+    assert!(state.command_line.is_empty());
+    assert_eq!(state.history_cursor, None, "clearing ends the recall");
+
+    // With the buffer empty, the mapper sends cursor moves for Up/Down
+    // again — the panel cursor must be free to move.
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    assert_eq!(state.left.cursor, 1, "the next Up/Down belongs to the panel, not to history");
+    assert!(state.command_line.is_empty(), "no history entry was recalled");
 }
 
 #[test]

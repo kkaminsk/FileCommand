@@ -6,7 +6,8 @@
 //! (integer left-panel percentage; panel-split), and the overridable
 //! bindings `key.paste_name` / `key.paste_path` / `key.quick_filter` /
 //! `key.fuzzy_jump` / `key.split_left` / `key.split_right` /
-//! `key.split_reset` / `key.clipboard_files` / `key.clipboard_paths`.
+//! `key.split_reset` / `key.clipboard_files` / `key.clipboard_paths` /
+//! `key.clear_line`.
 //! A `[mouse]` table holds `enabled` (bool, default true; mouse-input
 //! "Mouse capture configuration") — the one section header this otherwise
 //! flat, line-based parser recognizes, so `enabled` under `[mouse]` doesn't
@@ -98,6 +99,11 @@ pub struct Keys {
     /// Copies the F5-scope entries' absolute paths to the clipboard as
     /// text. Default Ctrl+Shift+Ins.
     pub clipboard_paths: KeyBinding,
+    /// Clears the whole command line, ending any history recall in
+    /// progress, while the panels own input and the buffer is non-empty.
+    /// Default Ctrl+Y (command-line "Clear the command line with a
+    /// dedicated key"; command-line-clear-key design D1).
+    pub clear_line: KeyBinding,
 }
 
 impl Default for Keys {
@@ -112,6 +118,7 @@ impl Default for Keys {
             split_reset: KeyBinding::new(true, false, false, "="),
             clipboard_files: KeyBinding::new(true, false, false, "c"),
             clipboard_paths: KeyBinding::new(true, false, true, "insert"),
+            clear_line: KeyBinding::new(true, false, false, "y"),
         }
     }
 }
@@ -291,6 +298,11 @@ pub fn parse(input: &str) -> Config {
             "key.clipboard_paths" => {
                 if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
                     config.keys.clipboard_paths = b;
+                }
+            }
+            "key.clear_line" => {
+                if let Some(b) = parse_string(value).as_deref().and_then(parse_binding) {
+                    config.keys.clear_line = b;
                 }
             }
             "panel_split" => {
@@ -1234,6 +1246,18 @@ mod tests {
         // Ctrl+Shift+Ins for Paths.
         assert_eq!(keys.clipboard_files, KeyBinding::new(true, false, false, "c"));
         assert_eq!(keys.clipboard_paths, KeyBinding::new(true, false, true, "insert"));
+        // command-line "Clear the command line with a dedicated key":
+        // Ctrl+Y by default.
+        assert_eq!(keys.clear_line, KeyBinding::new(true, false, false, "y"));
+    }
+
+    #[test]
+    fn parses_overridable_clear_line_binding() {
+        // command-line "Clear the command line with a dedicated key"
+        // scenario "Rebinding the clear key".
+        let config = parse("key.clear_line = \"ctrl+k\"\n");
+        assert_eq!(config.keys.clear_line, KeyBinding::new(true, false, false, "k"));
+        assert_eq!(parse("").keys.clear_line, KeyBinding::new(true, false, false, "y"), "unset keeps the default");
     }
 
     #[test]

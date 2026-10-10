@@ -161,6 +161,7 @@ key.split_right = "ctrl+right"
 key.split_reset = "ctrl+="
 key.clipboard_files = "ctrl+c"
 key.clipboard_paths = "ctrl+shift+insert"
+key.clear_line = "ctrl+y"
 ```
 
 | Key | Meaning | Default |
@@ -262,12 +263,15 @@ Some keys mean different things depending on whether the line is empty:
 | ↑ / ↓ | Move the panel cursor | Recall older / newer history |
 | Enter | Act on the cursor entry (open a directory, file-action menu for a file) | Run the line |
 | Ctrl+Enter / Ctrl+] | Paste the cursor entry's name / full path | Same, after a separating space |
+| Ctrl+Y | Nothing | Clear the line (ends any history recall) |
 | Esc | Ask to quit | Ask to quit (cancelling keeps your text) |
 
 All other keys keep their panel meaning while you type. Home/End and
 PgUp/PgDn move the panel cursor, and Tab switches panels without clearing the
 line. **Delete opens the delete confirmation for the cursor entry; it does
-not delete a character.** To clear the line, backspace it until it's empty.
+not delete a character.** To clear the line, press Ctrl+Y (rebindable via
+`key.clear_line` in [`config.toml`](#configtoml)), or backspace it until
+it's empty.
 
 #### Built-in commands
 
@@ -440,7 +444,8 @@ command output; only your terminal's scrollback does.
 
 All of the bindings marked overridable in [Configuration](#configuration)
 (`paste_name`, `paste_path`, `quick_filter`, `fuzzy_jump`, `split_left`,
-`split_right`, `split_reset`, `clipboard_files`, `clipboard_paths`) can be
+`split_right`, `split_reset`, `clipboard_files`, `clipboard_paths`,
+`clear_line`) can be
 remapped in `config.toml`; the rest of the table above is fixed.
 
 ### Mouse reference
