@@ -24,12 +24,22 @@ Each panel SHALL maintain its own state consisting of a current directory path, 
 
 ### Requirement: Full display mode layout
 
-The system SHALL render each panel in Full display mode with a double-line border, the current directory path centered in the top border, a column header row, entry rows, and a mini-status line inside the bottom border. The columns SHALL be the widest set from the ladder `Name+Size+Date+Time → Name+Size+Date → Name+Size → Name` that keeps the Name column at least 12 display cells wide, dropping columns rightmost-first (Time, then Date, then Size) as the panel narrows and restoring them in reverse as it widens; the column header row SHALL show exactly the columns currently rendered. At the 80×24 nominal size with the default 50/50 split, all four columns render. The active panel's path title SHALL render inverse (black on cyan) and the inactive panel's title SHALL render cyan on blue.
+The system SHALL render each panel in Full display mode with a double-line border, the current directory path centered in the top border, a column header row, entry rows, and a mini-status line inside the bottom border. The columns SHALL be the widest set from the ladder `Name+Size+Date+Time → Name+Size+Date → Name+Size → Name` that keeps the Name column at least 12 display cells wide, dropping columns rightmost-first (Time, then Date, then Size) as the panel narrows and restoring them in reverse as it widens; the column header row SHALL show exactly the columns currently rendered. A rendered row SHALL be laid out as the Name cell, a `│` separator, a 9-cell Size value, one space, an 8-cell Date value (`MM-DD-YY`), one space, and a 5-cell Time value (`HH:MM`), so that every rendered Size, Date, and Time value appears untruncated and the row fills the panel interior exactly. At the 80×24 nominal size with the default 50/50 split, all four columns render. The active panel's path title SHALL render inverse (black on cyan) and the inactive panel's title SHALL render cyan on blue.
 
 #### Scenario: All four columns at the nominal size
 
 - **WHEN** a panel renders Full mode at terminal size 80×24 with the default 50/50 split
 - **THEN** the header row reads `Name | Size | Date | Time` and all four columns render, with the Name column at least 12 display cells wide
+
+#### Scenario: Values render untruncated at the nominal size
+
+- **WHEN** a panel renders Full mode at 80×24 with the default split and an entry modified on 2026-06-27 at 23:30
+- **THEN** the row shows `06-27-26` and `23:30` complete, and a directory row shows `▶SUB-DIR◀` complete, with no blank cells between the Time value and the right border
+
+#### Scenario: Sizes are right-aligned
+
+- **WHEN** two file entries of 87 bytes and 35 KiB render in Full mode
+- **THEN** `87` and `35K` are right-aligned within the Size column so their last digits share a cell column
 
 #### Scenario: Time drops first on a narrowing panel
 
@@ -58,17 +68,32 @@ The system SHALL render each panel in Full display mode with a double-line borde
 
 ### Requirement: Entry row rendering
 
-The system SHALL render entry rows so directories appear in the bright-white directory style and files in the file style, with `▶UP--DIR◀` shown for the `..` entry and `▶SUB-DIR◀` shown in the Size column for directories. The entry under the cursor SHALL render as a full-width inverse bar using the `panel.cursor` role. Rendering SHALL use only ANSI-16 named color roles and CP437 box-drawing/geometric glyphs, with no emoji, Nerd Font, or file-type icons.
+The system SHALL render entry rows so directories appear in the bright-white directory style and files in the file style, with `▶UP--DIR◀` shown for the `..` entry and `▶SUB-DIR◀` shown complete in the Size column for directories; numeric sizes SHALL be right-aligned in that column. Entries flagged hidden — on Windows those carrying the hidden or system attribute, elsewhere names beginning with `.` — SHALL render their name with the `panel.hidden` role instead of the file or directory style; the `..` entry is never hidden. Style precedence SHALL be: drag-target highlight, then cursor bar, then selected, then hidden, then directory/file. The entry under the cursor SHALL render as a full-width inverse bar using the `panel.cursor` role. Rendering SHALL use only ANSI-16 named color roles and CP437 box-drawing/geometric glyphs, with no emoji, Nerd Font, or file-type icons.
 
 #### Scenario: Directory entry styling
 
 - **WHEN** an entry is a directory
-- **THEN** its name SHALL render in the `panel.directory` style and its Size column SHALL read `▶SUB-DIR◀`
+- **THEN** its name SHALL render in the `panel.directory` style and its Size column SHALL read `▶SUB-DIR◀` in full
 
 #### Scenario: Parent entry styling
 
 - **WHEN** the entry list contains the parent `..` entry
 - **THEN** it SHALL render as `▶UP--DIR◀` in the `panel.directory` style
+
+#### Scenario: Hidden entries render dimmed
+
+- **WHEN** a directory listing contains `desktop.ini` (hidden attribute) and `.git` (hidden directory)
+- **THEN** both names render with the `panel.hidden` role, `.git` still shows `▶SUB-DIR◀`, and neither entry's position in the sorted listing changes
+
+#### Scenario: Selected hidden entry shows selected style
+
+- **WHEN** a hidden file is selected with Ins
+- **THEN** its row renders with the `panel.selected` role, not `panel.hidden`
+
+#### Scenario: Cursor bar wins
+
+- **WHEN** the panel cursor is on a hidden entry
+- **THEN** that row SHALL render as the full-width `panel.cursor` inverse bar
 
 #### Scenario: Cursor row is an inverse bar
 
@@ -196,7 +221,7 @@ In Full display mode the panel body SHALL render a window of consecutive positio
 
 ### Requirement: Scroll offset is core panel state
 
-Each panel's scroll offset SHALL live in `filecommand-core` panel state (with Tree mode's offset in its tree state), and all offset changes SHALL flow through `core::update` — the renderer only reads it. The offset SHALL be a position in the quick-filter-narrowed visible list, not a raw entry index. Core SHALL derive each panel's body row count from state it already holds (terminal size from `Resize`, the panel split, the panel's display mode, and tab-strip visibility) — it SHALL NOT query the terminal — and SHALL re-clamp the offset so the cursor stays visible after every mutation that can move the cursor or change the list: cursor movement, quick-filter edits, re-sort, streamed listing updates, directory load completion (including find-file's deferred cursor settle), tab restore, and terminal resize.
+Each panel's scroll offset SHALL live in `filecommand-core` panel state (with Tree mode's offset in its tree state), and all offset changes SHALL flow through `core::update` — the renderer only reads it. The offset SHALL be a position in the quick-filter-narrowed visible list, not a raw entry index. Core SHALL derive each panel's body row count from state it already holds (terminal size from `Resize`, the panel split, the panel's display mode, and tab-strip visibility) — it SHALL NOT query the terminal — and SHALL re-clamp the offset so the cursor stays visible after every mutation that can move the cursor or change the list: cursor movement, quick-filter edits, re-sort, streamed listing updates, directory load completion (including find-file's deferred cursor settle and the same-directory re-read anchor restore), tab restore, and terminal resize.
 
 #### Scenario: Quick-filter narrowing re-clamps the offset
 
@@ -223,6 +248,11 @@ Each panel's scroll offset SHALL live in `filecommand-core` panel state (with Tr
 - **WHEN** entries stream into a freshly loaded directory and the user has not moved the cursor
 - **THEN** the offset stays 0 with the cursor pinned to the first entry, exactly as the cursor itself already behaves
 
+#### Scenario: Re-read anchor restore re-clamps against the shorter list
+
+- **WHEN** a same-directory re-read restores a scroll offset that would leave blank rows below the end of the now-shorter list
+- **THEN** the offset is re-clamped in the same reducer step so the window ends at the last entry and the cursor remains visible
+
 ### Requirement: Scrollbar indicator on overflow
 
 When (and only when) a panel's visible list is longer than its body window, the body's entry rows in the panel's right border column SHALL render a vertical scrollbar in place of the double-line `║` glyphs on those rows — this requirement takes precedence, on overflow, over the unbroken double-line border described by "Full display mode layout". The scrollbar SHALL use only CP437 glyphs — `░` for the track and `█` for the thumb — styled by the `panel.scrollbar` theme role, with thumb length proportional to the visible fraction (minimum one cell) and thumb position proportional to the scroll offset, touching the track's top exactly when the offset is 0 and its bottom exactly when the last position is visible. The scrollbar SHALL occupy only body entry rows: never the top border, tab-strip row, column-header row, or the bottom border and its mini-status. When the list fits the window, the right border SHALL render exactly as it does today, byte-identical.
@@ -246,4 +276,68 @@ When (and only when) a panel's visible list is longer than its body window, the 
 
 - **WHEN** the window sits partway through a long list
 - **THEN** the thumb sits strictly between the track's ends, at a row proportional to the offset
+
+### Requirement: Same-directory re-read preserves cursor and scroll position
+
+When a panel re-reads the directory it is already displaying — after a file-operation job completes or is cancelled, on Ctrl+R or the Left/Right menu's Re-read item, or on a stale background tab's activation refresh — the system SHALL restore the cursor to the entry it was on if that entry is still listed; otherwise to the first surviving entry at or after the cursor's previous row; otherwise to the nearest surviving entry before it. The scroll offset SHALL be restored to its previous value and then re-clamped so the window does not extend past the end of the new list and the cursor remains visible. The restored position SHALL hold while the re-read streams in — the cursor SHALL NOT transiently jump to the first entry — and after completion. Navigation into a different directory SHALL continue to reset the cursor and offset to the top. For same-directory re-reads this requirement takes precedence over "Streamed listing keeps the top pinned until the user moves".
+
+#### Scenario: Deleting the cursored file lands on the next entry
+
+- **WHEN** the cursor is on `b.txt` in a listing `a.txt`, `b.txt`, `c.txt` and the user confirms a delete of `b.txt` that completes
+- **THEN** after the automatic re-read the cursor is on `c.txt` and the scroll offset is unchanged
+
+#### Scenario: Deleting the last entry lands on the previous one
+
+- **WHEN** the cursor is on the last entry of a listing and the user confirms a delete of that entry that completes
+- **THEN** after the re-read the cursor is on the entry that preceded it, now the last entry
+
+#### Scenario: Multi-selection delete lands on the first survivor at or after the cursor
+
+- **WHEN** a listing `a`, `b`, `c`, `d`, `e` has `b`, `c`, `d` selected with the cursor on `c`, and a delete of the selection completes
+- **THEN** after the re-read the cursor is on `e`
+
+#### Scenario: Scrolled window stays put
+
+- **WHEN** a 60-entry listing is shown in a 20-row body with scroll offset 30 and the cursor on position 40, and a delete of the cursored entry completes
+- **THEN** after the re-read the scroll offset is still 30 and the cursor is on position 40, which is the entry formerly at position 41
+
+#### Scenario: Deleting at the very bottom pulls the window up by one
+
+- **WHEN** a 60-entry listing is shown in a 20-row body with scroll offset 40 and the cursor on the last entry, and a delete of that entry completes
+- **THEN** after the re-read the list has 59 entries, the scroll offset is re-clamped to 39, the cursor is on the new last entry, and no blank trailing row is shown
+
+#### Scenario: Ctrl+R keeps the cursor's entry
+
+- **WHEN** the cursor is on `report.txt` partway down a listing and the user presses Ctrl+R
+- **THEN** after the re-read the cursor is on `report.txt` and the scroll offset is unchanged
+
+#### Scenario: No jump while the re-read streams
+
+- **WHEN** a same-directory re-read is in progress and its first streamed chunk contains the anchored entry
+- **THEN** the cursor is on that entry as soon as the chunk is applied, not on the first entry
+
+#### Scenario: Navigating to a different directory still starts at the top
+
+- **WHEN** the cursor is partway down a listing and the user presses Enter on a subdirectory
+- **THEN** the new listing starts with the cursor on its first entry and the scroll offset at 0
+
+### Requirement: Swap panels (Ctrl+U)
+
+The system SHALL exchange the left and right panels' complete state — directory, tabs, listing, cursor, scroll offset, selection, sort mode, filter, display mode, and git info — on Ctrl+U or Commands → Swap panels, keeping the active side and the split percentage unchanged, without re-reading either directory. A swap requested while either panel's listing is still streaming SHALL be ignored. After a swap the system SHALL re-issue each panel's pending Info-mode and git-info queries so no reply from before the swap is applied to the wrong panel.
+
+#### Scenario: Swap keeps focus on the same side
+- **WHEN** the left panel is active showing `C:\a` and the right shows `D:\b`, and the user presses Ctrl+U
+- **THEN** the left panel shows `D:\b`, the right shows `C:\a`, the left panel is still active, and the command-line prompt reads `D:\b>`
+
+#### Scenario: Swap carries tabs and selection
+- **WHEN** the right panel has three tabs and two selected entries and the user presses Ctrl+U
+- **THEN** the left panel now has those three tabs and the same two selected entries
+
+#### Scenario: Swap refused while reading
+- **WHEN** the right panel's listing is still streaming and the user presses Ctrl+U
+- **THEN** nothing changes
+
+#### Scenario: Git info follows the swap
+- **WHEN** the left panel is inside a git repository and the user presses Ctrl+U
+- **THEN** the right panel's border shows that repository's branch suffix after its re-issued query resolves, and the left panel shows none
 

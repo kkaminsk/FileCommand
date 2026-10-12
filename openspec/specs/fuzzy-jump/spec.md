@@ -5,7 +5,7 @@ TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose af
 ## Requirements
 ### Requirement: Fuzzy jump dialog invocation
 
-The system SHALL open the fuzzy jump dialog when the user presses Ctrl+J (the default binding, overridable via `config.toml`), presenting a modal list of previously visited directories drawn in the standard NC dialog style over the panels. The dialog SHALL provide a single-line input field into which the user types a fuzzy match pattern, and Esc SHALL close the dialog without changing the active panel's directory.
+The system SHALL open the fuzzy jump dialog when the user presses Ctrl+J (the default binding, overridable via `config.toml`), presenting a modal list of previously visited directories drawn in the standard NC dialog style over the panels. The dialog SHALL provide a single-line input field — a shared text field per `text-field-editing` — into which the user types a fuzzy match pattern, and Esc SHALL close the dialog without changing the active panel's directory.
 
 #### Scenario: Ctrl+J opens the dialog
 
@@ -16,6 +16,11 @@ The system SHALL open the fuzzy jump dialog when the user presses Ctrl+J (the de
 
 - **WHEN** the fuzzy jump dialog is open and the user presses Esc
 - **THEN** the dialog closes and the active panel remains at its current directory unchanged
+
+#### Scenario: Pattern edited mid-string re-narrows the list
+
+- **WHEN** the pattern reads `prj` and the user presses Left, then types `o`
+- **THEN** the pattern reads `proj` and the list is re-narrowed against `proj`
 
 #### Scenario: Overridden binding still opens the dialog
 
