@@ -233,7 +233,9 @@ New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 # `wix extension add` (see README.md prerequisites) restores extensions into
 # a `.wix\extensions` cache relative to the current directory, so `wix
 # build` must run from $InstallerDir regardless of where this script was
-# invoked from, or it won't find WixToolset.BootstrapperApplications.wixext.
+# invoked from, or it won't find WixToolset.BootstrapperApplications.wixext
+# and WixToolset.Util.wixext (the bundle build uses both; both are pinned to
+# 5.0.2 in the README prerequisites).
 
 Push-Location $InstallerDir
 try {
@@ -270,6 +272,7 @@ try {
         -d "PerUserMsiPath=$PerUserMsi" `
         -d "PerMachineMsiPath=$PerMachineMsi" `
         -ext WixToolset.BootstrapperApplications.wixext `
+        -ext WixToolset.Util.wixext `
         -arch x64 `
         -o $BundleExe
     if ($LASTEXITCODE -ne 0) {
