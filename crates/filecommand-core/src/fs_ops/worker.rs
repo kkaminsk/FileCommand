@@ -18,6 +18,7 @@ use super::conflict::{ConflictChoice, ConflictInfo, ConflictPolicy, ConflictReso
 use super::error::{ErrorChoice, ErrorInfo, ErrorPolicy, ErrorResolution, SkippedItem};
 use super::fs::{is_cancelled, ChunkControl, FileId, FileSystem};
 use super::job::{Job, JobKind, JobOutcome, JobSink, ProgressInfo};
+use super::path::lexically_normalize;
 
 const CHUNK_BYTES: usize = 256 * 1024;
 
@@ -321,6 +322,44 @@ fn identity_matches(fs: &dyn FileSystem, a: &Path, b_id: Option<FileId>) -> bool
     matches!((fs.metadata_follow(a).ok().and_then(|m| m.file_id), b_id), (Some(x), Some(y)) if x == y)
 }
 
+/// Whether `target` resolves to the same file as `src` (file-operations "A
+/// copy never overwrites its own source"). Unlike [`identity_matches`], the
+/// target's identity is *followed*, so a file symlink pointing at the source
+/// also counts. When either identity is unknown, the decision falls back to
+/// comparing the lexically-normalized paths. A target that does not exist is
+/// never the same file.
+fn same_file(fs: &dyn FileSystem, src: &Path, target: &Path) -> bool {
+    let src_id = fs.metadata_follow(src).ok().and_then(|m| m.file_id);
+    let target_id = match fs.metadata_follow(target) {
+        Ok(md) => md.file_id,
+        Err(_) => return false,
+    };
+    match (src_id, target_id) {
+        (Some(a), Some(b)) => a == b,
+        _ => normalized_paths_equal(src, target),
+    }
+}
+
+/// [`same_file`]'s fallback when a file identity cannot be read: the two
+/// paths are equal after lexical normalization, compared case-insensitively
+/// on Windows (where a case-insensitive volume is the norm) and exactly
+/// elsewhere. Meaningful only for absolute paths; a relative path simply
+/// does not match, which is no worse than no fallback at all.
+fn normalized_paths_equal(a: &Path, b: &Path) -> bool {
+    let a = lexically_normalize(a);
+    let b = lexically_normalize(b);
+    #[cfg(windows)]
+    {
+        let a = a.as_os_str().to_string_lossy().to_lowercase();
+        let b = b.as_os_str().to_string_lossy().to_lowercase();
+        a == b
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_move: bool) {
     if is_move && !job.sources.is_empty() && job.sources.iter().all(|s| fs.same_volume(&s.path, &job.dest_dir).unwrap_or(false)) {
         run_move_same_volume(job, fs, sink);
@@ -367,6 +406,21 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
             }
             let target = job.dest_dir.join(&planned.rel_path);
             progress.current_file = planned.rel_path.file_name().unwrap_or_default().to_os_string();
+
+            // A copy never writes to its own source: creating the target
+            // would truncate the source before the first byte is read, and
+            // the copy half of a move would then delete it. Unlike
+            // `run_move_same_volume`/`run_rename`, where identity-equality
+            // means "no conflict" so case-only renames pass, here the same
+            // file is skipped outright — nothing is written, no conflict is
+            // raised, and a move's source removal is never reached.
+            if same_file(fs, &planned.src_abs, &target) {
+                skipped.push(SkippedItem {
+                    path: planned.src_abs.clone(),
+                    reason: "source and destination are the same file".to_string(),
+                });
+                continue 'files;
+            }
 
             let conflict = match fs.metadata(&target) {
                 Ok(target_md) if !identity_matches(fs, &planned.src_abs, target_md.file_id) => Some(ConflictInfo {
@@ -582,10 +636,11 @@ fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_ops::fs::FakeFs;
+    use crate::fs_ops::fs::{FakeFs, FsMetadata, RawEntry};
     use crate::fs_ops::job::{CancelFlag, SourceItem};
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
     use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
 
     /// A [`JobSink`] test double that records every event and auto-resolves
     /// conflicts/errors from a scripted queue (defaulting to Overwrite/Skip
@@ -596,11 +651,12 @@ mod tests {
         pub error_answers: Vec<ErrorChoice>,
         pub cancel: CancelFlag,
         pub outcome: Option<JobOutcome>,
+        pub conflicts_seen: usize,
     }
 
     impl RecordingSink {
         fn new() -> Self {
-            RecordingSink { events: vec![], conflict_answers: vec![], error_answers: vec![], cancel: CancelFlag::new(), outcome: None }
+            RecordingSink { events: vec![], conflict_answers: vec![], error_answers: vec![], cancel: CancelFlag::new(), outcome: None, conflicts_seen: 0 }
         }
     }
 
@@ -609,6 +665,7 @@ mod tests {
             self.events.push(format!("progress:{}/{}", info.files_done, info.files_total));
         }
         fn conflict(&mut self, _info: ConflictInfo) -> ConflictChoice {
+            self.conflicts_seen += 1;
             if self.conflict_answers.is_empty() {
                 ConflictChoice::Overwrite
             } else {
@@ -1104,5 +1161,245 @@ mod tests {
         });
         handle.join().unwrap();
         assert!(matches!(sink.lock().unwrap().outcome, Some(JobOutcome::Completed { .. })));
+    }
+
+    // -------------------------------------------------------------
+    // Copy-onto-itself guard (file-operations "A copy never
+    // overwrites its own source")
+    // -------------------------------------------------------------
+
+    /// A file with a known size, an alternate stream, and a known last-write
+    /// time. `FakeFs` does not model truncation, but a copy onto the same
+    /// path replaces the node — dropping the stream and the timestamp — so
+    /// those two are what detect a self-copy here.
+    fn self_copy_fixture(fake: &FakeFs, path: &Path) -> SystemTime {
+        fake.add_file_with_stream(path, 2048, "Zone.Identifier", 512);
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fake.set_modified(path, modified).unwrap();
+        modified
+    }
+
+    fn assert_untouched(fake: &FakeFs, path: &Path, modified: SystemTime) {
+        let md = fake.metadata(path).unwrap();
+        assert_eq!(md.size, 2048, "content size must survive");
+        assert_eq!(
+            md.modified,
+            Some(modified),
+            "last-write time must survive (a self-copy would have replaced the node)"
+        );
+        assert_eq!(
+            fake.list_streams(path).unwrap(),
+            vec![OsString::from("Zone.Identifier")],
+            "the alternate stream must survive"
+        );
+    }
+
+    fn assert_skipped_same_file(sink: &RecordingSink, src: &str) {
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(
+                    skipped.len(),
+                    1,
+                    "the same-file item is reported as skipped: {skipped:?}"
+                );
+                assert_eq!(skipped[0].path, PathBuf::from(src));
+                assert!(
+                    skipped[0].reason.contains("same file"),
+                    "the reason should name the self-copy: {}",
+                    skipped[0].reason
+                );
+            }
+            other => panic!("expected Completed with one skipped item, got {other:?}"),
+        }
+        assert_eq!(
+            sink.conflicts_seen, 0,
+            "a same-file copy must not raise the overwrite-conflict dialog"
+        );
+    }
+
+    #[test]
+    fn copy_into_own_directory_skips_same_file_without_conflict() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/work"));
+        let modified = self_copy_fixture(&fake, Path::new("/work/report.txt"));
+
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![source("report.txt", "/work/report.txt")],
+            source_dir: PathBuf::from("/work"),
+            dest_dir: PathBuf::from("/work"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        assert_skipped_same_file(&sink, "/work/report.txt");
+        assert_untouched(&fake, Path::new("/work/report.txt"), modified);
+    }
+
+    #[test]
+    fn copy_through_junction_alias_onto_itself_is_skipped() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/work"));
+        let modified = self_copy_fixture(&fake, Path::new("/work/report.txt"));
+        fake.add_reparse_point(
+            Path::new("/alias"),
+            true,
+            Path::new("/work"),
+            super::super::fs::ReparseKind::Junction,
+        );
+
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![source("report.txt", "/work/report.txt")],
+            source_dir: PathBuf::from("/work"),
+            dest_dir: PathBuf::from("/alias"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        // `/alias/report.txt` resolves to `/work/report.txt` through the
+        // junction, so the followed identities match and the item is skipped.
+        assert_skipped_same_file(&sink, "/work/report.txt");
+        assert_untouched(&fake, Path::new("/work/report.txt"), modified);
+    }
+
+    #[test]
+    fn move_copy_then_delete_onto_same_file_keeps_the_source() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_dir(Path::new("/v1/work"));
+        let modified = self_copy_fixture(&fake, Path::new("/v1/work/report.txt"));
+        fake.add_reparse_point(
+            Path::new("/v2/alias"),
+            true,
+            Path::new("/v1/work"),
+            super::super::fs::ReparseKind::Junction,
+        );
+
+        // Different volume tags make `same_volume` answer false, so the move
+        // takes the copy-then-delete path rather than the rename path.
+        let job = Job {
+            kind: JobKind::Move,
+            sources: vec![source("report.txt", "/v1/work/report.txt")],
+            source_dir: PathBuf::from("/v1/work"),
+            dest_dir: PathBuf::from("/v2/alias"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        assert_skipped_same_file(&sink, "/v1/work/report.txt");
+        assert_untouched(&fake, Path::new("/v1/work/report.txt"), modified);
+    }
+
+    /// Delegates every [`FileSystem`] call to the inner fake but reports no
+    /// file identity, simulating a file whose handle cannot be opened for
+    /// identity (design D1's unknown-identity path fallback).
+    struct NoIdentity<F: FileSystem>(F);
+
+    impl<F: FileSystem> FileSystem for NoIdentity<F> {
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            let mut md = self.0.metadata(path)?;
+            md.file_id = None;
+            Ok(md)
+        }
+        fn metadata_follow(&self, path: &Path) -> io::Result<FsMetadata> {
+            let mut md = self.0.metadata_follow(path)?;
+            md.file_id = None;
+            Ok(md)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
+            self.0.read_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            self.0.create_dir(path)
+        }
+        fn copy_file_chunked(
+            &self,
+            from: &Path,
+            to: &Path,
+            chunk_bytes: usize,
+            on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
+        ) -> io::Result<u64> {
+            self.0.copy_file_chunked(from, to, chunk_bytes, on_chunk)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.0.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.0.remove_file(path)
+        }
+        fn remove_dir(&self, path: &Path) -> io::Result<()> {
+            self.0.remove_dir(path)
+        }
+        fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()> {
+            self.0.set_readonly(path, readonly)
+        }
+        fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
+            self.0.set_modified(path, modified)
+        }
+        fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
+            self.0.list_streams(path)
+        }
+        fn copy_stream_chunked(
+            &self,
+            from: &Path,
+            stream: &OsStr,
+            to: &Path,
+            chunk_bytes: usize,
+        ) -> io::Result<u64> {
+            self.0.copy_stream_chunked(from, stream, to, chunk_bytes)
+        }
+        fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
+            self.0.same_volume(a, b)
+        }
+    }
+
+    #[test]
+    fn copy_into_own_directory_without_identity_uses_path_fallback() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/work"));
+        let modified = self_copy_fixture(&fake, Path::new("/work/report.txt"));
+        let fs = NoIdentity(fake);
+
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![source("report.txt", "/work/report.txt")],
+            source_dir: PathBuf::from("/work"),
+            dest_dir: PathBuf::from("/work"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fs, &mut sink);
+
+        // With identity unreadable, `identity_matches` answers false and the
+        // same file would raise an overwrite conflict against itself; the
+        // path fallback must instead skip it without asking.
+        assert_skipped_same_file(&sink, "/work/report.txt");
+        assert_untouched(&fs.0, Path::new("/work/report.txt"), modified);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_fallback_compares_case_insensitively_on_windows() {
+        let mixed_case = Path::new(r"C:\Work\Report.txt");
+        let normalized_dots = Path::new(r"c:\work\.\report.txt");
+        let a = Path::new(r"C:\work\a.txt");
+        let b = Path::new(r"C:\work\b.txt");
+        assert!(normalized_paths_equal(mixed_case, normalized_dots));
+        assert!(!normalized_paths_equal(a, b));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn path_fallback_compares_exactly_off_windows() {
+        let with_dot = Path::new("/work/./report.txt");
+        let plain = Path::new("/work/report.txt");
+        let different_case = Path::new("/work/Report.txt");
+        assert!(normalized_paths_equal(with_dot, plain));
+        assert!(!normalized_paths_equal(different_case, plain));
     }
 }
