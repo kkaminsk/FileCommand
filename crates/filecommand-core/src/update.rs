@@ -119,6 +119,10 @@ pub enum ButtonId {
     ConflictSkip,
     ConflictSkipAll,
     ConflictRename,
+    /// The overwrite-conflict dialog's `(C)ancel` control — the same job
+    /// abort Esc and `C` issue there (operation-dialogs "Overwrite-conflict
+    /// dialog"; process-lifecycle-hardening design D7).
+    ConflictCancel,
     ErrorRetry,
     ErrorSkip,
     ErrorSkipAll,
@@ -4130,6 +4134,7 @@ pub fn button_command(id: ButtonId) -> Option<Command> {
         ButtonId::ConflictSkip => Some(Command::FileOpConflictChoice(ConflictChoice::Skip)),
         ButtonId::ConflictSkipAll => Some(Command::FileOpConflictChoice(ConflictChoice::SkipAll)),
         ButtonId::ConflictRename => Some(Command::FileOpBeginRename),
+        ButtonId::ConflictCancel => Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)),
         ButtonId::ErrorRetry => Some(Command::FileOpErrorChoice(ErrorChoice::Retry)),
         ButtonId::ErrorSkip => Some(Command::FileOpErrorChoice(ErrorChoice::Skip)),
         ButtonId::ErrorSkipAll => Some(Command::FileOpErrorChoice(ErrorChoice::SkipAll)),

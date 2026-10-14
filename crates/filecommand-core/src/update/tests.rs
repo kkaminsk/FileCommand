@@ -906,6 +906,59 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
+/// application-shell "Panic hook restores the terminal before reporting"
+/// scenario "A panicked job ends and closes its dialog"
+/// (process-lifecycle-hardening task 5.5): the worker's `catch_unwind`
+/// reply is a `Cancelled` outcome carrying one internal-error skipped item
+/// (design D6). The reducer needs no special case — the item takes the
+/// job to the summary, which names the error, and the panels re-read.
+#[test]
+fn job_done_cancelled_with_an_internal_error_item_shows_the_summary_and_rereads_panels() {
+    let mut state = test_state(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/right"),
+        dialog: RunningDialog::Progress { kind: JobKind::Copy, progress: ProgressInfo::starting(3, 30) },
+    });
+    state.left.cwd = PathBuf::from("/left");
+    state.right.cwd = PathBuf::from("/right");
+    let skipped = vec![SkippedItem::skipped(PathBuf::from("/left"), "internal error: index out of bounds".to_string())];
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Cancelled { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
+    );
+    assert_eq!(state.phase, UiPhase::FileOpSummary(skipped), "the progress dialog is gone and the summary names the internal error");
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![
+            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
+            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+        ],
+        "both affected panels re-read"
+    );
+
+    // "a new file operation can be started afterwards": dismissing the
+    // summary returns to the panels.
+    let (state, _) = update(state, Command::FileOpConfirm);
+    assert_eq!(state.phase, UiPhase::Panels);
+}
+
+/// application-shell scenario "A panicked listing ends as a failed listing"
+/// (process-lifecycle-hardening task 5.5): a `ListingFailed` that arrives
+/// after some chunks have streamed in clears the `Streaming` state — the
+/// panel stops showing `Reading… N` and shows the error instead.
+#[test]
+fn listing_failed_after_chunks_clears_the_streaming_state() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.progress = crate::panel::ListingProgress::Streaming { count: 0 };
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a.txt", 1), file_entry("b.txt", 2)] });
+    assert!(state.left.progress.is_streaming(), "setup precondition: still reading after the first chunk");
+
+    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "Internal error while reading /left: boom".to_string() });
+    assert!(!state.left.progress.is_streaming(), "no longer `Reading… N`: {:?}", state.left.progress);
+    assert_eq!(state.left.progress.count(), state.left.entries.len(), "the entries that did arrive are kept and counted");
+    assert_eq!(state.left.last_error.as_deref(), Some("Internal error while reading /left: boom"));
+}
+
 /// operation-dialogs "End-of-job skipped-files summary" scenario "Summary
 /// shown for warnings alone" (error-diagnostics): a `JobDone` whose
 /// `skipped` vector holds only warnings still moves to the summary phase
@@ -6436,6 +6489,26 @@ fn dialog_button_click_conflict_skip_all_sends_the_same_effect_as_the_key() {
     let (_, effects) = update(state.clone(), Command::FileOpConflictChoice(ConflictChoice::SkipAll));
     let (_, click_effects) = update(state, Command::DialogButtonClick(ButtonId::ConflictSkipAll));
     assert_eq!(effects, click_effects);
+}
+
+/// operation-dialogs "Overwrite-conflict dialog" scenario "The Cancel
+/// control and hotkey match Esc" (process-lifecycle-hardening task 4.5): a
+/// Cancel answer — by key or by the `(C)ancel` control — is forwarded to
+/// the job as `SendConflictReply(Cancel)` and the dialog returns to
+/// Progress until `JobDone` arrives, exactly like every other answer.
+#[test]
+fn conflict_cancel_answer_is_forwarded_and_returns_the_dialog_to_progress() {
+    let progress_state = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (state, _) = update(progress_state, Command::JobConflict(sample_conflict()));
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }), "setup precondition");
+
+    let (after_key, effects) = update(state.clone(), Command::FileOpConflictChoice(ConflictChoice::Cancel));
+    assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Cancel)]);
+    assert!(matches!(after_key.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }), "back to Progress until JobDone: {:?}", after_key.phase);
+
+    let (after_click, click_effects) = update(state, Command::DialogButtonClick(ButtonId::ConflictCancel));
+    assert_eq!(click_effects, effects, "the control routes to the same command as the key");
+    assert_eq!(after_click.phase, after_key.phase);
 }
 
 /// mouse-input "Running job accepts Cancel only" — the Cancel button click

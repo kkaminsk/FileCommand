@@ -5,16 +5,19 @@
 //! additionally exposing a cancel flag and a reply channel so the main loop
 //! can answer conflict/error dialogs the worker thread blocks on.
 
+use std::any::Any;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use filecommand_core::drives;
 use filecommand_core::fs_ops::{
-    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs,
+    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs, SkippedItem,
 };
 use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
@@ -46,6 +49,53 @@ pub(crate) fn deliver(tx: &Sender<Command>, kind: &str, cmd: Command) -> bool {
 /// (`C:\`, `\\server\share`).
 pub(crate) fn name_or_path(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// Run `body` under `catch_unwind`, turning a panic into its message
+/// (process-lifecycle-hardening design D6). Every worker body runs through
+/// this so a panic becomes that worker's normal failure reply instead of a
+/// `Reading… N` or a progress dialog that never closes: the panic hook
+/// itself does nothing on a non-UI thread (design D4), so this is the only
+/// place the payload is seen.
+pub(crate) fn guarded<T>(body: impl FnOnce() -> T) -> Result<T, String> {
+    panic::catch_unwind(AssertUnwindSafe(body)).map_err(|payload| panic_message(payload.as_ref()))
+}
+
+/// The text of a panic payload: the `&str` or `String` `panic!` was given,
+/// or `"unknown panic"` for anything else.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "unknown panic".to_string()
+    }
+}
+
+/// Record a contained worker panic in the diagnostic log (error-diagnostics
+/// coordination): with the hook silent off the UI thread, the log and the
+/// failure reply are the only places the message appears.
+fn log_worker_panic(kind: &str, message: &str) {
+    diag::log("worker", format_args!("{kind} worker panicked: {message}"));
+}
+
+/// Spawn one worker thread that runs `body` under [`guarded`] and hands the
+/// outcome — the body's value, or the panic message — to `reply`, which
+/// sends the worker's result (or its defined failure reply, design D6) to
+/// the event loop. The gauge token is held for the thread's whole lifetime,
+/// so it is released after the reply's last send even when the body
+/// panicked (idle-aware-event-loop design D3).
+fn spawn_worker<T, B, R>(token: WorkerToken, body: B, reply: R)
+where
+    T: Send + 'static,
+    B: FnOnce() -> T + Send + 'static,
+    R: FnOnce(Result<T, String>) + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let _token = token;
+        reply(guarded(body));
+    });
 }
 
 /// A live count of the worker threads that can still post to the event
@@ -115,9 +165,21 @@ const GIT_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 /// dialog shows the drive with a blank label meanwhile, and a result that
 /// arrives after the dialog closed is discarded by `core::update`.
 pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        let label = drives::volume_info(letter).map(|(label, _serial)| label);
+    spawn_drive_label_with(target, letter, generation, tx, token, move || drives::volume_info(letter).map(|(label, _serial)| label));
+}
+
+/// `spawn_drive_label` with the lookup injected (a test seam for the
+/// panic reply, design D6): a panicked lookup resolves to no label, exactly
+/// like absent media.
+fn spawn_drive_label_with<B>(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce() -> Option<String> + Send + 'static,
+{
+    spawn_worker(token, body, move |result| {
+        let label = result.unwrap_or_else(|msg| {
+            log_worker_panic("drive label", &msg);
+            None
+        });
         deliver(&tx, "drive label", Command::DriveLabelResolved { target, letter, label, generation });
     });
 }
@@ -128,11 +190,43 @@ pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: S
 /// and complete together, and a single fill-in keeps the panel from
 /// repainting several times in a row.
 pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        let values = gather_info(&StdFsReader, &path);
-        deliver(&tx, "info query", Command::InfoResolved { panel, path, request, values });
-    });
+    spawn_info_query_with(panel, path, request, tx, token, |path| gather_info(&StdFsReader, path));
+}
+
+/// `spawn_info_query` with the gathering injected (design D6): a panic
+/// resolves every value to empty or zero, as for an unreadable directory,
+/// so no field is left showing `…` forever.
+fn spawn_info_query_with<B>(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path) -> InfoValues + Send + 'static,
+{
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(&body_path),
+        move |result| {
+            let values = result.unwrap_or_else(|msg| {
+                log_worker_panic("info query", &msg);
+                unreadable_info()
+            });
+            deliver(&tx, "info query", Command::InfoResolved { panel, path, request, values });
+        },
+    );
+}
+
+/// Every Info value resolved to empty or zero — what `gather_info` reports
+/// for a directory it cannot read and no drive letter, and the panic reply
+/// of the Info worker (design D6).
+fn unreadable_info() -> InfoValues {
+    InfoValues {
+        memory_bytes: Some(0),
+        drive_total: Some(0),
+        drive_free: Some(0),
+        volume_label: Some(String::new()),
+        serial: Some(drives::format_serial(0)),
+        file_count: Some(0),
+        dir_count: Some(0),
+    }
 }
 
 /// One panel's git-query slot: at most one status query runs per panel at a
@@ -250,7 +344,14 @@ where
     let query = Arc::new(query);
     let mut current = Some(first);
     while let Some((path, request)) = current {
-        let (info, timed_out_root) = run_one_git_query(timeout, &path, &query);
+        // The query itself already runs on `race_with_timeout`'s inner
+        // thread, whose panic surfaces as `Disconnected`; this guards the
+        // runner's own half so a panic there still answers "no info"
+        // (process-lifecycle-hardening design D6).
+        let (info, timed_out_root) = guarded(|| run_one_git_query(timeout, &path, &query)).unwrap_or_else(|msg| {
+            log_worker_panic("git info", &msg);
+            (GitInfo::none(), None)
+        });
         deliver(&tx, "git info", Command::GitInfoResolved { panel, path, request, info, timed_out_root: timed_out_root.clone() });
 
         let mut state = slot.lock().unwrap();
@@ -376,13 +477,24 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
 /// source is a local, so the worker's handle is released when the search
 /// returns (viewer: Instant open — "Closing the viewer releases the file").
 pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        let result = match ByteSource::open(&path) {
-            Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
-            Err(_) => None,
-        };
-        let (offset, match_range) = match result {
+    spawn_viewer_search_with(request, tx, token, move || match ByteSource::open(&path) {
+        Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
+        Err(_) => None,
+    });
+}
+
+/// `spawn_viewer_search` with the scan injected (design D6): a panicked
+/// scan reports "no match", the same reply as an unopenable file.
+fn spawn_viewer_search_with<B>(request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce() -> Option<(u64, u64)> + Send + 'static,
+{
+    spawn_worker(token, body, move |result| {
+        let found = result.unwrap_or_else(|msg| {
+            log_worker_panic("viewer search", &msg);
+            None
+        });
+        let (offset, match_range) = match found {
             Some((start, end)) => (Some(start), Some((start, end))),
             None => (None, None),
         };
@@ -399,11 +511,27 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
 /// leaving the query outstanding forever (additional-panel-modes "Children
 /// read on expand"; design D7).
 pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        let children = filecommand_core::listing::list_child_dirs(&StdFsReader, &path).unwrap_or_default();
-        deliver(&tx, "tree expansion", Command::TreeNodeExpanded { panel, path, children });
-    });
+    spawn_tree_expand_with(panel, path, tx, token, |path| filecommand_core::listing::list_child_dirs(&StdFsReader, path).unwrap_or_default());
+}
+
+/// `spawn_tree_expand` with the read injected (design D6): a panicked read
+/// reports no children, the same reply as a read failure.
+fn spawn_tree_expand_with<B>(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path) -> Vec<Entry> + Send + 'static,
+{
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(&body_path),
+        move |result| {
+            let children = result.unwrap_or_else(|msg| {
+                log_worker_panic("tree expansion", &msg);
+                vec![]
+            });
+            deliver(&tx, "tree expansion", Command::TreeNodeExpanded { panel, path, children });
+        },
+    );
 }
 
 /// Run the Alt+F7 subtree name search on a worker thread, streaming each
@@ -414,44 +542,93 @@ pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>, t
 /// (find-file "Non-blocking search with static progress", "UI stays
 /// responsive during a large walk").
 pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        find_in_subtree(&StdFsReader, &root, &pattern, |m| {
-            deliver(&tx, "find match", Command::FindFileMatch { request, m });
+    spawn_find_subtree_with(root, pattern, request, tx, token, move |root, pattern, tx| {
+        find_in_subtree(&StdFsReader, root, pattern, |m| {
+            deliver(tx, "find match", Command::FindFileMatch { request, m });
         });
-        deliver(&tx, "find done", Command::FindFileSearchDone { request });
     });
 }
 
+/// `spawn_find_subtree` with the walk injected (design D6): whether the
+/// walk returns or panics, the search is reported done, so the find dialog
+/// never shows a search still in progress.
+fn spawn_find_subtree_with<B>(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path, &str, &Sender<Command>) + Send + 'static,
+{
+    let body_tx = tx.clone();
+    spawn_worker(
+        token,
+        move || body(&root, &pattern, &body_tx),
+        move |result| {
+            if let Err(msg) = result {
+                log_worker_panic("find", &msg);
+            }
+            deliver(&tx, "find done", Command::FindFileSearchDone { request });
+        },
+    );
+}
+
 pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
-    std::thread::spawn(move || {
-        let _token = token;
-        let mut total = 0usize;
+    spawn_listing_with(panel, path, tx, token, read_listing);
+}
 
-        if parent_path(&path).is_some() {
-            total += 1;
-            if !deliver(&tx, "listing chunk", Command::ListingChunk { panel, entries: vec![Entry::parent_dir()] }) {
-                return;
-            }
+/// The listing worker's body: stream the synthetic `..` and every chunk of
+/// `path`, then return the closing message — `ListingComplete`, or
+/// `ListingFailed` naming the directory. `None` when a chunk could not be
+/// delivered (the event loop is gone), since nothing is listening for the
+/// closing message either.
+fn read_listing(panel: PanelSide, path: &Path, tx: &Sender<Command>) -> Option<Command> {
+    let mut total = 0usize;
+
+    if parent_path(path).is_some() {
+        total += 1;
+        if !deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: vec![Entry::parent_dir()] }) {
+            return None;
         }
+    }
 
-        let reader = StdFsReader;
-        let result = list_dir_chunked(&reader, &path, CHUNK_SIZE, |chunk| {
-            deliver(&tx, "listing chunk", Command::ListingChunk { panel, entries: chunk });
-        });
-
-        match result {
-            Ok(fs_count) => {
-                deliver(&tx, "listing complete", Command::ListingComplete { panel, total: total + fs_count });
-            }
-            Err(e) => {
-                // The message names the directory it could not read
-                // (filesystem-error-handling "Error messages name the
-                // affected path"), not just the bare OS error.
-                deliver(&tx, "listing failure", Command::ListingFailed { panel, message: listing_failed_message(&path, &e) });
-            }
-        }
+    let reader = StdFsReader;
+    let result = list_dir_chunked(&reader, path, CHUNK_SIZE, |chunk| {
+        deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: chunk });
     });
+
+    Some(match result {
+        Ok(fs_count) => Command::ListingComplete { panel, total: total + fs_count },
+        // The message names the directory it could not read
+        // (filesystem-error-handling "Error messages name the affected
+        // path"), not just the bare OS error.
+        Err(e) => Command::ListingFailed { panel, message: listing_failed_message(path, &e) },
+    })
+}
+
+/// `spawn_listing` with the read injected (design D6): a panicked read ends
+/// as a failed listing naming the directory, so the panel leaves `Reading…
+/// N` and shows the error instead of waiting forever (application-shell "A
+/// panicked listing ends as a failed listing").
+fn spawn_listing_with<B>(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(PanelSide, &Path, &Sender<Command>) -> Option<Command> + Send + 'static,
+{
+    let body_tx = tx.clone();
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(panel, &body_path, &body_tx),
+        move |result| {
+            let closing = match result {
+                Ok(closing) => closing,
+                Err(msg) => {
+                    log_worker_panic("listing", &msg);
+                    Some(Command::ListingFailed { panel, message: format!("Internal error while reading {}: {msg}", path.display()) })
+                }
+            };
+            if let Some(cmd) = closing {
+                let kind = if matches!(cmd, Command::ListingFailed { .. }) { "listing failure" } else { "listing complete" };
+                deliver(&tx, kind, cmd);
+            }
+        },
+    );
 }
 
 /// The main loop's answer to a conflict/error dialog the worker thread is
@@ -462,13 +639,21 @@ pub enum JobReply {
 }
 
 /// What the main loop keeps for an in-flight job: a flag it can flip to
-/// request cancellation, and a channel to forward dialog answers down to
-/// the blocked worker thread. Not part of `core::State` — channels/flags
-/// are TUI-only plumbing, not pure application state.
+/// request cancellation, a channel to forward dialog answers down to the
+/// blocked worker thread, and the thread itself so quit can wait for its
+/// cancellation cleanup (application-shell "Quit waits for job cancellation
+/// cleanup"; process-lifecycle-hardening design D3). Not part of
+/// `core::State` — channels/flags/threads are TUI-only plumbing, not pure
+/// application state.
 pub struct JobHandle {
     pub cancel: CancelFlag,
     pub reply_tx: Sender<JobReply>,
+    pub thread: JoinHandle<()>,
 }
+
+/// How often a job waiting on a conflict or error answer re-checks its
+/// cancel flag (design D5). Comfortably inside the 2 s quit budget.
+const REPLY_POLL: Duration = Duration::from_millis(100);
 
 struct ChannelSink {
     tx: Sender<Command>,
@@ -493,6 +678,27 @@ impl ChannelSink {
             deliver(&self.tx, "job progress", Command::JobProgress(info));
         }
     }
+
+    /// Wait for the main loop's answer to the prompt just sent, observing
+    /// cancellation meanwhile (operation-dialogs "Cancellation is observed
+    /// while a job waits for an answer"; design D5): `None` when the cancel
+    /// flag was set before an answer arrived, or when the answer can no
+    /// longer arrive because the `JobHandle` — and its sender — is gone.
+    /// Either way the caller resolves the prompt as an abort, never as a
+    /// default Skip applied to this and later items.
+    fn await_reply(&self) -> Option<JobReply> {
+        loop {
+            match self.reply_rx.recv_timeout(REPLY_POLL) {
+                Ok(reply) => return Some(reply),
+                Err(RecvTimeoutError::Timeout) => {
+                    if self.cancel.is_cancelled() {
+                        return None;
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
 }
 
 impl JobSink for ChannelSink {
@@ -504,14 +710,16 @@ impl JobSink for ChannelSink {
 
     fn conflict(&mut self, info: ConflictInfo) -> ConflictChoice {
         self.flush_progress();
+        // An undeliverable prompt means the event loop is gone: stop rather
+        // than continue unattended with a default answer.
         if !deliver(&self.tx, "conflict prompt", Command::JobConflict(info)) {
-            return ConflictChoice::Skip;
+            return ConflictChoice::Cancel;
         }
-        // Blocks until the main loop answers via `JobHandle::reply_tx` after
-        // the user responds to the conflict dialog.
-        match self.reply_rx.recv() {
-            Ok(JobReply::Conflict(choice)) => choice,
-            _ => ConflictChoice::Skip,
+        match self.await_reply() {
+            Some(JobReply::Conflict(choice)) => choice,
+            // Cancelled or disconnected while waiting — or a reply of the
+            // wrong kind, which core never sends while a conflict is shown.
+            _ => ConflictChoice::Cancel,
         }
     }
 
@@ -520,8 +728,8 @@ impl JobSink for ChannelSink {
         if !deliver(&self.tx, "error prompt", Command::JobError(info)) {
             return ErrorChoice::Abort;
         }
-        match self.reply_rx.recv() {
-            Ok(JobReply::Error(choice)) => choice,
+        match self.await_reply() {
+            Some(JobReply::Error(choice)) => choice,
             _ => ErrorChoice::Abort,
         }
     }
@@ -1077,20 +1285,253 @@ mod tests {
             "the held update is flushed before the conflict question"
         );
     }
+
+    // -------------------------------------------------------------
+    // process-lifecycle-hardening: cancellation is observed while a job
+    // waits for an answer (operation-dialogs; design D5; task 3.2)
+    // -------------------------------------------------------------
+
+    fn sample_conflict() -> ConflictInfo {
+        ConflictInfo {
+            source_name: std::ffi::OsString::from("b.txt"),
+            source_size: 2_000,
+            source_modified: None,
+            target_path: PathBuf::from("/dst/b.txt"),
+            target_size: 1_000,
+            target_modified: None,
+        }
+    }
+
+    fn sample_error() -> ErrorInfo {
+        ErrorInfo { path: PathBuf::from("/src/locked.db"), message: "in use".to_string() }
+    }
+
+    /// Set the sink's cancel flag from another thread after `delay`.
+    fn cancel_after(cancel: &CancelFlag, delay: Duration) {
+        let cancel = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(delay);
+            cancel.cancel();
+        });
+    }
+
+    #[test]
+    fn a_cancel_request_while_waiting_on_a_conflict_resolves_it_as_cancel() {
+        // Scenario "A cancel request ends a job waiting on a conflict
+        // prompt": no answer is ever sent; the flag alone ends the wait,
+        // within about two poll intervals.
+        let (mut sink, _reply_tx, _rx) = recording_sink();
+        cancel_after(&sink.cancel, Duration::from_millis(50));
+        let started = Instant::now();
+        assert_eq!(sink.conflict(sample_conflict()), ConflictChoice::Cancel);
+        assert!(started.elapsed() < Duration::from_millis(500), "the wait ends promptly after the flag is set, took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_cancel_request_while_waiting_on_an_error_resolves_it_as_abort() {
+        // Scenario "A cancel request ends a job waiting on an error prompt".
+        let (mut sink, _reply_tx, _rx) = recording_sink();
+        cancel_after(&sink.cancel, Duration::from_millis(50));
+        let started = Instant::now();
+        assert_eq!(sink.error(sample_error()), ErrorChoice::Abort);
+        assert!(started.elapsed() < Duration::from_millis(500), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn a_dropped_reply_sender_resolves_a_conflict_as_cancel_and_an_error_as_abort() {
+        // Scenario "A lost answer does not resume the job with a default":
+        // the `JobHandle` is gone, so neither prompt can ever be answered.
+        let (mut sink, reply_tx, _rx) = recording_sink();
+        drop(reply_tx);
+        assert_eq!(sink.conflict(sample_conflict()), ConflictChoice::Cancel, "not the old default Skip");
+        assert_eq!(sink.error(sample_error()), ErrorChoice::Abort);
+    }
+
+    #[test]
+    fn a_normal_answer_is_still_returned_unchanged() {
+        let (mut sink, reply_tx, _rx) = recording_sink();
+        reply_tx.send(JobReply::Conflict(ConflictChoice::Rename(std::ffi::OsString::from("b2.txt")))).unwrap();
+        assert_eq!(sink.conflict(sample_conflict()), ConflictChoice::Rename(std::ffi::OsString::from("b2.txt")));
+        reply_tx.send(JobReply::Error(ErrorChoice::Retry)).unwrap();
+        assert_eq!(sink.error(sample_error()), ErrorChoice::Retry);
+    }
+
+    #[test]
+    fn an_answer_arriving_after_a_poll_interval_is_still_delivered() {
+        // The timeout loop keeps waiting while the flag is clear: an answer
+        // that takes longer than one poll interval still arrives.
+        let (mut sink, reply_tx, _rx) = recording_sink();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = reply_tx.send(JobReply::Conflict(ConflictChoice::Overwrite));
+        });
+        assert_eq!(sink.conflict(sample_conflict()), ConflictChoice::Overwrite);
+    }
+
+    // -------------------------------------------------------------
+    // process-lifecycle-hardening: worker panics become each worker's
+    // defined failure reply (application-shell "Panic hook restores the
+    // terminal before reporting"; design D6; task 5.4)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn guarded_returns_the_value_or_the_panic_message() {
+        assert_eq!(guarded(|| 7), Ok(7));
+        assert_eq!(guarded::<()>(|| panic!("plain str")), Err("plain str".to_string()));
+        let n = 3;
+        assert_eq!(guarded::<()>(|| panic!("formatted {n}")), Err("formatted 3".to_string()));
+        assert_eq!(guarded::<()>(|| std::panic::panic_any(42u8)), Err("unknown panic".to_string()));
+    }
+
+    fn recv(rx: &mpsc::Receiver<Command>) -> Command {
+        rx.recv_timeout(Duration::from_secs(5)).expect("the worker replies even after a panic")
+    }
+
+    #[test]
+    fn a_panicked_listing_ends_as_a_failed_listing_naming_the_path() {
+        let (tx, rx) = mpsc::channel();
+        let gauge = WorkerGauge::new();
+        let dir = PathBuf::from(if cfg!(windows) { r"C:\data\reports" } else { "/data/reports" });
+        spawn_listing_with(PanelSide::Right, dir.clone(), tx, gauge.token(), |_, _, _| panic!("scripted listing panic"));
+        match recv(&rx) {
+            Command::ListingFailed { panel, message } => {
+                assert_eq!(panel, PanelSide::Right);
+                assert_eq!(message, format!("Internal error while reading {}: scripted listing panic", dir.display()));
+            }
+            other => panic!("expected ListingFailed, got {other:?}"),
+        }
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "nothing else follows");
+    }
+
+    #[test]
+    fn a_panicked_job_ends_cancelled_with_an_internal_error_item() {
+        let (tx, rx) = mpsc::channel();
+        let job = Job {
+            kind: filecommand_core::fs_ops::JobKind::Copy,
+            sources: vec![],
+            source_dir: PathBuf::from("/src"),
+            dest_dir: PathBuf::from("/dst"),
+            new_dir_name: None,
+        };
+        let handle = spawn_job_with(job, tx, WorkerGauge::new().token(), |_, _| panic!("scripted job panic"));
+        match recv(&rx) {
+            Command::JobDone { outcome: JobOutcome::Cancelled { skipped }, source_dir, dest_dir } => {
+                assert_eq!((source_dir, dest_dir), (PathBuf::from("/src"), PathBuf::from("/dst")));
+                assert_eq!(skipped.len(), 1);
+                assert_eq!(skipped[0].path, PathBuf::from("/src"));
+                assert_eq!(skipped[0].reason, "internal error: scripted job panic");
+                assert_eq!(skipped[0].kind, ItemKind::Skipped);
+            }
+            other => panic!("expected a Cancelled JobDone, got {other:?}"),
+        }
+        assert!(handle.thread.join().is_ok(), "the panic was contained: the thread itself exits normally");
+    }
+
+    #[test]
+    fn a_panicked_info_query_resolves_every_value() {
+        let (tx, rx) = mpsc::channel();
+        spawn_info_query_with(PanelSide::Left, PathBuf::from("/x"), 4, tx, WorkerGauge::new().token(), |_| panic!("scripted info panic"));
+        match recv(&rx) {
+            Command::InfoResolved { panel, path, request, values } => {
+                assert_eq!((panel, path, request), (PanelSide::Left, PathBuf::from("/x"), 4));
+                assert!(values.is_complete(), "no field is left pending: {values:?}");
+                assert_eq!((values.file_count, values.dir_count), (Some(0), Some(0)));
+            }
+            other => panic!("expected InfoResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicked_drive_label_lookup_resolves_to_no_label() {
+        let (tx, rx) = mpsc::channel();
+        spawn_drive_label_with(PanelSide::Left, 'E', 9, tx, WorkerGauge::new().token(), || panic!("scripted label panic"));
+        match recv(&rx) {
+            Command::DriveLabelResolved { target, letter, label, generation } => {
+                assert_eq!((target, letter, label, generation), (PanelSide::Left, 'E', None, 9));
+            }
+            other => panic!("expected DriveLabelResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicked_tree_expansion_resolves_to_no_children() {
+        let (tx, rx) = mpsc::channel();
+        spawn_tree_expand_with(PanelSide::Right, PathBuf::from("/tree"), tx, WorkerGauge::new().token(), |_| panic!("scripted tree panic"));
+        match recv(&rx) {
+            Command::TreeNodeExpanded { panel, path, children } => {
+                assert_eq!((panel, path), (PanelSide::Right, PathBuf::from("/tree")));
+                assert!(children.is_empty());
+            }
+            other => panic!("expected TreeNodeExpanded, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicked_find_walk_still_reports_the_search_done() {
+        let (tx, rx) = mpsc::channel();
+        spawn_find_subtree_with(PathBuf::from("/root"), "x".to_string(), 11, tx, WorkerGauge::new().token(), |_, _, _| panic!("scripted find panic"));
+        match recv(&rx) {
+            Command::FindFileSearchDone { request } => assert_eq!(request, 11),
+            other => panic!("expected FindFileSearchDone, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicked_viewer_search_reports_no_match() {
+        let (tx, rx) = mpsc::channel();
+        spawn_viewer_search_with(5, tx, WorkerGauge::new().token(), || panic!("scripted search panic"));
+        match recv(&rx) {
+            Command::ViewerSearchResult { offset: None, match_range: None, request: 5 } => {}
+            other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_panicked_worker_still_releases_its_gauge_token_after_replying() {
+        let (tx, rx) = mpsc::channel();
+        let gauge = WorkerGauge::new();
+        spawn_drive_label_with(PanelSide::Left, 'E', 1, tx, gauge.token(), || panic!("boom"));
+        let _ = recv(&rx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while gauge.live() != 0 {
+            assert!(Instant::now() < deadline, "the token is released once the reply is out");
+            std::thread::yield_now();
+        }
+    }
 }
 
 pub fn spawn_job(job: Job, tx: Sender<Command>, token: WorkerToken) -> JobHandle {
+    spawn_job_with(job, tx, token, |job, sink| {
+        let fs = RealFs::new();
+        filecommand_core::fs_ops::run_job(job, &fs, sink);
+    })
+}
+
+/// `spawn_job` with the engine run injected (design D6): a panicked job
+/// still ends — as `Cancelled` with one skipped item naming the internal
+/// error against the source directory — so the progress or prompt dialog
+/// closes, the panels re-read, and the end-of-job summary names the error
+/// (application-shell "A panicked job ends and closes its dialog"). The
+/// skipped list `run_job` had built up is lost with the unwound frame; the
+/// sender is cloned before the sink takes it so the reply can still go out.
+fn spawn_job_with<B>(job: Job, tx: Sender<Command>, token: WorkerToken, body: B) -> JobHandle
+where
+    B: FnOnce(&Job, &mut ChannelSink) + Send + 'static,
+{
     let cancel = CancelFlag::new();
     let (reply_tx, reply_rx) = mpsc::channel::<JobReply>();
-    let handle = JobHandle { cancel: cancel.clone(), reply_tx };
     let source_dir = job.source_dir.clone();
     let dest_dir = job.dest_dir.clone();
-    let cancel_for_thread = cancel;
-    std::thread::spawn(move || {
+    let cancel_for_thread = cancel.clone();
+    let thread = std::thread::spawn(move || {
         let _token = token;
-        let fs = RealFs::new();
-        let mut sink = ChannelSink { tx, reply_rx, cancel: cancel_for_thread, source_dir, dest_dir, throttle: ProgressThrottle::new() };
-        filecommand_core::fs_ops::run_job(&job, &fs, &mut sink);
+        let failure_tx = tx.clone();
+        let mut sink = ChannelSink { tx, reply_rx, cancel: cancel_for_thread, source_dir: source_dir.clone(), dest_dir: dest_dir.clone(), throttle: ProgressThrottle::new() };
+        if let Err(msg) = guarded(move || body(&job, &mut sink)) {
+            log_worker_panic("job", &msg);
+            let skipped = vec![SkippedItem::skipped(source_dir.clone(), format!("internal error: {msg}"))];
+            deliver(&failure_tx, "job outcome", Command::JobDone { outcome: JobOutcome::Cancelled { skipped }, source_dir, dest_dir });
+        }
     });
-    handle
+    JobHandle { cancel, reply_tx, thread }
 }

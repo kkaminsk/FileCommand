@@ -495,6 +495,14 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                     ConflictChoice::Rename(new_name) => {
                         final_target = target.parent().unwrap_or(&job.dest_dir).join(new_name);
                     }
+                    // Abort from the prompt: the conflicting target is left
+                    // as it is and not recorded as skipped, nothing after it
+                    // is processed (operation-dialogs "Overwrite-conflict
+                    // dialog"; process-lifecycle-hardening design D7).
+                    ConflictChoice::Cancel => {
+                        cancelled = true;
+                        break 'files;
+                    }
                 }
             }
 
@@ -592,6 +600,10 @@ fn run_move_same_volume(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) 
                         continue 'items;
                     }
                     ConflictChoice::Rename(new_name) => final_target = job.dest_dir.join(new_name),
+                    ConflictChoice::Cancel => {
+                        cancelled = true;
+                        break 'items;
+                    }
                 }
             }
         }
@@ -668,6 +680,10 @@ fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
                     return;
                 }
                 ConflictChoice::Rename(renamed_to) => final_target = job.dest_dir.join(renamed_to),
+                ConflictChoice::Cancel => {
+                    sink.done(JobOutcome::Cancelled { skipped });
+                    return;
+                }
             }
         }
     }
@@ -1108,6 +1124,95 @@ mod tests {
             other => panic!("expected two skipped items, got {other:?}"),
         }
         assert_eq!(fake.metadata(Path::new("/dst/a.txt")).unwrap().size, 99, "left untouched");
+    }
+
+    // -----------------------------------------------------------------
+    // process-lifecycle-hardening: Cancel from the conflict prompt
+    // (operation-dialogs "Overwrite-conflict dialog" — "Esc cancels the
+    // job from the conflict dialog"; design D7)
+    // -----------------------------------------------------------------
+
+    /// Three sources where only the second collides at the destination.
+    fn three_file_job(kind: JobKind, fake: &FakeFs) -> Job {
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/a.txt"), 1);
+        fake.add_file(Path::new("/src/b.txt"), 2);
+        fake.add_file(Path::new("/src/c.txt"), 3);
+        fake.add_dir(Path::new("/dst"));
+        fake.add_file(Path::new("/dst/b.txt"), 99);
+        Job {
+            kind,
+            sources: vec![source("a.txt", "/src/a.txt"), source("b.txt", "/src/b.txt"), source("c.txt", "/src/c.txt")],
+            source_dir: PathBuf::from("/src"),
+            dest_dir: PathBuf::from("/dst"),
+            new_dir_name: None,
+        }
+    }
+
+    #[test]
+    fn cancel_at_a_copy_conflict_stops_the_job_without_touching_or_recording_the_target() {
+        let fake = FakeFs::new();
+        // Distinct volumes so a Move would take the copy-then-delete path;
+        // for Copy it changes nothing.
+        let job = three_file_job(JobKind::Copy, &fake);
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Cancel);
+        run_job(&job, &fake, &mut sink);
+
+        assert_eq!(sink.conflicts_seen, 1, "the second file's conflict was asked once");
+        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "cancelled with no skipped item for the conflicting target: {:?}", sink.outcome);
+        assert_eq!(fake.metadata(Path::new("/dst/a.txt")).unwrap().size, 1, "the first file was copied before the conflict");
+        assert_eq!(fake.metadata(Path::new("/dst/b.txt")).unwrap().size, 99, "the conflicting target is untouched");
+        assert!(fake.metadata(Path::new("/dst/c.txt")).is_err(), "nothing after the conflict is processed");
+    }
+
+    #[test]
+    fn cancel_at_a_cross_volume_move_conflict_leaves_the_remaining_sources_in_place() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/src"), 1);
+        fake.set_volume(Path::new("/dst"), 2);
+        let job = three_file_job(JobKind::Move, &fake);
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Cancel);
+        run_job(&job, &fake, &mut sink);
+
+        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert!(fake.metadata(Path::new("/src/a.txt")).is_err(), "the first file was moved before the conflict");
+        assert_eq!(fake.metadata(Path::new("/dst/b.txt")).unwrap().size, 99, "the conflicting target is untouched");
+        assert!(fake.metadata(Path::new("/src/b.txt")).is_ok() && fake.metadata(Path::new("/src/c.txt")).is_ok(), "the conflicting source and the third file stay put");
+        assert!(fake.metadata(Path::new("/dst/c.txt")).is_err());
+    }
+
+    #[test]
+    fn cancel_at_a_same_volume_move_conflict_stops_the_job_without_touching_the_target() {
+        let fake = FakeFs::new();
+        let job = three_file_job(JobKind::Move, &fake);
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Cancel);
+        run_job(&job, &fake, &mut sink);
+
+        assert_eq!(sink.conflicts_seen, 1);
+        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert!(fake.metadata(Path::new("/dst/a.txt")).is_ok() && fake.metadata(Path::new("/src/a.txt")).is_err(), "the first file was moved");
+        assert_eq!(fake.metadata(Path::new("/dst/b.txt")).unwrap().size, 99, "the conflicting target is untouched");
+        assert!(fake.metadata(Path::new("/src/b.txt")).is_ok(), "the conflicting source stays");
+        assert!(fake.metadata(Path::new("/src/c.txt")).is_ok() && fake.metadata(Path::new("/dst/c.txt")).is_err(), "the third file is not moved");
+    }
+
+    #[test]
+    fn cancel_at_a_rename_conflict_ends_the_job_cancelled_with_both_files_untouched() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/d"));
+        fake.add_file(Path::new("/d/a.txt"), 4);
+        fake.add_file(Path::new("/d/b.txt"), 9);
+        let job = rename_job("/d", "a.txt", "b.txt");
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Cancel);
+        run_job(&job, &fake, &mut sink);
+
+        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_eq!(fake.metadata(Path::new("/d/a.txt")).unwrap().size, 4);
+        assert_eq!(fake.metadata(Path::new("/d/b.txt")).unwrap().size, 9, "the conflicting target is untouched");
     }
 
     #[test]

@@ -931,6 +931,13 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
             KeyCode::Char('s') | KeyCode::Char('S') => Some(Command::FileOpConflictChoice(ConflictChoice::Skip)),
             KeyCode::Char('a') | KeyCode::Char('A') => Some(Command::FileOpConflictChoice(ConflictChoice::SkipAll)),
             KeyCode::Char('r') | KeyCode::Char('R') => Some(Command::FileOpBeginRename),
+            // Cancel the job from the prompt — Esc or a plain `c`/`C`,
+            // mirroring the Progress dialog's own cancel above
+            // (operation-dialogs "Overwrite-conflict dialog": "Esc cancels
+            // the job from the conflict dialog"; process-lifecycle-hardening
+            // design D7). The plain guard keeps Ctrl+C out, as for Progress.
+            KeyCode::Esc => Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)),
+            KeyCode::Char('c') | KeyCode::Char('C') if is_plain(&key) => Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)),
             _ => None,
         },
         RunningDialog::Error { .. } => match key.code {

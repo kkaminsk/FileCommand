@@ -372,6 +372,48 @@ fn conflict_dialog_rename_mode_routes_typing_instead_of_mnemonics() {
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpCancel));
 }
 
+/// operation-dialogs "Overwrite-conflict dialog" scenarios "Esc cancels the
+/// job from the conflict dialog" and "The Cancel control and hotkey match
+/// Esc" (process-lifecycle-hardening task 4.4): with no rename field open,
+/// Esc and a plain `c`/`C` all issue the Cancel answer; Ctrl+C stays
+/// unmapped here as it is on the Progress dialog.
+#[test]
+fn conflict_dialog_esc_and_plain_c_cancel_the_job() {
+    let state = conflict_state(None);
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
+}
+
+/// Scenario "Esc in the Rename field returns to the choices": with the
+/// field open, Esc still closes the field (`FileOpCancel`) and never
+/// cancels the job; a typed `c` is text, not the hotkey.
+#[test]
+fn conflict_dialog_esc_in_the_rename_field_closes_the_field_not_the_job() {
+    let state = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpCancel));
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::TextEdit(TextEditOp::Insert('c'))));
+}
+
+/// operation-dialogs "Cancellation is observed while a job waits for an
+/// answer" scenario "Esc on the error-recovery dialog aborts": pinned
+/// (process-lifecycle-hardening task 4.4) — the mapping predates the
+/// scenario.
+#[test]
+fn error_dialog_esc_chooses_abort() {
+    let state = state_with(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/left"),
+        dialog: RunningDialog::Error {
+            kind: filecommand_core::fs_ops::JobKind::Delete,
+            info: filecommand_core::fs_ops::ErrorInfo { path: PathBuf::from("/left/locked.db"), message: "in use".into() },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(1, 1),
+        },
+    });
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpErrorChoice(ErrorChoice::Abort)));
+}
+
 #[test]
 fn error_dialog_routes_mnemonic_keys() {
     let state = state_with(UiPhase::FileOpRunning {

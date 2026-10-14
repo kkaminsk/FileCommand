@@ -25,6 +25,7 @@ use filecommand_core::{anim, config, drives, identity, update, Command, Effect, 
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
+use crate::console;
 use crate::diag;
 use crate::hitmap::HitMap;
 use crate::input::{self, MouseTracker, ViewerInput};
@@ -39,6 +40,14 @@ const POLL_INTERVAL: Duration = Duration::from_millis(33);
 const BURST_MAX_EVENTS: usize = 64;
 /// The burst's other bound: about this much processing time, then a draw.
 const BURST_MAX_DURATION: Duration = Duration::from_millis(8);
+/// How long a confirmed quit waits for a running job to finish its
+/// cancellation cleanup — removing a partially written destination file —
+/// before exiting anyway (application-shell "Quit waits for job cancellation
+/// cleanup"; process-lifecycle-hardening design D3). Bounded so a write
+/// blocked on an unresponsive share cannot hang quit.
+const QUIT_JOB_WAIT: Duration = Duration::from_secs(2);
+/// How often [`shutdown_job`] re-checks whether the job thread has ended.
+const QUIT_JOB_POLL: Duration = Duration::from_millis(10);
 const CONFIG_FILE: &str = "config.toml";
 const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 
@@ -346,7 +355,19 @@ fn legacy_notice(cwd: &Path, profile: &Path) -> Option<String> {
 }
 
 pub fn run(launch: LaunchOptions) -> io::Result<()> {
+    // Installed from this thread, which thereby becomes the UI thread the
+    // hook restores the terminal for; worker panics leave it alone
+    // (process-lifecycle-hardening design D4).
     crate::terminal::install_panic_hook();
+    // The console control handler that keeps a Ctrl+C typed during a
+    // suspended child run from ending FileCommand (application-shell
+    // "Ctrl+C during a suspended child run stops only the child"; design
+    // D1). Registered once; a failure only leaves the old behavior in place,
+    // so it is logged rather than fatal.
+    #[cfg(windows)]
+    if let Err(e) = console::install_ctrl_handler() {
+        diag::log("startup", format_args!("console control handler not installed: {e}"));
+    }
     // The diagnostic log is resolved and opened before anything below can
     // warn, so every startup warning — including ones a later warning
     // replaces in the single-slot dialog — is recorded (error-diagnostics
@@ -459,7 +480,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
-        return Ok(());
+        return shutdown(&mut rt);
     }
     let (mut state, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
     let mut hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
@@ -529,7 +550,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                 let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
                 // Design D5: with the first key handled, keep applying
@@ -540,17 +561,17 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 state = s;
                 needs_draw |= burst_applied;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
             }
             Some(Event::Resize(w, h)) => {
                 let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 let (s, quit) = apply(s, Command::Resize(w, h), &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
                 needs_draw = true;
@@ -558,7 +579,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             Some(Event::Mouse(first)) => {
                 let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
                 // Drain every mouse event already queued this frame after
@@ -578,7 +599,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 }
                 let (s, quit, batch_dirty) = apply_mouse_batch(state, batch, &hitmap, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
                 needs_draw |= batch_dirty;
@@ -589,7 +610,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             Some(Event::Paste(text)) => {
                 let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
                 for cmd in input::map_paste(&text, &state) {
@@ -597,7 +618,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                     state = s;
                     needs_draw = true;
                     if quit {
-                        return Ok(());
+                        return shutdown(&mut rt);
                     }
                 }
             }
@@ -614,7 +635,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 if core_due || minute_due {
                     let (s, quit) = apply(state, Command::Tick(now), &mut guard, &mut rt)?;
                     if quit {
-                        return Ok(());
+                        return shutdown(&mut rt);
                     }
                     state = s;
                     needs_draw = true;
@@ -633,6 +654,48 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             drawn_clock = wall_clock.now_local();
         }
     }
+}
+
+/// The one exit path for every quit return in [`run`] (application-shell
+/// "Quit waits for job cancellation cleanup"; process-lifecycle-hardening
+/// design D3). Acts on `rt.active_job` directly — whatever phase core is
+/// in, so a quit confirmed from a screen that no longer shows
+/// `FileOpRunning` still waits for the job — and returns `Ok(())` so the
+/// call sites read `return shutdown(&mut rt)`. With no job there is nothing
+/// to wait for and quit exits at once.
+fn shutdown(rt: &mut Runtime) -> io::Result<()> {
+    if let Some(job) = rt.active_job.take() {
+        if !shutdown_job(job, QUIT_JOB_WAIT) {
+            // The same partial-file risk as before this change, now confined
+            // to a job whose write has not returned in two seconds
+            // (error-diagnostics coordination: the timeout is logged).
+            diag::log("job", format_args!("quit: job thread still running after {} ms; exiting without its cleanup", QUIT_JOB_WAIT.as_millis()));
+        }
+    }
+    Ok(())
+}
+
+/// Request `job`'s cancellation and wait up to `wait` for its thread to
+/// end, polling `is_finished()` every [`QUIT_JOB_POLL`]. Returns `true`
+/// when the thread ended (and was joined), `false` when it was abandoned at
+/// the bound. No dialog answer is sent: the sink's reply loop turns the
+/// cancel flag into an abort for whichever prompt is pending (design D5),
+/// so a conflict and an error reply can never be mismatched. The screen is
+/// not redrawn meanwhile — at most `wait` passes with the last frame still
+/// showing.
+fn shutdown_job(job: worker::JobHandle, wait: Duration) -> bool {
+    job.cancel.cancel();
+    let deadline = Instant::now() + wait;
+    while !job.thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(QUIT_JOB_POLL);
+    }
+    // Finished: the join cannot block, and a contained panic has already
+    // been turned into the job's `JobDone` reply by `spawn_job`.
+    let _ = job.thread.join();
+    true
 }
 
 /// A wheel/scroll command not yet applied, accumulated across consecutive
@@ -1448,21 +1511,32 @@ fn cannot_message(verb: &str, path: &Path, reason: impl std::fmt::Display) -> St
 /// Restore runs on every path — a spawn failure, a non-zero exit, or a
 /// child that scribbled over the screen — because `resume` is idempotent
 /// and the panic hook covers the rest.
+///
+/// The whole stretch, from before the suspend until after the resume has
+/// re-entered raw mode, runs inside a [`console::ChildRunGuard`], so a
+/// Ctrl+C or Ctrl+Break typed meanwhile reaches only the child
+/// (application-shell "Ctrl+C during a suspended child run stops only the
+/// child"; process-lifecycle-hardening design D1/D2).
 fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::Result<()> {
+    let mut child_run = console::ChildRunGuard::new();
     guard.suspend()?;
-    let status = std::process::Command::new(&invocation.program)
-        .args(&invocation.args)
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
+    let status = console::spawn_and_wait(
+        std::process::Command::new(&invocation.program)
+            .args(&invocation.args)
+            .current_dir(&invocation.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+        &mut child_run,
+    );
     if let Err(e) = &status {
         // The message lands in the scrollback the user is about to see.
         let _ = writeln!(io::stdout(), "\r\nCould not run `{}`: {e}", invocation.program);
     }
     wait_for_key()?;
-    guard.resume()
+    guard.resume()?;
+    drop(child_run);
+    Ok(())
 }
 
 /// Open `path` with the application the platform associates it with
@@ -1555,13 +1629,18 @@ fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
 /// — so a misbehaving editor can never leave the terminal corrupted
 /// (external-editor: Terminal restored when the editor crashes).
 fn run_external_editor(guard: &mut TerminalGuard, invocation: &EditorInvocation) -> io::Result<Result<(), String>> {
+    // Same child-run guard as `run_shell_command`: Ctrl+C inside the editor
+    // never ends FileCommand (application-shell "Ctrl+C inside the external
+    // editor does not end FileCommand"; design D1/D2).
+    let mut child_run = console::ChildRunGuard::new();
     guard.suspend()?;
-    let result = spawn_editor_and_wait(invocation);
+    let result = spawn_editor_and_wait(invocation, &mut child_run);
     if let Err(message) = &result {
         let _ = writeln!(io::stdout(), "\r\n{message}");
     }
     wait_for_key()?;
     guard.resume()?;
+    drop(child_run);
     Ok(result)
 }
 
@@ -1571,18 +1650,20 @@ fn run_external_editor(guard: &mut TerminalGuard, invocation: &EditorInvocation)
 /// `run_shell_command`'s precedent of not treating the child's exit code as
 /// FileCommand's own error); `Err` only when the process could not be
 /// spawned at all (external-editor: Editor spawn errors do not crash the
-/// app).
-fn spawn_editor_and_wait(invocation: &EditorInvocation) -> Result<(), String> {
-    std::process::Command::new(&invocation.program)
-        .args(&invocation.leading_args)
-        .arg(&invocation.file_arg)
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map(|_| ())
-        .map_err(|e| format!("Could not run `{}`: {e}", invocation.program))
+/// app). `child_run` is armed once the editor has started (design D2).
+fn spawn_editor_and_wait(invocation: &EditorInvocation, child_run: &mut console::ChildRunGuard) -> Result<(), String> {
+    console::spawn_and_wait(
+        std::process::Command::new(&invocation.program)
+            .args(&invocation.leading_args)
+            .arg(&invocation.file_arg)
+            .current_dir(&invocation.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+        child_run,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Could not run `{}`: {e}", invocation.program))
 }
 
 /// Ctrl+O: hand the screen back so the host terminal's scrollback (which is
@@ -2367,7 +2448,9 @@ mod tests {
 
     #[test]
     fn spawn_editor_and_wait_succeeds_for_a_real_program() {
-        assert_eq!(spawn_editor_and_wait(&stub_invocation("0")), Ok(()));
+        let _serial = console::FLAG_LOCK.lock().unwrap();
+        let mut child_run = console::ChildRunGuard::new();
+        assert_eq!(spawn_editor_and_wait(&stub_invocation("0"), &mut child_run), Ok(()));
     }
 
     #[test]
@@ -2378,9 +2461,147 @@ mod tests {
             file_arg: OsString::from("report.txt"),
             cwd: std::env::temp_dir(),
         };
-        let result = spawn_editor_and_wait(&inv);
+        let _serial = console::FLAG_LOCK.lock().unwrap();
+        let mut child_run = console::ChildRunGuard::new();
+        let result = spawn_editor_and_wait(&inv, &mut child_run);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("filecommand-definitely-not-a-real-editor-binary"));
+    }
+
+    // -- process-lifecycle-hardening: quit waits for job cleanup (task 2.3,
+    // 2.4; application-shell "Quit waits for job cancellation cleanup";
+    // design D3) ---------------------------------------------------------
+
+    /// A `Runtime` with no terminal behind it, enough for `shutdown` and the
+    /// effect bodies the tests here drive.
+    fn test_runtime(dir: &Path) -> (Runtime, Receiver<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let rt = Runtime {
+            tx,
+            active_job: None,
+            history_path: dir.join("history.json"),
+            config_path: dir.join(CONFIG_FILE),
+            usermenu_path: dir.join("usermenu.toml"),
+            persist_enabled: false,
+            viewer_source: None,
+            clipboard: Box::new(clipboard::RecordingClipboard::default()),
+            mouse_tracker: MouseTracker::new(),
+            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+            workers: worker::WorkerGauge::new(),
+        };
+        (rt, rx)
+    }
+
+    /// A stand-in job thread: `body` runs with the handle's cancel flag.
+    fn fake_job(body: impl FnOnce(filecommand_core::fs_ops::CancelFlag) + Send + 'static) -> worker::JobHandle {
+        let cancel = filecommand_core::fs_ops::CancelFlag::new();
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let thread_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || body(thread_cancel));
+        worker::JobHandle { cancel, reply_tx, thread }
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_job_that_finishes_its_cleanup_after_the_cancel() {
+        // The thread notices the flag, then takes 300 ms to clean up (the
+        // partial-file removal) before ending: quit returns only after that.
+        let job = fake_job(|cancel| {
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let started = Instant::now();
+        assert!(shutdown_job(job, QUIT_JOB_WAIT), "the thread ended within the bound");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(300), "returned only after the cleanup finished, took {elapsed:?}");
+        assert!(elapsed < QUIT_JOB_WAIT, "and well before the bound, took {elapsed:?}");
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_job_that_never_finishes_after_about_two_seconds() {
+        // Scenario "The wait is bounded": a write blocked on an unresponsive
+        // share never returns; quit exits anyway after `QUIT_JOB_WAIT`.
+        let job = fake_job(|_cancel| std::thread::sleep(Duration::from_secs(20)));
+        let started = Instant::now();
+        assert!(!shutdown_job(job, QUIT_JOB_WAIT), "abandoned at the bound");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= QUIT_JOB_WAIT, "took {elapsed:?}");
+        assert!(elapsed < QUIT_JOB_WAIT + Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn shutdown_with_no_job_returns_immediately() {
+        // Scenario "No job means no wait".
+        let (mut rt, _rx) = test_runtime(&std::env::temp_dir());
+        let started = Instant::now();
+        shutdown(&mut rt).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn shutdown_joins_a_job_that_has_already_finished_without_waiting() {
+        let job = fake_job(|_cancel| {});
+        // Let the thread end first.
+        while !job.thread.is_finished() {
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        assert!(shutdown_job(job, QUIT_JOB_WAIT));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Scenario "Quit during a large copy leaves no partial file" (task
+    /// 2.4), end to end through the real `spawn_job` and `RealFs`: quit
+    /// confirmed mid-copy sets the flag, the engine's cancel path removes
+    /// the partially written destination, and `shutdown` returns only once
+    /// it has. The copy source is a sparse 256 MB file so the test is quick
+    /// to set up while the copy still takes long enough to be interrupted.
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_mid_copy_leaves_no_partial_destination_file() {
+        use filecommand_core::fs_ops::{Job, JobKind, JobOutcome, SourceItem};
+
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-quit-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        let dst_dir = dir.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let src = src_dir.join("big.bin");
+        std::fs::File::create(&src).unwrap().set_len(256 * 1024 * 1024).unwrap();
+        let dst = dst_dir.join("big.bin");
+
+        let (mut rt, rx) = test_runtime(&dir);
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![SourceItem { original_name: OsString::from("big.bin"), path: src.clone(), is_dir: false }],
+            source_dir: src_dir.clone(),
+            dest_dir: dst_dir.clone(),
+            new_dir_name: None,
+        };
+        rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token()));
+
+        // Mid-copy: the destination has been created and is being written.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !dst.exists() {
+            assert!(Instant::now() < deadline, "the copy never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let started = Instant::now();
+        shutdown(&mut rt).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!dst.exists(), "the partially written destination was removed before quit returned");
+        assert!(elapsed < QUIT_JOB_WAIT, "the job ended within the bound rather than being abandoned, took {elapsed:?}");
+        let outcomes: Vec<Command> = rx.try_iter().filter(|c| matches!(c, Command::JobDone { .. })).collect();
+        assert!(
+            matches!(outcomes.as_slice(), [Command::JobDone { outcome: JobOutcome::Cancelled { .. }, .. }]),
+            "the job reported itself cancelled: {outcomes:?}"
+        );
+        assert!(std::fs::metadata(&src).is_ok(), "the source is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // -- error-diagnostics: status-line errors name the item (task 4.3) ---

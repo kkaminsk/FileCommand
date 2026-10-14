@@ -309,6 +309,7 @@ dependencies = [
  "crossterm",
  "filecommand-core",
  "insta",
+ "libc",
  "proptest",
  "ratatui",
  "unicode-width 0.1.14",

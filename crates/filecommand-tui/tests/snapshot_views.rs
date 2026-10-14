@@ -318,6 +318,64 @@ fn snapshot_error_dialog_shows_the_full_path_above_the_message() {
     insta::assert_snapshot!("error_dialog_full_path_above_message", text);
 }
 
+// -----------------------------------------------------------------
+// process-lifecycle-hardening: the overwrite-conflict dialog's Cancel row
+// (operation-dialogs "Overwrite-conflict dialog"; design D7; task 4.6)
+// -----------------------------------------------------------------
+
+fn conflict_dialog_state(rename_input: Option<filecommand_core::line_edit::LineEdit>) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpRunning {
+        source_dir: PathBuf::from(r"D:\data\reports"),
+        dest_dir: PathBuf::from(r"C:\Users\demo\right"),
+        dialog: filecommand_core::fs_ops::dialog::RunningDialog::Conflict {
+            kind: JobKind::Copy,
+            info: filecommand_core::fs_ops::ConflictInfo {
+                source_name: "report.txt".into(),
+                source_size: 2_048,
+                source_modified: Some(fixed_date()),
+                target_path: PathBuf::from(r"C:\Users\demo\right\report.txt"),
+                target_size: 900,
+                target_modified: Some(DateTime { year: 2026, month: 1, day: 1, hour: 12, minute: 30 }),
+            },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(10, 20_480),
+            rename_input,
+        },
+    };
+    state
+}
+
+/// Scenario "The Cancel control and hotkey match Esc": the `(C)ancel`
+/// control is drawn on its own row directly below the existing choice row,
+/// which is unchanged (including its pre-existing truncation at the
+/// dialog's inner width).
+#[test]
+fn snapshot_conflict_dialog_with_cancel_row() {
+    let state = conflict_dialog_state(None);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let choice_line = text.lines().position(|l| l.contains("(O)verwrite  (S)kip  (R)ename")).expect("the choice row is drawn");
+    let cancel_line = text.lines().position(|l| l.contains("(C)ancel")).expect("the Cancel row is drawn");
+    assert_eq!(cancel_line, choice_line + 1, "Cancel sits directly below the choices:\n{text}");
+    insta::assert_snapshot!("conflict_dialog_with_cancel_row", text);
+}
+
+/// Scenario "Esc in the Rename field returns to the choices": while the
+/// name field is open, Esc closes the field rather than cancelling the job,
+/// so the Cancel row is not offered — the field takes the choice row and
+/// the row below it is blank.
+#[test]
+fn snapshot_conflict_dialog_rename_field_hides_the_cancel_row() {
+    let mut edit = filecommand_core::line_edit::LineEdit::default();
+    for c in "report2.txt".chars() {
+        edit.apply(&filecommand_core::line_edit::TextEditOp::Insert(c));
+    }
+    let state = conflict_dialog_state(Some(edit));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("New name:"), "the rename field is shown:\n{text}");
+    assert!(!text.contains("(C)ancel"), "no Cancel control while renaming:\n{text}");
+    insta::assert_snapshot!("conflict_dialog_rename_field_open", text);
+}
+
 /// Regression pin for the pre-existing skipped-only rendering (task 4.3):
 /// each summary row is `{full path}: {reason}`.
 #[test]

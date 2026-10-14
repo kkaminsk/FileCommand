@@ -257,6 +257,10 @@ pub fn restore_terminal() {
 
 /// Install a panic hook that restores the terminal *before* the default (or
 /// previously installed) hook prints its report, then chains to that hook.
+/// Must be called on the UI thread — the thread that owns the terminal and
+/// runs the event loop — because only a panic on that thread restores and
+/// reports (application-shell "Panic hook restores the terminal before
+/// reporting"; process-lifecycle-hardening design D4).
 pub fn install_panic_hook() {
     install_panic_hook_with(restore_terminal);
 }
@@ -265,9 +269,23 @@ pub fn install_panic_hook() {
 /// exists so tests can verify hook ordering/chaining without depending on a
 /// real console (raw-mode/alternate-screen calls are not portable inside a
 /// captured test harness).
+///
+/// The installing thread's `ThreadId` is captured into the hook closure
+/// (rather than a process-wide `OnceLock`, which the multi-threaded test
+/// harness could not reset between installations): the hook runs `restore`
+/// and the previous hook only when the panicking thread is that thread. A
+/// worker panic does neither — `std::panic::set_hook` is process-wide, and
+/// the default hook would otherwise print `thread '<unnamed>' panicked at
+/// …` onto the alternate screen while ratatui keeps diff-drawing over it.
+/// The worker's own `catch_unwind` recovers the payload and turns it into
+/// that worker's normal failure reply (design D4/D6).
 pub fn install_panic_hook_with(restore: fn()) {
+    let ui_thread = std::thread::current().id();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() != ui_thread {
+            return;
+        }
         restore();
         previous(info);
     }));
@@ -287,6 +305,12 @@ mod tests {
     /// runs, then the chained previous hook runs) via a real panic through
     /// `catch_unwind`, restoring whatever hook was installed immediately
     /// after so it can't leak into other tests.
+    ///
+    /// The second half (process-lifecycle-hardening design D4; scenario "A
+    /// worker panic leaves the terminal alone"): a panic on a *spawned*
+    /// thread, while the same hook is installed, records neither step — the
+    /// terminal is not restored out from under the UI, and no report is
+    /// written over it.
     #[test]
     fn panic_inside_guarded_scope_restores_terminal_before_report_prints() {
         // A plain `fn()` (required by `install_panic_hook_with`'s
@@ -308,12 +332,19 @@ mod tests {
             ORDER.lock().unwrap().push("report");
         }));
 
+        // Installed from this thread, which therefore plays the UI thread.
         install_panic_hook_with(record_restore);
         let result = std::panic::catch_unwind(|| panic!("boom"));
-        std::panic::set_hook(default_hook);
-
         assert!(result.is_err());
-        assert_eq!(*ORDER.lock().unwrap(), vec!["restore", "report"]);
+        assert_eq!(*ORDER.lock().unwrap(), vec!["restore", "report"], "a UI-thread panic restores first, then reports");
+
+        // A worker-thread panic, caught by joining: the hook declines both
+        // steps, so the log is unchanged.
+        let worker = std::thread::spawn(|| panic!("worker boom")).join();
+        assert!(worker.is_err(), "the spawned thread did panic");
+        assert_eq!(*ORDER.lock().unwrap(), vec!["restore", "report"], "a worker panic neither restores the terminal nor chains to the report hook");
+
+        std::panic::set_hook(default_hook);
     }
 
     #[test]
