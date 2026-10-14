@@ -79,6 +79,33 @@ struct Runtime {
     git_slots: [worker::GitQuerySlot; 2],
 }
 
+impl Runtime {
+    /// `Effect::OpenViewer`'s effect body. O(1): the open touches only the
+    /// handle and its length, never the content (viewer: Instant open —
+    /// "First frame reads only the visible window"), so this runs
+    /// synchronously rather than on a worker thread, exactly like
+    /// `EnumerateDrives`.
+    fn open_viewer_source(&mut self, path: PathBuf) {
+        match ByteSource::open(&path) {
+            Ok(source) => {
+                let file_len = source.len();
+                self.viewer_source = Some((path.clone(), source));
+                worker::deliver(&self.tx, "viewer opened", Command::ViewerOpened { path, file_len });
+            }
+            Err(e) => {
+                worker::deliver(&self.tx, "viewer open failure", Command::ViewerOpenFailed { message: cannot_message("open", &path, &e) });
+            }
+        }
+    }
+
+    /// `Command::ViewerClose`'s release of the viewer's byte source, so the
+    /// file handle is closed with the viewer (viewer: Instant open —
+    /// "Closing the viewer releases the file").
+    fn release_viewer_source(&mut self) {
+        self.viewer_source = None;
+    }
+}
+
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
 /// and threaded through to [`run`]. Kept as a small struct rather than a
 /// growing list of `bool`/`Option` parameters on `run` itself (design D2).
@@ -881,7 +908,7 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     // cached byte source needs to be dropped — checked before `update`
     // consumes `cmd`.
     if matches!(cmd, Command::ViewerClose) {
-        rt.viewer_source = None;
+        rt.release_viewer_source();
     }
     // Commands → Menu file edit, built-in-editor leg: remember whether the
     // editor currently has the user-menu file open, so the transition out of
@@ -1020,20 +1047,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 slot.request(panel, path, request, rt.tx.clone());
             }
             Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone()),
-            Effect::OpenViewer { path } => match ByteSource::open(&path) {
-                Ok(source) => {
-                    // O(1): opening/mapping touches only the handle and its
-                    // length, never the content (viewer: Instant open), so
-                    // this runs synchronously rather than on a worker
-                    // thread, exactly like `EnumerateDrives`.
-                    let file_len = source.len();
-                    rt.viewer_source = Some((path.clone(), source));
-                    worker::deliver(&rt.tx, "viewer opened", Command::ViewerOpened { path, file_len });
-                }
-                Err(e) => {
-                    worker::deliver(&rt.tx, "viewer open failure", Command::ViewerOpenFailed { message: cannot_message("open", &path, &e) });
-                }
-            },
+            Effect::OpenViewer { path } => rt.open_viewer_source(path),
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
                 worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
             }
@@ -1361,6 +1375,47 @@ mod tests {
             ("/bin/sh".to_string(), vec!["-c".to_string(), "exit 0".to_string()])
         };
         EditorInvocation { program, leading_args, file_arg: OsString::from(file_arg), cwd: std::env::temp_dir() }
+    }
+
+    /// viewer: Instant open — "Closing the viewer releases the file": after
+    /// `Effect::OpenViewer` installs the source and `Command::ViewerClose`
+    /// clears it, the file and its directory can both be removed — an open
+    /// handle blocks directory removal on Windows, so this fails if the
+    /// source leaks. `apply`/`run_effects` need a `TerminalGuard`, which a
+    /// headless test cannot construct, so this drives the same `Runtime`
+    /// methods those two call.
+    #[test]
+    fn closing_the_viewer_releases_the_file_and_its_directory() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+
+        let (tx, rx) = mpsc::channel();
+        let mut rt = Runtime {
+            tx,
+            active_job: None,
+            history_path: dir.join("history.json"),
+            config_path: dir.join(CONFIG_FILE),
+            usermenu_path: dir.join("usermenu.toml"),
+            persist_enabled: false,
+            viewer_source: None,
+            clipboard: Box::new(clipboard::RecordingClipboard::default()),
+            mouse_tracker: MouseTracker::new(),
+            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+        };
+
+        rt.open_viewer_source(path.clone());
+        assert!(rt.viewer_source.is_some());
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Command::ViewerOpened { path: opened, file_len: 11 }) => assert_eq!(opened, path),
+            other => panic!("expected ViewerOpened, got {other:?}"),
+        }
+
+        rt.release_viewer_source();
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     /// Regression test for the F4 external editor being silently dead: a

@@ -566,9 +566,9 @@ bin — deletes are permanent, and the confirmation dialog says so.
 
 ### Viewer (F3) and editor (F4)
 
-- **Viewer** — read-only, opens instantly at any file size (streams/memory-maps
-  rather than indexing). F2 toggles wrap, F4 toggles text/hex mode, F7
-  searches, F10/Esc closes.
+- **Viewer** — read-only, opens instantly at any file size (reads bounded
+  windows rather than indexing). F2 toggles wrap, F4 toggles text/hex mode,
+  F7 searches, F10/Esc closes.
 - **Editor** — F4 opens your configured external editor if `editor =` is set
   in `config.toml`; otherwise the built-in editor (files under 10 MB; larger
   files open in the viewer instead). F2 saves, F3 marks a line-selection

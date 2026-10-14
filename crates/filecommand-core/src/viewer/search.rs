@@ -128,6 +128,23 @@ mod tests {
         assert_eq!(found, Some((0, 6)));
     }
 
+    /// viewer-mapping-safety (design D3): a file that shrinks while it is
+    /// open reads short past its new end; the search treats that short
+    /// chunk as the end of the scan and terminates with no match instead of
+    /// faulting.
+    #[test]
+    fn truncation_while_open_terminates_the_search() {
+        let dir = std::env::temp_dir().join(format!("filecommand-viewer-search-test-{}-truncated", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("file.bin");
+        std::fs::write(&path, vec![b'y'; 3 * DEFAULT_CHUNK_SIZE]).unwrap();
+        let src = ByteSource::open(&path).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(1000).unwrap();
+        assert_eq!(find_forward(&src, 0, b"zebra", DEFAULT_CHUNK_SIZE), None);
+        // Starting past the new end reads empty and returns immediately.
+        assert_eq!(find_forward(&src, 2 * DEFAULT_CHUNK_SIZE as u64, b"zebra", DEFAULT_CHUNK_SIZE), None);
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;

@@ -2,10 +2,10 @@
 //! body, and its own F-key bar. A frame-less view that replaces the panels
 //! while open (viewer: Frame-less full-screen chrome), rendered as a pure
 //! function of `ViewerState` plus an already-open `ByteSource` window into
-//! the file (design D1). The byte reads it performs are bounded lookups
-//! into a memory map (or a small positioned read on the chunk-read
-//! fallback) — never a whole-file scan, matching the "instant open, no line
-//! index" contract the core `viewer` module implements.
+//! the file (design D1). The byte reads it performs are bounded positioned
+//! reads on the open handle — never a whole-file scan, matching the
+//! "instant open, no line index" contract the core `viewer` module
+//! implements.
 
 use filecommand_core::listing::{display_width, format_count, pad_to_width};
 use filecommand_core::theme::{ColorDepth, Role, Theme};

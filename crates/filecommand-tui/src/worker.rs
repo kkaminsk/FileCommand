@@ -313,8 +313,10 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
 /// unbounded in total wall time), so this must not block key handling the
 /// way `Effect::OpenViewer`'s O(1) open does (viewer: F7 streaming search —
 /// "Search is bounded and streaming"). Reopens the file rather than sharing
-/// the render loop's cached `ByteSource` across threads — a fresh mmap open
-/// is cheap and keeps the two paths independent.
+/// the render loop's cached `ByteSource` across threads — a second
+/// positioned-read open is cheap and keeps the two paths independent. The
+/// source is a local, so the worker's handle is released when the search
+/// returns (viewer: Instant open — "Closing the viewer releases the file").
 pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let result = match ByteSource::open(&path) {
@@ -516,6 +518,31 @@ mod tests {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
         }
+    }
+
+    /// viewer: Instant open — "Closing the viewer releases the file": the
+    /// worker's `ByteSource` is a local that drops before the result is
+    /// delivered, so once a search with no match has scanned to the end of
+    /// the file, no FileCommand thread still holds it — the file and its
+    /// directory can be removed (an open handle blocks directory removal on
+    /// Windows). Cancelling a still-running search when the viewer closes
+    /// is `listing-request-guard`'s scope; this pins the release-on-return
+    /// half.
+    #[test]
+    fn spawn_viewer_search_releases_the_file_when_the_search_finishes() {
+        // Larger than one chunk and match-free, so the worker scans to the
+        // end of the file before returning.
+        let contents = vec![b'y'; 3 * DEFAULT_CHUNK_SIZE];
+        let path = temp_file("release", &contents);
+        let dir = path.parent().unwrap().to_path_buf();
+        let (tx, rx) = mpsc::channel();
+        spawn_viewer_search(path.clone(), 0, b"zebra".to_vec(), 1, tx);
+        match rx.recv_timeout(std::time::Duration::from_secs(30)) {
+            Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
+            other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
+        }
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
     }
 
     struct FakeReader(io::Result<Vec<RawDirEntry>>);
