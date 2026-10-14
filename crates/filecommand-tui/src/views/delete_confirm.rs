@@ -92,7 +92,7 @@ fn pad(s: &str, width: usize) -> String {
 
 /// The `(Y)es`/`(N)o` button spans `render_delete_confirm` currently draws
 /// at `area` (mouse-input "Dialog button"). Derives its geometry from the
-/// same [`dialog_layout`] helper as the renderer, so the rects move with the
+/// same `dialog_layout` helper as the renderer, so the rects move with the
 /// disclosure row exactly like the painted buttons do.
 pub fn hit_buttons(area: Rect, setup: &FileOpSetup) -> Vec<(Rect, ButtonId)> {
     let FileOpSetup::DeleteConfirm { sources, needs_second_confirm, confirmed_once, hidden_by_filter, .. } = setup else { return vec![] };

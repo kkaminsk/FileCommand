@@ -321,7 +321,7 @@ pub struct PanelState {
     /// Other tabs belonging to this panel, in list order, with the
     /// currently active tab's slot omitted — its state lives inline in the
     /// fields above rather than duplicated here. See [`TabData`] and
-    /// [`PanelState::open_tab`]/[`close_tab`]/[`switch_tab`] (panel-tabs "Per-panel
+    /// [`PanelState::open_tab`]/[`PanelState::close_tab`]/[`PanelState::switch_tab`] (panel-tabs "Per-panel
     /// tab list with independent state").
     pub tabs: Vec<TabData>,
     /// This panel's active tab's zero-based position within the full
@@ -1248,7 +1248,7 @@ impl PanelState {
     /// Each tab's directory, in tab order — cheap to call every frame for
     /// tab-strip label rendering since it clones only the directory
     /// `PathBuf`s, never the full [`TabData`] (which carries each tab's
-    /// entire entry list). See [`Self::full_tab_list`] for the equivalent
+    /// entire entry list). See `Self::full_tab_list` for the equivalent
     /// that also carries state, used when actually switching tabs (panel-
     /// tabs "Tab label rendering and active styling").
     pub fn tab_dirs(&self) -> Vec<PathBuf> {
@@ -1458,18 +1458,18 @@ mod tests {
 
     #[test]
     fn parent_dir_sorts_first_regardless_of_direction() {
-        let mut entries = vec![file("b.txt"), dir("a"), Entry::parent_dir()];
+        let mut entries = [file("b.txt"), dir("a"), Entry::parent_dir()];
         entries.sort_by(|a, b| cmp_entries(a, b, SortMode::Name, SortDirection::Asc));
         assert_eq!(entries[0].kind, EntryKind::ParentDir);
 
-        let mut entries = vec![file("b.txt"), dir("a"), Entry::parent_dir()];
+        let mut entries = [file("b.txt"), dir("a"), Entry::parent_dir()];
         entries.sort_by(|a, b| cmp_entries(a, b, SortMode::Name, SortDirection::Desc));
         assert_eq!(entries[0].kind, EntryKind::ParentDir);
     }
 
     #[test]
     fn name_sort_is_case_insensitive() {
-        let mut entries = vec![file("Banana"), file("apple"), file("Cherry")];
+        let mut entries = [file("Banana"), file("apple"), file("Cherry")];
         entries.sort_by(|a, b| cmp_entries(a, b, SortMode::Name, SortDirection::Asc));
         let names: Vec<String> = entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
         assert_eq!(names, vec!["apple", "Banana", "Cherry"]);
@@ -2626,7 +2626,7 @@ mod tests {
             p.set_sort_mode(SortMode::Size);
             p.resort(); // no-op re-affirmation the mode is size-sorted already
             p.entries.reverse(); // now largest-to-smallest ("e0" last)
-            p.cursor = p.entries.iter().position(|e| e.name == OsString::from("e0")).unwrap();
+            p.cursor = p.entries.iter().position(|e| e.name == "e0").unwrap();
             assert_eq!(p.cursor, 29);
             p.ensure_cursor_visible(10);
             assert!(p.scroll_offset <= p.cursor && p.cursor < p.scroll_offset + 10);

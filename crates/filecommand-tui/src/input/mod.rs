@@ -889,7 +889,7 @@ fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> 
         FileOpSetup::DestinationInput { .. } | FileOpSetup::RenameInput { .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
-            _ => map_text_edit_key(key).or_else(|| match key.code {
+            _ => map_text_edit_key(key).or(match key.code {
                 KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
                 _ => None,
             }),
@@ -916,7 +916,7 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
             // Same historical unguarded-`Char` fallback as the destination/
             // rename fields (Ctrl+letter types its base character) behind
             // the shared helper's claims.
-            _ => map_text_edit_key(key).or_else(|| match key.code {
+            _ => map_text_edit_key(key).or(match key.code {
                 KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
                 _ => None,
             }),

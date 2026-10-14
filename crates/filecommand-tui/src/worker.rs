@@ -663,7 +663,7 @@ where
         move || body(&body_path),
         move |result| {
             let cmd = match result {
-                Ok(Ok(LoadResult::Loaded(editor))) => Command::EditorOpened { request, editor: Box::new(editor) },
+                Ok(Ok(LoadResult::Loaded(editor))) => Command::EditorOpened { request, editor },
                 Ok(Ok(LoadResult::TooLarge { size })) => Command::EditorTooLarge { request, path, size },
                 Ok(Ok(LoadResult::NotEditable { reason })) => Command::EditorNotEditable { request, path, reason },
                 Ok(Err(e)) => Command::EditorOpenFailed { request, message: cannot_message("open", &path, &e) },
@@ -773,6 +773,9 @@ fn with_com_initialized<T>(body: impl FnOnce() -> T) -> T {
         // every call on this thread is paired with the `CoUninitialize`
         // below when it succeeded.
         || unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) },
+        // SAFETY: `com_bracket` calls this only after the `CoInitializeEx`
+        // above succeeded on this same thread, so every uninitialize is
+        // paired with an initialize.
         || unsafe { CoUninitialize() },
         body,
     )
@@ -1092,6 +1095,49 @@ impl JobSink for ChannelSink {
     }
 }
 
+pub fn spawn_job(job: Job, tx: Sender<Command>, token: WorkerToken) -> JobHandle {
+    spawn_job_with(job, tx, token, |job, sink| {
+        let fs = RealFs::new();
+        filecommand_core::fs_ops::run_job(job, &fs, sink);
+    })
+}
+
+/// `spawn_job` with the engine run injected (design D6): a panicked job
+/// still ends — as `Cancelled` with one skipped item naming the internal
+/// error against the source directory — so the progress or prompt dialog
+/// closes, the panels re-read, and the end-of-job summary names the error
+/// (application-shell "A panicked job ends and closes its dialog"). The
+/// skipped list `run_job` had built up is lost with the unwound frame; the
+/// sender is cloned before the sink takes it so the reply can still go out.
+fn spawn_job_with<B>(job: Job, tx: Sender<Command>, token: WorkerToken, body: B) -> JobHandle
+where
+    B: FnOnce(&Job, &mut ChannelSink) + Send + 'static,
+{
+    let cancel = CancelFlag::new();
+    let (reply_tx, reply_rx) = mpsc::channel::<JobReply>();
+    let source_dir = job.source_dir.clone();
+    let dest_dir = job.dest_dir.clone();
+    let cancel_for_thread = cancel.clone();
+    let thread = std::thread::spawn(move || {
+        let _token = token;
+        let failure_tx = tx.clone();
+        let mut sink = ChannelSink {
+            tx,
+            reply_rx,
+            cancel: cancel_for_thread,
+            source_dir: source_dir.clone(),
+            dest_dir: dest_dir.clone(),
+            throttle: ProgressThrottle::new(),
+        };
+        if let Err(msg) = guarded(move || body(&job, &mut sink)) {
+            log_worker_panic("job", &msg);
+            let skipped = vec![SkippedItem::skipped(source_dir.clone(), format!("internal error: {msg}"))];
+            deliver(&failure_tx, "job outcome", Command::JobDone { outcome: JobOutcome::Cancelled { skipped }, source_dir, dest_dir });
+        }
+    });
+    JobHandle { cancel, reply_tx, thread }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1222,7 +1268,7 @@ mod tests {
 
         let boxes = filecommand_core::info::info_boxes(&values, None);
         let rendered: Vec<&str> = boxes.iter().flat_map(|b| b.fields.iter()).map(|f| f.value.as_str()).collect();
-        assert!(!rendered.iter().any(|v| *v == PENDING), "no field is left pending: {rendered:?}");
+        assert!(!rendered.contains(&PENDING), "no field is left pending: {rendered:?}");
     }
 
     #[test]
@@ -2209,47 +2255,4 @@ mod tests {
             std::thread::yield_now();
         }
     }
-}
-
-pub fn spawn_job(job: Job, tx: Sender<Command>, token: WorkerToken) -> JobHandle {
-    spawn_job_with(job, tx, token, |job, sink| {
-        let fs = RealFs::new();
-        filecommand_core::fs_ops::run_job(job, &fs, sink);
-    })
-}
-
-/// `spawn_job` with the engine run injected (design D6): a panicked job
-/// still ends — as `Cancelled` with one skipped item naming the internal
-/// error against the source directory — so the progress or prompt dialog
-/// closes, the panels re-read, and the end-of-job summary names the error
-/// (application-shell "A panicked job ends and closes its dialog"). The
-/// skipped list `run_job` had built up is lost with the unwound frame; the
-/// sender is cloned before the sink takes it so the reply can still go out.
-fn spawn_job_with<B>(job: Job, tx: Sender<Command>, token: WorkerToken, body: B) -> JobHandle
-where
-    B: FnOnce(&Job, &mut ChannelSink) + Send + 'static,
-{
-    let cancel = CancelFlag::new();
-    let (reply_tx, reply_rx) = mpsc::channel::<JobReply>();
-    let source_dir = job.source_dir.clone();
-    let dest_dir = job.dest_dir.clone();
-    let cancel_for_thread = cancel.clone();
-    let thread = std::thread::spawn(move || {
-        let _token = token;
-        let failure_tx = tx.clone();
-        let mut sink = ChannelSink {
-            tx,
-            reply_rx,
-            cancel: cancel_for_thread,
-            source_dir: source_dir.clone(),
-            dest_dir: dest_dir.clone(),
-            throttle: ProgressThrottle::new(),
-        };
-        if let Err(msg) = guarded(move || body(&job, &mut sink)) {
-            log_worker_panic("job", &msg);
-            let skipped = vec![SkippedItem::skipped(source_dir.clone(), format!("internal error: {msg}"))];
-            deliver(&failure_tx, "job outcome", Command::JobDone { outcome: JobOutcome::Cancelled { skipped }, source_dir, dest_dir });
-        }
-    });
-    JobHandle { cancel, reply_tx, thread }
 }

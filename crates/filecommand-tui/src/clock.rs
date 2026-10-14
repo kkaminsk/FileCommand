@@ -50,30 +50,15 @@ impl WallClock for RealWallClock {
 
 #[cfg(windows)]
 mod platform {
-    /// Mirrors the Win32 `SYSTEMTIME` layout; only the fields
-    /// `GetLocalTime` requires a home for are read.
-    #[repr(C)]
-    #[derive(Default)]
-    struct SystemTime {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetLocalTime(system_time: *mut SystemTime);
-    }
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
     pub fn now_local() -> (u8, u8) {
-        let mut st = SystemTime::default();
+        let mut st = SYSTEMTIME { wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0 };
+        // SAFETY: `st` is a live, fully initialized `SYSTEMTIME` that the
+        // call overwrites in place; nothing else is touched.
         unsafe { GetLocalTime(&mut st) };
-        (st.hour as u8, st.minute as u8)
+        (st.wHour as u8, st.wMinute as u8)
     }
 }
 

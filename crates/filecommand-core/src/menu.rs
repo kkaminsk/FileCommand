@@ -4,7 +4,7 @@
 //! sits alongside the phase in `State` so a file-op dialog and the menu can
 //! never both claim the phase slot. Everything here is pure data plus index
 //! arithmetic — dispatching an item's action is the caller's job
-//! ([`crate::update`] turns a [`MenuAction`] back into a `Command`).
+//! ([`crate::update`](fn@crate::update) turns a [`MenuAction`] back into a `Command`).
 
 use crate::listing::SortMode;
 use crate::panel::DisplayMode;

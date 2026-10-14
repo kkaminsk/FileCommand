@@ -2001,7 +2001,7 @@ fn conflict_rename_field_edits_in_the_middle() {
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('b')));
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Home));
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('a')));
-    let (state, effects) = update(state, Command::FileOpConfirm);
+    let (_state, effects) = update(state, Command::FileOpConfirm);
     assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Rename(OsString::from("ab")))]);
 }
 
@@ -3717,8 +3717,8 @@ fn swap_panels_exchanges_everything_and_keeps_focus_and_split() {
     // No directory is re-read (design D3); both sides' git queries are
     // re-issued with fresh ids so pre-swap replies drop as stale.
     assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "no re-read: {effects:?}");
-    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Left, path, .. } if *path == PathBuf::from("D:\\b"))));
-    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Right, path, .. } if *path == PathBuf::from("C:\\a"))));
+    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Left, path, .. } if *path == Path::new("D:\\b"))));
+    assert!(effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel: PanelSide::Right, path, .. } if *path == Path::new("C:\\a"))));
 }
 
 #[test]
@@ -4889,7 +4889,7 @@ fn editor_with_temp_file(name: &str, lines: &[&str]) -> EditorState {
     }
     std::fs::write(&path, &text).unwrap();
     match EditorState::open(&path).unwrap() {
-        crate::editor::LoadResult::Loaded(e) => e,
+        crate::editor::LoadResult::Loaded(e) => *e,
         crate::editor::LoadResult::TooLarge { .. } => panic!("test fixture unexpectedly exceeds the editor size cap"),
         crate::editor::LoadResult::NotEditable { reason } => panic!("test fixture unexpectedly not editable: {reason:?}"),
     }

@@ -351,42 +351,22 @@ mod copy_ex {
     //! `RealFs::copy_file` on Windows: `CopyFileExW` for the data, every
     //! named stream, the attributes and the last-write time, followed by an
     //! explicit creation-time restore, a length check, an optional flush and
-    //! a post-copy stream check (durable-file-copy design D3, D4). Raw FFI in
-    //! the style of the `identity`/`stream_enum` modules — no external crate.
+    //! a post-copy stream check (durable-file-copy design D3, D4). The Win32
+    //! prototypes and constants come from `windows-sys` (ci-and-build-tooling
+    //! design D6); only the progress-routine *callback* is defined here, with
+    //! the signature `LPPROGRESS_ROUTINE` expects.
     use super::{cancelled_error, ChunkControl, CopyOptions, CopyReport, Unrestored, UnrestoredKind};
+    use core::ffi::c_void;
     use std::fs::FileTimes;
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
     use std::path::Path;
-
-    #[allow(non_camel_case_types)]
-    type c_void = core::ffi::c_void;
-    type Handle = *mut c_void;
-
-    /// `LPPROGRESS_ROUTINE`: (TotalFileSize, TotalBytesTransferred,
-    /// StreamSize, StreamBytesTransferred, dwStreamNumber, dwCallbackReason,
-    /// hSourceFile, hDestinationFile, lpData) -> PROGRESS_*.
-    type ProgressRoutine = unsafe extern "system" fn(i64, i64, i64, i64, u32, u32, Handle, Handle, *mut c_void) -> u32;
-
-    const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x0000_0001;
-    const COPY_FILE_ALLOW_DECRYPTED_DESTINATION: u32 = 0x0000_0008;
-    const PROGRESS_CONTINUE: u32 = 0;
-    const PROGRESS_CANCEL: u32 = 1;
-    const ERROR_REQUEST_ABORTED: i32 = 1235;
-    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CopyFileExW(
-            existing_file_name: *const u16,
-            new_file_name: *const u16,
-            progress_routine: Option<ProgressRoutine>,
-            data: *mut c_void,
-            cancel: *mut i32,
-            copy_flags: u32,
-        ) -> i32;
-    }
+    use windows_sys::Win32::Foundation::{ERROR_REQUEST_ABORTED, HANDLE};
+    use windows_sys::Win32::Storage::FileSystem::{CopyFileExW, FILE_WRITE_ATTRIBUTES, LPPROGRESS_ROUTINE_CALLBACK_REASON};
+    use windows_sys::Win32::System::WindowsProgramming::{
+        COPY_FILE_ALLOW_DECRYPTED_DESTINATION, COPY_FILE_FAIL_IF_EXISTS, PROGRESS_CANCEL, PROGRESS_CONTINUE,
+    };
 
     /// Everything the progress routine needs, reached through `lpData`.
     struct ProgressState<'a> {
@@ -400,16 +380,18 @@ mod copy_ex {
         panic: Option<Box<dyn std::any::Any + Send>>,
     }
 
+    /// The `LPPROGRESS_ROUTINE` callback `CopyFileExW` invokes; its
+    /// signature matches the `windows-sys` function-pointer type exactly.
     unsafe extern "system" fn progress_routine(
         _total_file_size: i64,
         _total_bytes_transferred: i64,
         _stream_size: i64,
         stream_bytes_transferred: i64,
         stream_number: u32,
-        _callback_reason: u32,
-        _source_file: Handle,
-        _destination_file: Handle,
-        data: *mut c_void,
+        _callback_reason: LPPROGRESS_ROUTINE_CALLBACK_REASON,
+        _source_file: HANDLE,
+        _destination_file: HANDLE,
+        data: *const c_void,
     ) -> u32 {
         // SAFETY: `data` is the `&mut ProgressState` `copy_file` handed to
         // `CopyFileExW`, which outlives the call; `CopyFileExW` invokes the
@@ -461,7 +443,7 @@ mod copy_ex {
                 wide_from.as_ptr(),
                 wide_to.as_ptr(),
                 Some(progress_routine),
-                &mut state as *mut ProgressState<'_> as *mut c_void,
+                &mut state as *mut ProgressState<'_> as *const c_void,
                 std::ptr::null_mut(),
                 COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_ALLOW_DECRYPTED_DESTINATION,
             )
@@ -474,7 +456,7 @@ mod copy_ex {
         if let Some(e) = failure {
             // A cancelled copy fails with ERROR_REQUEST_ABORTED and
             // `CopyFileExW` has already deleted its partial destination.
-            return Err(if e.raw_os_error() == Some(ERROR_REQUEST_ABORTED) { cancelled_error() } else { e });
+            return Err(if e.raw_os_error() == Some(ERROR_REQUEST_ABORTED as i32) { cancelled_error() } else { e });
         }
         let bytes = state.stream1_bytes;
         let mut unrestored = Vec::new();
@@ -717,28 +699,13 @@ mod volume_caps {
     //! `GetVolumeInformationW` for the per-volume `FILE_NAMED_STREAMS`
     //! capability flag, used by the copy engine to detect destinations with
     //! no ADS support at all (FAT32/exFAT) and report one aggregated warning
-    //! per job instead of one per file (error-diagnostics design D5). Raw
-    //! FFI like the `identity`/`stream_enum` modules above — no external
-    //! crate.
+    //! per job instead of one per file (error-diagnostics design D5). The
+    //! prototype and the flag come from `windows-sys`.
     use std::io;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
-
-    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetVolumeInformationW(
-            root_path_name: *const u16,
-            volume_name_buffer: *mut u16,
-            volume_name_size: u32,
-            volume_serial_number: *mut u32,
-            maximum_component_length: *mut u32,
-            file_system_flags: *mut u32,
-            file_system_name_buffer: *mut u16,
-            file_system_name_size: u32,
-        ) -> i32;
-    }
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
+    use windows_sys::Win32::System::SystemServices::FILE_NAMED_STREAMS;
 
     /// Whether the volume holding `path` supports named streams.
     /// `GetVolumeInformationW` wants the volume root (`C:\` or a UNC share,
@@ -771,63 +738,23 @@ mod volume_caps {
 
 #[cfg(windows)]
 mod identity {
-    //! Volume-serial + file-index identity via raw `GetFileInformationByHandle`
-    //! FFI. `std::os::windows::fs::MetadataExt::file_index` /
-    //! `volume_serial_number` remain gated behind the unstable
+    //! Volume-serial + file-index identity via `GetFileInformationByHandle`
+    //! (through `windows-sys`). `std::os::windows::fs::MetadataExt::file_index`
+    //! / `volume_serial_number` remain gated behind the unstable
     //! `windows_by_handle` feature, so this crate queries the same
     //! `BY_HANDLE_FILE_INFORMATION` data directly instead of depending on it.
     use super::FileId;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
 
-    #[allow(non_camel_case_types)]
-    type HANDLE = *mut core::ffi::c_void;
-    #[allow(non_camel_case_types)]
-    type c_void = core::ffi::c_void;
-
-    #[repr(C)]
-    struct FileTime {
-        low: u32,
-        high: u32,
-    }
-
-    #[repr(C)]
-    struct ByHandleFileInformation {
-        file_attributes: u32,
-        creation_time: FileTime,
-        last_access_time: FileTime,
-        last_write_time: FileTime,
-        volume_serial_number: u32,
-        file_size_high: u32,
-        file_size_low: u32,
-        number_of_links: u32,
-        file_index_high: u32,
-        file_index_low: u32,
-    }
-
-    const GENERIC_READ_NONE: u32 = 0;
-    const FILE_SHARE_READ: u32 = 0x1;
-    const FILE_SHARE_WRITE: u32 = 0x2;
-    const FILE_SHARE_DELETE: u32 = 0x4;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-    const INVALID_HANDLE_VALUE: isize = -1;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateFileW(
-            file_name: *const u16,
-            desired_access: u32,
-            share_mode: u32,
-            security_attrs: *mut c_void,
-            creation_disposition: u32,
-            flags_and_attrs: u32,
-            template_file: HANDLE,
-        ) -> HANDLE;
-        fn GetFileInformationByHandle(file: HANDLE, info: *mut ByHandleFileInformation) -> i32;
-        fn CloseHandle(object: HANDLE) -> i32;
-    }
+    /// No data access at all: metadata only, so a file opened for exclusive
+    /// writing elsewhere can still be identified.
+    const NO_ACCESS: u32 = 0;
 
     /// Resolve `path`'s volume-serial + file-index identity. `follow`
     /// controls whether a reparse point at `path` is traversed
@@ -837,28 +764,34 @@ mod identity {
     pub fn file_id_via_handle(path: &Path, follow: bool) -> Option<FileId> {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
         let flags = FILE_FLAG_BACKUP_SEMANTICS | if follow { 0 } else { FILE_FLAG_OPEN_REPARSE_POINT };
+        // SAFETY: `wide` is NUL-terminated and outlives the calls; a null
+        // security-attributes pointer and a null template handle are
+        // permitted by `CreateFileW`; `info` is a live, zeroed out-struct
+        // (`BY_HANDLE_FILE_INFORMATION` is plain data, valid when zeroed);
+        // the handle is checked against `INVALID_HANDLE_VALUE` before use and
+        // closed on every path after it, so it is never used after close.
         unsafe {
             let handle = CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ_NONE,
+                NO_ACCESS,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                std::ptr::null_mut(),
+                std::ptr::null(),
                 OPEN_EXISTING,
                 flags,
                 std::ptr::null_mut(),
             );
-            if handle as isize == INVALID_HANDLE_VALUE {
+            if handle == INVALID_HANDLE_VALUE {
                 return None;
             }
-            let mut info: ByHandleFileInformation = std::mem::zeroed();
+            let mut info: BY_HANDLE_FILE_INFORMATION = std::mem::zeroed();
             let ok = GetFileInformationByHandle(handle, &mut info);
             CloseHandle(handle);
             if ok == 0 {
                 return None;
             }
             Some(FileId {
-                volume_serial: info.volume_serial_number as u64,
-                file_index: ((info.file_index_high as u64) << 32) | info.file_index_low as u64,
+                volume_serial: info.dwVolumeSerialNumber as u64,
+                file_index: ((info.nFileIndexHigh as u64) << 32) | info.nFileIndexLow as u64,
             })
         }
     }
@@ -866,37 +799,15 @@ mod identity {
 
 #[cfg(windows)]
 mod stream_enum {
-    //! Minimal raw FFI over `FindFirstStreamW`/`FindNextStreamW` (available
-    //! since Vista) to enumerate Alternate Data Streams. No external crate
-    //! is pulled in for this — just the handful of kernel32 entry points
-    //! needed.
+    //! `FindFirstStreamW`/`FindNextStreamW` (available since Vista), through
+    //! `windows-sys`, to enumerate Alternate Data Streams.
+    use core::ffi::c_void;
     use std::ffi::OsString;
     use std::io;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
-
-    #[repr(C)]
-    struct Win32FindStreamData {
-        stream_size: i64,
-        stream_name: [u16; 296], // MAX_PATH(260) + 36, per WIN32_FIND_STREAM_DATA
-    }
-
-    #[allow(non_camel_case_types)]
-    type HANDLE = *mut core::ffi::c_void;
-
-    const INVALID_HANDLE_VALUE: isize = -1;
-    const FIND_STREAM_INFO_STANDARD: u32 = 0;
-    const ERROR_HANDLE_EOF: i32 = 38;
-    const ERROR_FILE_NOT_FOUND: i32 = 2;
-    const ERROR_NOT_SUPPORTED: i32 = 50;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn FindFirstStreamW(lpFileName: *const u16, InfoLevel: u32, lpFindStreamData: *mut Win32FindStreamData, dwFlags: u32) -> HANDLE;
-        fn FindNextStreamW(hFindStream: HANDLE, lpFindStreamData: *mut Win32FindStreamData) -> i32;
-        fn FindClose(hFindFile: HANDLE) -> i32;
-        fn GetLastError() -> u32;
-    }
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_FILE_NOT_FOUND, ERROR_HANDLE_EOF, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard, WIN32_FIND_STREAM_DATA};
 
     fn wide(path: &Path) -> Vec<u16> {
         path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
@@ -907,20 +818,26 @@ mod stream_enum {
     /// only care about *named* ADS.
     pub fn list_streams(path: &Path) -> io::Result<Vec<OsString>> {
         let wpath = wide(path);
-        let mut data = Win32FindStreamData { stream_size: 0, stream_name: [0u16; 296] };
+        let mut data = WIN32_FIND_STREAM_DATA { StreamSize: 0, cStreamName: [0u16; 296] };
         let mut out = Vec::new();
+        // SAFETY: `wpath` is NUL-terminated and outlives the calls; `data` is
+        // a live `WIN32_FIND_STREAM_DATA`, exactly the layout the
+        // `FindStreamInfoStandard` level fills, passed as the untyped
+        // out-pointer the prototype takes; the handle is checked against
+        // `INVALID_HANDLE_VALUE` before use and closed on every path after
+        // it; `GetLastError` is read right after the failing call.
         unsafe {
-            let handle = FindFirstStreamW(wpath.as_ptr(), FIND_STREAM_INFO_STANDARD, &mut data, 0);
-            if handle as isize == INVALID_HANDLE_VALUE {
-                let err = GetLastError() as i32;
+            let handle = FindFirstStreamW(wpath.as_ptr(), FindStreamInfoStandard, &mut data as *mut WIN32_FIND_STREAM_DATA as *mut c_void, 0);
+            if handle == INVALID_HANDLE_VALUE {
+                let err = GetLastError();
                 return if err == ERROR_HANDLE_EOF || err == ERROR_FILE_NOT_FOUND || err == ERROR_NOT_SUPPORTED {
                     Ok(Vec::new())
                 } else {
-                    Err(io::Error::from_raw_os_error(err))
+                    Err(io::Error::from_raw_os_error(err as i32))
                 };
             }
             loop {
-                let name = decode_name(&data.stream_name);
+                let name = decode_name(&data.cStreamName);
                 // The unnamed default stream is reported as `::$DATA`; a
                 // named one as `:<name>:$DATA`. Only the latter are ADS.
                 if let Some(stripped) = name.strip_suffix(":$DATA").and_then(|s| s.strip_prefix(':')) {
@@ -928,11 +845,11 @@ mod stream_enum {
                         out.push(OsString::from(stripped));
                     }
                 }
-                if FindNextStreamW(handle, &mut data) == 0 {
-                    let err = GetLastError() as i32;
+                if FindNextStreamW(handle, &mut data as *mut WIN32_FIND_STREAM_DATA as *mut c_void) == 0 {
+                    let err = GetLastError();
                     if err != ERROR_HANDLE_EOF {
                         FindClose(handle);
-                        return Err(io::Error::from_raw_os_error(err));
+                        return Err(io::Error::from_raw_os_error(err as i32));
                     }
                     break;
                 }
@@ -1087,10 +1004,8 @@ impl FakeFs {
         let volumes = self.volumes.lock().unwrap();
         let mut best: Option<(&PathBuf, &u64)> = None;
         for (prefix, vol) in volumes.iter() {
-            if p.starts_with(prefix) {
-                if best.map(|(b, _)| prefix.components().count() > b.components().count()).unwrap_or(true) {
-                    best = Some((prefix, vol));
-                }
+            if p.starts_with(prefix) && best.map(|(b, _)| prefix.components().count() > b.components().count()).unwrap_or(true) {
+                best = Some((prefix, vol));
             }
         }
         best.map(|(_, v)| *v).unwrap_or(0)
@@ -1415,7 +1330,7 @@ impl FileSystem for FakeFs {
         let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         if nodes.keys().any(|k| k.parent() == Some(p.as_path())) {
-            return Err(io::Error::new(io::ErrorKind::Other, "directory not empty"));
+            return Err(io::Error::other("directory not empty"));
         }
         nodes.remove(&p).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         Ok(())

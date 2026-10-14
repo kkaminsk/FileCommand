@@ -374,6 +374,10 @@ fn build_hitmap(area: Rect, state: &State) -> HitMap {
     hm
 }
 
+// The phase renderer genuinely needs every one of these inputs (buffer,
+// area, state, theme, depth, identity, clock, viewer source); bundling them
+// into a struct would only move the same eight values one level down.
+#[allow(clippy::too_many_arguments)]
 fn render_phase(
     buf: &mut Buffer,
     area: Rect,

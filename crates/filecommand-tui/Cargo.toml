@@ -2,10 +2,14 @@
 name = "filecommand-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "FileCommand terminal UI binary: event loop, rendering, terminal ownership"
 default-run = "filecommand"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "filecommand"
@@ -21,13 +25,13 @@ unicode-width = { workspace = true }
 # Windows clipboard: CF_HDROP file objects + "Preferred DropEffect" for the
 # clipboard-export Files action (design D3).
 clipboard-win = "5.4"
-# Open with the associated application: ShellExecuteW with the `open` verb
-# (open-with-associated-app; design D1). `Win32_System_Console` is for the
-# console control handler that keeps Ctrl+C during a suspended child run
-# from ending FileCommand (process-lifecycle-hardening design D1).
-# `Win32_System_Com` is for the CoInitializeEx/CoUninitialize bracket around
-# ShellExecuteW on its worker thread (offload-blocking-io design D7).
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Com"] }
+# Shared workspace binding (ci-and-build-tooling design D6). Used here for:
+# ShellExecuteW with the `open` verb (open-with-associated-app design D1);
+# the console control handler that keeps Ctrl+C during a suspended child run
+# from ending FileCommand (process-lifecycle-hardening design D1); the
+# CoInitializeEx/CoUninitialize bracket around ShellExecuteW on its worker
+# thread (offload-blocking-io design D7); and GetLocalTime for the clock.
+windows-sys = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 # Non-Windows fallback: text-only clipboard (Paths/Names; Files falls back

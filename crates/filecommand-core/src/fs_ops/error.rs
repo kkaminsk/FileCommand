@@ -127,9 +127,8 @@ mod tests {
 
     #[test]
     fn skipped_items_accumulate_in_order() {
-        let mut skipped = Vec::new();
-        skipped.push(SkippedItem::skipped(PathBuf::from("/a"), "denied".into()));
-        skipped.push(SkippedItem::skipped(PathBuf::from("/b"), "sharing violation".into()));
+        let skipped =
+            [SkippedItem::skipped(PathBuf::from("/a"), "denied".into()), SkippedItem::skipped(PathBuf::from("/b"), "sharing violation".into())];
         assert_eq!(skipped.len(), 2);
         assert_eq!(skipped[0].path, PathBuf::from("/a"));
         assert_eq!(skipped[1].reason, "sharing violation");

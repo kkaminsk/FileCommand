@@ -106,7 +106,7 @@ pub fn query(dir: &Path) -> GitInfo {
 /// repository — the same condition [`query`] reports as [`GitInfo::none`].
 ///
 /// The depth is computed on canonicalized spellings for the same reason
-/// [`pathspec_status`] compares them (8.3 short-name vs long-name forms);
+/// `pathspec_status` compares them (8.3 short-name vs long-name forms);
 /// when there is no working directory (a bare repository) or the comparison
 /// fails, it falls back to 0, i.e. "the queried directory itself".
 pub fn discover(dir: &Path) -> Option<(Repository, usize)> {

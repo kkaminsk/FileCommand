@@ -258,7 +258,7 @@ pub struct LaunchOptions {
     /// `path` for this session, winning over the `FILECOMMAND_LOG`
     /// environment variable. Same absent/empty/value convention as `theme`
     /// and `config_dir` above; resolution happens in `run` via
-    /// [`resolve_log_path`] (error-diagnostics; application-shell "Optional
+    /// `resolve_log_path` (error-diagnostics; application-shell "Optional
     /// diagnostic log").
     pub log: Option<String>,
 }
@@ -577,7 +577,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         usermenu_path,
         viewer_source: None,
         viewer_handoff: mpsc::channel(),
-        clipboard: Box::new(PlatformClipboard::default()),
+        clipboard: Box::new(PlatformClipboard),
         mouse_tracker: MouseTracker::new(),
         git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
         workers: worker::WorkerGauge::new(),

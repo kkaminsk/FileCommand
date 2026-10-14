@@ -290,7 +290,7 @@ pub struct State {
     /// `DriveSelect::generation`) that let a worker reply be matched against
     /// the request that's still current, so an out-of-order completion from
     /// a superseded request is dropped instead of silently overwriting a
-    /// fresher answer. See [`State::next_request_id`].
+    /// fresher answer. See `State::next_request_id`.
     pub request_seq: u64,
     /// Directory frecency history backing the Ctrl+J fuzzy-jump dialog,
     /// persisted alongside command history in `history.json` (fuzzy-jump
@@ -1144,7 +1144,7 @@ pub enum Command {
     CopyToClipboard(ClipboardPayloadKind),
     /// Reply to `Effect::SetClipboard` once the TUI's `Clipboard` trait has
     /// run. `payload` echoes back the request (the resolved paths are
-    /// needed to render the singular "Path copied: <path>" message without
+    /// needed to render the singular "Path copied: `<path>`" message without
     /// re-deriving scope); `fell_back_to_paths` is set only when a `Files`
     /// request was carried out as a plain-text `Paths` write because file
     /// objects aren't supported on this platform (clipboard-export
@@ -1476,11 +1476,11 @@ pub enum Effect {
 }
 
 /// The pure state transition. Equal `(state, command)` always yields equal
-/// `(state, Vec<Effect>)`. A thin wrapper around [`update_impl`] that
+/// `(state, Vec<Effect>)`. A thin wrapper around `update_impl` that
 /// enforces the one invariant that must hold no matter which internal path a
 /// command took: `state.drag` is never `Some` outside `UiPhase::Panels` with
 /// no overlay open (mouse-drag "Cancel and phase-change clear the drag";
-/// design D5) — see [`drag_allowed`]. Applying it here, once, after every
+/// design D5) — see `drag_allowed`. Applying it here, once, after every
 /// call — rather than threading a clear into each of `update_impl`'s many
 /// phase-transition arms — is what makes it a true postcondition: every
 /// return path is covered by construction, including ones a future phase
@@ -2914,7 +2914,7 @@ fn editor_viewport(term_size: (u16, u16)) -> (usize, usize) {
 }
 
 /// A panel's body entry-row count for a given terminal height, display mode,
-/// and tab count — the same shape as [`editor_viewport`], kept as a
+/// and tab count — the same shape as `editor_viewport`, kept as a
 /// duplicate of `filecommand-tui`'s `layout::compute` +
 /// `views::panel::render` geometry rather than a cross-crate dependency, so
 /// `core::update` can call [`PanelState::ensure_cursor_visible`] without
@@ -4861,10 +4861,8 @@ fn handle_click_entry(state: &mut State, side: PanelSide, name: OsString, mods: 
     let Some(idx) = panel.entries.iter().position(|e| e.name == name) else { return vec![] };
     panel.cursor = idx;
     panel.cursor_user_moved = true;
-    if mods == ClickMods::Ctrl && panel.entries[idx].kind != EntryKind::ParentDir {
-        if !panel.selected.remove(&name) {
-            panel.selected.insert(name);
-        }
+    if mods == ClickMods::Ctrl && panel.entries[idx].kind != EntryKind::ParentDir && !panel.selected.remove(&name) {
+        panel.selected.insert(name);
     }
     reconcile_panel_viewport(state, side);
     vec![]

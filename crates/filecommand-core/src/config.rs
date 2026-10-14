@@ -738,7 +738,7 @@ fn write_config_durably(path: &Path, updated: &str) -> io::Result<()> {
 }
 
 /// Write the updated `theme =` key to `config.toml` at `path` durably (see
-/// [`write_config_durably`]). Reads the existing file so every other line
+/// `write_config_durably`). Reads the existing file so every other line
 /// survives the round trip.
 pub fn save_theme_atomic(path: &Path, theme_name: &str) -> io::Result<()> {
     let existing = read_config_for_rewrite(path)?;
@@ -819,7 +819,7 @@ fn json_escape(s: &str) -> String {
 /// well-formed string array yields whatever strings could be read, so a
 /// corrupt history file degrades to a shorter history rather than an error.
 /// A leading BOM is ignored and string escapes decode losslessly
-/// ([`decode_json_string`]), so no entry is lost to an escape the reader
+/// (`decode_json_string`), so no entry is lost to an escape the reader
 /// does not understand (configuration-files "History file strings decode
 /// without losing entries").
 pub fn parse_history(input: &str) -> Vec<String> {

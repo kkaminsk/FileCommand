@@ -46,7 +46,7 @@ impl TextEditOp {
 /// routing (idle-aware-event-loop design D6), so every paste path flattens
 /// identically.
 pub fn flatten_line_breaks(text: &str) -> String {
-    text.replace("\r\n", " ").replace('\r', " ").replace('\n', " ")
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// A single line of text plus a caret (char index, `0..=len_chars()`).

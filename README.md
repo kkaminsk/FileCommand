@@ -72,13 +72,22 @@ signing) and the winget package template.
 
 ## Building from source
 
-Requires the [Rust toolchain](https://rustup.rs) (stable).
+Requires the [Rust toolchain](https://rustup.rs), stable **1.88 or newer**.
+The workspace declares `rust-version = "1.88"`, so an older toolchain stops
+with cargo's standard message naming the required version. Windows is the
+primary target; Linux and macOS builds are best-effort. They need a C
+compiler (for the vendored libgit2 and zlib) but **no OpenSSL development
+headers**, because `git2` is built without its network transports — git info
+only reads local repository state.
 
 ```powershell
 git clone https://github.com/kkaminsk/FileCommand.git
 cd FileCommand
 cargo build --release
 ```
+
+Release builds use thin LTO, a single codegen unit and stripped symbols;
+panics still unwind, which the terminal-restoring guard relies on.
 
 The binary is produced at `target\release\filecommand.exe`. Run it directly,
 or via Cargo:
@@ -670,11 +679,33 @@ FileCommand/
 cargo test --workspace
 ```
 
-Covers `filecommand-core` unit and property-based tests (file ops against
-temp directories, sorting/filtering, selection semantics, config/theme
-parsing, git info against fixture repos) and `filecommand-tui` ratatui
-`TestBackend` snapshot tests (panels, dialogs, viewer/editor, splash, help,
-menus) via `insta`.
+Covers `filecommand-core` unit and property-based tests — the file-operation
+engine against the in-memory `FakeFs` double (conflicts, error recovery,
+cancellation, fault injection), sorting/filtering, selection semantics,
+config/theme parsing, and git info against fixture repositories created in
+temporary directories — plus the `RealFs` integration suite
+(`crates/filecommand-core/tests/realfs.rs`), which runs the job engine
+against the real filesystem in per-test temporary directories (round trips,
+cancellation, read-only targets, Windows-specific cases). `filecommand-tui`
+has ratatui `TestBackend` snapshot tests (panels, dialogs, viewer/editor,
+splash, help, menus) via `insta`, plus integration tests for the binary's
+flags and terminal restoration.
+
+Every pull request runs the same gates in CI (`.github/workflows/ci.yml`:
+Windows, pinned stable toolchain, against the committed `Cargo.lock`). To
+reproduce the required job locally:
+
+```powershell
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+$env:RUSTDOCFLAGS = '-D warnings'; cargo doc --workspace --no-deps --locked
+```
+
+A second required job checks the workspace on the declared minimum Rust
+version (`cargo check --workspace --all-targets --locked` on 1.88). A
+best-effort Linux job builds and tests on `ubuntu-latest`; its result is
+reported but never blocks a merge.
 
 ## Contributing
 

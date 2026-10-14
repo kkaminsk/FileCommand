@@ -1,8 +1,8 @@
-/// Integration tests for -h / -? / --help flags (help-flags OpenSpec change).
-///
-/// Uses CARGO_BIN_EXE_filecommand (set by cargo at test build time) to invoke
-/// the real binary and assert exit-code 0 + version string in stdout without
-/// the TUI ever being launched.
+//! Integration tests for -h / -? / --help flags (help-flags OpenSpec change).
+//!
+//! Uses CARGO_BIN_EXE_filecommand (set by cargo at test build time) to invoke
+//! the real binary and assert exit-code 0 + version string in stdout without
+//! the TUI ever being launched.
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BIN: &str = env!("CARGO_BIN_EXE_filecommand");

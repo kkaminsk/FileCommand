@@ -78,7 +78,7 @@ pub fn render_conflict(
             buf.set_string(x + 1, y + 5, "New name:", body);
             buf.set_string(x + 11, y + 5, "[", field_style);
             buf.set_string(x + 12, y + 5, &slice, field_style);
-            buf.set_string(x + 12 + display_width(&slice) as u16, y + 5, &format!("]{}", " ".repeat(pad)), field_style);
+            buf.set_string(x + 12 + display_width(&slice) as u16, y + 5, format!("]{}", " ".repeat(pad)), field_style);
             buf.set_string(x + 1 + inner_w as u16, y + 5, "\u{2551}", body);
             // While the field is open Esc closes it rather than cancelling
             // the job, and `c` is text, so the Cancel row is not offered.

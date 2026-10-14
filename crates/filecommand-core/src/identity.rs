@@ -31,7 +31,7 @@ pub fn version_line() -> String {
     format!("Version {}", version())
 }
 
-/// "Copyright (C) <year> The FileCommand Authors"
+/// "Copyright (C) `<year>` The FileCommand Authors"
 pub fn copyright_line(year: i32) -> String {
     format!("Copyright (C) {year} The FileCommand Authors")
 }

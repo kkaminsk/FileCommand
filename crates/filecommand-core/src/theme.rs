@@ -1,5 +1,5 @@
 //! Named 16-color theme model. Every renderer resolves colors by role, never
-//! by hardcoding an ANSI or RGB value directly — see [`Theme::resolve`].
+//! by hardcoding an ANSI or RGB value directly — see [`ColorSpec::resolve_fg`] and [`ColorSpec::resolve_bg`].
 
 use std::collections::BTreeMap;
 use std::fmt;

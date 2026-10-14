@@ -176,18 +176,16 @@ pub fn classify_editor_bytes(bytes: &[u8]) -> Result<EditorText<'_>, NotEditable
 /// "Editor invocation and size cap").
 #[derive(Debug)]
 pub enum LoadResult {
-    Loaded(EditorState),
+    /// Boxed so the result is not sized by the whole editor buffer
+    /// (clippy `large_enum_variant`).
+    Loaded(Box<EditorState>),
     /// The file is `size` bytes, at or above [`EDITOR_MAX_BYTES`]; the
     /// caller should redirect to the F3 viewer instead.
-    TooLarge {
-        size: u64,
-    },
+    TooLarge { size: u64 },
     /// The file is under the cap but is not UTF-8 text the editor can write
     /// back byte-exactly; the caller should redirect to the F3 viewer with a
     /// reason-specific notice (design D1/D2).
-    NotEditable {
-        reason: NotEditableReason,
-    },
+    NotEditable { reason: NotEditableReason },
 }
 
 /// The F4-in-editor search-and-replace prompt's two stages: the literal
@@ -259,7 +257,7 @@ pub struct EditorState {
     /// Whether the file began with a UTF-8 byte-order mark on load. The mark
     /// is kept out of the buffer — it is zero-width, so as a buffer
     /// character the caret could silently type in front of it or delete it
-    /// — and written back by [`Self::to_bytes`] (builtin-editor "UTF-8
+    /// — and written back by `Self::to_bytes` (builtin-editor "UTF-8
     /// byte-order mark is written back"; design D3).
     pub has_bom: bool,
 }
@@ -312,7 +310,7 @@ impl EditorState {
         }
         let bytes = std::fs::read(&extended)?;
         Ok(match EditorState::from_bytes(path.to_path_buf(), &bytes) {
-            Ok(editor) => LoadResult::Loaded(editor),
+            Ok(editor) => LoadResult::Loaded(Box::new(editor)),
             Err(reason) => LoadResult::NotEditable { reason },
         })
     }

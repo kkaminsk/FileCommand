@@ -115,62 +115,43 @@ pub fn drive_letter_of(path: &Path) -> Option<char> {
 
 #[cfg(windows)]
 mod platform {
+    //! Win32 calls go through `windows-sys` (ci-and-build-tooling design
+    //! D6): prototypes, constants and struct layouts come from the binding
+    //! crate, never from hand-written copies.
     use super::DiskSpace;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-
-    /// Suppress the "There is no disk in the drive" system modal — without
-    /// this, probing an empty `A:` pops a dialog the user must dismiss.
-    const SEM_FAILCRITICALERRORS: u32 = 0x0001;
-
-    #[repr(C)]
-    struct MemoryStatusEx {
-        length: u32,
-        memory_load: u32,
-        total_phys: u64,
-        avail_phys: u64,
-        total_page_file: u64,
-        avail_page_file: u64,
-        total_virtual: u64,
-        avail_virtual: u64,
-        avail_extended_virtual: u64,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetLogicalDrives() -> u32;
-        fn SetThreadErrorMode(new_mode: u32, old_mode: *mut u32) -> i32;
-        fn GetVolumeInformationW(
-            root_path: *const u16,
-            volume_name: *mut u16,
-            volume_name_size: u32,
-            serial: *mut u32,
-            max_component_len: *mut u32,
-            fs_flags: *mut u32,
-            fs_name: *mut u16,
-            fs_name_size: u32,
-        ) -> i32;
-        fn GetDiskFreeSpaceExW(directory: *const u16, free_to_caller: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
-        fn GlobalMemoryStatusEx(buffer: *mut MemoryStatusEx) -> i32;
-    }
+    use windows_sys::Win32::Storage::FileSystem::{GetDiskFreeSpaceExW, GetLogicalDrives, GetVolumeInformationW};
+    use windows_sys::Win32::System::Diagnostics::Debug::{SetThreadErrorMode, SEM_FAILCRITICALERRORS};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 
     fn wide(s: &str) -> Vec<u16> {
         OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
     }
 
     /// Run `f` with the critical-error dialog suppressed for this thread.
+    /// `SEM_FAILCRITICALERRORS` suppresses the "There is no disk in the
+    /// drive" system modal — without it, probing an empty `A:` pops a
+    /// dialog the user must dismiss.
     fn quietly<T>(f: impl FnOnce() -> T) -> T {
         let mut previous = 0u32;
+        // SAFETY: `previous` is a live local that receives the old mode; the
+        // call touches nothing else.
         let changed = unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, &mut previous) } != 0;
         let out = f();
         if changed {
+            // SAFETY: `previous` was filled in by the successful call above,
+            // and a null old-mode pointer is permitted by the API.
             unsafe { SetThreadErrorMode(previous, std::ptr::null_mut()) };
         }
         out
     }
 
     pub fn enumerate_drives() -> Vec<char> {
-        super::drives_from_bitmask(unsafe { GetLogicalDrives() })
+        // SAFETY: `GetLogicalDrives` takes no arguments and only returns a
+        // bitmask; it cannot violate any invariant.
+        let mask = unsafe { GetLogicalDrives() };
+        super::drives_from_bitmask(mask)
     }
 
     /// `(label, serial)` for a drive, or `None` when the volume can't be
@@ -179,17 +160,23 @@ mod platform {
         let root = wide(&format!("{}:\\", letter.to_ascii_uppercase()));
         let mut name = [0u16; 261];
         let mut serial = 0u32;
-        let ok = quietly(|| unsafe {
-            GetVolumeInformationW(
-                root.as_ptr(),
-                name.as_mut_ptr(),
-                name.len() as u32,
-                &mut serial,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                0,
-            )
+        let ok = quietly(|| {
+            // SAFETY: `root` is NUL-terminated and outlives the call; `name`
+            // is a 261-element buffer whose length is passed alongside it;
+            // `serial` is a live local; the remaining out-pointers are null
+            // with a zero size, which the API permits.
+            unsafe {
+                GetVolumeInformationW(
+                    root.as_ptr(),
+                    name.as_mut_ptr(),
+                    name.len() as u32,
+                    &mut serial,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            }
         });
         if ok == 0 {
             return None;
@@ -204,7 +191,11 @@ mod platform {
         let mut free_to_caller = 0u64;
         let mut total = 0u64;
         let mut total_free = 0u64;
-        let ok = quietly(|| unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free_to_caller, &mut total, &mut total_free) });
+        let ok = quietly(|| {
+            // SAFETY: `root` is NUL-terminated and outlives the call; the
+            // three out-pointers are live locals.
+            unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut free_to_caller, &mut total, &mut total_free) }
+        });
         if ok == 0 {
             return None;
         }
@@ -212,21 +203,23 @@ mod platform {
     }
 
     pub fn available_memory() -> Option<u64> {
-        let mut status = MemoryStatusEx {
-            length: std::mem::size_of::<MemoryStatusEx>() as u32,
-            memory_load: 0,
-            total_phys: 0,
-            avail_phys: 0,
-            total_page_file: 0,
-            avail_page_file: 0,
-            total_virtual: 0,
-            avail_virtual: 0,
-            avail_extended_virtual: 0,
+        let mut status = MEMORYSTATUSEX {
+            dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+            dwMemoryLoad: 0,
+            ullTotalPhys: 0,
+            ullAvailPhys: 0,
+            ullTotalPageFile: 0,
+            ullAvailPageFile: 0,
+            ullTotalVirtual: 0,
+            ullAvailVirtual: 0,
+            ullAvailExtendedVirtual: 0,
         };
+        // SAFETY: `status` is a live `MEMORYSTATUSEX` whose `dwLength` is
+        // preset to the struct size, as the API requires before the call.
         if unsafe { GlobalMemoryStatusEx(&mut status) } == 0 {
             return None;
         }
-        Some(status.avail_phys)
+        Some(status.ullAvailPhys)
     }
 
     /// NC renders volume serials as `XXXX-XXXX` hex.

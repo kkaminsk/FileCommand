@@ -152,7 +152,7 @@ pub fn resolve_shell(configured: Option<&str>) -> ShellSpec {
 
 /// Build the full invocation for `user_text`, run from `cwd` (the active
 /// panel's directory). Both the program path and `cwd` are routed through
-/// [`spawn_safe_path`] so a shell configured with a long quoted program path,
+/// `spawn_safe_path` so a shell configured with a long quoted program path,
 /// or a panel directory near/over `MAX_PATH`, still spawns correctly.
 pub fn build_command(configured: Option<&str>, user_text: &str, cwd: &Path) -> Invocation {
     let spec = resolve_shell(configured);
