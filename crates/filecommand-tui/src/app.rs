@@ -116,6 +116,19 @@ impl Runtime {
     fn release_viewer_source(&mut self) {
         self.viewer_source = None;
     }
+
+    /// `apply`'s post-`update` check (resize-preserves-session-state design
+    /// D7): the source goes when the viewer phase has just ended by any
+    /// route, or when a `ViewerOpened` was applied but the phase did not
+    /// become `Viewer` (the reply was discarded). It is keyed to that
+    /// *transition*, never to "the phase is not `Viewer`" — `open_viewer_source`
+    /// installs the source while the phase is still `Panels`, and a command
+    /// applied before the queued `ViewerOpened` must not drop it.
+    fn release_viewer_source_if_viewer_ended(&mut self, was_viewer: bool, viewer_opened: bool, after: &State) {
+        if (was_viewer || viewer_opened) && !matches!(after.phase, UiPhase::Viewer(_)) {
+            self.release_viewer_source();
+        }
+    }
 }
 
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
@@ -727,8 +740,12 @@ fn apply_mouse_batch(
         if matches!(m.kind, MouseEventKind::Moved) {
             continue;
         }
+        // While the placeholder hides the screen, the viewer/editor wheel
+        // arms are skipped and every event goes through `input::map_mouse`,
+        // whose `context` ignores all of it except the quit dialog's buttons
+        // (resize-preserves-session-state design D3).
         match &state.phase {
-            UiPhase::Viewer(_) => match m.kind {
+            UiPhase::Viewer(_) if !state.undersized => match m.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                     let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                     pending = match pending {
@@ -741,7 +758,7 @@ fn apply_mouse_batch(
                 }
                 _ => flush!(),
             },
-            UiPhase::Editor(_) => match m.kind {
+            UiPhase::Editor(_) if !state.undersized => match m.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                     let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                     pending = match pending {
@@ -871,9 +888,13 @@ impl BurstHandler for LoopHandler<'_> {
 /// outranks the viewer/editor's own direct dispatch (application-shell
 /// "Quit request keys and confirmation"; design D5), then the viewer and
 /// editor map through their own functions, then everything else goes
-/// through `input::map_key`.
+/// through `input::map_key`. The "terminal too small" placeholder takes the
+/// same precedence as the quit dialog: while `state.undersized` is set the
+/// viewer's and editor's direct dispatch is bypassed so `map_key`'s
+/// undersized arm can gate every key (resize-preserves-session-state design
+/// D3).
 fn map_pressed_key(key: KeyEvent, state: &State, keys: &config::Keys, viewer_source: Option<&ByteSource>) -> Option<Command> {
-    if state.quit_confirm {
+    if state.quit_confirm || state.undersized {
         let page_size = active_panel_page_size(state);
         return input::map_key(key, state, page_size, keys);
     }
@@ -1165,6 +1186,13 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     if matches!(cmd, Command::ViewerClose) {
         rt.release_viewer_source();
     }
+    // The source must also go whenever the viewer phase *ends* by any other
+    // route, and when a `ViewerOpened` is discarded, so the file is held
+    // exactly as long as the viewer exists — see
+    // `Runtime::release_viewer_source_if_viewer_ended` (resize-preserves-
+    // session-state design D7; viewer "Closing the viewer releases the file").
+    let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
+    let viewer_opened = matches!(cmd, Command::ViewerOpened { .. });
     // Commands → Menu file edit, built-in-editor leg: remember whether the
     // editor currently has the user-menu file open, so the transition out of
     // `UiPhase::Editor` (any of the quit paths, save-on-exit included)
@@ -1173,6 +1201,7 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     let editing_user_menu = matches!(&state.phase, UiPhase::Editor(editor) if editor.path == rt.usermenu_path);
     let (state, effects) = update(state, cmd);
     let quit = run_effects(effects, guard, rt)?;
+    rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened, &state);
     if editing_user_menu && !matches!(state.phase, UiPhase::Editor(_)) {
         reload_user_menu(rt);
     }
@@ -1675,6 +1704,109 @@ mod tests {
         }
 
         rt.release_viewer_source();
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// A `Runtime` with no terminal and no worker threads, for the viewer-
+    /// source tests below (and the one above, which predates it).
+    fn headless_runtime(dir: &std::path::Path) -> (Runtime, Receiver<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let rt = Runtime {
+            tx,
+            active_job: None,
+            history_path: dir.join("history.json"),
+            config_path: dir.join(CONFIG_FILE),
+            usermenu_path: dir.join("usermenu.toml"),
+            persist_enabled: false,
+            viewer_source: None,
+            clipboard: Box::new(clipboard::RecordingClipboard::default()),
+            mouse_tracker: MouseTracker::new(),
+            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+            workers: worker::WorkerGauge::new(),
+        };
+        (rt, rx)
+    }
+
+    /// Mirrors `apply` minus `run_effects` (which needs a `TerminalGuard`):
+    /// the pre-`update` `ViewerClose` release and the post-`update`
+    /// transition check, in the same order.
+    fn apply_headless(state: State, cmd: Command, rt: &mut Runtime) -> State {
+        if matches!(cmd, Command::ViewerClose) {
+            rt.release_viewer_source();
+        }
+        let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
+        let viewer_opened = matches!(cmd, Command::ViewerOpened { .. });
+        let (state, _effects) = update(state, cmd);
+        rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened, &state);
+        state
+    }
+
+    /// resize-preserves-session-state design D7 (task 3.4): the byte source
+    /// follows the viewer *phase*. It survives an unrelated command applied
+    /// between `Effect::OpenViewer` and the queued `ViewerOpened` (the phase
+    /// is still `Panels` then), survives a shrink below the floor and the
+    /// enlarge back, and is released exactly when the viewer closes.
+    #[test]
+    fn viewer_source_follows_the_viewer_phase_across_a_resize() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-resize-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        let mut state = State::empty(Theme::classic());
+        state.term_size = (80, 24);
+        rt.open_viewer_source(path.clone());
+        assert!(rt.viewer_source.is_some());
+        let opened = match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(cmd @ Command::ViewerOpened { .. }) => cmd,
+            other => panic!("expected ViewerOpened, got {other:?}"),
+        };
+
+        // A listing chunk already queued ahead of the reply is applied while
+        // the phase is still `Panels`: the fresh source must survive it.
+        let state = apply_headless(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![] }, &mut rt);
+        assert!(rt.viewer_source.is_some(), "an unrelated command before ViewerOpened must not drop the source");
+        let state = apply_headless(state, opened, &mut rt);
+        assert!(matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some());
+
+        // Shrink below the floor and enlarge: the viewer phase persists, and
+        // so does its source.
+        let state = apply_headless(state, Command::Resize(50, 12), &mut rt);
+        assert!(state.undersized && matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the hidden viewer keeps its file open");
+        let state = apply_headless(state, Command::Resize(80, 24), &mut rt);
+        assert!(!state.undersized && matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the source is still there when the viewer reappears");
+
+        // Closing releases it — and only then.
+        let state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// Design D7's second clause: a `ViewerOpened` the reducer discards
+    /// (here it arrives while the end-of-job summary owns the phase) must not
+    /// leave the source `Effect::OpenViewer` installed behind.
+    #[test]
+    fn a_discarded_viewer_opened_releases_the_source() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-discard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        rt.open_viewer_source(path.clone());
+        let opened = rx.recv_timeout(Duration::from_secs(5)).expect("ViewerOpened");
+        let mut state = State::empty(Theme::classic());
+        state.phase = UiPhase::FileOpSummary(vec![]);
+        let state = apply_headless(state, opened, &mut rt);
+        assert!(!matches!(state.phase, UiPhase::Viewer(_)), "the summary dialog swallowed the reply");
         assert!(rt.viewer_source.is_none());
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&dir).unwrap();

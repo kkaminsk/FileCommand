@@ -45,6 +45,15 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
     if state.startup_warning.is_some() {
         return map_startup_warning_key(key);
     }
+    // Below the 60x16 floor the placeholder hides whatever screen is active
+    // — panels, an open overlay, a dialog, the viewer or the editor — and
+    // input must never reach a screen the user cannot see. Only the two
+    // dialogs above, which are drawn over the placeholder, keep their keys
+    // (application-shell "Resize handling with 60x16 hard floor and
+    // placeholder"; resize-preserves-session-state design D3).
+    if state.undersized {
+        return map_undersized_key(key, state);
+    }
     if state.drive_select.is_some() {
         return map_drive_select_key(key);
     }
@@ -102,6 +111,23 @@ pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> O
             }
             map_panel_key(key, state, page_size, keys)
         }
+    }
+}
+
+/// What a key means while the "terminal too small" placeholder is shown:
+/// F10 and Esc ask to quit (the quit-confirmation dialog is drawn over the
+/// placeholder), everything else is ignored. The one exception is a hidden
+/// built-in editor: there F10 and Esc are ignored too, because a confirmed
+/// quit would discard unsaved edits without the editor's own save-on-exit
+/// prompt — the same way the global quit dialog cannot be opened from inside
+/// the editor at full size (design D3).
+fn map_undersized_key(key: KeyEvent, state: &State) -> Option<Command> {
+    if matches!(state.phase, UiPhase::Editor(_)) {
+        return None;
+    }
+    match key.code {
+        KeyCode::F(10) | KeyCode::Esc => Some(Command::RequestQuit),
+        _ => None,
     }
 }
 

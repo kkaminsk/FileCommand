@@ -148,8 +148,9 @@ enum Context {
     FileActionMenuOpen,
     /// An overlay mouse-basics does not support yet (drive select, fuzzy
     /// jump, find file, user menu, the Alt+F8 history dialog, theme picker,
-    /// help, the startup warning) or a phase with nothing clickable (splash,
-    /// placeholder) — every event is ignored.
+    /// help, the startup warning), a phase with nothing clickable (splash),
+    /// or the "terminal too small" placeholder hiding the active screen —
+    /// every event is ignored.
     Ignored,
 }
 
@@ -160,6 +161,14 @@ fn context(state: &State) -> Context {
     // everything else here too, mirroring `core::update`'s own precedence.
     if state.quit_confirm {
         return Context::DialogButtons;
+    }
+    // Below the 60x16 floor the placeholder hides the active screen, so no
+    // click or wheel notch may reach it — checked after `quit_confirm` so
+    // the quit dialog's buttons, drawn over the placeholder, stay clickable
+    // (application-shell "Resize handling with 60x16 hard floor and
+    // placeholder"; resize-preserves-session-state design D3).
+    if state.undersized {
+        return Context::Ignored;
     }
     if state.startup_warning.is_some()
         || state.drive_select.is_some()
@@ -179,11 +188,11 @@ fn context(state: &State) -> Context {
         UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => Context::DialogButtons,
         UiPhase::Panels if state.menu.is_some() => Context::PulldownOpen,
         UiPhase::Panels => Context::Panels,
-        // Splash/Placeholder have nothing clickable; Viewer/Editor are
-        // never routed here at all (see the module doc comment) — kept as
-        // an explicit arm rather than a catch-all so a future `UiPhase`
-        // variant doesn't silently fall through to "ignored" unnoticed.
-        UiPhase::Splash { .. } | UiPhase::Placeholder | UiPhase::Viewer(_) | UiPhase::Editor(_) => Context::Ignored,
+        // Splash has nothing clickable; Viewer/Editor are never routed here
+        // at full size (see the module doc comment) — kept as an explicit
+        // arm rather than a catch-all so a future `UiPhase` variant doesn't
+        // silently fall through to "ignored" unnoticed.
+        UiPhase::Splash { .. } | UiPhase::Viewer(_) | UiPhase::Editor(_) => Context::Ignored,
     }
 }
 

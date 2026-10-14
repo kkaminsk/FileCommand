@@ -261,10 +261,14 @@ fn splash_auto_dismisses_after_min_hold_via_tick() {
 
 #[test]
 fn placeholder_below_min_and_grows_back_to_panels_never_splash() {
+    // resize-preserves-session-state design D1/D2: "too small" is the
+    // `undersized` flag beside the phase; the splash is dismissed for good.
     let state = test_state(UiPhase::Splash { started_at_ms: 0 });
     let (state, _) = update(state, Command::Resize(40, 10));
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(80, 24));
+    assert!(!state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
@@ -272,27 +276,31 @@ fn placeholder_below_min_and_grows_back_to_panels_never_splash() {
 fn too_small_boundary_at_59x16_is_placeholder() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(59, 16));
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
 fn too_small_boundary_at_60x15_is_placeholder() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(60, 15));
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
 fn too_small_boundary_at_60x16_is_panels() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(60, 16));
+    assert!(!state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
 fn splash_skipped_when_starting_below_60x16_floor() {
     let (state, _) = State::initial(Theme::classic(), (59, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
@@ -305,9 +313,11 @@ fn splash_starts_normally_at_exactly_60x16() {
 fn placeholder_replaces_splash_when_resized_below_new_floor_mid_splash() {
     let state = test_state(UiPhase::Splash { started_at_ms: 0 });
     let (state, _) = update(state, Command::Resize(59, 16));
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
     // Enlarging back never returns to Splash, only Panels.
     let (state, _) = update(state, Command::Resize(60, 16));
+    assert!(!state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
@@ -399,7 +409,8 @@ fn initial_builds_start_listing_effects_for_both_panels() {
 #[test]
 fn initial_below_min_size_skips_straight_to_placeholder() {
     let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
@@ -6998,7 +7009,8 @@ fn drag_clears_on_resize_below_the_minimum() {
     state.left.entries = vec![file_entry("a.txt", 1)];
     let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
     let (state, _) = update(state, Command::Resize(10, 5));
-    assert!(matches!(state.phase, UiPhase::Placeholder));
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels, "the panels survive the shrink; only the drag is cleared");
     assert!(state.drag.is_none());
 }
 
@@ -7321,8 +7333,10 @@ fn no_reveal_is_recorded_when_the_splash_never_showed() {
     // Below the floor the splash is skipped for the placeholder; growing
     // back to Panels is not a Splash -> Panels transition either.
     let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/"), PathBuf::from("/"), true);
-    assert_eq!(state.phase, UiPhase::Placeholder);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(80, 24));
+    assert!(!state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(state.panels_revealed_at_ms, None);
 }
@@ -7361,4 +7375,393 @@ fn animations_flag_is_off_in_empty_states_and_exposes_the_clock_only_when_on() {
     assert_eq!(state.anim_now(), None);
     state.animations = true;
     assert_eq!(state.anim_now(), Some(77));
+}
+
+// ---------------------------------------------------------------------
+// resize-preserves-session-state: shrinking below the 60x16 floor raises
+// `State::undersized` and leaves the phase and every overlay intact
+// (application-shell "Resize handling with 60x16 hard floor and
+// placeholder"; design D1-D7)
+// ---------------------------------------------------------------------
+
+/// Task 4.1: shrink to 50x12, then enlarge back to 80x24. The phase and
+/// every overlay field — in fact the whole `State` apart from `term_size`
+/// and `undersized`, which are restored too — must be equal before and
+/// after, with `undersized` set in between. The input is first normalised
+/// to 80x24 so the comparison is against a reconciled 80x24 state.
+fn assert_survives_shrink_and_enlarge(state: State) -> State {
+    let (state, _) = update(state, Command::Resize(80, 24));
+    let before = state.clone();
+
+    let (shrunk, effects) = update(state, Command::Resize(50, 12));
+    assert!(effects.is_empty(), "a resize emits no effects");
+    assert!(shrunk.undersized, "50x12 is below the floor");
+    assert_eq!(shrunk.term_size, (50, 12));
+    assert_eq!(shrunk.phase, before.phase, "the shrink must not touch the phase");
+    assert_eq!(shrunk.menu, before.menu);
+    assert_eq!(shrunk.drive_select, before.drive_select);
+    assert_eq!(shrunk.fuzzy_jump, before.fuzzy_jump);
+    assert_eq!(shrunk.find_file, before.find_file);
+    assert_eq!(shrunk.user_menu, before.user_menu);
+    assert_eq!(shrunk.history_dialog, before.history_dialog);
+    assert_eq!(shrunk.theme_picker, before.theme_picker);
+    assert_eq!(shrunk.file_action_menu, before.file_action_menu);
+    assert_eq!(shrunk.help, before.help);
+    assert_eq!(shrunk.quick_search, before.quick_search);
+    assert_eq!(shrunk.command_line, before.command_line);
+    assert_eq!(shrunk.left.quick_filter, before.left.quick_filter);
+
+    let (restored, effects) = update(shrunk, Command::Resize(80, 24));
+    assert!(effects.is_empty());
+    assert!(!restored.undersized);
+    assert_eq!(restored, before, "enlarging must restore the state exactly as it was");
+    restored
+}
+
+fn twenty_line_editor() -> EditorState {
+    let text: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+    EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes())
+}
+
+/// Task 4.2: the editor with a modified buffer, the caret on line 12 and
+/// overwrite mode (application-shell "Unsaved editor buffer survives a
+/// shrink").
+#[test]
+fn undersized_preserves_a_modified_editor_buffer_caret_and_mode() {
+    let mut state = editor_state(twenty_line_editor());
+    state.term_size = (80, 24);
+    let (state, _) = update(state, Command::EditorChar('x'));
+    let mut state = state;
+    for _ in 0..12 {
+        let (s, _) = update(state, Command::EditorMove(EditorMove::Down));
+        state = s;
+    }
+    let (state, _) = update(state, Command::EditorToggleMode);
+    let UiPhase::Editor(before) = &state.phase else { panic!("expected the editor") };
+    assert!(before.is_modified());
+    assert_eq!(before.caret.line, 12);
+    assert_eq!(before.mode, crate::editor::EntryMode::Overwrite);
+    let before = before.clone();
+
+    let restored = assert_survives_shrink_and_enlarge(state);
+    let UiPhase::Editor(after) = &restored.phase else { panic!("expected the editor") };
+    assert_eq!(*after, before);
+    assert!(after.is_modified(), "the modified indicator survives");
+    assert_eq!(after.caret.line, 12);
+    assert_eq!(after.mode, crate::editor::EntryMode::Overwrite);
+    assert!(after.lines[0].starts_with('x'), "the unsaved edit is still in the buffer");
+}
+
+/// Task 4.2: the viewer in hex mode at a non-zero offset (application-shell
+/// "Viewer position and mode survive a shrink").
+#[test]
+fn undersized_preserves_the_viewer_mode_and_offset() {
+    let mut viewer = ViewerState::new(PathBuf::from("/left/big.bin"), 1 << 20);
+    viewer.mode = crate::viewer::ViewMode::Hex;
+    viewer.top_offset = 0x4000;
+    let state = test_state(UiPhase::Viewer(viewer.clone()));
+    let restored = assert_survives_shrink_and_enlarge(state);
+    assert_eq!(restored.phase, UiPhase::Viewer(viewer));
+}
+
+/// Task 4.2: the F5 destination dialog with typed text (application-shell
+/// "Open dialog and typed text survive a shrink").
+#[test]
+fn undersized_preserves_the_destination_dialog_and_its_text() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestCopy);
+    let mut state = state;
+    for c in r"D:\backup".chars() {
+        let (s, _) = update(state, Command::TextEdit(TextEditOp::Insert(c)));
+        state = s;
+    }
+    // The dialog opens pre-filled with the other panel's directory; the
+    // typed text lands after it.
+    let typed = match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => {
+            assert!(input.text().ends_with(r"D:\backup"), "typed text landed: {:?}", input.text());
+            input.clone()
+        }
+        other => panic!("expected the destination dialog, got {other:?}"),
+    };
+    let restored = assert_survives_shrink_and_enlarge(state);
+    match &restored.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => assert_eq!(*input, typed, "text and caret are where they were"),
+        other => panic!("expected the destination dialog, got {other:?}"),
+    }
+}
+
+/// Task 4.2: the F8 delete confirmation.
+#[test]
+fn undersized_preserves_the_delete_confirmation() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestDelete);
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })));
+    let restored = assert_survives_shrink_and_enlarge(state);
+    assert!(matches!(restored.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })));
+}
+
+/// Task 4.2: a running job with each of its dialogs (application-shell
+/// "Running job keeps reporting progress while undersized").
+#[test]
+fn undersized_preserves_a_running_job_and_each_of_its_dialogs() {
+    // Progress.
+    let progress = running_progress_state(JobKind::Copy, "/left", "/right");
+    let restored = assert_survives_shrink_and_enlarge(progress.clone());
+    assert!(matches!(restored.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Progress { .. }, .. }));
+
+    // Conflict, without a rename in progress.
+    let (conflict, _) = update(progress.clone(), Command::JobConflict(sample_conflict()));
+    assert!(matches!(conflict.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { rename_input: None, .. }, .. }));
+    let restored = assert_survives_shrink_and_enlarge(conflict.clone());
+    assert!(matches!(restored.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { rename_input: None, .. }, .. }));
+
+    // Conflict, with a rename being typed.
+    let (renaming, _) = update(conflict, Command::FileOpBeginRename);
+    let (renaming, _) = update(renaming, Command::TextEdit(TextEditOp::Insert('b')));
+    assert!(matches!(renaming.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { rename_input: Some(_), .. }, .. }));
+    let restored = assert_survives_shrink_and_enlarge(renaming);
+    match &restored.phase {
+        UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { rename_input: Some(input), .. }, .. } => assert_eq!(input.text(), "b"),
+        other => panic!("expected the conflict dialog mid-rename, got {other:?}"),
+    }
+
+    // Error.
+    let info = ErrorInfo { path: PathBuf::from("/left/a.txt"), message: "permission denied".to_string() };
+    let (error, _) = update(progress, Command::JobError(info));
+    assert!(matches!(error.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Error { .. }, .. }));
+    let restored = assert_survives_shrink_and_enlarge(error);
+    assert!(matches!(restored.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Error { .. }, .. }));
+}
+
+/// Task 4.2: the end-of-job summary.
+#[test]
+fn undersized_preserves_the_end_of_job_summary() {
+    let skipped = vec![SkippedItem::skipped(PathBuf::from("/left/a.txt"), "exists".to_string())];
+    let state = test_state(UiPhase::FileOpSummary(skipped.clone()));
+    let restored = assert_survives_shrink_and_enlarge(state);
+    assert_eq!(restored.phase, UiPhase::FileOpSummary(skipped));
+}
+
+/// One way of opening an overlay beside the `Panels` phase, for task 4.3.
+type OpenOverlay = Box<dyn Fn(&mut State)>;
+
+/// Task 4.3: every overlay that lives beside the `Panels` phase.
+#[test]
+fn undersized_preserves_every_overlay_over_the_panels() {
+    let overlays: Vec<(&str, OpenOverlay)> = vec![
+        ("F9 menu", Box::new(|s| s.menu = Some(MenuState::opened()))),
+        ("drive select", Box::new(|s| s.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C', 'D'], Some('C'))))),
+        ("fuzzy jump", Box::new(|s| s.fuzzy_jump = Some(FuzzyJumpState::new()))),
+        ("find file", Box::new(|s| s.find_file = Some(FindFileState::new(PathBuf::from("/left"))))),
+        ("user menu", Box::new(|s| s.user_menu = Some(UserMenuState::new()))),
+        ("history dialog", Box::new(|s| s.history_dialog = Some(HistoryDialogState::new()))),
+        ("theme picker", Box::new(|s| s.theme_picker = Some(ThemePickerState::open("nc-classic")))),
+        ("file-action menu", Box::new(|s| s.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false)))),
+        ("help", Box::new(|s| s.help = Some(HelpState::new()))),
+        ("quick filter", Box::new(|s| s.left.quick_filter = Some("rep".to_string()))),
+        ("type-ahead", Box::new(|s| s.quick_search = Some("no".to_string()))),
+        ("command-line text", Box::new(|s| s.command_line = LineEdit::from("dir /w"))),
+    ];
+    for (name, open) in overlays {
+        let mut state = test_state(UiPhase::Panels);
+        state.left.entries = vec![file_entry("a.txt", 1), file_entry("notes.txt", 2)];
+        open(&mut state);
+        let restored = assert_survives_shrink_and_enlarge(state.clone());
+        assert_eq!(restored.phase, UiPhase::Panels, "{name}");
+    }
+}
+
+/// Task 4.4: the splash is the one exception — it is dismissed by the shrink
+/// and does not return (startup-splash "Shrinking below the floor
+/// mid-splash", "Below the floor at startup").
+#[test]
+fn undersized_dismisses_the_splash_for_good() {
+    let state = test_state(UiPhase::Splash { started_at_ms: 0 });
+    let (state, _) = update(state, Command::Resize(50, 12));
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels);
+    let (state, _) = update(state, Command::Resize(80, 24));
+    assert!(!state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels, "enlarging reveals the panels, never the splash");
+
+    let (state, _) = State::initial(Theme::classic(), (50, 12), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::Panels, "a start below the floor skips the splash");
+}
+
+fn shrunk(state: State) -> State {
+    let (state, _) = update(state, Command::Resize(50, 12));
+    assert!(state.undersized);
+    state
+}
+
+/// Task 4.5: job replies keep being applied to the hidden running dialog
+/// (application-shell "Running job keeps reporting progress while
+/// undersized", "Conflict raised while undersized waits for an answer",
+/// "Job finishing while undersized still refreshes the panels").
+#[test]
+fn undersized_still_applies_job_progress_conflict_and_error() {
+    let state = shrunk(running_progress_state(JobKind::Copy, "/left", "/right"));
+
+    let info = ProgressInfo { files_done: 2, files_total: 3, bytes_done: 20, bytes_total: 30, current_file: OsString::from("b.txt") };
+    let (state, effects) = update(state, Command::JobProgress(info.clone()));
+    assert!(effects.is_empty());
+    assert!(state.undersized);
+    match &state.phase {
+        UiPhase::FileOpRunning { dialog: RunningDialog::Progress { progress, .. }, .. } => assert_eq!(*progress, info),
+        other => panic!("expected the hidden progress dialog to update, got {other:?}"),
+    }
+
+    let (conflict, effects) = update(state.clone(), Command::JobConflict(sample_conflict()));
+    assert!(effects.is_empty(), "no default answer is sent: the job waits for the user");
+    assert!(conflict.undersized);
+    assert!(matches!(conflict.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }));
+    // Enlarging shows the conflict dialog, and answering it resumes the job.
+    let (conflict, _) = update(conflict, Command::Resize(80, 24));
+    assert!(matches!(conflict.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Conflict { .. }, .. }));
+    let (_, effects) = update(conflict, Command::FileOpConflictChoice(ConflictChoice::Overwrite));
+    assert_eq!(effects, vec![Effect::SendConflictReply(ConflictChoice::Overwrite)]);
+
+    let info = ErrorInfo { path: PathBuf::from("/left/a.txt"), message: "permission denied".to_string() };
+    let (error, effects) = update(state, Command::JobError(info));
+    assert!(effects.is_empty());
+    assert!(error.undersized);
+    assert!(matches!(error.phase, UiPhase::FileOpRunning { dialog: RunningDialog::Error { .. }, .. }));
+}
+
+#[test]
+fn undersized_job_done_still_rereads_the_panels() {
+    let state = shrunk(running_progress_state(JobKind::Copy, "/left", "/right"));
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
+    );
+    assert!(state.undersized, "the placeholder stays up");
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![
+            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
+            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+        ]
+    );
+
+    let state = shrunk(running_progress_state(JobKind::Copy, "/left", "/right"));
+    let skipped = vec![SkippedItem::skipped(PathBuf::from("/left/a.txt"), "exists".to_string())];
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
+    );
+    assert!(state.undersized);
+    assert_eq!(state.phase, UiPhase::FileOpSummary(skipped), "the summary waits under the placeholder");
+    assert!(without_git_info_effects(effects).iter().all(|e| matches!(e, Effect::StartListing { .. })));
+}
+
+/// Task 4.6: replies to requests made before the shrink are applied to the
+/// hidden screen.
+#[test]
+fn undersized_still_applies_editor_saved_viewer_opened_and_editor_opened() {
+    // EditorSaved: the saved buffer replaces the hidden one, and the caret
+    // is not re-scrolled against the sub-floor viewport (design D6).
+    let mut state = editor_state(twenty_line_editor());
+    state.term_size = (80, 24);
+    let mut state = state;
+    for _ in 0..12 {
+        let (s, _) = update(state, Command::EditorMove(EditorMove::Down));
+        state = s;
+    }
+    let (state, _) = update(state, Command::EditorChar('x'));
+    let state = shrunk(state);
+    let mut saved = twenty_line_editor();
+    for _ in 0..12 {
+        saved.move_down();
+    }
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: false });
+    assert!(effects.is_empty());
+    assert!(state.undersized);
+    match &state.phase {
+        UiPhase::Editor(editor) => {
+            assert!(!editor.is_modified(), "the saved buffer replaced the hidden one");
+            assert_eq!(editor.caret.line, 12);
+            assert_eq!(editor.top_line, 0, "no re-scroll against a 10-row window while undersized");
+        }
+        other => panic!("expected the hidden editor, got {other:?}"),
+    }
+    // A failed save likewise lands on the hidden editor without a re-scroll.
+    let (state, _) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    match &state.phase {
+        UiPhase::Editor(editor) => {
+            assert_eq!(editor.save_error.as_deref(), Some("disk full"));
+            assert_eq!(editor.top_line, 0);
+        }
+        other => panic!("expected the hidden editor, got {other:?}"),
+    }
+
+    // ViewerOpened over hidden panels.
+    let state = shrunk(test_state(UiPhase::Panels));
+    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/a.txt"), file_len: 10 });
+    assert!(state.undersized);
+    assert!(matches!(state.phase, UiPhase::Viewer(_)), "the viewer opens under the placeholder");
+
+    // EditorOpened over hidden panels.
+    let state = shrunk(test_state(UiPhase::Panels));
+    let (state, _) = update(state, Command::EditorOpened(Box::new(twenty_line_editor())));
+    assert!(state.undersized);
+    assert!(matches!(state.phase, UiPhase::Editor(_)), "the editor opens under the placeholder");
+}
+
+/// Design D6: the first resize back above the floor re-scrolls a hidden
+/// editor so its caret is visible at the restored size; the caret itself
+/// never moves.
+#[test]
+fn enlarging_rescrolls_the_hidden_editor_to_its_caret() {
+    let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
+    let mut editor = EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes());
+    for _ in 0..30 {
+        editor.move_down();
+    }
+    assert_eq!((editor.caret.line, editor.top_line), (30, 0), "built unreconciled on purpose");
+    let mut state = editor_state(editor);
+    state.term_size = (80, 24);
+    let state = shrunk(state);
+    match &state.phase {
+        UiPhase::Editor(editor) => assert_eq!(editor.top_line, 0, "the shrink touches nothing"),
+        other => panic!("expected the editor, got {other:?}"),
+    }
+    let (state, _) = update(state, Command::Resize(80, 24));
+    match &state.phase {
+        UiPhase::Editor(editor) => {
+            assert_eq!(editor.caret.line, 30, "the caret never moves");
+            assert!(editor.top_line > 0 && editor.top_line <= 30, "the caret is scrolled into the 22-row body, got top_line {}", editor.top_line);
+            assert!(editor.caret.line < editor.top_line + 22);
+        }
+        other => panic!("expected the editor, got {other:?}"),
+    }
+}
+
+/// Task 4.7: quitting from the placeholder over a running job cancels the
+/// job first, as it does at full size (design D4). Before this change the
+/// placeholder phase had replaced `FileOpRunning`, so only `Quit` was sent.
+#[test]
+fn undersized_confirm_quit_over_a_running_job_cancels_it() {
+    let state = shrunk(running_progress_state(JobKind::Copy, "/left", "/right"));
+    let (state, _) = update(state, Command::RequestQuit);
+    assert!(state.quit_confirm);
+    let (_, effects) = update(state, Command::ConfirmQuit);
+    assert_eq!(effects, vec![Effect::CancelJob, Effect::Quit]);
+}
+
+/// Task 4.8 is `drag_clears_on_resize_below_the_minimum` above; this pins
+/// the other half of design D6 — the drag cannot be started under the
+/// placeholder either.
+#[test]
+fn undersized_refuses_a_new_drag() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let state = shrunk(state);
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    assert!(state.drag.is_none());
 }

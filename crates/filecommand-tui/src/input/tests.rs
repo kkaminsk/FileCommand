@@ -1482,3 +1482,85 @@ fn paste_with_no_focused_text_input_is_ignored() {
 
     assert_eq!(map_paste("", &panels()), Vec::new(), "an empty paste produces nothing");
 }
+
+// ---------------------------------------------------------------------
+// resize-preserves-session-state task 5.1: while the "terminal too small"
+// placeholder hides the screen, no key reaches it (application-shell
+// "Resize handling with 60x16 hard floor and placeholder"; design D3)
+// ---------------------------------------------------------------------
+
+fn undersized(phase: UiPhase) -> State {
+    State { undersized: true, term_size: (50, 12), ..state_with(phase) }
+}
+
+#[test]
+fn undersized_over_the_editor_ignores_every_key_including_quit() {
+    // "Typing over the hidden editor does nothing": letters, Enter, F2, F10
+    // and Esc all map to nothing, so no edit, save, quit prompt or quit
+    // dialog can happen to a buffer the user cannot see.
+    let state = undersized(UiPhase::Editor(open_editor("abc\n")));
+    for k in [plain(KeyCode::Char('a')), plain(KeyCode::Enter), plain(KeyCode::F(2)), plain(KeyCode::F(10)), plain(KeyCode::Esc)] {
+        assert_eq!(map(k, &state), None, "{k:?} must be ignored over the hidden editor");
+    }
+}
+
+#[test]
+fn undersized_over_panels_and_viewer_lets_only_f10_and_esc_through() {
+    // "F10 over the placeholder asks to quit": the quit dialog is drawn over
+    // the placeholder; everything else is ignored.
+    for state in [undersized(UiPhase::Panels), undersized(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)))] {
+        assert_eq!(map(plain(KeyCode::F(10)), &state), Some(Command::RequestQuit));
+        assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::RequestQuit));
+        for k in [plain(KeyCode::Char('a')), plain(KeyCode::Enter), plain(KeyCode::Tab), plain(KeyCode::F(5)), plain(KeyCode::Down), key(KeyCode::Char('j'), KeyModifiers::CONTROL)] {
+            assert_eq!(map(k, &state), None, "{k:?} must not reach the hidden screen");
+        }
+    }
+}
+
+#[test]
+fn undersized_hides_open_overlays_from_the_keyboard() {
+    // A key is never routed blindly to a menu, dialog or typing sink the
+    // user cannot see (design D3 "Hidden overlay").
+    let mut menu = undersized(UiPhase::Panels);
+    menu.menu = Some(MenuState::opened());
+    assert_eq!(map(plain(KeyCode::Enter), &menu), None, "Enter must not activate a hidden menu item");
+    assert_eq!(map(plain(KeyCode::Esc), &menu), Some(Command::RequestQuit), "Esc asks to quit rather than closing the hidden menu");
+
+    let mut drive = undersized(UiPhase::Panels);
+    drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], Some('C')));
+    assert_eq!(map(plain(KeyCode::Enter), &drive), None);
+
+    let mut typing = undersized(UiPhase::Panels);
+    typing.command_line = filecommand_core::line_edit::LineEdit::from("dir");
+    assert_eq!(map(plain(KeyCode::Char('x')), &typing), None, "no text reaches the hidden command line");
+    assert_eq!(map(plain(KeyCode::Enter), &typing), None, "the hidden command line is never executed");
+
+    let delete = undersized(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter: 0,
+    }));
+    assert_eq!(map(plain(KeyCode::Enter), &delete), None, "a hidden delete confirmation cannot be confirmed");
+    assert_eq!(map(plain(KeyCode::Esc), &delete), Some(Command::RequestQuit));
+}
+
+#[test]
+fn undersized_keeps_the_quit_and_startup_warning_dialog_keys() {
+    // Both dialogs are drawn over the placeholder, so their keys still work.
+    let mut quitting = undersized(UiPhase::Panels);
+    quitting.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Char('y')), &quitting), Some(Command::ConfirmQuit));
+    assert_eq!(map(plain(KeyCode::Char('n')), &quitting), Some(Command::CancelQuit));
+    assert_eq!(map(plain(KeyCode::Esc), &quitting), Some(Command::CancelQuit));
+
+    let mut over_viewer = undersized(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)));
+    over_viewer.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Enter), &over_viewer), Some(Command::ConfirmQuit));
+
+    let mut warning = undersized(UiPhase::Panels);
+    warning.startup_warning = Some("usermenu.toml is malformed".to_string());
+    assert_eq!(map(plain(KeyCode::Esc), &warning), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Char('x')), &warning), Some(Command::DismissStartupWarning));
+}

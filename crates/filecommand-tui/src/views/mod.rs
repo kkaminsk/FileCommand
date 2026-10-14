@@ -316,7 +316,13 @@ pub fn render(
 /// anything itself.
 fn build_hitmap(area: Rect, state: &State) -> HitMap {
     let mut hm = HitMap::default();
+    // Below the floor `render_phase` drew the placeholder, not the phase, so
+    // nothing of the hidden screen is recorded — only the quit dialog's
+    // buttons (added below, independent of the phase) are clickable there,
+    // and a stale panel hit map cannot outlive the shrink (resize-preserves-
+    // session-state design D5).
     match &state.phase {
+        _ if state.undersized => {}
         UiPhase::Panels | UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height), state.split_percent);
             *hm.panel_mut(PanelSide::Left) = panel::hit_test(l.left, &state.left);
@@ -352,8 +358,8 @@ fn build_hitmap(area: Rect, state: &State) -> HitMap {
                 _ => {}
             }
         }
-        // Splash/Placeholder have nothing clickable; Viewer/Editor's wheel-
-        // only handling is dispatched directly by the event loop from
+        // Splash has nothing clickable; Viewer/Editor's wheel-only
+        // handling is dispatched directly by the event loop from
         // `state.phase` (mirroring how it already calls `map_viewer_key`/
         // `map_editor_key` directly rather than through `map_key`), so
         // neither needs a hit map at all.
@@ -378,14 +384,20 @@ fn render_phase(
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
 ) -> Option<(u16, u16)> {
+    // Below the 60x16 floor the "terminal too small" placeholder is drawn in
+    // place of whatever phase is active, which stays intact underneath it
+    // and is redrawn as-is once the terminal is enlarged (application-shell
+    // "Resize handling with 60x16 hard floor and placeholder"; resize-
+    // preserves-session-state design D5). No phase view ever lays out at a
+    // sub-floor size, and no text field owns the cursor.
+    if state.undersized {
+        placeholder::render_placeholder(buf, area, theme, depth);
+        return None;
+    }
     match &state.phase {
         UiPhase::Splash { started_at_ms } => {
             let elapsed = elapsed_since(state.anim_now(), *started_at_ms);
             splash::render_splash(buf, area, theme, depth, identity_lines, elapsed);
-            None
-        }
-        UiPhase::Placeholder => {
-            placeholder::render_placeholder(buf, area, theme, depth);
             None
         }
         UiPhase::Viewer(v) => {

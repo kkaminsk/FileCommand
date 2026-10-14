@@ -385,11 +385,45 @@ fn snapshot_splash_nc_mono() {
     insta::assert_snapshot!("splash_nc_mono", text);
 }
 
+/// The "terminal too small" placeholder is `State::undersized` beside the
+/// phase, not a phase of its own, so it is drawn over whatever screen is
+/// active without discarding it (application-shell "Resize handling with
+/// 60x16 hard floor and placeholder"; resize-preserves-session-state design
+/// D1/D5).
+fn undersized_state(phase: UiPhase) -> State {
+    State { undersized: true, term_size: (40, 10), ..base_state(phase, Theme::classic()) }
+}
+
 #[test]
 fn snapshot_terminal_too_small_placeholder() {
-    let state = base_state(UiPhase::Placeholder, Theme::classic());
+    let state = undersized_state(UiPhase::Panels);
     let text = render_to_text(40, 10, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("placeholder_too_small", text);
+}
+
+#[test]
+fn snapshot_placeholder_hides_the_editor_identically() {
+    // The hidden screen never shows through: the placeholder over a modified
+    // editor buffer is byte-identical to the one over the panels.
+    let mut editor = EditorState::from_bytes(PathBuf::from("notes.txt"), b"one\ntwo\nthree\n");
+    editor.type_char('x');
+    assert!(editor.is_modified());
+    let over_editor = render_to_text(40, 10, &undersized_state(UiPhase::Editor(editor)), ColorDepth::Ansi16);
+    let over_panels = render_to_text(40, 10, &undersized_state(UiPhase::Panels), ColorDepth::Ansi16);
+    assert_eq!(over_editor, over_panels, "the placeholder must not leak the hidden editor");
+    insta::assert_snapshot!("placeholder_over_editor", over_editor);
+}
+
+#[test]
+fn snapshot_quit_confirm_dialog_over_the_placeholder() {
+    // application-shell "F10 over the placeholder asks to quit": the quit
+    // dialog is drawn over the placeholder, exactly as it is over any phase.
+    let mut state = undersized_state(UiPhase::Panels);
+    state.term_size = (50, 12);
+    state.quit_confirm = true;
+    let text = render_to_text(50, 12, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the placeholder");
+    insta::assert_snapshot!("quit_confirm_dialog_over_placeholder", text);
 }
 
 #[test]

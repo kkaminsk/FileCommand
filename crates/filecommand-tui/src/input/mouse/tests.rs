@@ -587,11 +587,61 @@ fn splash_phase_ignores_mouse() {
     assert_ignores_mouse_over_a_hit_row(state);
 }
 
+/// application-shell "Mouse input is ignored while undersized": the
+/// placeholder is `State::undersized` beside the phase now, not a phase, so
+/// it must ignore the mouse over *every* hidden screen (resize-preserves-
+/// session-state design D3).
 #[test]
-fn placeholder_phase_ignores_mouse() {
+fn undersized_ignores_mouse_over_every_phase() {
+    let phases = [
+        UiPhase::Panels,
+        UiPhase::Splash { started_at_ms: 0 },
+        UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 0)),
+        UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"")),
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+            sources: vec![],
+            source_dir: PathBuf::from("/left"),
+            needs_second_confirm: false,
+            confirmed_once: false,
+            hidden_by_filter: 0,
+        }),
+        UiPhase::FileOpSummary(vec![]),
+    ];
+    for phase in phases {
+        let mut state = test_state();
+        state.undersized = true;
+        state.phase = phase;
+        assert_ignores_mouse_over_a_hit_row(state);
+    }
+    // Overlays beside the phase are hidden too — a menu's title must not be
+    // clickable under the placeholder.
     let mut state = test_state();
-    state.phase = UiPhase::Placeholder;
+    state.undersized = true;
+    state.menu = Some(MenuState::opened());
     assert_ignores_mouse_over_a_hit_row(state);
+    let mut state = test_state();
+    state.undersized = true;
+    state.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false));
+    assert_ignores_mouse_over_a_hit_row(state);
+}
+
+/// application-shell "Quit dialog buttons stay clickable over the
+/// placeholder": `quit_confirm` is checked before `undersized` in
+/// `context`, so a click on the dialog's No button still maps.
+#[test]
+fn undersized_quit_dialog_buttons_stay_clickable() {
+    let hitmap = sample_hitmap();
+    let mut state = test_state();
+    state.undersized = true;
+    state.quit_confirm = true;
+    let mut tracker = MouseTracker::new();
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 7, 1), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 7, 1), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, Some(Command::DialogButtonClick(ButtonId::QuitNo)));
+    // Off the buttons, nothing underneath is reachable.
+    map_mouse(ev(MouseEventKind::Down(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    let cmd = map_mouse(ev(MouseEventKind::Up(MouseButton::Left), 3, 3), &hitmap, &mut tracker, &state);
+    assert_eq!(cmd, None);
 }
 
 /// The viewer/editor phases are never actually routed through `map_mouse`

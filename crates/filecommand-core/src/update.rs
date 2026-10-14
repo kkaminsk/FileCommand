@@ -151,9 +151,6 @@ pub enum ButtonId {
 pub enum UiPhase {
     Splash { started_at_ms: u64 },
     Panels,
-    /// Terminal is below the 60x16 hard floor. Growing back always resolves
-    /// to `Panels`, never back to `Splash`.
-    Placeholder,
     /// Gathering input before a Copy/Move/Mkdir/Delete job is dispatched.
     FileOpSetup(FileOpSetup),
     /// A job is running on the worker thread; `dialog` shows progress, or a
@@ -207,6 +204,16 @@ pub struct State {
     pub phase: UiPhase,
     pub theme: Theme,
     pub term_size: (u16, u16),
+    /// `true` while `term_size` is below the 60x16 hard floor. A flag
+    /// *beside* the phase rather than a phase of its own, so shrinking the
+    /// terminal never discards the active screen: the phase, every overlay
+    /// and every dialog stay exactly as they were, the renderer draws the
+    /// "terminal too small" placeholder over them, and the TUI's input
+    /// mappers let nothing but F10/Esc (the quit dialog) and the quit/
+    /// startup-warning dialogs' own keys through until the terminal is
+    /// enlarged again (application-shell "Resize handling with 60x16 hard
+    /// floor and placeholder"; resize-preserves-session-state design D1).
+    pub undersized: bool,
     /// The vertical panel split, stored as a left-panel percentage
     /// (default 50); `filecommand-tui::layout::compute` derives the
     /// effective column split from this via
@@ -388,6 +395,7 @@ impl State {
             phase: UiPhase::Panels,
             theme,
             term_size: (MIN_COLS, MIN_ROWS),
+            undersized: false,
             split_percent: panel_split::DEFAULT_SPLIT_PERCENT,
             request_seq: 0,
             dir_history: Vec::new(),
@@ -437,9 +445,12 @@ impl State {
         right_cwd: PathBuf,
         show_splash: bool,
     ) -> (State, Vec<Effect>) {
-        let phase = if Self::too_small(term_size) {
-            UiPhase::Placeholder
-        } else if show_splash {
+        // Below the floor the splash is skipped outright: the session starts
+        // on the panels with the placeholder drawn over them, and enlarging
+        // simply reveals the panels (startup-splash "Below the floor at
+        // startup"; design D2).
+        let undersized = Self::too_small(term_size);
+        let phase = if show_splash && !undersized {
             UiPhase::Splash { started_at_ms: now_ms }
         } else {
             UiPhase::Panels
@@ -449,6 +460,7 @@ impl State {
             right: PanelState::new(right_cwd.clone()),
             phase,
             term_size,
+            undersized,
             clock_ms: now_ms,
             ..State::empty(theme)
         };
@@ -1186,9 +1198,11 @@ pub fn update(state: State, cmd: Command) -> (State, Vec<Effect>) {
 /// every other context too (mouse-drag "Cancel and phase-change clear the
 /// drag": job completion, listing failure, F9, quit request, resize below
 /// the minimum — every one of those either leaves `UiPhase::Panels` or sets
-/// one of these fields).
+/// one of these fields; the resize sets `undersized`, since the phase no
+/// longer changes to signal it — design D6).
 fn drag_allowed(state: &State) -> bool {
     matches!(state.phase, UiPhase::Panels)
+        && !state.undersized
         && state.menu.is_none()
         && state.drive_select.is_none()
         && state.fuzzy_jump.is_none()
@@ -1224,21 +1238,36 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
     let mut effects = Vec::new();
 
-    // Resize is handled uniformly regardless of phase.
+    // Resize is handled uniformly regardless of phase. Dropping below the
+    // 60x16 floor only raises `undersized`; the phase and every overlay are
+    // left exactly as they are, so the screen the placeholder hides —
+    // editor buffer, viewer position, running job and its dialog, open menus
+    // — is still there when the terminal is enlarged (application-shell
+    // "Resize handling with 60x16 hard floor and placeholder"; design D1).
     if let Command::Resize(w, h) = cmd {
+        let was_undersized = state.undersized;
         state.term_size = (w, h);
-        let too_small = State::too_small((w, h));
-        state.phase = match (&state.phase, too_small) {
-            (UiPhase::Placeholder, false) => UiPhase::Panels,
-            (UiPhase::Placeholder, true) => UiPhase::Placeholder,
-            (_, true) => UiPhase::Placeholder,
-            (other, false) => other.clone(),
-        };
+        state.undersized = State::too_small((w, h));
+        // The splash is the one exception: shrinking dismisses it for good,
+        // and enlarging reveals the panels rather than the splash
+        // (startup-splash "Shrinking below the floor mid-splash"; design D2).
+        if state.undersized && matches!(state.phase, UiPhase::Splash { .. }) {
+            state.phase = UiPhase::Panels;
+        }
         // A shrinking terminal can leave either panel's cursor below its new,
         // shorter window; re-clamp both sides unconditionally (panel-
         // navigation "Terminal resize re-clamps").
         reconcile_panel_viewport(&mut state, PanelSide::Left);
         reconcile_panel_viewport(&mut state, PanelSide::Right);
+        // `handle_editor` skips its caret re-scroll while undersized (design
+        // D6), so the first resize back above the floor does it once here
+        // against the restored viewport. The buffer and caret are untouched.
+        if was_undersized && !state.undersized {
+            if let UiPhase::Editor(editor) = &mut state.phase {
+                let (rows, cols) = editor_viewport(state.term_size);
+                editor.ensure_caret_visible(rows, cols);
+            }
+        }
         return (state, effects);
     }
 
@@ -1359,8 +1388,8 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     }
 
     // File-op setup/running/summary phases (and the job events that drive
-    // them) are handled uniformly here, independent of the
-    // Splash/Placeholder/Panels phases below.
+    // them) are handled uniformly here, independent of the Splash/Panels
+    // phases below.
     if matches!(state.phase, UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_))
         || matches!(cmd, Command::JobProgress(_) | Command::JobConflict(_) | Command::JobError(_) | Command::JobDone { .. })
     {
@@ -1451,7 +1480,6 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 state.phase = UiPhase::Panels;
             }
         },
-        UiPhase::Placeholder => {}
         UiPhase::Panels => match cmd {
             Command::MoveCursor(m) => {
                 // A movement key exits type-ahead (if active) *and* is
@@ -2555,7 +2583,14 @@ fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
 
         _ => {}
     }
-    editor.ensure_caret_visible(rows, cols);
+    // While the placeholder hides the editor, `term_size` is a one- or
+    // two-row window; re-scrolling to it would wreck the viewport for a
+    // reply (`EditorSaved`/`EditorSaveFailed`) the user never sees. The
+    // `Resize` arm re-runs this once the terminal is back above the floor
+    // (design D6).
+    if !state.undersized {
+        editor.ensure_caret_visible(rows, cols);
+    }
     state.phase = UiPhase::Editor(editor);
     effects
 }
@@ -3192,9 +3227,11 @@ fn handle_file_op(state: &mut State, cmd: Command) -> Vec<Effect> {
                 _ => UiPhase::FileOpSummary(skipped),
             };
         }
-        // A Job* event arrived outside FileOpRunning — shouldn't happen
-        // given the single-active-job design, but drop it defensively
-        // rather than lose the phase we were actually in.
+        // A Job* event arrived outside FileOpRunning. Purely defensive: a
+        // resize can no longer bring this about (the running phase survives
+        // the placeholder — design D1), and the single-active-job design
+        // rules out a stray event otherwise; drop it rather than lose the
+        // phase we were actually in.
         other => state.phase = other,
     }
     effects

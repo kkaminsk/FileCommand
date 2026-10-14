@@ -135,7 +135,10 @@ fn splash_nc_mono() {
 
 #[test]
 fn terminal_too_small_placeholder() {
-    let state = State { phase: UiPhase::Placeholder, term_size: (40, 10), ..State::empty(Theme::classic()) };
+    // "Terminal too small" is `State::undersized` beside the phase, not a
+    // phase (resize-preserves-session-state design D1); the accepted
+    // snapshot is unchanged by construction (design D5).
+    let state = State { undersized: true, term_size: (40, 10), ..State::empty(Theme::classic()) };
     insta::assert_snapshot!("terminal_too_small_placeholder", render(&state, (40, 10)));
 }
 
@@ -151,7 +154,7 @@ fn splash_renders_at_60x16() {
 fn placeholder_below_the_floor() {
     // application-shell "Placeholder below the floor": one column below
     // the new 60x16 floor still shows the placeholder, naming 60x16.
-    let state = State { phase: UiPhase::Placeholder, term_size: (59, 16), ..State::empty(Theme::classic()) };
+    let state = State { undersized: true, term_size: (59, 16), ..State::empty(Theme::classic()) };
     let text = render(&state, (59, 16));
     assert!(text.contains("60x16"), "expected the placeholder to name the 60x16 floor:\n{text}");
     insta::assert_snapshot!("placeholder_below_the_60x16_floor", text);

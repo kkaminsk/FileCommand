@@ -163,8 +163,9 @@ impl Snapshot {
             state.quit_opened_at_ms = now;
         }
         // Splash → Panels only: leaving the splash for the placeholder (a
-        // resize below the floor) or never showing it records nothing.
-        if self.in_splash && matches!(state.phase, UiPhase::Panels) {
+        // resize below the floor, which now lands on `Panels` with
+        // `undersized` set) or never showing it records nothing.
+        if self.in_splash && matches!(state.phase, UiPhase::Panels) && !state.undersized {
             state.panels_revealed_at_ms = Some(now);
         }
     }
