@@ -13,6 +13,8 @@ pub mod worker;
 pub use conflict::{ConflictChoice, ConflictInfo, ConflictPolicy, ConflictResolution};
 pub use dialog::{DropButtons, FileOpSetup, RunningDialog};
 pub use error::{ErrorChoice, ErrorInfo, ErrorPolicy, ErrorResolution, ItemKind, SkippedItem};
-pub use fs::{ChunkControl, FakeFs, FileId, FileSystem, FsMetadata, RawEntry, RealFs, ReparseKind};
+#[cfg(test)]
+pub use fs::FakeFs;
+pub use fs::{ChunkControl, CopyOptions, CopyReport, FileId, FileSystem, FsMetadata, RawEntry, RealFs, ReparseKind, Unrestored, UnrestoredKind};
 pub use job::{CancelFlag, Job, JobKind, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, SourceItem};
 pub use worker::run_job;

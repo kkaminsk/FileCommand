@@ -16,11 +16,25 @@ use crate::listing::DateTime;
 
 use super::conflict::{ConflictChoice, ConflictInfo, ConflictPolicy, ConflictResolution};
 use super::error::{ErrorChoice, ErrorInfo, ErrorPolicy, ErrorResolution, SkippedItem};
-use super::fs::{is_cancelled, ChunkControl, FileId, FileSystem};
+use super::fs::{is_cancelled, ChunkControl, CopyOptions, CopyReport, FileId, FileSystem, Unrestored, UnrestoredKind};
 use super::job::{Job, JobKind, JobOutcome, JobSink, ProgressInfo};
 use super::path::lexically_normalize;
 
 const CHUNK_BYTES: usize = 256 * 1024;
+
+/// Every copied file lands through `<target name>.~fc-partial` in the
+/// target's own directory and is renamed over the target only once the copy
+/// succeeded (durable-file-copy design D1; file-operations "Copies land via
+/// a temporary partial file"). The suffix keeps a leftover next to its
+/// target in a name-sorted panel, claims no shell association, and is
+/// self-describing and safe to delete.
+pub(crate) const PARTIAL_SUFFIX: &str = ".~fc-partial";
+/// How many numbered variants (`-2`, `-3`, …) are tried when the plain
+/// temporary name is taken, before the exclusive create is left to refuse.
+const PARTIAL_NAME_ATTEMPTS: u32 = 100;
+/// NTFS's (and most filesystems') limit on one path component, in UTF-16
+/// code units.
+const MAX_COMPONENT_UTF16: usize = 255;
 
 pub fn run_job(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
     match job.kind {
@@ -360,6 +374,7 @@ fn copy_one_file(
     fs: &dyn FileSystem,
     src: &Path,
     dst: &Path,
+    opts: &CopyOptions,
     error_policy: &mut ErrorPolicy,
     sink: &mut dyn JobSink,
     progress: &mut ProgressInfo,
@@ -368,8 +383,12 @@ fn copy_one_file(
     streams_not_copied: &mut usize,
     warnings: &mut Vec<SkippedItem>,
 ) -> CopyOneResult {
+    // durable-file-copy design D1: choose a temporary name in the target's
+    // directory, copy into it, rename it over the target, and on *every*
+    // other path remove it. Retry starts over from a fresh temporary.
     loop {
-        let result = fs.copy_file_chunked(src, dst, CHUNK_BYTES, &mut |done| {
+        let temp = partial_path(fs, dst);
+        let copied = fs.copy_file(src, &temp, opts, &mut |done| {
             progress.bytes_done = bytes_done_baseline + done;
             sink.progress(progress.clone());
             if sink.is_cancelled() {
@@ -378,13 +397,19 @@ fn copy_one_file(
                 ChunkControl::Continue
             }
         });
-        match result {
-            Ok(bytes) => {
-                restore_metadata(fs, src, dst, streams_supported, streams_not_copied, warnings);
-                return CopyOneResult::Done(bytes);
+        // A rename failure after a complete copy is a failure of this file's
+        // copy like any other: the target is untouched, the dialog is shown.
+        let landed: io::Result<CopyReport> = copied.and_then(|report| fs.rename(&temp, dst).map(|()| report));
+        match landed {
+            Ok(report) => {
+                record_unrestored(dst, report.unrestored, streams_supported, streams_not_copied, warnings);
+                return CopyOneResult::Done(report.bytes);
             }
-            Err(e) if is_cancelled(&e) => return CopyOneResult::Cancelled,
             Err(e) => {
+                remove_partial(fs, &temp);
+                if is_cancelled(&e) {
+                    return CopyOneResult::Cancelled;
+                }
                 let msg = e.to_string();
                 let choice = match error_policy.resolve(ErrorInfo { path: src.to_path_buf(), message: msg.clone() }) {
                     ErrorResolution::Auto(c) => c,
@@ -401,51 +426,71 @@ fn copy_one_file(
     }
 }
 
-/// After a successful content copy, carry over what the plain copy does
-/// not: named alternate streams, the modification time, and the read-only
-/// attribute. Every failure is recorded as a [`SkippedItem`] *warning*
-/// against the destination path rather than silently discarded — the file
-/// itself still counts as copied (error-diagnostics design D5;
-/// operation-dialogs "Metadata-restore failures are reported in the
-/// end-of-job summary").
+/// The temporary file a copy of `final_target` lands through: the first free
+/// name among `<name>.~fc-partial`, `<name>.~fc-partial-2`, `-3`, … in the
+/// target's own directory (so the final step is a same-volume rename), with
+/// `<name>` shortened if the component would exceed the filename limit. "Free"
+/// is decided by a metadata probe; the copy then creates the file
+/// *exclusively*, so a name taken in between is refused rather than
+/// overwritten, and an existing file with the temporary name is never
+/// modified or removed to make room (durable-file-copy design D1).
+fn partial_path(fs: &dyn FileSystem, final_target: &Path) -> PathBuf {
+    let dir = final_target.parent().unwrap_or(Path::new(""));
+    let base = final_target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let candidate = |attempt: u32| {
+        let suffix = if attempt == 1 { PARTIAL_SUFFIX.to_string() } else { format!("{PARTIAL_SUFFIX}-{attempt}") };
+        dir.join(fit_component(&base, &suffix))
+    };
+    for attempt in 1..=PARTIAL_NAME_ATTEMPTS {
+        let path = candidate(attempt);
+        if fs.metadata(&path).is_err() {
+            return path;
+        }
+    }
+    // Every variant is taken: hand back the last one and let the exclusive
+    // create refuse it, which surfaces through the error dialog.
+    candidate(PARTIAL_NAME_ATTEMPTS)
+}
+
+/// `<base><suffix>`, with `base` shortened (whole characters) until the
+/// component fits [`MAX_COMPONENT_UTF16`]. The temporary name never needs to
+/// round-trip, so a lossy shortening is fine.
+fn fit_component(base: &str, suffix: &str) -> String {
+    let suffix_units = suffix.encode_utf16().count();
+    let mut base = base.to_string();
+    while !base.is_empty() && base.encode_utf16().count() + suffix_units > MAX_COMPONENT_UTF16 {
+        base.pop();
+    }
+    format!("{base}{suffix}")
+}
+
+/// Best-effort removal of a temporary file on a non-success path. The copy
+/// may already have given it the source's read-only attribute, and
+/// `CopyFileExW` may already have deleted it on cancel (`NotFound` is fine).
+fn remove_partial(fs: &dyn FileSystem, temp: &Path) {
+    let _ = fs.set_readonly(temp, false);
+    let _ = fs.remove_file(temp);
+}
+
+/// Turn the metadata a copy could not carry over into [`SkippedItem`]
+/// *warnings* against the destination path — the file itself still counts
+/// as copied (error-diagnostics design D5; operation-dialogs
+/// "Metadata-restore failures are reported in the end-of-job summary").
 ///
-/// When the destination volume has no named-stream support at all, per-file
-/// stream copies are skipped entirely and the file is counted in
+/// When the destination volume has no named-stream support at all, a file's
+/// missing streams are not reported one by one: the file is counted in
 /// `streams_not_copied` instead, so the job reports one aggregated warning
 /// rather than one per file.
-fn restore_metadata(
-    fs: &dyn FileSystem,
-    src: &Path,
-    dst: &Path,
-    streams_supported: bool,
-    streams_not_copied: &mut usize,
-    warnings: &mut Vec<SkippedItem>,
-) {
-    match fs.list_streams(src) {
-        Ok(streams) => {
-            if streams_supported {
-                for name in streams {
-                    if let Err(e) = fs.copy_stream_chunked(src, &name, dst, CHUNK_BYTES) {
-                        warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("stream {} not copied: {e}", name.to_string_lossy())));
-                    }
-                }
-            } else if !streams.is_empty() {
-                *streams_not_copied += 1;
-            }
+fn record_unrestored(dst: &Path, unrestored: Vec<Unrestored>, streams_supported: bool, streams_not_copied: &mut usize, warnings: &mut Vec<SkippedItem>) {
+    let mut streams_missing = false;
+    for item in unrestored {
+        match item.what {
+            UnrestoredKind::Stream(_) if !streams_supported => streams_missing = true,
+            _ => warnings.push(SkippedItem::warning(dst.to_path_buf(), item.reason())),
         }
-        Err(e) => warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("alternate data streams not listed: {e}"))),
     }
-    if let Ok(md) = fs.metadata_follow(src) {
-        if let Some(modified) = md.modified {
-            if let Err(e) = fs.set_modified(dst, modified) {
-                warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("modification time not restored: {e}")));
-            }
-        }
-        if md.readonly {
-            if let Err(e) = fs.set_readonly(dst, true) {
-                warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("read-only attribute not restored: {e}")));
-            }
-        }
+    if streams_missing {
+        *streams_not_copied += 1;
     }
 }
 
@@ -514,6 +559,11 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
     // count is reported as a single job-level warning below.
     let streams_supported = fs.supports_named_streams(&job.dest_dir).unwrap_or(true);
     let mut streams_not_copied = 0usize;
+    // A move is about to delete the only other copy, so each file is flushed
+    // to stable storage and length-checked before its source is touched; a
+    // plain copy skips the flush but keeps the length check
+    // (durable-file-copy design D4).
+    let copy_opts = CopyOptions { chunk_bytes: CHUNK_BYTES, flush: is_move };
     // Per planned directory: whether any file copied through that link
     // ended in anything other than `Done`. A marked link is kept, the same
     // way a real directory survives a skipped file (move-reparse-point-
@@ -588,6 +638,11 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                 conflict_policy.apply(&choice);
                 match choice {
                     ConflictChoice::Overwrite | ConflictChoice::OverwriteAll => {
+                        // A rename cannot replace a read-only target, so the
+                        // bit is cleared up front; the target is otherwise
+                        // untouched until the finished copy is renamed over
+                        // it, so a failed overwrite leaves it intact
+                        // (durable-file-copy design D7).
                         let _ = fs.set_readonly(&target, false);
                     }
                     ConflictChoice::Skip | ConflictChoice::SkipAll => {
@@ -613,16 +668,36 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
 
             if do_copy {
                 let baseline = progress.bytes_done;
-                match copy_one_file(fs, &planned.src_abs, &final_target, &mut error_policy, sink, &mut progress, baseline, streams_supported, &mut streams_not_copied, &mut skipped) {
+                match copy_one_file(fs, &planned.src_abs, &final_target, &copy_opts, &mut error_policy, sink, &mut progress, baseline, streams_supported, &mut streams_not_copied, &mut skipped) {
                     CopyOneResult::Done(bytes) => {
                         progress.files_done += 1;
                         progress.bytes_done = baseline + bytes;
                         sink.progress(progress.clone());
                         if is_move {
                             match planned.removal {
+                                // The verified copy is in place; a source
+                                // that cannot be removed goes through the
+                                // error-recovery dialog and, on Skip, into
+                                // the summary as copied but not removed —
+                                // never ignored (durable-file-copy design D5;
+                                // file-operations "A source that cannot be
+                                // removed is reported").
                                 SourceRemoval::RemoveFile => {
-                                    let _ = fs.set_readonly(&planned.src_abs, false);
-                                    let _ = fs.remove_file(&planned.src_abs);
+                                    let src = &planned.src_abs;
+                                    let outcome = attempt_with_recovery(src, &mut error_policy, sink, || {
+                                        let _ = fs.set_readonly(src, false);
+                                        fs.remove_file(src)
+                                    });
+                                    match outcome {
+                                        RetryOutcome::Done => {}
+                                        RetryOutcome::Skip(reason) => {
+                                            skipped.push(SkippedItem::skipped(src.clone(), format!("copied, but the source could not be removed: {reason}")));
+                                        }
+                                        RetryOutcome::Abort => {
+                                            cancelled = true;
+                                            break 'files;
+                                        }
+                                    }
                                 }
                                 // A file symlink: the copy followed it; only
                                 // the link goes, and a failure is reported
@@ -854,7 +929,7 @@ mod tests {
     use crate::fs_ops::error::ItemKind;
     use crate::fs_ops::fs::{FakeFs, FsMetadata, InjectableOp, RawEntry};
     use crate::fs_ops::job::{CancelFlag, SourceItem};
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
 
@@ -868,17 +943,34 @@ mod tests {
         pub cancel: CancelFlag,
         pub outcome: Option<JobOutcome>,
         pub conflicts_seen: usize,
+        pub errors_seen: Vec<ErrorInfo>,
+        /// Raise the cancel flag when the n-th progress event (1-based)
+        /// arrives — the job's opening `starting` report is event 1, so the
+        /// first in-copy chunk report is event 2.
+        pub cancel_on_progress_event: Option<usize>,
     }
 
     impl RecordingSink {
         fn new() -> Self {
-            RecordingSink { events: vec![], conflict_answers: vec![], error_answers: vec![], cancel: CancelFlag::new(), outcome: None, conflicts_seen: 0 }
+            RecordingSink {
+                events: vec![],
+                conflict_answers: vec![],
+                error_answers: vec![],
+                cancel: CancelFlag::new(),
+                outcome: None,
+                conflicts_seen: 0,
+                errors_seen: vec![],
+                cancel_on_progress_event: None,
+            }
         }
     }
 
     impl JobSink for RecordingSink {
         fn progress(&mut self, info: ProgressInfo) {
             self.events.push(format!("progress:{}/{}", info.files_done, info.files_total));
+            if self.cancel_on_progress_event == Some(self.events.len()) {
+                self.cancel.cancel();
+            }
         }
         fn conflict(&mut self, _info: ConflictInfo) -> ConflictChoice {
             self.conflicts_seen += 1;
@@ -888,7 +980,8 @@ mod tests {
                 self.conflict_answers.remove(0)
             }
         }
-        fn error(&mut self, _info: ErrorInfo) -> ErrorChoice {
+        fn error(&mut self, info: ErrorInfo) -> ErrorChoice {
+            self.errors_seen.push(info);
             if self.error_answers.is_empty() {
                 ErrorChoice::Skip
             } else {
@@ -1291,6 +1384,330 @@ mod tests {
         assert_shared_target_intact(&fake);
         assert!(fake.metadata(Path::new("/v1/work/proj/shared")).is_ok(), "the link is still there");
         assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).unwrap().size, 10, "its content was copied");
+    }
+
+    // -------------------------------------------------------------
+    // durable-file-copy (file-operations "Copies land via a temporary
+    // partial file", "Same-volume move is a rename; cross-volume move is
+    // copy-then-verified-delete")
+    // -------------------------------------------------------------
+
+    /// Delegates every [`FileSystem`] call to the inner filesystem and logs
+    /// the destination of each `copy_file`, each `rename` and each
+    /// `remove_file`, so a test can see which temporary name a copy used and
+    /// in what order a move landed its copy and removed its source.
+    struct Recording<F: FileSystem> {
+        inner: F,
+        ops: Mutex<Vec<Op>>,
+    }
+
+    /// Paths are compared as `PathBuf`s, so a `/dst/x` joined on Windows
+    /// (`/dst\x`) still equals the test's expectation.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Op {
+        CopyTo(PathBuf),
+        Rename(PathBuf, PathBuf),
+        RemoveFile(PathBuf),
+    }
+
+    impl<F: FileSystem> Recording<F> {
+        fn new(inner: F) -> Self {
+            Recording { inner, ops: Mutex::new(vec![]) }
+        }
+        fn ops(&self) -> Vec<Op> {
+            self.ops.lock().unwrap().clone()
+        }
+        fn log(&self, op: Op) {
+            self.ops.lock().unwrap().push(op);
+        }
+    }
+
+    impl<F: FileSystem> FileSystem for Recording<F> {
+        fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+            self.inner.metadata(path)
+        }
+        fn metadata_follow(&self, path: &Path) -> io::Result<FsMetadata> {
+            self.inner.metadata_follow(path)
+        }
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
+            self.inner.read_dir(path)
+        }
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            self.inner.create_dir(path)
+        }
+        fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
+            self.log(Op::CopyTo(to.to_path_buf()));
+            self.inner.copy_file(from, to, opts, on_progress)
+        }
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.log(Op::Rename(from.to_path_buf(), to.to_path_buf()));
+            self.inner.rename(from, to)
+        }
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.log(Op::RemoveFile(path.to_path_buf()));
+            self.inner.remove_file(path)
+        }
+        fn remove_dir(&self, path: &Path) -> io::Result<()> {
+            self.inner.remove_dir(path)
+        }
+        fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()> {
+            self.inner.set_readonly(path, readonly)
+        }
+        fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
+            self.inner.supports_named_streams(path)
+        }
+        fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
+            self.inner.same_volume(a, b)
+        }
+    }
+
+    fn partial(target: &str) -> PathBuf {
+        PathBuf::from(format!("{target}{PARTIAL_SUFFIX}"))
+    }
+
+    fn assert_no_partials(fake: &FakeFs, dir: &str) {
+        let leftovers: Vec<OsString> = fake
+            .read_dir(Path::new(dir))
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .filter(|n| n.to_string_lossy().contains(PARTIAL_SUFFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "no temporary partial file may remain in {dir}: {leftovers:?}");
+    }
+
+    /// "A successful copy appears under the target name with no partial file
+    /// left" — and it got there through the temporary name.
+    #[test]
+    fn copy_lands_through_a_partial_file_and_leaves_only_the_target() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/report.txt"), 30);
+        fake.add_dir(Path::new("/dst"));
+        let fs = Recording::new(fake);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("report.txt"), &fs, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_eq!(fs.inner.metadata(Path::new("/dst/report.txt")).unwrap().size, 30);
+        assert_no_partials(&fs.inner, "/dst");
+        assert_eq!(
+            fs.ops(),
+            vec![Op::CopyTo(partial("/dst/report.txt")), Op::Rename(partial("/dst/report.txt"), PathBuf::from("/dst/report.txt"))],
+            "copied into the temporary, then renamed over the target"
+        );
+    }
+
+    /// "A failed overwrite keeps the existing target".
+    #[test]
+    fn failed_overwrite_keeps_the_existing_target_and_no_partial() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/report.txt"), 30);
+        fake.add_dir(Path::new("/dst"));
+        fake.add_file(Path::new("/dst/report.txt"), 99);
+        let old_modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        fake.set_modified(Path::new("/dst/report.txt"), old_modified).unwrap();
+        fake.inject(InjectableOp::CopyAfterChunks(0), Path::new("/dst/report.txt"), io::ErrorKind::StorageFull);
+
+        let mut sink = RecordingSink::new();
+        sink.conflict_answers.push(ConflictChoice::Overwrite);
+        sink.error_answers.push(ErrorChoice::Skip);
+        run_job(&copy_job_of("report.txt"), &fake, &mut sink);
+
+        assert_eq!(sink.conflicts_seen, 1);
+        assert_eq!(sink.errors_seen.len(), 1, "the disk-full error reached the dialog");
+        let target = fake.metadata(Path::new("/dst/report.txt")).unwrap();
+        assert_eq!(target.size, 99, "the previous, complete content survives");
+        assert_eq!(target.modified, Some(old_modified), "the target was never rewritten");
+        assert_no_partials(&fake, "/dst");
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "{skipped:?}");
+                assert_eq!(skipped[0].path, PathBuf::from("/src/report.txt"));
+            }
+            other => panic!("expected Completed with one skip, got {other:?}"),
+        }
+    }
+
+    /// "Skip after a failed copy leaves nothing behind".
+    #[test]
+    fn skip_after_a_failed_copy_leaves_no_target_and_no_partial() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/big.iso"), 600_000);
+        fake.add_dir(Path::new("/dst"));
+        fake.inject(InjectableOp::CopyAfterChunks(1), Path::new("/dst/big.iso"), io::ErrorKind::StorageFull);
+
+        let mut sink = RecordingSink::new();
+        sink.error_answers.push(ErrorChoice::Skip);
+        run_job(&copy_job_of("big.iso"), &fake, &mut sink);
+
+        assert!(fake.metadata(Path::new("/dst/big.iso")).is_err(), "no file under the target name");
+        assert_no_partials(&fake, "/dst");
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "{skipped:?}");
+                assert_eq!(skipped[0].path, PathBuf::from("/src/big.iso"));
+            }
+            other => panic!("expected Completed with one skip, got {other:?}"),
+        }
+    }
+
+    /// "Cancel removes the partial file".
+    #[test]
+    fn cancel_mid_copy_removes_the_partial_file() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/big.iso"), 3 * CHUNK_BYTES as u64);
+        fake.add_dir(Path::new("/dst"));
+
+        let mut sink = RecordingSink::new();
+        // Event 1 is the job's `starting` report; event 2 is the first chunk.
+        sink.cancel_on_progress_event = Some(2);
+        run_job(&copy_job_of("big.iso"), &fake, &mut sink);
+
+        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { .. })), "{:?}", sink.outcome);
+        assert!(fake.metadata(Path::new("/dst/big.iso")).is_err());
+        assert_no_partials(&fake, "/dst");
+    }
+
+    /// "An existing file with the temporary name is left alone".
+    #[test]
+    fn an_existing_file_with_the_temporary_name_is_left_alone() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/report.txt"), 30);
+        fake.add_dir(Path::new("/dst"));
+        let leftover = partial("/dst/report.txt");
+        fake.add_file(&leftover, 7);
+        let leftover_modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_500_000_000);
+        fake.set_modified(&leftover, leftover_modified).unwrap();
+        let fs = Recording::new(fake);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("report.txt"), &fs, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_eq!(fs.inner.metadata(Path::new("/dst/report.txt")).unwrap().size, 30, "the copy landed under the target name");
+        let kept = fs.inner.metadata(&leftover).unwrap();
+        assert_eq!((kept.size, kept.modified), (7, Some(leftover_modified)), "the existing file is neither modified nor removed");
+        let dash_two = PathBuf::from(format!("/dst/report.txt{PARTIAL_SUFFIX}-2"));
+        assert_eq!(fs.ops()[0], Op::CopyTo(dash_two.clone()), "the copy used the -2 variant: {:?}", fs.ops());
+        assert!(fs.inner.metadata(&dash_two).is_err(), "the -2 temporary was renamed away");
+    }
+
+    #[test]
+    fn partial_name_is_shortened_to_fit_the_component_limit() {
+        let base = "x".repeat(300);
+        let name = fit_component(&base, PARTIAL_SUFFIX);
+        assert_eq!(name.encode_utf16().count(), MAX_COMPONENT_UTF16);
+        assert!(name.ends_with(PARTIAL_SUFFIX));
+        assert_eq!(fit_component("short.txt", PARTIAL_SUFFIX), format!("short.txt{PARTIAL_SUFFIX}"));
+    }
+
+    fn cross_volume_move_of(name: &str) -> Job {
+        Job {
+            kind: JobKind::Move,
+            sources: vec![source(name, &format!("/v1/{name}"))],
+            source_dir: PathBuf::from("/v1"),
+            dest_dir: PathBuf::from("/v2"),
+            new_dir_name: None,
+        }
+    }
+
+    /// "A flush failure keeps the source".
+    #[test]
+    fn move_cross_volume_flush_failure_keeps_the_source_and_leaves_no_partial() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_file(Path::new("/v1/a.txt"), 100);
+        fake.add_dir(Path::new("/v2"));
+        fake.inject(InjectableOp::Flush, Path::new("/v2/a.txt"), io::ErrorKind::Other);
+
+        let mut sink = RecordingSink::new();
+        sink.error_answers.push(ErrorChoice::Skip);
+        run_job(&cross_volume_move_of("a.txt"), &fake, &mut sink);
+
+        assert_eq!(sink.errors_seen.len(), 1, "the flush failure reached the error dialog");
+        assert_eq!(sink.errors_seen[0].path, PathBuf::from("/v1/a.txt"));
+        assert_eq!(fake.metadata(Path::new("/v1/a.txt")).unwrap().size, 100, "the source survives");
+        assert!(fake.metadata(Path::new("/v2/a.txt")).is_err(), "nothing under the target name");
+        assert_no_partials(&fake, "/v2");
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => assert_eq!(skipped.len(), 1, "{skipped:?}"),
+            other => panic!("expected Completed with one skip, got {other:?}"),
+        }
+    }
+
+    /// A plain copy does not flush, so the same injection is inert there.
+    #[test]
+    fn plain_copy_does_not_flush() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/a.txt"), 10);
+        fake.add_dir(Path::new("/dst"));
+        fake.inject(InjectableOp::Flush, Path::new("/dst/a.txt"), io::ErrorKind::Other);
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("a.txt"), &fake, &mut sink);
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert!(sink.errors_seen.is_empty());
+    }
+
+    /// "A source that cannot be removed is reported".
+    #[test]
+    fn move_cross_volume_reports_a_source_that_could_not_be_removed() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_file(Path::new("/v1/a.txt"), 100);
+        fake.add_dir(Path::new("/v2"));
+        fake.inject(InjectableOp::RemoveFile, Path::new("/v1/a.txt"), io::ErrorKind::PermissionDenied);
+        let fs = Recording::new(fake);
+
+        let mut sink = RecordingSink::new();
+        sink.error_answers.push(ErrorChoice::Skip);
+        run_job(&cross_volume_move_of("a.txt"), &fs, &mut sink);
+
+        assert_eq!(sink.errors_seen.len(), 1, "the removal failure reached the error dialog");
+        assert_eq!(sink.errors_seen[0].path, PathBuf::from("/v1/a.txt"));
+        assert_eq!(fs.inner.metadata(Path::new("/v2/a.txt")).unwrap().size, 100, "the verified copy stays");
+        assert_eq!(fs.inner.metadata(Path::new("/v1/a.txt")).unwrap().size, 100, "the source is still there");
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "{skipped:?}");
+                assert_eq!(skipped[0].path, PathBuf::from("/v1/a.txt"));
+                assert!(skipped[0].reason.starts_with("copied, but the source could not be removed: "), "{}", skipped[0].reason);
+                assert_eq!(skipped[0].kind, ItemKind::Skipped);
+            }
+            other => panic!("expected Completed with one skipped item, got {other:?}"),
+        }
+        // The copy landed (rename) before the source removal was attempted.
+        let ops = fs.ops();
+        let landed = ops.iter().position(|o| *o == Op::Rename(partial("/v2/a.txt"), PathBuf::from("/v2/a.txt"))).expect("rename over the target");
+        let removed = ops.iter().position(|o| *o == Op::RemoveFile(PathBuf::from("/v1/a.txt"))).expect("source removal attempted");
+        assert!(landed < removed, "{ops:?}");
+    }
+
+    /// Retry on a failed source removal retries the removal, and the next
+    /// attempt succeeding leaves a clean summary.
+    #[test]
+    fn move_cross_volume_source_removal_retry_succeeds() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_file(Path::new("/v1/a.txt"), 10);
+        fake.add_dir(Path::new("/v2"));
+        fake.inject(InjectableOp::RemoveFile, Path::new("/v1/a.txt"), io::ErrorKind::PermissionDenied);
+
+        let mut sink = RecordingSink::new();
+        sink.error_answers.push(ErrorChoice::Retry);
+        run_job(&cross_volume_move_of("a.txt"), &fake, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert!(fake.metadata(Path::new("/v1/a.txt")).is_err(), "removed on the retry");
     }
 
     #[test]
@@ -1794,14 +2211,14 @@ mod tests {
         fn create_dir(&self, path: &Path) -> io::Result<()> {
             self.0.create_dir(path)
         }
-        fn copy_file_chunked(
+        fn copy_file(
             &self,
             from: &Path,
             to: &Path,
-            chunk_bytes: usize,
-            on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<u64> {
-            self.0.copy_file_chunked(from, to, chunk_bytes, on_chunk)
+            opts: &CopyOptions,
+            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+        ) -> io::Result<CopyReport> {
+            self.0.copy_file(from, to, opts, on_progress)
         }
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
             self.0.rename(from, to)
@@ -1814,21 +2231,6 @@ mod tests {
         }
         fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()> {
             self.0.set_readonly(path, readonly)
-        }
-        fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-            self.0.set_modified(path, modified)
-        }
-        fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
-            self.0.list_streams(path)
-        }
-        fn copy_stream_chunked(
-            &self,
-            from: &Path,
-            stream: &OsStr,
-            to: &Path,
-            chunk_bytes: usize,
-        ) -> io::Result<u64> {
-            self.0.copy_stream_chunked(from, stream, to, chunk_bytes)
         }
         fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
             self.0.supports_named_streams(path)

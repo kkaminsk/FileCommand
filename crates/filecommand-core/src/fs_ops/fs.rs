@@ -4,15 +4,13 @@
 //! [`crate::fs_ops::path::to_extended_path`].
 //!
 //! Two implementations exist: [`RealFs`] (the real, Windows-backed
-//! filesystem) and [`FakeFs`] (an in-memory double for deterministic unit
-//! tests, including error injection).
+//! filesystem) and, compiled for this crate's unit tests only, `FakeFs` (an
+//! in-memory double for deterministic unit tests, including error
+//! injection; durable-file-copy design D9).
 
-use std::collections::BTreeMap;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::SystemTime;
 
 use super::path::to_extended_path;
@@ -65,11 +63,84 @@ pub struct RawEntry {
     pub metadata: FsMetadata,
 }
 
-/// What a chunked-copy progress callback tells the caller to do next.
+/// What a copy progress callback tells the caller to do next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkControl {
     Continue,
     Cancel,
+}
+
+/// Options for [`FileSystem::copy_file`] (durable-file-copy design D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyOptions {
+    /// The chunk size for implementations that copy in a read/write loop,
+    /// and so the progress-callback cadence. A hint: the Windows
+    /// implementation hands the copy to `CopyFileExW`, which chooses its own
+    /// chunking.
+    pub chunk_bytes: usize,
+    /// Flush the destination to stable storage before returning, so a flush
+    /// or close failure fails the copy. A move passes `true`, because it is
+    /// about to delete the only other copy; a plain copy passes `false`
+    /// (design D4).
+    pub flush: bool,
+}
+
+/// One piece of metadata a copy could not carry over. The `Display` form is
+/// the user-facing clause the end-of-job summary shows, followed by the
+/// operating system's message (operation-dialogs "Metadata-restore failures
+/// are reported in the end-of-job summary").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UnrestoredKind {
+    /// A named alternate data stream that is missing on the copy.
+    Stream(OsString),
+    /// The source's (or the copy's) stream list could not be read, so
+    /// nothing is known about its streams.
+    StreamListing,
+    ModifiedTime,
+    CreatedTime,
+    ReadOnly,
+}
+
+impl std::fmt::Display for UnrestoredKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            UnrestoredKind::Stream(name) => write!(f, "stream {} not copied", name.to_string_lossy()),
+            UnrestoredKind::StreamListing => f.write_str("alternate data streams not listed"),
+            UnrestoredKind::ModifiedTime => f.write_str("modification time not restored"),
+            UnrestoredKind::CreatedTime => f.write_str("creation time not restored"),
+            UnrestoredKind::ReadOnly => f.write_str("read-only attribute not restored"),
+        }
+    }
+}
+
+/// Metadata a [`FileSystem::copy_file`] could not carry over, with the
+/// operating system's message. Never fails the copy and never swallowed
+/// inside the filesystem layer: the worker turns each one into a summary
+/// warning (durable-file-copy design D2; error-diagnostics design D5).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unrestored {
+    pub what: UnrestoredKind,
+    pub error: String,
+}
+
+impl Unrestored {
+    pub fn new(what: UnrestoredKind, error: impl ToString) -> Unrestored {
+        Unrestored { what, error: error.to_string() }
+    }
+
+    /// `"<what>: <os message>"`, the row the end-of-job summary shows.
+    pub fn reason(&self) -> String {
+        format!("{}: {}", self.what, self.error)
+    }
+}
+
+/// The outcome of a successful [`FileSystem::copy_file`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CopyReport {
+    /// Bytes of the main data stream — the same quantity the progress
+    /// callback reports, and the length the destination was checked against.
+    pub bytes: u64,
+    pub unrestored: Vec<Unrestored>,
 }
 
 /// The narrow fs-access seam. `metadata` never follows a reparse point
@@ -80,28 +151,45 @@ pub trait FileSystem: Send + Sync {
     fn metadata_follow(&self, path: &Path) -> io::Result<FsMetadata>;
     fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>>;
     fn create_dir(&self, path: &Path) -> io::Result<()>;
-    /// Copy `from` to `to` in chunks of roughly `chunk_bytes`, invoking
-    /// `on_chunk` with the cumulative byte count after each chunk. Returns
-    /// the total bytes copied. If `on_chunk` returns
-    /// [`ChunkControl::Cancel`], the copy stops and an `io::Error` of kind
-    /// `Interrupted` is returned (the caller distinguishes cancellation from
-    /// a genuine I/O failure by that error kind).
-    fn copy_file_chunked(
+    /// Copy `from` — data *and* metadata — to `to` (durable-file-copy design
+    /// D2). The contract:
+    ///
+    /// - **Exclusive create.** `to` must not exist; if it does, the call
+    ///   fails with `AlreadyExists`. Nothing existing is ever overwritten or
+    ///   removed to make room.
+    /// - **Metadata.** Named alternate data streams, the read-only, hidden,
+    ///   system and archive attributes, and the creation and last-write
+    ///   times are preserved as far as the platform allows (Windows:
+    ///   `CopyFileExW` plus an explicit creation-time restore; elsewhere the
+    ///   last-write time and read-only state).
+    /// - **Byte count.** [`CopyReport::bytes`] is the main data stream's
+    ///   byte count, the quantity `on_progress` reports cumulatively.
+    /// - **Length check.** Before returning `Ok`, the destination's length is
+    ///   compared with `bytes`; a mismatch is an error.
+    /// - **Flush.** With [`CopyOptions::flush`], the destination is flushed
+    ///   to stable storage first, and a flush or close failure is an error.
+    /// - **Unrestored metadata.** Metadata that could not be carried over is
+    ///   listed in [`CopyReport::unrestored`]. It never fails the call and is
+    ///   never silently discarded here.
+    ///
+    /// If `on_progress` returns [`ChunkControl::Cancel`], the copy stops, the
+    /// partial destination is removed as far as the platform allows, and an
+    /// `io::Error` of kind `Interrupted` is returned (the caller
+    /// distinguishes cancellation from a genuine I/O failure by that kind).
+    fn copy_file(
         &self,
         from: &Path,
         to: &Path,
-        chunk_bytes: usize,
-        on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<u64>;
+        opts: &CopyOptions,
+        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+    ) -> io::Result<CopyReport>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir(&self, path: &Path) -> io::Result<()>;
+    /// Still on the seam after `copy_file` took over metadata restore: the
+    /// worker clears a target's read-only attribute before an overwrite and
+    /// a source's before a move removes it.
     fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()>;
-    fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()>;
-    /// Alternate Data Stream names attached to `path` (Windows NTFS only).
-    /// Always empty on platforms/filesystems without ADS support.
-    fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>>;
-    fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, chunk_bytes: usize) -> io::Result<u64>;
     /// Whether the volume holding `path` supports named alternate data
     /// streams (Windows: `GetVolumeInformationW`'s `FILE_NAMED_STREAMS`
     /// flag). The copy engine asks once per job; an error is treated as
@@ -226,14 +314,14 @@ mod windows_impl {
             std::fs::create_dir(ext(path))
         }
 
-        fn copy_file_chunked(
+        fn copy_file(
             &self,
             from: &Path,
             to: &Path,
-            chunk_bytes: usize,
-            on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<u64> {
-            copy_chunked_impl(&ext(from), &ext(to), chunk_bytes, on_chunk)
+            opts: &CopyOptions,
+            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+        ) -> io::Result<CopyReport> {
+            super::copy_ex::copy_file(&ext(from), &ext(to), opts, on_progress)
         }
 
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -255,22 +343,6 @@ mod windows_impl {
             std::fs::set_permissions(&p, perms)
         }
 
-        fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-            let p = ext(path);
-            let file = std::fs::OpenOptions::new().write(true).open(&p)?;
-            file.set_modified(modified)
-        }
-
-        fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
-            super::stream_enum::list_streams(&ext(path))
-        }
-
-        fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, chunk_bytes: usize) -> io::Result<u64> {
-            let from_stream = super::stream_enum::stream_path(&ext(from), stream);
-            let to_stream = super::stream_enum::stream_path(&ext(to), stream);
-            copy_chunked_impl(&from_stream, &to_stream, chunk_bytes, &mut |_| ChunkControl::Continue)
-        }
-
         fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
             super::volume_caps::supports_named_streams(&ext(path))
         }
@@ -284,32 +356,232 @@ mod windows_impl {
             }
         }
     }
+}
 
-    fn copy_chunked_impl(
-        from: &Path,
-        to: &Path,
-        chunk_bytes: usize,
-        on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<u64> {
-        use std::io::{Read, Write};
-        let mut src = std::fs::File::open(from)?;
-        let mut dst = std::fs::File::create(to)?;
-        let mut buf = vec![0u8; chunk_bytes.max(4096)];
-        let mut total = 0u64;
-        loop {
-            let n = src.read(&mut buf)?;
-            if n == 0 {
-                break;
+#[cfg(windows)]
+mod copy_ex {
+    //! `RealFs::copy_file` on Windows: `CopyFileExW` for the data, every
+    //! named stream, the attributes and the last-write time, followed by an
+    //! explicit creation-time restore, a length check, an optional flush and
+    //! a post-copy stream check (durable-file-copy design D3, D4). Raw FFI in
+    //! the style of the `identity`/`stream_enum` modules — no external crate.
+    use super::{cancelled_error, ChunkControl, CopyOptions, CopyReport, Unrestored, UnrestoredKind};
+    use std::fs::FileTimes;
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::{FileTimesExt, OpenOptionsExt};
+    use std::path::Path;
+
+    #[allow(non_camel_case_types)]
+    type c_void = core::ffi::c_void;
+    type Handle = *mut c_void;
+
+    /// `LPPROGRESS_ROUTINE`: (TotalFileSize, TotalBytesTransferred,
+    /// StreamSize, StreamBytesTransferred, dwStreamNumber, dwCallbackReason,
+    /// hSourceFile, hDestinationFile, lpData) -> PROGRESS_*.
+    type ProgressRoutine = unsafe extern "system" fn(i64, i64, i64, i64, u32, u32, Handle, Handle, *mut c_void) -> u32;
+
+    const COPY_FILE_FAIL_IF_EXISTS: u32 = 0x0000_0001;
+    const COPY_FILE_ALLOW_DECRYPTED_DESTINATION: u32 = 0x0000_0008;
+    const PROGRESS_CONTINUE: u32 = 0;
+    const PROGRESS_CANCEL: u32 = 1;
+    const ERROR_REQUEST_ABORTED: i32 = 1235;
+    const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CopyFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            progress_routine: Option<ProgressRoutine>,
+            data: *mut c_void,
+            cancel: *mut i32,
+            copy_flags: u32,
+        ) -> i32;
+    }
+
+    /// Everything the progress routine needs, reached through `lpData`.
+    struct ProgressState<'a> {
+        on_progress: &'a mut dyn FnMut(u64) -> ChunkControl,
+        /// Cumulative bytes of stream 1, the main data stream. ADS bytes
+        /// never move the gauge past the planned total.
+        stream1_bytes: u64,
+        /// A panic caught inside the routine, to be re-raised once
+        /// `CopyFileExW` has returned: unwinding across the FFI boundary is
+        /// undefined behavior.
+        panic: Option<Box<dyn std::any::Any + Send>>,
+    }
+
+    unsafe extern "system" fn progress_routine(
+        _total_file_size: i64,
+        _total_bytes_transferred: i64,
+        _stream_size: i64,
+        stream_bytes_transferred: i64,
+        stream_number: u32,
+        _callback_reason: u32,
+        _source_file: Handle,
+        _destination_file: Handle,
+        data: *mut c_void,
+    ) -> u32 {
+        // SAFETY: `data` is the `&mut ProgressState` `copy_file` handed to
+        // `CopyFileExW`, which outlives the call; `CopyFileExW` invokes the
+        // routine synchronously on the calling thread, so no one else
+        // touches the state while this runs.
+        let state = unsafe { &mut *(data as *mut ProgressState<'_>) };
+        if state.panic.is_some() {
+            return PROGRESS_CANCEL;
+        }
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if stream_number == 1 {
+                state.stream1_bytes = stream_bytes_transferred.max(0) as u64;
             }
-            dst.write_all(&buf[..n])?;
-            total += n as u64;
-            if on_chunk(total) == ChunkControl::Cancel {
-                drop(dst);
-                let _ = std::fs::remove_file(to);
-                return Err(super::cancelled_error());
+            // Polled on every callback, including CALLBACK_STREAM_SWITCH, so
+            // cancellation is observed at the OS's chunk cadence.
+            (state.on_progress)(state.stream1_bytes)
+        }));
+        match outcome {
+            Ok(ChunkControl::Continue) => PROGRESS_CONTINUE,
+            Ok(ChunkControl::Cancel) => PROGRESS_CANCEL,
+            Err(payload) => {
+                state.panic = Some(payload);
+                PROGRESS_CANCEL
             }
         }
-        Ok(total)
+    }
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    fn length_mismatch(expected: u64, actual: u64) -> io::Error {
+        io::Error::other(format!("destination length {actual} does not match the {expected} bytes copied"))
+    }
+
+    pub fn copy_file(
+        from: &Path,
+        to: &Path,
+        opts: &CopyOptions,
+        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+    ) -> io::Result<CopyReport> {
+        // Followed, like `CopyFileExW` itself (no COPY_FILE_COPY_SYMLINK): a
+        // file symlink is copied as its target's content.
+        let src_md = std::fs::metadata(from)?;
+        let wide_from = wide(from);
+        let wide_to = wide(to);
+        let mut state = ProgressState { on_progress, stream1_bytes: 0, panic: None };
+        // SAFETY: both path buffers are null-terminated and outlive the
+        // call; `state` is a live local that `progress_routine` reads back
+        // through `data` only while `CopyFileExW` runs; the routine never
+        // unwinds (it catches panics and stores them in `state`).
+        let ok = unsafe {
+            CopyFileExW(
+                wide_from.as_ptr(),
+                wide_to.as_ptr(),
+                Some(progress_routine),
+                &mut state as *mut ProgressState<'_> as *mut c_void,
+                std::ptr::null_mut(),
+                COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_ALLOW_DECRYPTED_DESTINATION,
+            )
+        };
+        // Taken before anything else can clobber it.
+        let failure = if ok == 0 { Some(io::Error::last_os_error()) } else { None };
+        if let Some(payload) = state.panic.take() {
+            std::panic::resume_unwind(payload);
+        }
+        if let Some(e) = failure {
+            // A cancelled copy fails with ERROR_REQUEST_ABORTED and
+            // `CopyFileExW` has already deleted its partial destination.
+            return Err(if e.raw_os_error() == Some(ERROR_REQUEST_ABORTED) { cancelled_error() } else { e });
+        }
+        let bytes = state.stream1_bytes;
+        let mut unrestored = Vec::new();
+
+        // Creation time: not preserved by `CopyFileExW`. FILE_WRITE_ATTRIBUTES
+        // opens even a read-only copy. Without `flush`, the length check runs
+        // on this handle too.
+        match std::fs::OpenOptions::new().access_mode(FILE_WRITE_ATTRIBUTES).open(to) {
+            Ok(file) => {
+                match src_md.created() {
+                    Ok(created) => {
+                        if let Err(e) = file.set_times(FileTimes::new().set_created(created)) {
+                            unrestored.push(Unrestored::new(UnrestoredKind::CreatedTime, e));
+                        }
+                    }
+                    Err(e) => unrestored.push(Unrestored::new(UnrestoredKind::CreatedTime, e)),
+                }
+                if !opts.flush {
+                    let len = file.metadata()?.len();
+                    if len != bytes {
+                        return Err(length_mismatch(bytes, len));
+                    }
+                }
+            }
+            Err(e) => {
+                unrestored.push(Unrestored::new(UnrestoredKind::CreatedTime, e));
+                if !opts.flush {
+                    let len = std::fs::metadata(to)?.len();
+                    if len != bytes {
+                        return Err(length_mismatch(bytes, len));
+                    }
+                }
+            }
+        }
+
+        // Flush: `FlushFileBuffers` needs a write handle, and a read-only
+        // file cannot be opened for writing, so the bit is cleared around the
+        // flush and restored afterwards (design D3). A flush, length or
+        // close failure fails the copy; a failure to restore read-only does
+        // not.
+        if opts.flush {
+            let was_readonly = std::fs::metadata(to)?.permissions().readonly();
+            if was_readonly {
+                let mut perms = std::fs::metadata(to)?.permissions();
+                // Windows-only module: clearing read-only toggles exactly the
+                // FILE_ATTRIBUTE_READONLY bit (the lint is about Unix modes).
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                std::fs::set_permissions(to, perms)?;
+            }
+            let flushed = (|| -> io::Result<()> {
+                let file = std::fs::OpenOptions::new().write(true).open(to)?;
+                let len = file.metadata()?.len();
+                if len != bytes {
+                    return Err(length_mismatch(bytes, len));
+                }
+                file.sync_all()?;
+                drop(file);
+                Ok(())
+            })();
+            if was_readonly {
+                let mut perms = std::fs::metadata(to)?.permissions();
+                perms.set_readonly(true);
+                if let Err(e) = std::fs::set_permissions(to, perms) {
+                    unrestored.push(Unrestored::new(UnrestoredKind::ReadOnly, e));
+                }
+            }
+            flushed?;
+        }
+
+        // Named streams: `CopyFileExW` copies them itself but is not
+        // documented to report one it could not create, so when the source
+        // has any, the copy's list is compared afterwards. Files without
+        // named streams — the common case — pay one `FindFirstStreamW`.
+        match super::stream_enum::list_streams(from) {
+            Ok(src_streams) if !src_streams.is_empty() => match super::stream_enum::list_streams(to) {
+                Ok(dst_streams) => {
+                    for name in src_streams {
+                        if !dst_streams.contains(&name) {
+                            unrestored.push(Unrestored::new(UnrestoredKind::Stream(name), "not present on the copy"));
+                        }
+                    }
+                }
+                Err(e) => unrestored.push(Unrestored::new(UnrestoredKind::StreamListing, e)),
+            },
+            Ok(_) => {}
+            Err(e) => unrestored.push(Unrestored::new(UnrestoredKind::StreamListing, e)),
+        }
+
+        Ok(CopyReport { bytes, unrestored })
     }
 }
 
@@ -367,17 +639,25 @@ mod portable_impl {
             std::fs::create_dir(ext(path))
         }
 
-        fn copy_file_chunked(
+        /// The manual read/write loop (durable-file-copy design D8):
+        /// exclusive create, chunked copy with cancel handling, last-write
+        /// time on the open handle, optional `sync_all`, a length check, and
+        /// read-only applied after close. Creation time, extended attributes
+        /// and ADS are not exposed portably and are not attempted.
+        fn copy_file(
             &self,
             from: &Path,
             to: &Path,
-            chunk_bytes: usize,
-            on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<u64> {
+            opts: &CopyOptions,
+            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+        ) -> io::Result<CopyReport> {
             use std::io::{Read, Write};
-            let mut src = std::fs::File::open(ext(from))?;
-            let mut dst = std::fs::File::create(ext(to))?;
-            let mut buf = vec![0u8; chunk_bytes.max(4096)];
+            let from = ext(from);
+            let to = ext(to);
+            let src_md = std::fs::metadata(&from)?;
+            let mut src = std::fs::File::open(&from)?;
+            let mut dst = std::fs::OpenOptions::new().write(true).create_new(true).open(&to)?;
+            let mut buf = vec![0u8; opts.chunk_bytes.max(4096)];
             let mut total = 0u64;
             loop {
                 let n = src.read(&mut buf)?;
@@ -386,13 +666,37 @@ mod portable_impl {
                 }
                 dst.write_all(&buf[..n])?;
                 total += n as u64;
-                if on_chunk(total) == ChunkControl::Cancel {
+                if on_progress(total) == ChunkControl::Cancel {
                     drop(dst);
-                    let _ = std::fs::remove_file(ext(to));
+                    let _ = std::fs::remove_file(&to);
                     return Err(super::cancelled_error());
                 }
             }
-            Ok(total)
+            let mut unrestored = Vec::new();
+            match src_md.modified() {
+                Ok(modified) => {
+                    if let Err(e) = dst.set_modified(modified) {
+                        unrestored.push(Unrestored::new(UnrestoredKind::ModifiedTime, e));
+                    }
+                }
+                Err(e) => unrestored.push(Unrestored::new(UnrestoredKind::ModifiedTime, e)),
+            }
+            if opts.flush {
+                dst.sync_all()?;
+            }
+            let len = dst.metadata()?.len();
+            if len != total {
+                return Err(io::Error::other(format!("destination length {len} does not match the {total} bytes copied")));
+            }
+            drop(dst);
+            if src_md.permissions().readonly() {
+                let mut perms = std::fs::metadata(&to)?.permissions();
+                perms.set_readonly(true);
+                if let Err(e) = std::fs::set_permissions(&to, perms) {
+                    unrestored.push(Unrestored::new(UnrestoredKind::ReadOnly, e));
+                }
+            }
+            Ok(CopyReport { bytes: total, unrestored })
         }
 
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -414,24 +718,9 @@ mod portable_impl {
             std::fs::set_permissions(&p, perms)
         }
 
-        fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-            let p = ext(path);
-            let file = std::fs::OpenOptions::new().write(true).open(&p)?;
-            file.set_modified(modified)
-        }
-
-        fn list_streams(&self, _path: &Path) -> io::Result<Vec<OsString>> {
-            Ok(Vec::new())
-        }
-
-        fn copy_stream_chunked(&self, _from: &Path, _stream: &OsStr, _to: &Path, _chunk_bytes: usize) -> io::Result<u64> {
-            Ok(0)
-        }
-
         fn supports_named_streams(&self, _path: &Path) -> io::Result<bool> {
-            // ADS is Windows-only; with `list_streams` always empty here, no
-            // file ever carries streams, so this answer never produces a
-            // warning off-Windows.
+            // ADS is Windows-only; `copy_file` never reports a stream here,
+            // so this answer never produces a warning off-Windows.
             Ok(false)
         }
 
@@ -595,7 +884,7 @@ mod stream_enum {
     //! since Vista) to enumerate Alternate Data Streams. No external crate
     //! is pulled in for this — just the handful of kernel32 entry points
     //! needed.
-    use std::ffi::{OsStr, OsString};
+    use std::ffi::OsString;
     use std::io;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::Path;
@@ -671,20 +960,23 @@ mod stream_enum {
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         OsString::from_wide(&buf[..len]).to_string_lossy().into_owned()
     }
-
-    /// Build the `path:stream` form used to address a named ADS.
-    pub fn stream_path(path: &Path, stream: &OsStr) -> std::path::PathBuf {
-        let mut s = path.as_os_str().to_os_string();
-        s.push(":");
-        s.push(stream);
-        std::path::PathBuf::from(s)
-    }
 }
 
 // ---------------------------------------------------------------------
-// FakeFs — deterministic in-memory double for unit tests
+// FakeFs — deterministic in-memory double for unit tests. Compiled for this
+// crate's tests only: the release binary carries no fault-injection double
+// (durable-file-copy design D9; filesystem-error-handling "The release
+// binary carries no fault-injection double").
 // ---------------------------------------------------------------------
 
+#[cfg(test)]
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::Mutex;
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 enum FakeNode {
     File { size: u64, modified: Option<SystemTime>, readonly: bool, streams: BTreeMap<OsString, u64> },
@@ -693,27 +985,38 @@ enum FakeNode {
 }
 
 /// Which fs-trait operation an [`Injection`] applies to.
+///
+/// Copy-related injections (`CopyAfterChunks`, `Flush`, `SetModified`,
+/// `SetReadonly`, `CopyStream`) are keyed on the copy's *final target* path
+/// as well as on the destination actually passed to `copy_file`, so a test
+/// can inject on `/dst/a.txt` without knowing that the worker copies into
+/// `/dst/a.txt.~fc-partial` first (durable-file-copy design D1, D10).
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InjectableOp {
     Metadata,
     ReadDir,
     CreateDir,
-    /// Fails a chunked copy after the given number of chunks have already
-    /// succeeded (simulates disk-full mid-copy).
+    /// Fails a copy after the given number of chunks have already succeeded
+    /// (simulates disk-full mid-copy). The partial destination node is left
+    /// in place, as on a real filesystem.
     CopyAfterChunks(u64),
+    /// Fails a `flush: true` copy after its last chunk, with the destination
+    /// node fully written (durable-file-copy design D10).
+    Flush,
     Rename,
     RemoveFile,
     RemoveDir,
     SetReadonly,
-    /// Metadata-restore fault injection (error-diagnostics task 5.4):
-    /// `SetModified` and `ListStreams` key on the path they are called
-    /// with; `CopyStream` keys on the *destination* path, mirroring
-    /// `CopyAfterChunks`.
+    /// Metadata-restore fault injection (error-diagnostics task 5.4): each
+    /// turns the corresponding piece of metadata into an `Unrestored` entry
+    /// of the copy's report. `ListStreams` keys on the *source* path.
     SetModified,
     ListStreams,
     CopyStream,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct Injection {
     op: InjectableOp,
@@ -725,6 +1028,7 @@ struct Injection {
 /// `PathBuf`s (via [`super::path::lexically_normalize`]); volumes are
 /// modeled by an explicit per-path prefix so cross-volume-move tests don't
 /// need real multi-volume hardware — see [`FakeFs::set_volume`].
+#[cfg(test)]
 pub struct FakeFs {
     nodes: Mutex<BTreeMap<PathBuf, FakeNode>>,
     volumes: Mutex<BTreeMap<PathBuf, u64>>,
@@ -737,12 +1041,14 @@ pub struct FakeFs {
     named_streams: AtomicBool,
 }
 
+#[cfg(test)]
 impl Default for FakeFs {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 impl FakeFs {
     pub fn new() -> Self {
         FakeFs {
@@ -830,6 +1136,60 @@ impl FakeFs {
         None
     }
 
+    /// The paths a copy-related injection may be keyed on for a copy into
+    /// `to`: `to` itself, and — when `to` is a worker temporary
+    /// (`<name>.~fc-partial[-N]`) — the final target it stands for.
+    fn copy_injection_keys(to: &Path) -> Vec<PathBuf> {
+        let to = Self::norm(to);
+        let mut keys = vec![to.clone()];
+        if let (Some(parent), Some(name)) = (to.parent(), to.file_name()) {
+            let name = name.to_string_lossy();
+            if let Some(cut) = name.find(super::worker::PARTIAL_SUFFIX) {
+                keys.push(parent.join(&name[..cut]));
+            }
+        }
+        keys
+    }
+
+    /// Like [`Self::take_injection`], for an `op` that applies to a copy
+    /// into `to` (see [`InjectableOp`]).
+    fn take_copy_injection(&self, op: InjectableOp, to: &Path) -> Option<io::ErrorKind> {
+        let keys = Self::copy_injection_keys(to);
+        let mut injections = self.injections.lock().unwrap();
+        if let Some(idx) = injections.iter().position(|i| i.op == op && keys.contains(&i.path)) {
+            return Some(injections.remove(idx).kind);
+        }
+        None
+    }
+
+    /// Test helper: pin a file's last-write time (the field `copy_file`
+    /// carries over). Not on the trait any more (durable-file-copy design
+    /// D2).
+    pub fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
+        let p = self.resolve_ancestors(path);
+        let mut nodes = self.nodes.lock().unwrap();
+        match nodes.get_mut(&p) {
+            Some(FakeNode::File { modified: m, .. }) => {
+                *m = Some(modified);
+                Ok(())
+            }
+            _ => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
+    /// Test helper: the named streams modeled on a file, for asserting what
+    /// `copy_file` carried over. Not on the trait any more (durable-file-copy
+    /// design D2).
+    pub fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
+        let p = self.resolve_ancestors(path);
+        let nodes = self.nodes.lock().unwrap();
+        match nodes.get(&p) {
+            Some(FakeNode::File { streams, .. }) => Ok(streams.keys().cloned().collect()),
+            Some(_) => Ok(Vec::new()),
+            None => Err(io::Error::from(io::ErrorKind::NotFound)),
+        }
+    }
+
     /// Resolve `path` the way real NTFS resolves a path through junctions:
     /// every *ancestor* component is transparently redirected if it's a
     /// reparse point, but the final component itself is left as-is (so
@@ -885,6 +1245,7 @@ impl FakeFs {
     }
 }
 
+#[cfg(test)]
 impl FileSystem for FakeFs {
     fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
         if let Some(kind) = self.take_injection(InjectableOp::Metadata, path) {
@@ -936,22 +1297,38 @@ impl FileSystem for FakeFs {
         Ok(())
     }
 
-    fn copy_file_chunked(
+    /// Durable-file-copy design D10: the destination node exists from the
+    /// first chunk and grows per chunk, so an injected failure or a cancel
+    /// leaves a partial node exactly as a real filesystem would; creation is
+    /// exclusive; and the source's streams, read-only state and last-write
+    /// time are carried over on success, each one divertible into
+    /// `unrestored` by the matching injection.
+    fn copy_file(
         &self,
         from: &Path,
         to: &Path,
-        chunk_bytes: usize,
-        on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<u64> {
+        opts: &CopyOptions,
+        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
+    ) -> io::Result<CopyReport> {
         // Opening a file for reading follows a file symlink, so the source
         // is resolved fully; the destination resolves its ancestors like
         // every other mutation (move-reparse-point-safety design D5).
-        let size = match self.metadata_follow(from)? {
-            FsMetadata { size, is_dir: false, .. } => size,
-            _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+        let src = self.resolve_full(from);
+        let (size, streams, readonly, modified) = match self.nodes.lock().unwrap().get(&src) {
+            Some(FakeNode::File { size, streams, readonly, modified }) => (*size, streams.clone(), *readonly, *modified),
+            Some(_) => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
+            None => return Err(io::Error::from(io::ErrorKind::NotFound)),
         };
         let dest = self.resolve_ancestors(to);
-        let chunk = chunk_bytes.max(1) as u64;
+        {
+            let mut nodes = self.nodes.lock().unwrap();
+            if nodes.contains_key(&dest) {
+                return Err(io::Error::from(io::ErrorKind::AlreadyExists));
+            }
+            nodes.insert(dest.clone(), FakeNode::File { size: 0, modified: None, readonly: false, streams: BTreeMap::new() });
+        }
+        let keys = Self::copy_injection_keys(to);
+        let chunk = opts.chunk_bytes.max(1) as u64;
         let mut done = 0u64;
         let mut chunk_index = 0u64;
         loop {
@@ -959,7 +1336,7 @@ impl FileSystem for FakeFs {
                 let mut injections = self.injections.lock().unwrap();
                 let idx = injections
                     .iter()
-                    .position(|i| matches!(i.op, InjectableOp::CopyAfterChunks(n) if n == chunk_index) && i.path == Self::norm(to));
+                    .position(|i| matches!(i.op, InjectableOp::CopyAfterChunks(n) if n == chunk_index) && keys.contains(&i.path));
                 idx.map(|idx| injections.remove(idx).kind)
             };
             if let Some(kind) = fail_after {
@@ -968,18 +1345,51 @@ impl FileSystem for FakeFs {
             let step = chunk.min(size - done);
             done += step;
             chunk_index += 1;
-            if on_chunk(done) == ChunkControl::Cancel {
+            if let Some(FakeNode::File { size: s, .. }) = self.nodes.lock().unwrap().get_mut(&dest) {
+                *s = done;
+            }
+            if on_progress(done) == ChunkControl::Cancel {
                 return Err(cancelled_error());
             }
             if done >= size {
                 break;
             }
         }
-        self.nodes
-            .lock()
-            .unwrap()
-            .insert(dest, FakeNode::File { size, modified: None, readonly: false, streams: BTreeMap::new() });
-        Ok(size)
+        if opts.flush {
+            if let Some(kind) = self.take_copy_injection(InjectableOp::Flush, to) {
+                return Err(io::Error::from(kind));
+            }
+        }
+
+        let mut unrestored = Vec::new();
+        if let Some(kind) = self.take_injection(InjectableOp::ListStreams, from) {
+            unrestored.push(Unrestored::new(UnrestoredKind::StreamListing, io::Error::from(kind)));
+        } else {
+            for (name, stream_size) in streams {
+                if !self.named_streams.load(Ordering::SeqCst) {
+                    unrestored.push(Unrestored::new(UnrestoredKind::Stream(name), "destination volume has no named-stream support"));
+                } else if let Some(kind) = self.take_copy_injection(InjectableOp::CopyStream, to) {
+                    unrestored.push(Unrestored::new(UnrestoredKind::Stream(name), io::Error::from(kind)));
+                } else if let Some(FakeNode::File { streams, .. }) = self.nodes.lock().unwrap().get_mut(&dest) {
+                    streams.insert(name, stream_size);
+                }
+            }
+        }
+        if let Some(modified) = modified {
+            if let Some(kind) = self.take_copy_injection(InjectableOp::SetModified, to) {
+                unrestored.push(Unrestored::new(UnrestoredKind::ModifiedTime, io::Error::from(kind)));
+            } else if let Some(FakeNode::File { modified: m, .. }) = self.nodes.lock().unwrap().get_mut(&dest) {
+                *m = Some(modified);
+            }
+        }
+        if readonly {
+            if let Some(kind) = self.take_copy_injection(InjectableOp::SetReadonly, to) {
+                unrestored.push(Unrestored::new(UnrestoredKind::ReadOnly, io::Error::from(kind)));
+            } else if let Some(FakeNode::File { readonly: r, .. }) = self.nodes.lock().unwrap().get_mut(&dest) {
+                *r = true;
+            }
+        }
+        Ok(CopyReport { bytes: size, unrestored })
     }
 
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -1054,53 +1464,6 @@ impl FileSystem for FakeFs {
         Ok(())
     }
 
-    fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-        if let Some(kind) = self.take_injection(InjectableOp::SetModified, path) {
-            return Err(io::Error::from(kind));
-        }
-        let p = self.resolve_ancestors(path);
-        let mut nodes = self.nodes.lock().unwrap();
-        match nodes.get_mut(&p) {
-            Some(FakeNode::File { modified: m, .. }) => {
-                *m = Some(modified);
-                Ok(())
-            }
-            _ => Err(io::Error::from(io::ErrorKind::NotFound)),
-        }
-    }
-
-    fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
-        if let Some(kind) = self.take_injection(InjectableOp::ListStreams, path) {
-            return Err(io::Error::from(kind));
-        }
-        let p = Self::norm(path);
-        let nodes = self.nodes.lock().unwrap();
-        match nodes.get(&p) {
-            Some(FakeNode::File { streams, .. }) => Ok(streams.keys().cloned().collect()),
-            _ => Ok(Vec::new()),
-        }
-    }
-
-    fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, _chunk_bytes: usize) -> io::Result<u64> {
-        if let Some(kind) = self.take_injection(InjectableOp::CopyStream, to) {
-            return Err(io::Error::from(kind));
-        }
-        let pf = Self::norm(from);
-        let size = {
-            let nodes = self.nodes.lock().unwrap();
-            match nodes.get(&pf) {
-                Some(FakeNode::File { streams, .. }) => *streams.get(stream).unwrap_or(&0),
-                _ => 0,
-            }
-        };
-        let pt = Self::norm(to);
-        let mut nodes = self.nodes.lock().unwrap();
-        if let Some(FakeNode::File { streams, .. }) = nodes.get_mut(&pt) {
-            streams.insert(stream.to_os_string(), size);
-        }
-        Ok(size)
-    }
-
     fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
         Ok(self.volume_of(a) == self.volume_of(b))
     }
@@ -1125,20 +1488,27 @@ mod tests {
         assert!(fake.metadata(Path::new("/a.txt")).is_ok());
     }
 
+    fn opts(chunk_bytes: usize, flush: bool) -> CopyOptions {
+        CopyOptions { chunk_bytes, flush }
+    }
+
     #[test]
-    fn fake_fs_copy_disk_full_after_n_chunks() {
+    fn fake_fs_copy_disk_full_after_n_chunks_leaves_a_partial_node() {
         let fake = FakeFs::new();
         fake.add_file(Path::new("/src.bin"), 30);
         fake.inject(InjectableOp::CopyAfterChunks(2), Path::new("/dst.bin"), io::ErrorKind::StorageFull);
         let mut chunks = 0u64;
         let err = fake
-            .copy_file_chunked(Path::new("/src.bin"), Path::new("/dst.bin"), 10, &mut |_| {
+            .copy_file(Path::new("/src.bin"), Path::new("/dst.bin"), &opts(10, false), &mut |_| {
                 chunks += 1;
                 ChunkControl::Continue
             })
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::StorageFull);
         assert_eq!(chunks, 2);
+        // durable-file-copy design D10: the partial destination stays, as
+        // on a real filesystem, so the worker's cleanup is testable.
+        assert_eq!(fake.metadata(Path::new("/dst.bin")).unwrap().size, 20, "two chunks of ten bytes landed");
     }
 
     #[test]
@@ -1146,7 +1516,7 @@ mod tests {
         let fake = FakeFs::new();
         fake.add_file(Path::new("/src.bin"), 30);
         let err = fake
-            .copy_file_chunked(Path::new("/src.bin"), Path::new("/dst.bin"), 10, &mut |done| {
+            .copy_file(Path::new("/src.bin"), Path::new("/dst.bin"), &opts(10, false), &mut |done| {
                 if done >= 10 {
                     ChunkControl::Cancel
                 } else {
@@ -1155,6 +1525,40 @@ mod tests {
             })
             .unwrap_err();
         assert!(is_cancelled(&err));
+        assert_eq!(fake.metadata(Path::new("/dst.bin")).unwrap().size, 10, "a cancel leaves the partial node too");
+    }
+
+    #[test]
+    fn fake_fs_copy_creates_the_destination_exclusively() {
+        let fake = FakeFs::new();
+        fake.add_file(Path::new("/src.bin"), 3);
+        fake.add_file(Path::new("/dst.bin"), 99);
+        let err = fake.copy_file(Path::new("/src.bin"), Path::new("/dst.bin"), &opts(10, false), &mut |_| ChunkControl::Continue).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fake.metadata(Path::new("/dst.bin")).unwrap().size, 99, "the existing file is untouched");
+    }
+
+    #[test]
+    fn fake_fs_flush_injection_fails_a_flushed_copy_after_the_last_chunk() {
+        let fake = FakeFs::new();
+        fake.add_file(Path::new("/src.bin"), 30);
+        fake.inject(InjectableOp::Flush, Path::new("/dst.bin"), io::ErrorKind::Other);
+        let err = fake.copy_file(Path::new("/src.bin"), Path::new("/dst.bin"), &opts(10, true), &mut |_| ChunkControl::Continue).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Other);
+        assert_eq!(fake.metadata(Path::new("/dst.bin")).unwrap().size, 30, "fully written, then the flush failed");
+        // The same injection is ignored by an unflushed copy.
+        fake.inject(InjectableOp::Flush, Path::new("/dst2.bin"), io::ErrorKind::Other);
+        assert!(fake.copy_file(Path::new("/src.bin"), Path::new("/dst2.bin"), &opts(10, false), &mut |_| ChunkControl::Continue).is_ok());
+    }
+
+    #[test]
+    fn fake_fs_copy_injections_key_on_the_final_target_of_a_partial_file() {
+        let fake = FakeFs::new();
+        fake.add_file(Path::new("/src.bin"), 30);
+        fake.inject(InjectableOp::CopyAfterChunks(0), Path::new("/dst/a.bin"), io::ErrorKind::StorageFull);
+        let temp = PathBuf::from(format!("/dst/a.bin{}-2", super::super::worker::PARTIAL_SUFFIX));
+        let err = fake.copy_file(Path::new("/src.bin"), &temp, &opts(10, false), &mut |_| ChunkControl::Continue).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
     }
 
     #[test]
@@ -1255,13 +1659,42 @@ mod tests {
     }
 
     #[test]
-    fn fake_fs_streams_roundtrip() {
+    fn fake_fs_copy_carries_streams_readonly_and_modified_over() {
         let fake = FakeFs::new();
         fake.add_file_with_stream(Path::new("/a.txt"), 5, "Zone.Identifier", 3);
-        let streams = fake.list_streams(Path::new("/a.txt")).unwrap();
-        assert_eq!(streams, vec![OsString::from("Zone.Identifier")]);
-        fake.add_file(Path::new("/b.txt"), 5);
-        fake.copy_stream_chunked(Path::new("/a.txt"), OsStr::new("Zone.Identifier"), Path::new("/b.txt"), 64).unwrap();
+        fake.set_readonly(Path::new("/a.txt"), true).unwrap();
+        let modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        fake.set_modified(Path::new("/a.txt"), modified).unwrap();
+        assert_eq!(fake.list_streams(Path::new("/a.txt")).unwrap(), vec![OsString::from("Zone.Identifier")]);
+
+        let report = fake.copy_file(Path::new("/a.txt"), Path::new("/b.txt"), &opts(64, false), &mut |_| ChunkControl::Continue).unwrap();
+        assert_eq!(report.bytes, 5);
+        assert!(report.unrestored.is_empty(), "{:?}", report.unrestored);
         assert_eq!(fake.list_streams(Path::new("/b.txt")).unwrap(), vec![OsString::from("Zone.Identifier")]);
+        let md = fake.metadata(Path::new("/b.txt")).unwrap();
+        assert!(md.readonly);
+        assert_eq!(md.modified, Some(modified));
+    }
+
+    #[test]
+    fn fake_fs_metadata_injections_divert_into_the_copy_report() {
+        let fake = FakeFs::new();
+        fake.add_file_with_stream(Path::new("/a.txt"), 5, "Zone.Identifier", 3);
+        fake.set_readonly(Path::new("/a.txt"), true).unwrap();
+        fake.set_modified(Path::new("/a.txt"), SystemTime::UNIX_EPOCH).unwrap();
+        fake.inject(InjectableOp::CopyStream, Path::new("/b.txt"), io::ErrorKind::PermissionDenied);
+        fake.inject(InjectableOp::SetModified, Path::new("/b.txt"), io::ErrorKind::PermissionDenied);
+        fake.inject(InjectableOp::SetReadonly, Path::new("/b.txt"), io::ErrorKind::PermissionDenied);
+
+        let report = fake.copy_file(Path::new("/a.txt"), Path::new("/b.txt"), &opts(64, false), &mut |_| ChunkControl::Continue).unwrap();
+        let kinds: Vec<&UnrestoredKind> = report.unrestored.iter().map(|u| &u.what).collect();
+        assert_eq!(kinds, vec![&UnrestoredKind::Stream(OsString::from("Zone.Identifier")), &UnrestoredKind::ModifiedTime, &UnrestoredKind::ReadOnly]);
+        assert_eq!(report.unrestored[0].reason(), format!("stream Zone.Identifier not copied: {}", io::Error::from(io::ErrorKind::PermissionDenied)));
+        assert!(report.unrestored[1].reason().starts_with("modification time not restored: "));
+        assert!(report.unrestored[2].reason().starts_with("read-only attribute not restored: "));
+        let md = fake.metadata(Path::new("/b.txt")).unwrap();
+        assert_eq!(md.size, 5, "the content still arrived");
+        assert!(!md.readonly);
+        assert!(fake.list_streams(Path::new("/b.txt")).unwrap().is_empty());
     }
 }
