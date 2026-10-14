@@ -5,6 +5,8 @@
 use std::io::{self, Stdout};
 
 use crossterm::cursor::{Hide, Show};
+#[cfg(not(windows))]
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
@@ -89,7 +91,10 @@ impl TerminalGuard {
     /// command line would inherit mouse tracking, and on Windows capture
     /// leaves conhost's QuickEdit disabled for as long as it stays on
     /// (design D1; application-shell "Suspended shell run gets a normal
-    /// terminal").
+    /// terminal"). Bracketed paste is likewise disabled first, so a child
+    /// program gets a terminal without it (idle-aware-event-loop design D6;
+    /// text-field-editing "Child programs get a terminal without bracketed
+    /// paste").
     pub fn suspend(&mut self) -> io::Result<()> {
         if !self.state.begin_suspend() {
             return Ok(());
@@ -97,6 +102,7 @@ impl TerminalGuard {
         suspend_with(
             self.mouse_enabled,
             disable_raw_mode,
+            || set_bracketed_paste(false),
             || execute!(io::stdout(), DisableMouseCapture).map(|_| ()),
             || execute!(io::stdout(), LeaveAlternateScreen, Show).map(|_| ()),
         )
@@ -118,6 +124,7 @@ impl TerminalGuard {
             self.mouse_enabled,
             enable_raw_mode,
             || execute!(io::stdout(), EnterAlternateScreen, Hide).map(|_| ()),
+            || set_bracketed_paste(true),
             || execute!(io::stdout(), EnableMouseCapture).map(|_| ()),
         )?;
         // The alternate screen we come back to is blank, and ratatui's
@@ -141,35 +148,70 @@ impl Drop for TerminalGuard {
 /// `new` (which cannot be exercised in a headless test runner — see
 /// [`SuspendState`]'s doc comment — so it has no need of the closure-injected
 /// shape [`suspend_with`]/[`resume_with`] give `suspend`/`resume`): the
-/// alternate screen, a hidden cursor, and — when `mouse_enabled` — mouse
-/// capture, in that order. Mouse capture last so it only ever becomes active
-/// once the alternate screen is already in place.
+/// alternate screen, a hidden cursor, bracketed paste (off Windows —
+/// crossterm's input layer reports `Event::Paste` only there, so the mode is
+/// never enabled on Windows, where a paste arrives as ordinary key events;
+/// idle-aware-event-loop design D6), and — when `mouse_enabled` — mouse
+/// capture, in that order. Capture last so it only ever becomes active once
+/// the alternate screen is already in place.
 fn enter_commands(w: &mut impl io::Write, mouse_enabled: bool) -> io::Result<()> {
+    #[cfg(not(windows))]
+    execute!(w, EnterAlternateScreen, Hide, EnableBracketedPaste)?;
+    #[cfg(windows)]
+    execute!(w, EnterAlternateScreen, Hide)?;
     if mouse_enabled {
-        execute!(w, EnterAlternateScreen, Hide, EnableMouseCapture)
+        execute!(w, EnableMouseCapture)?;
+    }
+    Ok(())
+}
+
+/// The bracketed-paste step of `enter_commands`, `suspend`, `resume`, and
+/// [`restore_terminal`]: enable or disable the mode on the real terminal.
+/// Off Windows this writes the standard `CSI ?2004h`/`CSI ?2004l` sequence
+/// (a harmless no-op where the console does not support it). On Windows the
+/// mode is never touched at all — crossterm cannot report pastes there, and
+/// on an ANSI-capable console enabling it would wrap pastes in delimiters
+/// the Windows reader would deliver as stray key events
+/// (idle-aware-event-loop design D6; text-field-editing "Terminal paste
+/// arrives as one paste").
+#[cfg(not(windows))]
+fn set_bracketed_paste(enable: bool) -> io::Result<()> {
+    if enable {
+        execute!(io::stdout(), EnableBracketedPaste).map(|_| ())
     } else {
-        execute!(w, EnterAlternateScreen, Hide)
+        execute!(io::stdout(), DisableBracketedPaste).map(|_| ())
     }
 }
 
+/// The Windows no-op half of the bracketed-paste step — see the
+/// `cfg(not(windows))` arm above for why the mode is never touched there.
+#[cfg(windows)]
+fn set_bracketed_paste(enable: bool) -> io::Result<()> {
+    let _ = enable;
+    Ok(())
+}
+
 /// The ordered steps [`TerminalGuard::suspend`] performs, with the actual
-/// raw-mode, mouse-capture, and alternate-screen operations injected as
-/// separate closures so the *order between them* — raw mode off, then (when
-/// `mouse_enabled`) mouse capture off, then the alternate screen left — is
-/// unit-testable without a real console, the same constraint
-/// [`install_panic_hook_with`] works around for the panic hook (design D1:
-/// "otherwise a child shell inherits mouse tracking"; application-shell
-/// "Suspended shell run gets a normal terminal"). Production code and the
-/// test in `tests/panic_restoration.rs` both call this one function, so
-/// there is no separate "description" of the order to drift from what
-/// actually runs.
+/// raw-mode, bracketed-paste, mouse-capture, and alternate-screen operations
+/// injected as separate closures so the *order between them* — raw mode off,
+/// then bracketed paste off (a child program gets a terminal without it;
+/// idle-aware-event-loop design D6), then (when `mouse_enabled`) mouse
+/// capture off, then the alternate screen left — is unit-testable without a
+/// real console, the same constraint [`install_panic_hook_with`] works around
+/// for the panic hook (design D1: "otherwise a child shell inherits mouse
+/// tracking"; application-shell "Suspended shell run gets a normal
+/// terminal"). Production code and the test in `tests/panic_restoration.rs`
+/// both call this one function, so there is no separate "description" of the
+/// order to drift from what actually runs.
 pub fn suspend_with(
     mouse_enabled: bool,
     set_raw_mode_off: impl FnOnce() -> io::Result<()>,
+    disable_bracketed_paste: impl FnOnce() -> io::Result<()>,
     disable_mouse_capture: impl FnOnce() -> io::Result<()>,
     leave_alternate_screen: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     set_raw_mode_off()?;
+    disable_bracketed_paste()?;
     if mouse_enabled {
         disable_mouse_capture()?;
     }
@@ -177,17 +219,20 @@ pub fn suspend_with(
 }
 
 /// The [`TerminalGuard::resume`] counterpart to [`suspend_with`]: raw mode
-/// on, then the alternate screen re-entered, then (when `mouse_enabled`)
-/// mouse capture re-enabled — the reverse of `suspend_with`'s order, so
-/// capture is never active outside the alternate screen either way.
+/// on, then the alternate screen re-entered, then bracketed paste re-enabled
+/// (off Windows), then (when `mouse_enabled`) mouse capture re-enabled — the
+/// reverse of `suspend_with`'s order, so neither capture nor paste mode is
+/// ever active outside the alternate screen either way.
 pub fn resume_with(
     mouse_enabled: bool,
     set_raw_mode_on: impl FnOnce() -> io::Result<()>,
     enter_alternate_screen: impl FnOnce() -> io::Result<()>,
+    enable_bracketed_paste: impl FnOnce() -> io::Result<()>,
     enable_mouse_capture: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<()> {
     set_raw_mode_on()?;
     enter_alternate_screen()?;
+    enable_bracketed_paste()?;
     if mouse_enabled {
         enable_mouse_capture()?;
     }
@@ -195,14 +240,18 @@ pub fn resume_with(
 }
 
 /// Leave raw mode and the alternate screen, and unconditionally release
-/// mouse capture — harmless when it was never enabled (the panic hook and
-/// `Drop` have no access to the `[mouse] enabled` flag, so there is nothing
-/// to gate on; application-shell "Panic hook restores the terminal before
-/// reporting"; design D1). Idempotent and infallible from the caller's
-/// perspective (errors are swallowed) — safe to call from `Drop` or from a
-/// panic hook where nothing useful can be done with a failure anyway.
+/// mouse capture and bracketed paste — harmless when either was never
+/// enabled (the panic hook and `Drop` have no access to the `[mouse]
+/// enabled` flag, so there is nothing to gate on; application-shell "Panic
+/// hook restores the terminal before reporting"; design D1). Bracketed
+/// paste's disable is itself a Windows no-op, since the mode is never
+/// enabled there (idle-aware-event-loop design D6). Idempotent and
+/// infallible from the caller's perspective (errors are swallowed) — safe to
+/// call from `Drop` or from a panic hook where nothing useful can be done
+/// with a failure anyway.
 pub fn restore_terminal() {
     let _ = disable_raw_mode();
+    let _ = set_bracketed_paste(false);
     let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen, Show);
 }
 

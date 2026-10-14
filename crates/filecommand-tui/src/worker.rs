@@ -7,13 +7,14 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use filecommand_core::drives;
 use filecommand_core::fs_ops::{
-    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
+    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs,
 };
 use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
@@ -47,6 +48,51 @@ pub(crate) fn name_or_path(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
 }
 
+/// A live count of the worker threads that can still post to the event
+/// loop's channel (idle-aware-event-loop design D3): while it is nonzero the
+/// loop polls for terminal input at the usual ~33 ms cadence so results keep
+/// today's latency; at zero the loop sleeps until the next time-driven
+/// deadline instead. Every `spawn_*` moves a [`WorkerToken`] into its thread.
+#[derive(Clone, Default)]
+pub struct WorkerGauge {
+    live: Arc<AtomicUsize>,
+}
+
+impl WorkerGauge {
+    pub fn new() -> WorkerGauge {
+        WorkerGauge::default()
+    }
+
+    /// The number of worker threads currently holding a token.
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::Acquire)
+    }
+
+    /// A token keeping one worker counted until it is dropped. Created by the
+    /// caller *before* the thread starts — an increment from inside the
+    /// thread would leave a window where the loop sees zero live workers and
+    /// parks while the worker is about to post.
+    pub fn token(&self) -> WorkerToken {
+        self.live.fetch_add(1, Ordering::AcqRel);
+        WorkerToken { live: self.live.clone() }
+    }
+}
+
+/// The RAII half of [`WorkerGauge`]: moved into the worker thread, so a
+/// normal return *or* a panic decrements the count — always after the
+/// thread's last channel send, with release ordering so a loop that reads
+/// zero (acquire) then drains the channel once more is guaranteed to see
+/// that send (idle-aware-event-loop design D3).
+pub struct WorkerToken {
+    live: Arc<AtomicUsize>,
+}
+
+impl Drop for WorkerToken {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::Release);
+    }
+}
+
 /// The `ListingFailed` status-line message, `Cannot read <name>: <err>`
 /// (filesystem-error-handling "Error messages name the affected path";
 /// design D4): the name rather than the full path, because the panel's
@@ -68,8 +114,9 @@ const GIT_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 /// unreachable network shares block here, never in the render loop; the
 /// dialog shows the drive with a blank label meanwhile, and a result that
 /// arrives after the dialog closed is discarded by `core::update`.
-pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>) {
+pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         let label = drives::volume_info(letter).map(|(label, _serial)| label);
         deliver(&tx, "drive label", Command::DriveLabelResolved { target, letter, label, generation });
     });
@@ -80,8 +127,9 @@ pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: S
 /// The whole set is sent as one result: these queries hit the same volume
 /// and complete together, and a single fill-in keeps the panel from
 /// repainting several times in a row.
-pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
+pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         let values = gather_info(&StdFsReader, &path);
         deliver(&tx, "info query", Command::InfoResolved { panel, path, request, values });
     });
@@ -123,8 +171,8 @@ impl GitQuerySlot {
     /// Route one `Effect::QueryGitInfo` through the slot: start the runner
     /// when the slot is idle, or replace the pending request while a query
     /// is running.
-    pub fn request(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
-        self.request_with(panel, path, request, tx, GIT_INFO_TIMEOUT, discover_then_query);
+    pub fn request(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, token: WorkerToken) {
+        self.request_with(panel, path, request, tx, token, GIT_INFO_TIMEOUT, discover_then_query);
     }
 
     /// `request` with the timeout and the per-directory query injected, so
@@ -132,12 +180,18 @@ impl GitQuerySlot {
     /// When a runner is already serving the slot, `query` is unused — the
     /// runner's own query function drives the pending request too
     /// (production always passes the same one).
-    fn request_with<F>(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, timeout: Duration, query: F)
+    #[allow(clippy::too_many_arguments)]
+    fn request_with<F>(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, token: WorkerToken, timeout: Duration, query: F)
     where
         F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
     {
         let mut state = self.state.lock().unwrap();
         if state.running {
+            // The token stays with the already-running runner, which keeps
+            // the gauge honest for as long as queued requests can still be
+            // served; this request's own token is dropped (the decrement
+            // balances its `token()` call).
+            drop(token);
             state.pending = Some((path, request));
             return;
         }
@@ -147,7 +201,7 @@ impl GitQuerySlot {
         // order.
         state.pending = None;
         let slot = self.state.clone();
-        std::thread::spawn(move || run_git_query_slot(slot, panel, (path, request), tx, timeout, query));
+        std::thread::spawn(move || run_git_query_slot(slot, panel, (path, request), tx, token, timeout, query));
     }
 }
 
@@ -184,10 +238,14 @@ impl Drop for GitQuerySlotGuard {
 /// "Silent absence on timeout and stale-result discarding" — and the slot
 /// is released when the timeout reply is *sent*, not when the orphaned walk
 /// eventually returns, which may be minutes later (design D3).
-fn run_git_query_slot<F>(slot: Arc<Mutex<GitQuerySlotState>>, panel: PanelSide, first: (PathBuf, u64), tx: Sender<Command>, timeout: Duration, query: F)
+fn run_git_query_slot<F>(slot: Arc<Mutex<GitQuerySlotState>>, panel: PanelSide, first: (PathBuf, u64), tx: Sender<Command>, token: WorkerToken, timeout: Duration, query: F)
 where
     F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
 {
+    // Held for the runner's whole lifetime — including a panic unwind — so
+    // the gauge counts this slot until its last reply has been sent
+    // (idle-aware-event-loop design D3).
+    let _token = token;
     let guard = GitQuerySlotGuard { state: slot.clone(), disarmed: false };
     let query = Arc::new(query);
     let mut current = Some(first);
@@ -317,8 +375,9 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
 /// positioned-read open is cheap and keeps the two paths independent. The
 /// source is a local, so the worker's handle is released when the search
 /// returns (viewer: Instant open — "Closing the viewer releases the file").
-pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>) {
+pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         let result = match ByteSource::open(&path) {
             Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
             Err(_) => None,
@@ -339,8 +398,9 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
 /// node expanded, so a broken node simply shows no children instead of
 /// leaving the query outstanding forever (additional-panel-modes "Children
 /// read on expand"; design D7).
-pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         let children = filecommand_core::listing::list_child_dirs(&StdFsReader, &path).unwrap_or_default();
         deliver(&tx, "tree expansion", Command::TreeNodeExpanded { panel, path, children });
     });
@@ -353,8 +413,9 @@ pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
 /// incrementally rather than only once the whole subtree has been walked
 /// (find-file "Non-blocking search with static progress", "UI stays
 /// responsive during a large walk").
-pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>) {
+pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         find_in_subtree(&StdFsReader, &root, &pattern, |m| {
             deliver(&tx, "find match", Command::FindFileMatch { request, m });
         });
@@ -362,8 +423,9 @@ pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Send
     });
 }
 
-pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
+pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
     std::thread::spawn(move || {
+        let _token = token;
         let mut total = 0usize;
 
         if parent_path(&path).is_some() {
@@ -414,14 +476,34 @@ struct ChannelSink {
     cancel: CancelFlag,
     source_dir: PathBuf,
     dest_dir: PathBuf,
+    /// Rate-limits `progress` to ~20 updates a second (idle-aware-event-loop
+    /// "Progress updates are rate-limited"; design D7) — at the sink rather
+    /// than inside the engine, so every emitter (per-chunk copy progress,
+    /// per-file delete/move progress) is throttled in one place and
+    /// `run_job`'s own tests stay unthrottled and deterministic.
+    throttle: ProgressThrottle,
+}
+
+impl ChannelSink {
+    /// Design D7's flush points: the newest held progress goes out ahead of
+    /// any message the user makes a decision on — or that ends the job — so
+    /// those moments never render stale file names or counts.
+    fn flush_progress(&mut self) {
+        if let Some(info) = self.throttle.flush() {
+            deliver(&self.tx, "job progress", Command::JobProgress(info));
+        }
+    }
 }
 
 impl JobSink for ChannelSink {
     fn progress(&mut self, info: ProgressInfo) {
-        deliver(&self.tx, "job progress", Command::JobProgress(info));
+        if let Some(info) = self.throttle.offer(info, Instant::now()) {
+            deliver(&self.tx, "job progress", Command::JobProgress(info));
+        }
     }
 
     fn conflict(&mut self, info: ConflictInfo) -> ConflictChoice {
+        self.flush_progress();
         if !deliver(&self.tx, "conflict prompt", Command::JobConflict(info)) {
             return ConflictChoice::Skip;
         }
@@ -434,6 +516,7 @@ impl JobSink for ChannelSink {
     }
 
     fn error(&mut self, info: ErrorInfo) -> ErrorChoice {
+        self.flush_progress();
         if !deliver(&self.tx, "error prompt", Command::JobError(info)) {
             return ErrorChoice::Abort;
         }
@@ -444,6 +527,7 @@ impl JobSink for ChannelSink {
     }
 
     fn done(&mut self, outcome: JobOutcome) {
+        self.flush_progress();
         // Metadata-restore warnings the engine recorded are logged under
         // `copy`, so a partial failure leaves a diagnostic trail even when
         // the user dismisses the end-of-job summary unread
@@ -487,7 +571,7 @@ mod tests {
     fn spawn_viewer_search_reports_the_match_back_on_the_channel() {
         let path = temp_file("found", b"the quick brown fox jumps over the lazy dog");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, tx);
+        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset, match_range, request }) => {
                 assert_eq!(offset, Some(10));
@@ -502,7 +586,7 @@ mod tests {
     fn spawn_viewer_search_reports_no_match_as_none() {
         let path = temp_file("not-found", b"the quick brown fox");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, tx);
+        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -513,7 +597,7 @@ mod tests {
     fn spawn_viewer_search_on_an_unopenable_path_reports_no_match_instead_of_panicking() {
         let missing = std::env::temp_dir().join("filecommand-tui-worker-viewer-test-does-not-exist.bin");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, tx);
+        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -536,7 +620,7 @@ mod tests {
         let path = temp_file("release", &contents);
         let dir = path.parent().unwrap().to_path_buf();
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path.clone(), 0, b"zebra".to_vec(), 1, tx);
+        spawn_viewer_search(path.clone(), 0, b"zebra".to_vec(), 1, tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -690,10 +774,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let timeout = std::time::Duration::from_secs(5);
 
-        slot.request_with(PanelSide::Left, PathBuf::from("/first"), 1, tx.clone(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/first"), 1, tx.clone(), WorkerGauge::new().token(), timeout, fake_query(&fake));
         assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/first")), "the first query starts");
-        slot.request_with(PanelSide::Left, PathBuf::from("/second"), 2, tx.clone(), timeout, fake_query(&fake));
-        slot.request_with(PanelSide::Left, PathBuf::from("/third"), 3, tx.clone(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/second"), 2, tx.clone(), WorkerGauge::new().token(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/third"), 3, tx.clone(), WorkerGauge::new().token(), timeout, fake_query(&fake));
         gate_tx.send(()).unwrap(); // let the first query finish within its timeout
 
         let (path, request, _info, timed_out_root) = recv_git_reply(&rx);
@@ -723,11 +807,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let timeout = std::time::Duration::from_millis(300);
 
-        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx.clone(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx.clone(), WorkerGauge::new().token(), timeout, fake_query(&fake));
         assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/repo/src")));
         // Queued while the first query is still walking (before it times
         // out), inside the about-to-be-remembered repository.
-        slot.request_with(PanelSide::Left, PathBuf::from("/repo/docs"), 2, tx, timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/docs"), 2, tx, WorkerGauge::new().token(), timeout, fake_query(&fake));
 
         let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(request, 1);
@@ -751,7 +835,7 @@ mod tests {
             FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
         let slot = GitQuerySlot::new();
         let (tx, rx) = mpsc::channel();
-        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx, std::time::Duration::from_millis(100), fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx, WorkerGauge::new().token(), std::time::Duration::from_millis(100), fake_query(&fake));
 
         let (path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(path, PathBuf::from("/repo/src"));
@@ -771,7 +855,7 @@ mod tests {
         let fake = FakeGitQuery::new(started_tx, vec![(PathBuf::from("/slow/deep"), FakeScript::Block(gate_rx))]);
         let slot = GitQuerySlot::new();
         let (tx, rx) = mpsc::channel();
-        slot.request_with(PanelSide::Left, PathBuf::from("/slow/deep"), 1, tx, std::time::Duration::from_millis(100), fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/slow/deep"), 1, tx, WorkerGauge::new().token(), std::time::Duration::from_millis(100), fake_query(&fake));
 
         let (path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(path, PathBuf::from("/slow/deep"));
@@ -797,7 +881,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let timeout = std::time::Duration::from_secs(5);
 
-        slot.request_with(PanelSide::Left, PathBuf::from("/panic"), 1, tx.clone(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/panic"), 1, tx.clone(), WorkerGauge::new().token(), timeout, fake_query(&fake));
         assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/panic")), "the first query starts");
         let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(request, 1);
@@ -811,7 +895,7 @@ mod tests {
             std::thread::yield_now();
         }
 
-        slot.request_with(PanelSide::Left, PathBuf::from("/ok"), 2, tx, timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/ok"), 2, tx, WorkerGauge::new().token(), timeout, fake_query(&fake));
         assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/ok")), "an idle slot serves the next request");
         let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(request, 2);
@@ -851,7 +935,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let (tx, rx) = mpsc::channel();
-        spawn_listing(PanelSide::Left, dir, tx);
+        spawn_listing(PanelSide::Left, dir, tx, WorkerGauge::new().token());
         loop {
             match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(Command::ListingChunk { .. }) => continue, // the synthetic `..` entry
@@ -875,7 +959,7 @@ mod tests {
         std::fs::write(dir.join("other.txt"), b"x").unwrap();
 
         let (tx, rx) = mpsc::channel();
-        spawn_find_subtree(dir.clone(), "report".to_string(), 7, tx);
+        spawn_find_subtree(dir.clone(), "report".to_string(), 7, tx, WorkerGauge::new().token());
 
         let mut matched_names = Vec::new();
         let saw_done;
@@ -898,9 +982,104 @@ mod tests {
         assert!(saw_done);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // -------------------------------------------------------------
+    // idle-aware-event-loop: the worker gauge (design D3; task 2.1) and
+    // the sink's progress throttle (file-operations "Progress updates are
+    // rate-limited"; design D7; task 4.2)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn the_gauge_counts_live_tokens_and_a_panicked_thread_releases_its() {
+        let gauge = WorkerGauge::new();
+        assert_eq!(gauge.live(), 0);
+        let token = gauge.token();
+        assert_eq!(gauge.live(), 1);
+        let panicked = std::thread::spawn(move || {
+            let _token = token;
+            panic!("scripted worker panic");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert_eq!(gauge.live(), 0, "the token's Drop decrements even on panic");
+    }
+
+    /// A `ChannelSink` over a recording channel, with the reply channel's
+    /// sender returned so conflict/error answers can be pre-loaded.
+    fn recording_sink() -> (ChannelSink, Sender<JobReply>, mpsc::Receiver<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let sink = ChannelSink {
+            tx,
+            reply_rx,
+            cancel: CancelFlag::new(),
+            source_dir: PathBuf::from("/src"),
+            dest_dir: PathBuf::from("/dst"),
+            throttle: ProgressThrottle::new(),
+        };
+        (sink, reply_tx, rx)
+    }
+
+    fn progress(files_done: usize, bytes_done: u64, name: &str) -> ProgressInfo {
+        ProgressInfo { files_done, files_total: 3, bytes_done, bytes_total: 6_000, current_file: std::ffi::OsString::from(name) }
+    }
+
+    #[test]
+    fn a_fast_job_flushes_its_final_progress_before_done() {
+        // file-operations "The final progress is always delivered": three
+        // files' progress inside one 50 ms interval is held by the throttle,
+        // and `done` pushes the newest figures ahead of `JobDone`.
+        let (mut sink, _reply_tx, rx) = recording_sink();
+        sink.progress(progress(1, 2_000, "a.txt"));
+        sink.progress(progress(2, 4_000, "b.txt"));
+        sink.progress(progress(3, 6_000, "c.txt"));
+        sink.done(JobOutcome::Completed { skipped: vec![] });
+
+        let msgs: Vec<Command> = rx.try_iter().collect();
+        assert_eq!(
+            msgs,
+            vec![
+                Command::JobProgress(progress(1, 2_000, "a.txt")),
+                Command::JobProgress(progress(3, 6_000, "c.txt")),
+                Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/src"), dest_dir: PathBuf::from("/dst") },
+            ],
+            "the first update goes straight out, the newest held one precedes JobDone, the middle one is dropped"
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_preceded_by_the_pending_progress() {
+        // file-operations "Progress is current when a conflict is asked":
+        // the held `a.txt` update reaches the UI ahead of the question.
+        let (mut sink, reply_tx, rx) = recording_sink();
+        sink.progress(progress(1, 2_000, "a.txt"));
+        sink.progress(progress(2, 4_000, "b.txt"));
+        let conflict = ConflictInfo {
+            source_name: std::ffi::OsString::from("b.txt"),
+            source_size: 2_000,
+            source_modified: None,
+            target_path: PathBuf::from("/dst/b.txt"),
+            target_size: 1_000,
+            target_modified: None,
+        };
+        // Pre-load the answer so the blocking `conflict` returns at once.
+        reply_tx.send(JobReply::Conflict(ConflictChoice::Skip)).unwrap();
+        assert_eq!(sink.conflict(conflict.clone()), ConflictChoice::Skip);
+
+        let msgs: Vec<Command> = rx.try_iter().collect();
+        assert_eq!(
+            msgs,
+            vec![
+                Command::JobProgress(progress(1, 2_000, "a.txt")),
+                Command::JobProgress(progress(2, 4_000, "b.txt")),
+                Command::JobConflict(conflict),
+            ],
+            "the held update is flushed before the conflict question"
+        );
+    }
 }
 
-pub fn spawn_job(job: Job, tx: Sender<Command>) -> JobHandle {
+pub fn spawn_job(job: Job, tx: Sender<Command>, token: WorkerToken) -> JobHandle {
     let cancel = CancelFlag::new();
     let (reply_tx, reply_rx) = mpsc::channel::<JobReply>();
     let handle = JobHandle { cancel: cancel.clone(), reply_tx };
@@ -908,8 +1087,9 @@ pub fn spawn_job(job: Job, tx: Sender<Command>) -> JobHandle {
     let dest_dir = job.dest_dir.clone();
     let cancel_for_thread = cancel;
     std::thread::spawn(move || {
+        let _token = token;
         let fs = RealFs::new();
-        let mut sink = ChannelSink { tx, reply_rx, cancel: cancel_for_thread, source_dir, dest_dir };
+        let mut sink = ChannelSink { tx, reply_rx, cancel: cancel_for_thread, source_dir, dest_dir, throttle: ProgressThrottle::new() };
         filecommand_core::fs_ops::run_job(&job, &fs, &mut sink);
     });
     handle

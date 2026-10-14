@@ -6,21 +6,22 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
 use filecommand_core::editor::{EditorMove, EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
+use filecommand_core::line_edit::flatten_line_breaks;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
 use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
-use filecommand_core::{config, drives, identity, update, Command, Effect, PanelSide, State, UiPhase};
+use filecommand_core::{anim, config, drives, identity, update, Command, Effect, PanelSide, State, UiPhase};
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
@@ -32,6 +33,12 @@ use crate::views;
 use crate::worker;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
+/// A burst of already-queued input applies at most this many events before
+/// a draw, so the screen never falls far behind the keyboard
+/// (idle-aware-event-loop "Bursts of key input render once"; design D5).
+const BURST_MAX_EVENTS: usize = 64;
+/// The burst's other bound: about this much processing time, then a draw.
+const BURST_MAX_DURATION: Duration = Duration::from_millis(8);
 const CONFIG_FILE: &str = "config.toml";
 const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 
@@ -77,6 +84,11 @@ struct Runtime {
     /// navigation does not pile up queries"; git-info-timeout-memory design
     /// D3).
     git_slots: [worker::GitQuerySlot; 2],
+    /// How many worker threads that can still post to `tx` are alive
+    /// (idle-aware-event-loop design D3): the loop polls at the usual ~33 ms
+    /// cadence only while this is nonzero, and sleeps until the next
+    /// time-driven deadline otherwise.
+    workers: worker::WorkerGauge,
 }
 
 impl Runtime {
@@ -430,6 +442,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         clipboard: Box::new(PlatformClipboard::default()),
         mouse_tracker: MouseTracker::new(),
         git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+        workers: worker::WorkerGauge::new(),
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
@@ -439,80 +452,110 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     let mut hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
 
     // A non-mouse event read while draining a burst of mouse events (design
-    // D7) is stashed here rather than lost — crossterm has no way to push an
-    // event back onto its queue, so the next loop iteration consumes this
-    // instead of polling again.
+    // D7), or a mouse event that ended a key burst (idle-aware-event-loop
+    // design D5), is stashed here rather than lost — crossterm has no way to
+    // push an event back onto its queue, so the next loop iteration consumes
+    // this instead of polling again.
     let mut pending_event: Option<Event> = None;
 
+    // Idle-aware-event-loop design D1: `needs_draw` persists across
+    // iterations and is cleared only by an actual draw, so a worker result
+    // drained in an iteration whose key then maps to no command still
+    // repaints (application-shell "Redraw survives an unmapped key") — the
+    // old per-iteration `dirty` flag lost that redraw.
+    let mut needs_draw = false;
+    // The wall-clock reading the last drawn frame's header clock showed; a
+    // changed reading at a poll timeout means a minute boundary passed and
+    // the header must be repainted (application-shell "Header clock still
+    // advances while idle").
+    let mut drawn_clock = wall_clock.now_local();
+    let mut events = CrosstermEvents;
+
     loop {
-        let (s, mut dirty) = drain_events(state, &rx, &mut guard, &mut rt)?;
+        let (s, applied) = drain_events(state, &rx, &mut guard, &mut rt)?;
         state = s;
+        needs_draw |= applied;
+
+        // Design D3's race: a worker can post its last message and drop its
+        // gauge token between the drain above and this gauge read. The send
+        // happens-before the token's release-decrement, so with a zero
+        // reading one more drain is guaranteed to see that message — without
+        // it the loop could sleep a whole deadline with it unapplied.
+        let workers_alive = rt.workers.live() > 0;
+        if !workers_alive {
+            let (s, applied) = drain_events(state, &rx, &mut guard, &mut rt)?;
+            state = s;
+            needs_draw |= applied;
+        }
+
+        // While a draw is already pending there is no sleeping: poll with a
+        // zero timeout so input that is already queued applies before the
+        // frame (one draw for the whole batch), then fall through to it.
+        let timeout = if needs_draw {
+            Duration::ZERO
+        } else {
+            let now = clock.now_ms();
+            next_timeout(
+                now,
+                anim::next_wake_ms(&state),
+                Duration::from_millis(crate::clock::ms_until_next_minute(crate::clock::now_unix_ms())),
+                workers_alive,
+                // `streaming-listing-performance`'s drain backlog forces a
+                // zero timeout here once it lands; until then there is none.
+                false,
+            )
+        };
 
         let next_event = match pending_event.take() {
             Some(e) => Some(e),
-            None if event::poll(POLL_INTERVAL)? => Some(event::read()?),
+            None if events.poll(timeout)? => Some(events.read()?),
             None => None,
         };
 
         match next_event {
             Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                // The quit-confirmation dialog outranks the viewer/editor's
-                // own direct-dispatch key routing: once it is up, every key
-                // goes through `map_key` (which checks `quit_confirm`
-                // first), regardless of `state.phase` — the same way it
-                // outranks every other overlay inside `map_key` itself
-                // (application-shell "Quit request keys and
-                // confirmation"; design D5).
-                let cmd = if state.quit_confirm {
-                    let page_size = active_panel_page_size(&state);
-                    input::map_key(key, &state, page_size, &keys)
-                } else {
-                    match &state.phase {
-                        UiPhase::Viewer(viewer) => {
-                            let rows_visible = views::viewer::body_rows(state.term_size.1);
-                            let source = rt.viewer_source.as_ref().map(|(_, s)| s);
-                            input::map_viewer_key(key, viewer, rows_visible)
-                                .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
-                        }
-                        UiPhase::Editor(editor) => {
-                            let rows_visible = views::editor::body_rows(state.term_size.1);
-                            input::map_editor_key(key, editor, rows_visible)
-                        }
-                        _ => {
-                            let page_size = active_panel_page_size(&state);
-                            input::map_key(key, &state, page_size, &keys)
-                        }
-                    }
-                };
-                match cmd {
-                    Some(cmd) => {
-                        let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
-                        if quit {
-                            return Ok(());
-                        }
-                        state = s;
-                        dirty = true;
-                    }
-                    None => continue,
-                }
-            }
-            Some(Event::Resize(w, h)) => {
-                let (s, quit) = apply(state, Command::Resize(w, h), &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
                     return Ok(());
                 }
                 state = s;
-                dirty = true;
+                // Design D5: with the first key handled, keep applying
+                // already-queued input — each key mapped against the state
+                // the previous one produced — then draw once.
+                let mut handler = LoopHandler { guard: &mut guard, rt: &mut rt, keys: &keys };
+                let (s, quit, burst_applied) = drain_key_burst(key, state, &mut events, &mut pending_event, &mut handler)?;
+                state = s;
+                needs_draw |= burst_applied;
+                if quit {
+                    return Ok(());
+                }
+            }
+            Some(Event::Resize(w, h)) => {
+                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
+                }
+                let (s, quit) = apply(s, Command::Resize(w, h), &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
+                }
+                state = s;
+                needs_draw = true;
             }
             Some(Event::Mouse(first)) => {
+                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                if quit {
+                    return Ok(());
+                }
+                state = s;
                 // Drain every mouse event already queued this frame after
                 // the first, so a burst of wheel/drag events causes at most
                 // one redraw (mouse-input "Mouse events are coalesced";
                 // design D7). A non-mouse event read mid-drain is stashed in
                 // `pending_event` rather than lost.
                 let mut batch = vec![first];
-                while event::poll(Duration::ZERO)? {
-                    match event::read()? {
+                while events.poll(Duration::ZERO)? {
+                    match events.read()? {
                         Event::Mouse(m) => batch.push(m),
                         other => {
                             pending_event = Some(other);
@@ -525,26 +568,56 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                     return Ok(());
                 }
                 state = s;
-                dirty = dirty || batch_dirty;
+                needs_draw |= batch_dirty;
             }
-            Some(_) => {}
-            None => {
-                let (s, quit) = apply(state, Command::Tick(clock.now_ms()), &mut guard, &mut rt)?;
+            // A bracketed paste (never produced on Windows — design D6) is
+            // one batch of commands into the field Ctrl+V would paste into,
+            // drawn once.
+            Some(Event::Paste(text)) => {
+                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
                 if quit {
                     return Ok(());
                 }
                 state = s;
-                dirty = true;
+                for cmd in input::map_paste(&text, &state) {
+                    let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
+                    state = s;
+                    needs_draw = true;
+                    if quit {
+                        return Ok(());
+                    }
+                }
+            }
+            // Key releases, focus events: nothing to apply.
+            Some(_) => {}
+            None => {
+                // A poll timeout applies nothing and draws nothing unless a
+                // deadline actually came due (design D1/D2) — the
+                // worker-cadence wakeups this arm also gets are what used to
+                // cost a full frame every 33 ms forever (audit P-05).
+                let now = clock.now_ms();
+                let core_due = anim::next_wake_ms(&state).is_some_and(|wake| now >= wake);
+                let minute_due = wall_clock.now_local() != drawn_clock;
+                if core_due || minute_due {
+                    let (s, quit) = apply(state, Command::Tick(now), &mut guard, &mut rt)?;
+                    if quit {
+                        return Ok(());
+                    }
+                    state = s;
+                    needs_draw = true;
+                }
             }
         }
 
-        if dirty {
+        if needs_draw {
             // Effects that feed a command straight back (drive enumeration)
             // must land before the frame, so the dialog paints complete on
             // its very first appearance rather than a frame later.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
             hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+            needs_draw = false;
+            drawn_clock = wall_clock.now_local();
         }
     }
 }
@@ -706,6 +779,188 @@ fn apply_mouse_batch(
     }
     flush!();
     Ok((state, false, dirty))
+}
+
+/// The loop's terminal-event source, factored behind a trait so the burst
+/// drain can be driven by a scripted queue in tests (idle-aware-event-loop
+/// task 2.7). Production reads crossterm.
+trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+/// The poll timeout for one loop iteration (idle-aware-event-loop design
+/// D2/D3), factored pure for tests. Zero while a drained worker backlog is
+/// still pending (`streaming-listing-performance` supplies that signal once
+/// it lands — always `false` until then); at most `POLL_INTERVAL` while
+/// worker threads that can still post results are alive, so results keep
+/// today's latency; otherwise the earliest of the reducer's next wake
+/// (`core_wake`, on the same monotonic-millisecond axis as `now`) and the
+/// header clock's next minute flip (`minute_wake`).
+fn next_timeout(now: u64, core_wake: Option<u64>, minute_wake: Duration, workers_alive: bool, backlog: bool) -> Duration {
+    if backlog {
+        return Duration::ZERO;
+    }
+    let mut timeout = minute_wake;
+    if let Some(wake) = core_wake {
+        timeout = timeout.min(Duration::from_millis(wake.saturating_sub(now)));
+    }
+    if workers_alive {
+        timeout = timeout.min(POLL_INTERVAL);
+    }
+    timeout
+}
+
+/// Design D4: bring the reducer clock up to date before the first event of
+/// an input batch is applied, when the last delivered tick is older than
+/// `POLL_INTERVAL` — so a surface opened after an idle stretch is stamped
+/// with the real time and animates from its opening frame, and two clicks
+/// separated by idle time are not mistaken for a double-click
+/// (application-shell "Clicks separated by idle time are not a
+/// double-click"). A no-op while the clock is already fresh; applies no
+/// transition early (a key during the splash hold still dismisses the
+/// splash, exactly as before).
+fn tick_before_input(state: State, clock: &RealClock, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
+    let now = clock.now_ms();
+    if now.saturating_sub(state.clock_ms) > POLL_INTERVAL.as_millis() as u64 {
+        apply(state, Command::Tick(now), guard, rt)
+    } else {
+        Ok((state, false))
+    }
+}
+
+/// What the key-burst drain needs from the loop around it: the per-key
+/// mapping (factored out of the loop body, design D5) and the command
+/// application path. Production wires [`map_pressed_key`] + [`apply`] through
+/// [`LoopHandler`]; tests drive the same drain with a recording handler and
+/// no terminal.
+trait BurstHandler {
+    fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command>;
+    fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)>;
+}
+
+struct LoopHandler<'a> {
+    guard: &'a mut TerminalGuard,
+    rt: &'a mut Runtime,
+    keys: &'a config::Keys,
+}
+
+impl BurstHandler for LoopHandler<'_> {
+    fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command> {
+        map_pressed_key(key, state, self.keys, self.rt.viewer_source.as_ref().map(|(_, s)| s))
+    }
+    fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)> {
+        apply(state, cmd, self.guard, self.rt)
+    }
+}
+
+/// The loop's per-key mapping (idle-aware-event-loop design D5), factored
+/// out of the loop body so the first key of an iteration and every drained
+/// burst key go through the same routing: the quit-confirmation dialog
+/// outranks the viewer/editor's own direct dispatch (application-shell
+/// "Quit request keys and confirmation"; design D5), then the viewer and
+/// editor map through their own functions, then everything else goes
+/// through `input::map_key`.
+fn map_pressed_key(key: KeyEvent, state: &State, keys: &config::Keys, viewer_source: Option<&ByteSource>) -> Option<Command> {
+    if state.quit_confirm {
+        let page_size = active_panel_page_size(state);
+        return input::map_key(key, state, page_size, keys);
+    }
+    match &state.phase {
+        UiPhase::Viewer(viewer) => {
+            let rows_visible = views::viewer::body_rows(state.term_size.1);
+            input::map_viewer_key(key, viewer, rows_visible).and_then(|action| resolve_viewer_navigation(viewer, viewer_source, action, rows_visible))
+        }
+        UiPhase::Editor(editor) => {
+            let rows_visible = views::editor::body_rows(state.term_size.1);
+            input::map_editor_key(key, editor, rows_visible)
+        }
+        _ => {
+            let page_size = active_panel_page_size(state);
+            input::map_key(key, state, page_size, keys)
+        }
+    }
+}
+
+/// One iteration's application of an input burst (idle-aware-event-loop
+/// "Bursts of key input render once"; design D5): apply `first` (a pressed
+/// key), then keep reading with a zero poll while the burst budget
+/// ([`BURST_MAX_EVENTS`] events or [`BURST_MAX_DURATION`]) lasts — each
+/// pressed key mapped against the state the previous one produced, so
+/// state-dependent routing (Enter opening a dialog, the next characters
+/// landing in its field) is exactly as if the keys had arrived one loop
+/// iteration at a time. Key releases and focus events are skipped; a resize
+/// is applied like any command; a paste goes through `input::map_paste` as
+/// one batch; a mouse event ends the burst and is stashed in
+/// `pending_event` for the next iteration's mouse-batch path. Returns
+/// `(state, quit, applied)`, `applied` feeding the loop's `needs_draw`.
+fn drain_key_burst(
+    first: KeyEvent,
+    mut state: State,
+    events: &mut dyn EventSource,
+    pending_event: &mut Option<Event>,
+    handler: &mut dyn BurstHandler,
+) -> io::Result<(State, bool, bool)> {
+    let started = Instant::now();
+    let mut applied = false;
+    let mut handled = 0usize;
+    let mut next = Event::Key(first);
+    loop {
+        match next {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(cmd) = handler.map_key(key, &state) {
+                    let (s, quit) = handler.apply(state, cmd)?;
+                    state = s;
+                    applied = true;
+                    if quit {
+                        return Ok((state, true, applied));
+                    }
+                }
+            }
+            Event::Resize(w, h) => {
+                let (s, quit) = handler.apply(state, Command::Resize(w, h))?;
+                state = s;
+                applied = true;
+                if quit {
+                    return Ok((state, true, applied));
+                }
+            }
+            Event::Paste(text) => {
+                for cmd in input::map_paste(&text, &state) {
+                    let (s, quit) = handler.apply(state, cmd)?;
+                    state = s;
+                    applied = true;
+                    if quit {
+                        return Ok((state, true, applied));
+                    }
+                }
+            }
+            Event::Mouse(mouse) => {
+                *pending_event = Some(Event::Mouse(mouse));
+                return Ok((state, false, applied));
+            }
+            _ => {}
+        }
+        handled += 1;
+        if handled >= BURST_MAX_EVENTS || started.elapsed() >= BURST_MAX_DURATION {
+            return Ok((state, false, applied));
+        }
+        if !events.poll(Duration::ZERO)? {
+            return Ok((state, false, applied));
+        }
+        next = events.read()?;
+    }
 }
 
 /// Resolve the startup theme from `config.theme` and an optional `--theme`
@@ -953,9 +1208,9 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
     let mut quit = false;
     for effect in effects {
         match effect {
-            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, rt.tx.clone()),
+            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, rt.tx.clone(), rt.workers.token()),
             Effect::Quit => quit = true,
-            Effect::RunJob(job) => rt.active_job = Some(worker::spawn_job(job, rt.tx.clone())),
+            Effect::RunJob(job) => rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token())),
             Effect::CancelJob => {
                 if let Some(handle) = &rt.active_job {
                     handle.cancel.cancel();
@@ -1037,19 +1292,19 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // first painted frame already lists every letter.
                 worker::deliver(&rt.tx, "drive list", Command::DriveListReady { target, drives: drives::enumerate_drives() });
             }
-            Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
-            Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
+            Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone(), rt.workers.token()),
+            Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone(), rt.workers.token()),
             Effect::QueryGitInfo { panel, path, request } => {
                 let slot = match panel {
                     PanelSide::Left => &rt.git_slots[0],
                     PanelSide::Right => &rt.git_slots[1],
                 };
-                slot.request(panel, path, request, rt.tx.clone());
+                slot.request(panel, path, request, rt.tx.clone(), rt.workers.token());
             }
-            Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone()),
+            Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone(), rt.workers.token()),
             Effect::OpenViewer { path } => rt.open_viewer_source(path),
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
-                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
+                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone(), rt.workers.token());
             }
             Effect::RunExternalEditor(invocation, side) => {
                 let result = run_external_editor(guard, &invocation)?;
@@ -1091,7 +1346,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 }
             },
             Effect::FindInSubtree { root, pattern, request } => {
-                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone());
+                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone(), rt.workers.token());
             }
             Effect::SaveEditor { editor, then_quit } => {
                 let mut editor = *editor;
@@ -1129,11 +1384,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // `TextEdit(Paste(..))` for whichever field owns the
                 // keyboard when it arrives. Line breaks flatten to a single
                 // space here (`LineEdit::insert_str` does the same again,
-                // so the core behavior never depends on this path), and a
-                // clipboard with no text feeds nothing back — the key is
-                // then a no-op ("Empty clipboard is a no-op").
+                // so the core behavior never depends on this path — and the
+                // terminal bracketed-paste route flattens through the same
+                // helper; idle-aware-event-loop design D6), and a clipboard
+                // with no text feeds nothing back — the key is then a no-op
+                // ("Empty clipboard is a no-op").
                 if let Some(text) = rt.clipboard.get_text() {
-                    let text = text.replace("\r\n", " ").replace('\r', " ").replace('\n', " ");
+                    let text = flatten_line_breaks(&text);
                     if !text.is_empty() {
                         worker::deliver(&rt.tx, "paste", Command::TextEdit(filecommand_core::line_edit::TextEditOp::Paste(text)));
                     }
@@ -1361,6 +1618,7 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::ffi::OsString;
 
     /// A harmless, always-present "editor" invocation per platform — exits
@@ -1403,6 +1661,7 @@ mod tests {
             clipboard: Box::new(clipboard::RecordingClipboard::default()),
             mouse_tracker: MouseTracker::new(),
             git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+            workers: worker::WorkerGauge::new(),
         };
 
         rt.open_viewer_source(path.clone());
@@ -2069,5 +2328,201 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         ByteSource::open(&path).unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // idle-aware-event-loop: the poll-timeout choice (design D2/D3; task
+    // 2.3) and the key-burst drain (design D5; task 2.7)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn next_timeout_is_zero_with_a_drain_backlog() {
+        assert_eq!(next_timeout(1_000, Some(1_033), Duration::from_millis(60_000), true, true), Duration::ZERO);
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(60_000), false, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn next_timeout_is_capped_at_the_poll_interval_while_workers_are_alive() {
+        // No deadlines at all: the worker cadence governs (design D3).
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(60_000), true, false), POLL_INTERVAL);
+        // A nearer deadline wins over the cap; a farther one does not raise it.
+        assert_eq!(next_timeout(1_000, Some(1_010), Duration::from_millis(60_000), true, false), Duration::from_millis(10));
+        assert_eq!(next_timeout(1_000, Some(5_000), Duration::from_millis(60_000), true, false), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn next_timeout_is_the_earliest_deadline_with_no_workers() {
+        // The minute boundary alone bounds the sleep (application-shell
+        // "Header clock still advances while idle").
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(42_000), false, false), Duration::from_millis(42_000));
+        // A core deadline ahead of it wins.
+        assert_eq!(next_timeout(1_000, Some(1_033), Duration::from_millis(42_000), false, false), Duration::from_millis(33));
+        // A deadline already in the past is due now.
+        assert_eq!(next_timeout(1_000, Some(900), Duration::from_millis(42_000), false, false), Duration::ZERO);
+    }
+
+    /// A scripted `EventSource`: `poll` reports "ready" while the queue is
+    /// non-empty, `read` pops it.
+    struct ScriptedEvents {
+        queue: std::collections::VecDeque<Event>,
+    }
+
+    impl ScriptedEvents {
+        fn of(events: impl IntoIterator<Item = Event>) -> ScriptedEvents {
+            ScriptedEvents { queue: events.into_iter().collect() }
+        }
+
+        fn remaining(&self) -> usize {
+            self.queue.len()
+        }
+    }
+
+    impl EventSource for ScriptedEvents {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(!self.queue.is_empty())
+        }
+        fn read(&mut self) -> io::Result<Event> {
+            Ok(self.queue.pop_front().expect("poll reported an event ready"))
+        }
+    }
+
+    /// A `BurstHandler` that records the mapped commands and applies them
+    /// through the real reducer — no terminal, and effects reduced to the
+    /// quit flag (a headless test cannot run a `TerminalGuard`).
+    struct RecordingHandler {
+        keys: config::Keys,
+        applied: Vec<Command>,
+    }
+
+    impl BurstHandler for RecordingHandler {
+        fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command> {
+            map_pressed_key(key, state, &self.keys, None)
+        }
+        fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)> {
+            self.applied.push(cmd.clone());
+            let (state, effects) = update(state, cmd);
+            Ok((state, effects.contains(&Effect::Quit)))
+        }
+    }
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// The pre-burst-loop behavior, as the reference the burst must match:
+    /// map each key against the state the previous one produced, apply,
+    /// repeat (application-shell "Bursts of key input render once":
+    /// "Applying a burst SHALL produce the same final state as applying the
+    /// same keys one at a time").
+    fn apply_one_at_a_time(mut state: State, codes: &[KeyCode]) -> (State, Vec<Command>) {
+        let mut applied = Vec::new();
+        for &code in codes {
+            if let Some(cmd) = map_pressed_key(KeyEvent::new(code, KeyModifiers::NONE), &state, &config::Keys::default(), None) {
+                applied.push(cmd.clone());
+                let (s, _) = update(state, cmd);
+                state = s;
+            }
+        }
+        (state, applied)
+    }
+
+    fn burst(initial: State, first: KeyCode, rest: Vec<Event>) -> (State, bool, bool, Vec<Command>, ScriptedEvents, Option<Event>) {
+        let mut events = ScriptedEvents::of(rest);
+        let mut pending_event = None;
+        let mut handler = RecordingHandler { keys: config::Keys::default(), applied: Vec::new() };
+        let (state, quit, applied) =
+            drain_key_burst(KeyEvent::new(first, KeyModifiers::NONE), initial, &mut events, &mut pending_event, &mut handler).unwrap();
+        (state, quit, applied, handler.applied, events, pending_event)
+    }
+
+    #[test]
+    fn a_held_page_down_burst_applies_every_key_and_draws_once() {
+        // application-shell "Holding PgDn renders one frame per burst": five
+        // queued PgDn presses apply five page movements, the queue empties
+        // in one drain (one loop iteration, hence one draw), and the final
+        // state matches one-at-a-time application.
+        let mut state = State::empty(Theme::classic());
+        state.term_size = (80, 24);
+        let entries: Vec<_> = (0..500).map(|i| filecommand_core::listing::Entry {
+            name: OsString::from(format!("f{i:03}.txt")),
+            kind: filecommand_core::listing::EntryKind::File,
+            size: 1,
+            modified: None,
+            hidden: false,
+        }).collect();
+        let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+        state = s;
+
+        let keys = [KeyCode::PageDown; 5];
+        let (burst_state, quit, applied, commands, events, pending) = burst(state.clone(), keys[0], keys[1..].iter().map(|&c| press(c)).collect());
+        assert!(!quit);
+        assert!(applied, "the burst applied commands, so the loop draws once after it");
+        assert_eq!(events.remaining(), 0, "the whole burst drained in one call");
+        assert!(pending.is_none());
+        assert_eq!(commands.len(), 5, "every queued key was applied");
+
+        let (reference_state, reference_commands) = apply_one_at_a_time(state, &keys);
+        assert_eq!(commands, reference_commands);
+        assert_eq!(burst_state, reference_state, "burst and one-at-a-time produce the same state");
+        assert!(burst_state.left.cursor > 0, "the cursor actually paged down");
+    }
+
+    #[test]
+    fn burst_routing_follows_the_state_each_key_produces() {
+        // application-shell "Routing follows the state each key produces":
+        // F7 opens the Make-directory dialog, `new` types into its field,
+        // Enter confirms it — exactly as if the keys had been pressed
+        // slowly. Mapping the burst against the *original* state would
+        // route the characters to the command line and Enter to
+        // `Command::Enter` instead of `FileOpConfirm`.
+        let state = State::empty(Theme::classic());
+        let rest = vec![press(KeyCode::Char('n')), press(KeyCode::Char('e')), press(KeyCode::Char('w')), press(KeyCode::Enter)];
+        let (burst_state, quit, applied, commands, events, pending) = burst(state.clone(), KeyCode::F(7), rest);
+        assert!(!quit && applied && pending.is_none() && events.remaining() == 0);
+        assert_eq!(
+            commands,
+            vec![
+                Command::RequestMkdir,
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('n')),
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('e')),
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('w')),
+                Command::FileOpConfirm,
+            ],
+            "each key mapped against the state the previous one produced"
+        );
+        let (reference_state, _) = apply_one_at_a_time(state, &[KeyCode::F(7), KeyCode::Char('n'), KeyCode::Char('e'), KeyCode::Char('w'), KeyCode::Enter]);
+        assert_eq!(burst_state, reference_state);
+        assert!(
+            matches!(burst_state.phase, UiPhase::FileOpSetup(filecommand_core::fs_ops::dialog::FileOpSetup::DestinationInput { .. }) | UiPhase::FileOpRunning { .. }),
+            "the dialog opened and was confirmed: {:?}",
+            burst_state.phase
+        );
+    }
+
+    #[test]
+    fn a_burst_past_the_event_cap_stops_and_draws_before_continuing() {
+        // application-shell "A paste delivered as key events renders once
+        // per burst": 70 queued characters apply 64, then the drain returns
+        // so the loop draws before the remaining 6 are read next iteration.
+        let state = State::empty(Theme::classic());
+        let rest: Vec<Event> = (0..69).map(|_| press(KeyCode::Char('x'))).collect();
+        let (state, quit, applied, commands, events, _) = burst(state, KeyCode::Char('x'), rest);
+        assert!(!quit && applied);
+        assert_eq!(commands.len(), BURST_MAX_EVENTS, "the burst stops at the cap");
+        assert_eq!(events.remaining(), 70 - BURST_MAX_EVENTS);
+        assert_eq!(state.command_line.text().len(), BURST_MAX_EVENTS, "all 64 characters landed in the command line");
+    }
+
+    #[test]
+    fn a_mouse_event_ends_the_burst_and_is_stashed_for_the_next_iteration() {
+        // design D5: the mouse-batch path takes the stashed event next
+        // iteration.
+        let state = State::empty(Theme::classic());
+        let mouse = Event::Mouse(crossterm::event::MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 5, modifiers: KeyModifiers::NONE });
+        let (_state, quit, applied, commands, events, pending) = burst(state, KeyCode::PageDown, vec![mouse]);
+        assert!(!quit && applied);
+        assert_eq!(commands.len(), 1, "only the first key applied before the mouse event");
+        assert_eq!(events.remaining(), 0);
+        assert!(matches!(pending, Some(Event::Mouse(_))), "the mouse event is stashed, not lost or applied mid-burst");
     }
 }

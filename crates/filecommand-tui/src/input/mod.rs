@@ -15,7 +15,7 @@ use filecommand_core::editor::{EditorMove, EditorState};
 use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
-use filecommand_core::line_edit::TextEditOp;
+use filecommand_core::line_edit::{flatten_line_breaks, TextEditOp};
 use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
 use filecommand_core::update::ClipboardPayloadKind;
@@ -167,6 +167,84 @@ pub fn map_viewer_key(key: KeyEvent, viewer: &ViewerState, rows_visible: usize) 
 
 fn is_plain(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Route a terminal bracketed-paste (`Event::Paste`, reported only off
+/// Windows — crossterm's Windows reader delivers a paste as ordinary key
+/// events) to the text that owns the keyboard, as one batch of commands the
+/// event loop applies before a single draw (idle-aware-event-loop design
+/// D6; text-field-editing "Terminal paste arrives as one paste"):
+///
+/// - wherever Ctrl+V would paste — a single-line text field owns the
+///   keyboard (a dialog field, or the command line over the panels) — one
+///   `TextEdit(Paste(..))` with line breaks flattened, exactly what Ctrl+V's
+///   clipboard read produces. The target is *derived from the Ctrl+V
+///   mapping* (probed with the compiled-in keymap, since the paste chords
+///   are not rebindable), so there is no second routing table to drift;
+/// - in the built-in editor's text, the commands the characters would
+///   produce if typed — `EditorChar` per character, `EditorNewline` per
+///   line break;
+/// - in the editor's search/replace prompts and the viewer's search prompt,
+///   the per-character prompt commands with line breaks flattened to
+///   spaces, so a pasted line break never confirms the prompt;
+/// - anywhere else (menus, confirmation and conflict dialogs, help, the
+///   quit dialog): nothing — a pasted `y` must not answer a confirmation.
+pub fn map_paste(text: &str, state: &State) -> Vec<Command> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // The quit-confirmation dialog outranks even the viewer/editor's own
+    // routing, exactly as in `map_key` — a paste never answers it.
+    if state.quit_confirm {
+        return Vec::new();
+    }
+    match &state.phase {
+        UiPhase::Viewer(viewer) => {
+            if viewer.search_input.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::ViewerSearchChar).collect();
+            }
+            Vec::new()
+        }
+        UiPhase::Editor(editor) => {
+            if editor.quit_confirm {
+                return Vec::new();
+            }
+            if editor.replace_prompt.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::EditorReplaceChar).collect();
+            }
+            if editor.search_prompt.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::EditorSearchChar).collect();
+            }
+            let mut commands = Vec::new();
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\r' => {
+                        // CRLF is one line break, not two.
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                        commands.push(Command::EditorNewline);
+                    }
+                    '\n' => commands.push(Command::EditorNewline),
+                    _ => commands.push(Command::EditorChar(c)),
+                }
+            }
+            commands
+        }
+        _ => {
+            // Where would Ctrl+V go right now? `RequestPaste` means a
+            // single-line text field owns the keyboard — this paste is that
+            // field's text. The paste keys are compiled in (not config-
+            // rebindable), so the default keymap probes the same answer.
+            let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+            if matches!(map_key(ctrl_v, state, 0, &Keys::default()), Some(Command::RequestPaste)) {
+                vec![Command::TextEdit(TextEditOp::Paste(flatten_line_breaks(text)))]
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Map a key while the F4 built-in editor is open. Unlike the viewer, the

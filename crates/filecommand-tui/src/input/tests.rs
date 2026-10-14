@@ -1332,3 +1332,153 @@ fn startup_warning_outranks_every_other_modal_and_typing_sink() {
     state.menu = Some(MenuState::opened());
     assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::DismissStartupWarning));
 }
+
+// ---------------------------------------------------------------------
+// idle-aware-event-loop: `map_paste` — a terminal bracketed paste arrives
+// as one paste (text-field-editing "Terminal paste arrives as one paste";
+// design D6; task 3.5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn paste_into_the_command_line_over_the_panels_is_one_paste_op() {
+    // "Paste a path into the command line": one `TextEdit(Paste(..))`, and
+    // none of the pasted characters touch the panel cursor or selection.
+    let state = panels();
+    assert_eq!(
+        map_paste(r"C:\Program Files\App", &state),
+        vec![Command::TextEdit(TextEditOp::Paste(r"C:\Program Files\App".to_string()))]
+    );
+    let state = typing("cd ");
+    assert_eq!(
+        map_paste(r"D:\docs", &state),
+        vec![Command::TextEdit(TextEditOp::Paste(r"D:\docs".to_string()))],
+        "mid-composition too, exactly as Ctrl+V"
+    );
+}
+
+#[test]
+fn paste_with_an_active_quick_filter_still_lands_in_the_command_line() {
+    // The quick filter claims only plain printables; Ctrl+V keeps its
+    // command-line meaning while it is active, so a terminal paste does too.
+    let mut state = panels();
+    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(
+        map_paste("report.txt", &state),
+        vec![Command::TextEdit(TextEditOp::Paste("report.txt".to_string()))]
+    );
+}
+
+#[test]
+fn a_multi_line_paste_is_flattened_and_never_executed() {
+    // "Multi-line paste is flattened and not executed": one paste op joined
+    // by single spaces — no command runs.
+    let state = panels();
+    assert_eq!(
+        map_paste("dir /b\r\necho hi\n", &state),
+        vec![Command::TextEdit(TextEditOp::Paste("dir /b echo hi ".to_string()))]
+    );
+}
+
+#[test]
+fn paste_into_a_dialog_field_is_one_paste_op() {
+    // "Paste into a dialog field": the destination field stands in for every
+    // field sharing `map_text_edit_key` (rename, conflict-rename, fuzzy jump).
+    let state = destination_input_state();
+    assert_eq!(map_paste("backup", &state), vec![Command::TextEdit(TextEditOp::Paste("backup".to_string()))]);
+}
+
+#[test]
+fn paste_into_the_find_file_pattern_is_one_paste_op() {
+    let mut state = panels();
+    state.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    assert_eq!(map_paste("*.rs", &state), vec![Command::TextEdit(TextEditOp::Paste("*.rs".to_string()))]);
+    // Once the search is in flight the pattern is fixed, so a paste goes
+    // nowhere (find-file "Find-file invocation").
+    let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
+    submitted.submit(1);
+    state.find_file = Some(submitted);
+    assert_eq!(map_paste("*.rs", &state), Vec::new());
+}
+
+#[test]
+fn paste_into_the_editor_text_is_typed_characters_and_newlines() {
+    // "A paste into the built-in editor's text SHALL be inserted at the
+    // caret as if typed, line breaks included."
+    let state = state_with(UiPhase::Editor(open_editor("abc")));
+    assert_eq!(
+        map_paste("x\r\ny\nz", &state),
+        vec![
+            Command::EditorChar('x'),
+            Command::EditorNewline,
+            Command::EditorChar('y'),
+            Command::EditorNewline,
+            Command::EditorChar('z'),
+        ],
+        "CRLF is one line break"
+    );
+    // The save-on-exit prompt is a yes/no dialog: a paste never answers it.
+    let mut quitting = state_with(UiPhase::Editor(open_editor("abc")));
+    if let UiPhase::Editor(editor) = &mut quitting.phase {
+        editor.quit_confirm = true;
+    }
+    assert_eq!(map_paste("y", &quitting), Vec::new());
+}
+
+#[test]
+fn paste_into_the_editor_and_viewer_search_prompts_is_flattened_characters() {
+    // Per-character prompt commands, line breaks flattened to spaces — a
+    // pasted line break never confirms the prompt.
+    let mut editor = open_editor("abc");
+    editor.search_prompt = Some(String::new());
+    let state = state_with(UiPhase::Editor(editor));
+    assert_eq!(
+        map_paste("a\nb", &state),
+        vec![Command::EditorSearchChar('a'), Command::EditorSearchChar(' '), Command::EditorSearchChar('b')]
+    );
+    let mut editor = open_editor("abc");
+    editor.replace_prompt = Some(filecommand_core::editor::ReplacePrompt::Pattern(String::new()));
+    let state = state_with(UiPhase::Editor(editor));
+    assert_eq!(
+        map_paste("a\nb", &state),
+        vec![Command::EditorReplaceChar('a'), Command::EditorReplaceChar(' '), Command::EditorReplaceChar('b')]
+    );
+
+    let mut viewer = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    viewer.search_input = Some(String::new());
+    let state = state_with(UiPhase::Viewer(viewer));
+    assert_eq!(
+        map_paste("a\nb", &state),
+        vec![Command::ViewerSearchChar('a'), Command::ViewerSearchChar(' '), Command::ViewerSearchChar('b')]
+    );
+    // Without the prompt open, the viewer has no text sink at all.
+    let state = state_with(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)));
+    assert_eq!(map_paste("q", &state), Vec::new());
+}
+
+#[test]
+fn paste_with_no_focused_text_input_is_ignored() {
+    // "Paste with no focused text input is ignored": a pasted `y` must not
+    // answer the delete confirmation.
+    let delete = state_with(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter: 0,
+    }));
+    assert_eq!(map_paste("y", &delete), Vec::new());
+
+    let mut menu_open = panels();
+    menu_open.menu = Some(MenuState::opened());
+    assert_eq!(map_paste("q", &menu_open), Vec::new(), "a menu's hotkey letters are not text input");
+
+    let mut quitting = panels();
+    quitting.quit_confirm = true;
+    assert_eq!(map_paste("y", &quitting), Vec::new(), "the quit dialog is never answered by a paste");
+
+    let mut warning = panels();
+    warning.startup_warning = Some("warn".to_string());
+    assert_eq!(map_paste("x", &warning), Vec::new());
+
+    assert_eq!(map_paste("", &panels()), Vec::new(), "an empty paste produces nothing");
+}

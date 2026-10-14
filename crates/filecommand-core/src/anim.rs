@@ -9,6 +9,7 @@
 //! and tests reference one definition. It reads no clock and draws nothing.
 
 use crate::dialogs::OverlayRect;
+use crate::update::{State, UiPhase};
 
 /// Full progress, in per-mille. Progress is carried as an integer so the
 /// helpers below stay exact and snapshot-stable (no float rounding).
@@ -48,6 +49,120 @@ pub const POPUP_UNFOLD_MS: u64 = 100;
 pub const HIGHLIGHT_SETTLE_MS: u64 = 50;
 /// Modal dialogs open through a centered iris.
 pub const DIALOG_IRIS_MS: u64 = 100;
+
+/// The frame cadence [`next_wake_ms`] requests while an animation is in
+/// flight — the ~33 ms cadence the event loop used to tick at even when
+/// idle (idle-aware-event-loop design D2).
+pub const FRAME_MS: u64 = 33;
+
+/// The earliest reducer-clock time at which `update(Tick)` or a render could
+/// produce something different from the current frame (idle-aware-event-loop
+/// design D2) — the event loop's "when must I wake even without input"
+/// answer, so an idle screen is never redrawn and nothing timed is ever
+/// late. Three deadline kinds, earliest first:
+///
+/// - `clock_ms + FRAME_MS` while any stamped surface is still inside its
+///   animation duration (only when `State::animations` is on — with them
+///   off, every surface renders its final frame immediately);
+/// - the splash hold's end while in `UiPhase::Splash` (regardless of
+///   `animations` — the hold is not decorative);
+/// - the earliest clipboard-feedback `expires_at_ms` still showing.
+///
+/// `None` means nothing timed is pending: the loop may sleep until input or
+/// the (TUI-side) header clock's next minute flip.
+pub fn next_wake_ms(state: &State) -> Option<u64> {
+    let mut wake: Option<u64> = None;
+    if state.animations && animation_running(state) {
+        wake = Some(state.clock_ms + FRAME_MS);
+    }
+    if let UiPhase::Splash { started_at_ms } = &state.phase {
+        let hold_end = started_at_ms.saturating_add(crate::update::SPLASH_MIN_HOLD_MS);
+        wake = Some(wake.map_or(hold_end, |w: u64| w.min(hold_end)));
+    }
+    for panel in [&state.left, &state.right] {
+        if let Some(feedback) = &panel.clipboard_feedback {
+            wake = Some(wake.map_or(feedback.expires_at_ms, |w: u64| w.min(feedback.expires_at_ms)));
+        }
+    }
+    wake
+}
+
+/// Whether any stamped surface is still inside its animation duration at
+/// `state.clock_ms`, so the frame one `FRAME_MS` from now would differ from
+/// the current one. The stamp inventory mirrors the renderers in
+/// `filecommand-tui::views` one-to-one — a surface added there must be added
+/// here, or it would freeze mid-animation while idle (idle-aware-event-loop
+/// design Risks).
+fn animation_running(state: &State) -> bool {
+    let now = state.clock_ms;
+    let within = |stamp: u64, duration: u64| now.saturating_sub(stamp) < duration;
+    // Pop-up menus (F9 pull-downs, F2 user menu, Enter action menu, Alt+F8
+    // history) unfold top-down, and a just-moved highlight flashes for
+    // `HIGHLIGHT_SETTLE_MS`.
+    let popup = |opened_at_ms: u64, selected_at_ms: Option<u64>| {
+        within(opened_at_ms, POPUP_UNFOLD_MS) || selected_at_ms.is_some_and(|at| within(at, HIGHLIGHT_SETTLE_MS))
+    };
+
+    if let UiPhase::Splash { started_at_ms } = &state.phase {
+        if within(*started_at_ms, SPLASH_ENTRANCE_MS) {
+            return true;
+        }
+    }
+    if let Some(revealed) = state.panels_revealed_at_ms {
+        if within(revealed, PANEL_WIPE_MS) {
+            return true;
+        }
+    }
+    if let Some(menu) = &state.menu {
+        if within(menu.opened_at_ms, MENU_BAR_SWEEP_MS) {
+            return true;
+        }
+        // The pull-down renders only while open, so only then do its unfold
+        // and highlight-settle stamps animate.
+        if menu.pulldown_open && popup(menu.pulldown_opened_at_ms, menu.selected_at_ms) {
+            return true;
+        }
+    }
+    if let Some(menu) = &state.user_menu {
+        if popup(menu.opened_at_ms, menu.selected_at_ms) {
+            return true;
+        }
+    }
+    if let Some(menu) = &state.file_action_menu {
+        if popup(menu.opened_at_ms, menu.selected_at_ms) {
+            return true;
+        }
+    }
+    if let Some(dialog) = &state.history_dialog {
+        if popup(dialog.opened_at_ms, dialog.selected_at_ms) {
+            return true;
+        }
+    }
+    // The dialog iris keys on `dialog_opened_at_ms`, which outlives the
+    // dialog itself — count it only while one of the dialogs that render
+    // through the iris is actually up (the same inventory
+    // `stamps::DialogMark` tracks).
+    if dialog_visible(state) && within(state.dialog_opened_at_ms, DIALOG_IRIS_MS) {
+        return true;
+    }
+    // The quit confirmation layers over any dialog with its own stamp.
+    state.quit_confirm && within(state.quit_opened_at_ms, DIALOG_IRIS_MS)
+}
+
+/// Whether a modal dialog that irises in on `State::dialog_opened_at_ms` is
+/// currently visible: the file-op phase dialogs (setup, running, summary)
+/// plus the overlays rendered through `views`'s iris — drive select, fuzzy
+/// jump, find file, theme picker, help, and the startup warning. The pop-up
+/// menus animate on their own stamps and are not listed here.
+fn dialog_visible(state: &State) -> bool {
+    matches!(state.phase, UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_))
+        || state.drive_select.is_some()
+        || state.fuzzy_jump.is_some()
+        || state.find_file.is_some()
+        || state.theme_picker.is_some()
+        || state.help.is_some()
+        || state.startup_warning.is_some()
+}
 
 /// Progress through `duration_ms` after `elapsed_ms`, in per-mille
 /// (`0..=FULL`). Clamps at both ends; a zero duration is already complete.
@@ -191,5 +306,182 @@ mod tests {
         // 760, inside the 800 ms hold (checked at compile time above).
         let last_line_end = SPLASH_IDENTITY_START_MS + 3 * SPLASH_IDENTITY_STAGGER_MS + SPLASH_IDENTITY_LINE_MS;
         assert_eq!(last_line_end, SPLASH_SWEEP_START_MS);
+    }
+
+    // -----------------------------------------------------------------
+    // idle-aware-event-loop: `next_wake_ms` wake deadlines (design D2;
+    // task 1.2)
+    // -----------------------------------------------------------------
+
+    use crate::menu::MenuState;
+    use crate::panel::ClipboardFeedback;
+    use crate::theme::Theme;
+
+    /// An animations-on panels state parked at clock `now`, with nothing
+    /// open and nothing stamped.
+    fn animated_state_at(now: u64) -> State {
+        let mut state = State::empty(Theme::classic());
+        state.animations = true;
+        state.clock_ms = now;
+        state
+    }
+
+    /// Assert the wake contract for one surface stamped at `t`: a frame wake
+    /// right after opening, still a frame wake just before the duration
+    /// ends, and nothing due once it has.
+    fn assert_surface(mut state: State, t: u64, duration: u64) {
+        state.clock_ms = t;
+        assert_eq!(next_wake_ms(&state), Some(t + FRAME_MS), "just opened: one frame out");
+        state.clock_ms = t + duration - 1;
+        assert_eq!(next_wake_ms(&state), Some(t + duration - 1 + FRAME_MS), "still animating one ms before the end");
+        state.clock_ms = t + duration;
+        assert_eq!(next_wake_ms(&state), None, "finished: no wake");
+    }
+
+    #[test]
+    fn splash_entrance_wakes_until_its_duration_then_only_the_hold_end() {
+        let mut state = animated_state_at(1_000);
+        state.phase = UiPhase::Splash { started_at_ms: 1_000 };
+        let hold_end = 1_000 + crate::update::SPLASH_MIN_HOLD_MS;
+        assert_eq!(next_wake_ms(&state), Some(1_000 + FRAME_MS), "the entrance animates a frame at a time");
+        state.clock_ms = 1_000 + SPLASH_ENTRANCE_MS - 1;
+        assert_eq!(next_wake_ms(&state), Some(1_000 + SPLASH_ENTRANCE_MS - 1 + FRAME_MS));
+        state.clock_ms = 1_000 + SPLASH_ENTRANCE_MS;
+        assert_eq!(next_wake_ms(&state), Some(hold_end), "the entrance is done; only the hold remains");
+    }
+
+    #[test]
+    fn splash_hold_end_is_a_deadline_even_with_animations_off() {
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 42_000;
+        state.phase = UiPhase::Splash { started_at_ms: 42_000 };
+        assert_eq!(next_wake_ms(&state), Some(42_000 + crate::update::SPLASH_MIN_HOLD_MS));
+    }
+
+    #[test]
+    fn panel_wipe_wakes_until_its_duration() {
+        let mut state = animated_state_at(0);
+        state.panels_revealed_at_ms = Some(5_000);
+        assert_surface(state, 5_000, PANEL_WIPE_MS);
+    }
+
+    #[test]
+    fn menu_bar_sweep_wakes_until_its_duration() {
+        let mut state = animated_state_at(0);
+        let mut menu = MenuState::opened();
+        menu.pulldown_open = false;
+        menu.opened_at_ms = 2_000;
+        state.menu = Some(menu);
+        assert_surface(state, 2_000, MENU_BAR_SWEEP_MS);
+    }
+
+    #[test]
+    fn pulldown_unfold_and_highlight_settle_wake_until_their_durations() {
+        let mut state = animated_state_at(0);
+        let mut menu = MenuState::opened();
+        menu.opened_at_ms = 1_000; // the bar's own sweep long finished
+        menu.pulldown_opened_at_ms = 2_500;
+        state.menu = Some(menu);
+        assert_surface(state.clone(), 2_500, POPUP_UNFOLD_MS);
+
+        state.menu.as_mut().unwrap().pulldown_opened_at_ms = 2_000; // unfold done
+        state.menu.as_mut().unwrap().selected_at_ms = Some(3_000);
+        assert_surface(state, 3_000, HIGHLIGHT_SETTLE_MS);
+    }
+
+    #[test]
+    fn a_closed_pulldown_neither_unfolds_nor_settles() {
+        let mut state = animated_state_at(0);
+        let mut menu = MenuState::opened();
+        menu.pulldown_open = false;
+        menu.opened_at_ms = 1_000;
+        menu.pulldown_opened_at_ms = 2_500;
+        menu.selected_at_ms = Some(2_500);
+        state.menu = Some(menu);
+        state.clock_ms = 2_500;
+        assert_eq!(next_wake_ms(&state), None, "a closed pull-down renders nothing animated");
+    }
+
+    #[test]
+    fn popup_menus_wake_for_unfold_and_highlight_settle() {
+        for slot in ["user_menu", "file_action_menu", "history_dialog"] {
+            let mut state = animated_state_at(0);
+            match slot {
+                "user_menu" => state.user_menu = Some(crate::dialogs::UserMenuState { cursor: 0, opened_at_ms: 4_000, selected_at_ms: None }),
+                "file_action_menu" => {
+                    state.file_action_menu = Some(crate::dialogs::FileActionMenuState::new("f.txt".into(), false));
+                    state.file_action_menu.as_mut().unwrap().opened_at_ms = 4_000;
+                }
+                _ => {
+                    state.history_dialog = Some(crate::dialogs::HistoryDialogState::default());
+                    state.history_dialog.as_mut().unwrap().opened_at_ms = 4_000;
+                }
+            }
+            assert_surface(state.clone(), 4_000, POPUP_UNFOLD_MS);
+
+            // A highlight that moved after the unfold finished settles.
+            let mut state = state;
+            let settle_at = 4_000 + POPUP_UNFOLD_MS;
+            match slot {
+                "user_menu" => state.user_menu.as_mut().unwrap().selected_at_ms = Some(settle_at),
+                "file_action_menu" => state.file_action_menu.as_mut().unwrap().selected_at_ms = Some(settle_at),
+                _ => state.history_dialog.as_mut().unwrap().selected_at_ms = Some(settle_at),
+            }
+            assert_surface(state, settle_at, HIGHLIGHT_SETTLE_MS);
+        }
+    }
+
+    #[test]
+    fn a_visible_dialog_irises_but_a_stale_stamp_does_not_wake() {
+        let mut state = animated_state_at(0);
+        state.dialog_opened_at_ms = 5_000;
+        state.clock_ms = 5_000;
+        assert_eq!(next_wake_ms(&state), None, "no dialog visible: the stamp alone animates nothing");
+        state.startup_warning = Some("warn".to_string());
+        assert_surface(state, 5_000, DIALOG_IRIS_MS);
+    }
+
+    #[test]
+    fn the_quit_dialog_irises_on_its_own_stamp() {
+        let mut state = animated_state_at(0);
+        state.quit_confirm = true;
+        state.quit_opened_at_ms = 6_000;
+        assert_surface(state, 6_000, DIALOG_IRIS_MS);
+    }
+
+    #[test]
+    fn animations_off_yields_no_animation_wake() {
+        // Every surface stamped at once: with `animations` off, all render
+        // their final frame and nothing wakes (application-shell "Idle
+        // screen is not redrawn").
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 7_000;
+        state.panels_revealed_at_ms = Some(7_000);
+        state.menu = Some(MenuState::opened());
+        state.quit_confirm = true;
+        state.quit_opened_at_ms = 7_000;
+        assert_eq!(next_wake_ms(&state), None);
+    }
+
+    #[test]
+    fn clipboard_feedback_expiry_is_a_deadline() {
+        // application-shell "Clipboard feedback expires without input": the
+        // wake lands exactly on `expires_at_ms`, the earlier of the two
+        // panels winning.
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 1_000;
+        let feedback = |expires_at_ms| ClipboardFeedback { message: "copied".to_string(), is_error: false, expires_at_ms };
+        state.left.clipboard_feedback = Some(feedback(9_999));
+        assert_eq!(next_wake_ms(&state), Some(9_999));
+        state.right.clipboard_feedback = Some(feedback(4_000));
+        assert_eq!(next_wake_ms(&state), Some(4_000), "the earliest expiry wins");
+        state.right.clipboard_feedback = None;
+        state.animations = true;
+        assert_eq!(next_wake_ms(&state), Some(9_999), "not mistaken for an animation frame wake");
+    }
+
+    #[test]
+    fn an_idle_panels_screen_has_no_wake() {
+        assert_eq!(next_wake_ms(&animated_state_at(12_345)), None);
     }
 }

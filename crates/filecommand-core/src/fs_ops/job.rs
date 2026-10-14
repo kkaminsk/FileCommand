@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::conflict::{ConflictChoice, ConflictInfo};
 use super::error::{ErrorChoice, ErrorInfo, SkippedItem};
@@ -69,6 +70,57 @@ impl ProgressInfo {
     }
 }
 
+/// The minimum spacing between progress updates a sink should forward to the
+/// UI — about 20 per second (idle-aware-event-loop "Progress updates are
+/// rate-limited"; design D7).
+pub const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
+
+/// A pure rate-limiter for [`JobSink::progress`] (idle-aware-event-loop
+/// design D7): `now` is injected, so engine tests stay deterministic and the
+/// engine itself (`super::worker::run_job` with its recording sinks) is never
+/// throttled. The first offer is always delivered; an offer inside
+/// [`PROGRESS_INTERVAL`] of the last delivered one is held as `pending`, the
+/// newest replacing it; [`flush`](Self::flush) hands out whatever is held.
+/// The sink flushes before a conflict, an error, and completion, so a
+/// decision point or the final frame never shows stale figures.
+#[derive(Debug, Default)]
+pub struct ProgressThrottle {
+    last_delivered: Option<Instant>,
+    pending: Option<ProgressInfo>,
+}
+
+impl ProgressThrottle {
+    pub fn new() -> ProgressThrottle {
+        ProgressThrottle::default()
+    }
+
+    /// Offer one progress update: returned (deliver it) when at least
+    /// [`PROGRESS_INTERVAL`] has passed since the last delivered update — or
+    /// none was delivered yet; otherwise held, replacing any previously held
+    /// update, with `None` returned.
+    pub fn offer(&mut self, info: ProgressInfo, now: Instant) -> Option<ProgressInfo> {
+        let due = match self.last_delivered {
+            None => true,
+            Some(last) => now.duration_since(last) >= PROGRESS_INTERVAL,
+        };
+        if due {
+            self.last_delivered = Some(now);
+            self.pending = None;
+            Some(info)
+        } else {
+            self.pending = Some(info);
+            None
+        }
+    }
+
+    /// The newest held update, if any. `last_delivered` is left alone: a
+    /// flushed update goes out beside the message that triggered the flush,
+    /// so it does not reset the cadence.
+    pub fn flush(&mut self) -> Option<ProgressInfo> {
+        self.pending.take()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
     /// `skipped` carries both kinds of `SkippedItem`: items the job did
@@ -110,5 +162,62 @@ impl CancelFlag {
 
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(files_done: usize, bytes_done: u64) -> ProgressInfo {
+        ProgressInfo { files_done, files_total: 10, bytes_done, bytes_total: 1_000, current_file: OsString::new() }
+    }
+
+    // idle-aware-event-loop (file-operations "Progress updates are
+    // rate-limited"; design D7; task 1.4)
+
+    #[test]
+    fn the_first_offer_is_always_delivered() {
+        let mut throttle = ProgressThrottle::new();
+        assert_eq!(throttle.offer(info(0, 0), Instant::now()), Some(info(0, 0)));
+    }
+
+    #[test]
+    fn offers_within_the_interval_are_held_and_only_the_latest_is_flushed() {
+        let t0 = Instant::now();
+        let mut throttle = ProgressThrottle::new();
+        assert!(throttle.offer(info(1, 100), t0).is_some(), "the first offer goes out");
+        assert_eq!(throttle.offer(info(2, 200), t0 + Duration::from_millis(10)), None, "inside the interval: held");
+        assert_eq!(throttle.offer(info(3, 300), t0 + Duration::from_millis(20)), None, "held, replacing the previous one");
+        assert_eq!(throttle.flush(), Some(info(3, 300)), "only the newest held update is flushed");
+        assert_eq!(throttle.flush(), None, "nothing is held after the flush");
+    }
+
+    #[test]
+    fn an_offer_after_the_interval_is_delivered() {
+        let t0 = Instant::now();
+        let mut throttle = ProgressThrottle::new();
+        assert!(throttle.offer(info(1, 100), t0).is_some());
+        assert_eq!(throttle.offer(info(2, 200), t0 + PROGRESS_INTERVAL - Duration::from_millis(1)), None, "one ms short is held");
+        assert_eq!(throttle.offer(info(3, 300), t0 + PROGRESS_INTERVAL), Some(info(3, 300)), "exactly at the interval is due");
+        // A delivered offer drops anything that was held before it.
+        assert_eq!(throttle.flush(), None);
+    }
+
+    #[test]
+    fn a_thousand_offers_over_one_second_deliver_at_most_twenty_one() {
+        // file-operations "A fast copy does not flood the UI": the first
+        // offer plus one per 50 ms interval is 20 in a 1 s span.
+        let t0 = Instant::now();
+        let mut throttle = ProgressThrottle::new();
+        let mut delivered = 0;
+        for i in 0..1_000u64 {
+            if throttle.offer(info(i as usize, i), t0 + Duration::from_millis(i)).is_some() {
+                delivered += 1;
+            }
+        }
+        assert!(delivered <= 21, "{delivered} updates passed the throttle in one second");
+        assert_eq!(delivered, 20, "t = 0, 50, ..., 950 ms");
+        assert_eq!(throttle.flush(), Some(info(999, 999)), "the final figures are never lost");
     }
 }

@@ -14,5 +14,5 @@ pub use conflict::{ConflictChoice, ConflictInfo, ConflictPolicy, ConflictResolut
 pub use dialog::{DropButtons, FileOpSetup, RunningDialog};
 pub use error::{ErrorChoice, ErrorInfo, ErrorPolicy, ErrorResolution, ItemKind, SkippedItem};
 pub use fs::{ChunkControl, FakeFs, FileId, FileSystem, FsMetadata, RawEntry, RealFs, ReparseKind};
-pub use job::{CancelFlag, Job, JobKind, JobOutcome, JobSink, ProgressInfo, SourceItem};
+pub use job::{CancelFlag, Job, JobKind, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, SourceItem};
 pub use worker::run_job;

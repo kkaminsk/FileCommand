@@ -28,20 +28,20 @@ const QUIET_TIMEOUT: Duration = Duration::from_millis(150);
 /// `app::run_effects` does. Effects outside this test's scope (menu/drive-
 /// select/viewer/...) are silently ignored — they simply don't arise from
 /// the scripted command sequence below. `git_slots` are the test's per-panel
-/// git-query slots, mirroring `Runtime`'s (git-info-timeout-memory design
-/// D3).
-fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQuerySlot; 2]) {
+/// git-query slots, and `workers` its worker gauge, mirroring `Runtime`'s
+/// (git-info-timeout-memory design D3; idle-aware-event-loop design D3).
+fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQuerySlot; 2], workers: &worker::WorkerGauge) {
     for effect in effects {
         match effect {
-            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, tx.clone()),
+            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, tx.clone(), workers.token()),
             Effect::QueryGitInfo { panel, path, request } => {
                 let slot = match panel {
                     PanelSide::Left => &git_slots[0],
                     PanelSide::Right => &git_slots[1],
                 };
-                slot.request(panel, path, request, tx.clone());
+                slot.request(panel, path, request, tx.clone(), workers.token());
             }
-            Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, tx.clone()),
+            Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, tx.clone(), workers.token()),
             // `Effect::OpenEditor`/`SaveEditor` are cheap enough to run
             // synchronously on the input path in the real app too (design
             // D1) — mirrored here rather than spawning a thread for them.
@@ -70,14 +70,14 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
 /// (and *their* resulting effects, transitively) until the system goes
 /// quiet — so callers always see a settled `State` rather than one with
 /// listings still streaming in.
-fn step(mut state: State, cmd: Command, tx: &Sender<Command>, rx: &Receiver<Command>, git_slots: &[worker::GitQuerySlot; 2]) -> State {
+fn step(mut state: State, cmd: Command, tx: &Sender<Command>, rx: &Receiver<Command>, git_slots: &[worker::GitQuerySlot; 2], workers: &worker::WorkerGauge) -> State {
     let (s, effects) = update(state, cmd);
     state = s;
-    execute(effects, tx, git_slots);
+    execute(effects, tx, git_slots, workers);
     while let Ok(reply) = rx.recv_timeout(QUIET_TIMEOUT) {
         let (s, effects) = update(state, reply);
         state = s;
-        execute(effects, tx, git_slots);
+        execute(effects, tx, git_slots, workers);
     }
     state
 }
@@ -122,11 +122,12 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     let fx = Fixture::new("main");
     let (tx, rx) = mpsc::channel::<Command>();
     let git_slots = [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()];
+    let workers = worker::WorkerGauge::new();
 
     let (state, effects) =
         State::initial(filecommand_core::theme::Theme::classic(), (80, 24), 1_000, fx.left(), fx.root.join("right"), false);
-    execute(effects, &tx, &git_slots);
-    let mut state = step(state, Command::Tick(1_000), &tx, &rx, &git_slots);
+    execute(effects, &tx, &git_slots, &workers);
+    let mut state = step(state, Command::Tick(1_000), &tx, &rx, &git_slots, &workers);
 
     // ---- Sanity: both panels loaded for real -------------------------
     assert!(state.left.entries.iter().any(|e| e.name == "report.txt"), "left panel must have listed report.txt: {:?}", state.left.entries);
@@ -135,17 +136,17 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     // ---- F4 edit + save ------------------------------------------------
     let report_idx = state.left.entries.iter().position(|e| e.name == "report.txt").expect("report.txt listed");
     state.left.cursor = report_idx;
-    state = step(state, Command::RequestEditor, &tx, &rx, &git_slots);
+    state = step(state, Command::RequestEditor, &tx, &rx, &git_slots, &workers);
     assert!(matches!(state.phase, UiPhase::Editor(_)), "F4 must open the built-in editor, got {:?}", state.phase);
 
-    state = step(state, Command::EditorChar('X'), &tx, &rx, &git_slots);
+    state = step(state, Command::EditorChar('X'), &tx, &rx, &git_slots, &workers);
     if let UiPhase::Editor(editor) = &state.phase {
         assert!(editor.is_modified(), "typing a character must mark the buffer modified");
     } else {
         panic!("expected the editor phase to still be open");
     }
 
-    state = step(state, Command::EditorSave, &tx, &rx, &git_slots);
+    state = step(state, Command::EditorSave, &tx, &rx, &git_slots, &workers);
     let on_disk = std::fs::read_to_string(fx.left().join("report.txt")).expect("read saved file");
     assert!(on_disk.starts_with('X'), "the typed character must have been written to disk: {on_disk:?}");
     if let UiPhase::Editor(editor) = &state.phase {
@@ -156,62 +157,62 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
 
     // F10 on an unmodified buffer exits directly (builtin-editor "Quitting
     // an unmodified buffer exits directly").
-    state = step(state, Command::EditorRequestQuit, &tx, &rx, &git_slots);
+    state = step(state, Command::EditorRequestQuit, &tx, &rx, &git_slots, &workers);
     assert_eq!(state.phase, UiPhase::Panels, "F10 on an unmodified buffer returns straight to the panels");
 
     // ---- Ctrl+T / Alt+<n> panel tabs -----------------------------------
     assert_eq!(state.left.tab_count(), 1);
-    state = step(state, Command::OpenTab(PanelSide::Left), &tx, &rx, &git_slots);
+    state = step(state, Command::OpenTab(PanelSide::Left), &tx, &rx, &git_slots, &workers);
     assert_eq!(state.left.tab_count(), 2, "Ctrl+T opens a second tab");
     // Navigate the (now active) second tab into `sub` — this also records
     // the frecency visit Ctrl+J will read from later.
     let sub_idx = state.left.entries.iter().position(|e| e.name == "sub").expect("sub listed");
     state.left.cursor = sub_idx;
-    state = step(state, Command::Enter, &tx, &rx, &git_slots);
+    state = step(state, Command::Enter, &tx, &rx, &git_slots, &workers);
     assert_eq!(state.left.cwd, fx.sub(), "tab 2 navigated into sub");
 
-    state = step(state, Command::SwitchTab(1), &tx, &rx, &git_slots);
+    state = step(state, Command::SwitchTab(1), &tx, &rx, &git_slots, &workers);
     assert_eq!(state.left.cwd, fx.left(), "switching back to tab 1 restores its own directory");
     assert!(state.left.entries.iter().any(|e| e.name == "report.txt"));
 
     // ---- Ctrl+P quick filter --------------------------------------------
-    state = step(state, Command::QuickFilterStart(PanelSide::Left), &tx, &rx, &git_slots);
-    state = step(state, Command::QuickFilterChar('r'), &tx, &rx, &git_slots);
-    state = step(state, Command::QuickFilterChar('e'), &tx, &rx, &git_slots);
+    state = step(state, Command::QuickFilterStart(PanelSide::Left), &tx, &rx, &git_slots, &workers);
+    state = step(state, Command::QuickFilterChar('r'), &tx, &rx, &git_slots, &workers);
+    state = step(state, Command::QuickFilterChar('e'), &tx, &rx, &git_slots, &workers);
     let visible_names: Vec<String> =
         state.left.visible_indices().into_iter().map(|i| state.left.entries[i].name.to_string_lossy().into_owned()).collect();
     assert!(visible_names.contains(&"report.txt".to_string()), "{visible_names:?}");
     assert!(!visible_names.contains(&"sub".to_string()), "`sub` does not contain `re`: {visible_names:?}");
-    state = step(state, Command::QuickFilterEnd, &tx, &rx, &git_slots);
+    state = step(state, Command::QuickFilterEnd, &tx, &rx, &git_slots, &workers);
     assert!(state.left.quick_filter.is_none(), "Esc clears the filter");
 
     // ---- Ctrl+J fuzzy jump ------------------------------------------------
     assert!(state.dir_history.iter().any(|e| e.path == fx.sub()), "the earlier tab-2 navigation into sub must be recorded");
-    state = step(state, Command::FuzzyJumpOpen, &tx, &rx, &git_slots);
+    state = step(state, Command::FuzzyJumpOpen, &tx, &rx, &git_slots, &workers);
     assert!(state.fuzzy_jump.is_some());
-    state = step(state, Command::FuzzyJumpConfirm, &tx, &rx, &git_slots);
+    state = step(state, Command::FuzzyJumpConfirm, &tx, &rx, &git_slots, &workers);
     assert!(state.fuzzy_jump.is_none(), "the dialog closes");
     assert_eq!(state.left.cwd, fx.sub(), "Ctrl+J jumped the active panel to the most-frecent visited directory");
 
     // Back to `left`'s root before searching its subtree.
-    state = step(state, Command::ParentDir, &tx, &rx, &git_slots);
+    state = step(state, Command::ParentDir, &tx, &rx, &git_slots, &workers);
     assert_eq!(state.left.cwd, fx.left());
     assert_eq!(state.active, PanelSide::Left);
 
     // ---- Alt+F7 find file ---------------------------------------------
-    state = step(state, Command::FindFileOpen, &tx, &rx, &git_slots);
+    state = step(state, Command::FindFileOpen, &tx, &rx, &git_slots, &workers);
     assert_eq!(state.find_file.as_ref().unwrap().root, fx.left());
     for c in "nested".chars() {
-        state = step(state, Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert(c)), &tx, &rx, &git_slots);
+        state = step(state, Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert(c)), &tx, &rx, &git_slots, &workers);
     }
-    state = step(state, Command::FindFileSubmit, &tx, &rx, &git_slots);
+    state = step(state, Command::FindFileSubmit, &tx, &rx, &git_slots, &workers);
     {
         let dialog = state.find_file.as_ref().expect("find-file dialog still open");
         assert!(dialog.done, "the walk must have finished by the time `step` quiesces");
         assert_eq!(dialog.results.len(), 1, "exactly nested.txt should match `nested`: {:?}", dialog.results);
         assert_eq!(dialog.results[0].entry.name, "nested.txt");
     }
-    state = step(state, Command::FindFileConfirm, &tx, &rx, &git_slots);
+    state = step(state, Command::FindFileConfirm, &tx, &rx, &git_slots, &workers);
     assert!(state.find_file.is_none(), "the dialog closes on confirm");
     assert_eq!(state.left.cwd, fx.sub(), "find-file navigated the active panel to the match's containing directory");
     let cursor_name = state.left.entries.get(state.left.cursor).map(|e| e.name.to_string_lossy().into_owned());

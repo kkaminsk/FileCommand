@@ -39,6 +39,16 @@ impl TextEditOp {
     }
 }
 
+/// Replace every line break with a single space — `\r\n`, a lone `\r`, or a
+/// lone `\n` each become one space (text-field-editing "Paste into a text
+/// field"). The one definition shared by [`LineEdit::insert_str`], the TUI's
+/// clipboard read (`Effect::ReadClipboardText`), and terminal bracketed-paste
+/// routing (idle-aware-event-loop design D6), so every paste path flattens
+/// identically.
+pub fn flatten_line_breaks(text: &str) -> String {
+    text.replace("\r\n", " ").replace('\r', " ").replace('\n', " ")
+}
+
 /// A single line of text plus a caret (char index, `0..=len_chars()`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LineEdit {
@@ -91,7 +101,7 @@ impl LineEdit {
     /// `TextEditOp::Paste` already; doing it here as well keeps the model's
     /// own contract independent of that path.
     pub fn insert_str(&mut self, s: &str) {
-        let flattened = s.replace("\r\n", " ").replace('\r', " ").replace('\n', " ");
+        let flattened = flatten_line_breaks(s);
         let byte = self.byte_of_char(self.caret);
         self.text.insert_str(byte, &flattened);
         self.caret += flattened.chars().count();
