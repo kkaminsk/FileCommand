@@ -71,6 +71,10 @@ impl ProgressInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JobOutcome {
+    /// `skipped` carries both kinds of `SkippedItem`: items the job did
+    /// not process (`ItemKind::Skipped`) and metadata-restore warnings
+    /// (`ItemKind::Warning`) for files whose content *was* copied
+    /// (error-diagnostics design D5).
     Completed { skipped: Vec<SkippedItem> },
     /// Covers both an explicit user Cancel and an Abort chosen from the
     /// error-recovery dialog — both mean "stop early."

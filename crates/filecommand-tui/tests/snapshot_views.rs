@@ -207,6 +207,88 @@ fn snapshot_drop_dialog_with_move_focused() {
     insta::assert_snapshot!("drop_dialog_move_focused", text);
 }
 
+// -----------------------------------------------------------------
+// error-diagnostics: the job dialogs name full paths, and the end-of-job
+// summary groups skipped items and warnings (tasks 4.3, 5.5).
+// -----------------------------------------------------------------
+
+/// filesystem-error-handling "Error messages name the affected path"
+/// scenario "The error-recovery dialog shows the full path": the failing
+/// item's path on one row, the OS message on the next.
+#[test]
+fn snapshot_error_dialog_shows_the_full_path_above_the_message() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpRunning {
+        source_dir: PathBuf::from(r"D:\data\reports"),
+        dest_dir: PathBuf::from(r"C:\Users\demo\right"),
+        dialog: filecommand_core::fs_ops::dialog::RunningDialog::Error {
+            kind: JobKind::Copy,
+            info: filecommand_core::fs_ops::ErrorInfo {
+                path: PathBuf::from(r"D:\data\reports\q3.xlsx"),
+                message: "Access is denied. (os error 5)".to_string(),
+            },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(3, 30_000),
+        },
+    };
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains(r"D:\data\reports\q3.xlsx"), "the path row is shown:\n{text}");
+    assert!(text.contains("Access is denied. (os error 5)"), "the message row follows it:\n{text}");
+    insta::assert_snapshot!("error_dialog_full_path_above_message", text);
+}
+
+/// Regression pin for the pre-existing skipped-only rendering (task 4.3):
+/// each summary row is `{full path}: {reason}`.
+#[test]
+fn snapshot_skipped_summary_skipped_items() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSummary(vec![
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\old.log"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\archive.zip"), "target already exists".to_string()),
+    ]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Skipped 2 item(s)"), "the title counts the skipped items:\n{text}");
+    assert!(text.contains(r"D:\data\old.log: target already exists"), "each row is path: reason:\n{text}");
+    insta::assert_snapshot!("skipped_summary_skipped_items", text);
+}
+
+/// operation-dialogs "Metadata-restore failures are reported in the
+/// end-of-job summary": a warnings-only summary is titled by its warning
+/// count.
+#[test]
+fn snapshot_skipped_summary_warnings_only() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    // The reason is kept short so the whole row fits the 80-column screen
+    // un-truncated — the point here is the grouping, not the OS text.
+    state.phase = UiPhase::FileOpSummary(vec![filecommand_core::fs_ops::SkippedItem::warning(
+        PathBuf::from(r"C:\dst\report.docx"),
+        "modification time not restored: denied".to_string(),
+    )]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("1 warning(s)"), "the title is the warning count:\n{text}");
+    assert!(text.contains("Warnings"), "the warnings group is headed:\n{text}");
+    assert!(text.contains(r"C:\dst\report.docx: modification time not restored: denied"), "{text}");
+    insta::assert_snapshot!("skipped_summary_warnings_only", text);
+}
+
+/// "Warnings and skipped items appear together": one summary, skipped items
+/// first, the warnings group second, both counts in the title.
+#[test]
+fn snapshot_skipped_summary_skipped_and_warnings() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSummary(vec![
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\a.txt"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\b.txt"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::warning(PathBuf::from(r"D:\data\c.txt"), "read-only attribute not restored: denied".to_string()),
+    ]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Skipped 2 item(s), 1 warning(s)"), "the title gives both counts:\n{text}");
+    let skipped_pos = text.find(r"D:\data\a.txt: target already exists").expect("skipped row present");
+    let header_pos = text.find("Warnings").expect("the warnings group header is present");
+    let warning_pos = text.find(r"D:\data\c.txt: read-only attribute not restored: denied").expect("warning row present");
+    assert!(skipped_pos < header_pos && header_pos < warning_pos, "skipped rows come before the Warnings group:\n{text}");
+    insta::assert_snapshot!("skipped_summary_skipped_and_warnings", text);
+}
+
 #[test]
 fn snapshot_splash_nc_classic() {
     let state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());

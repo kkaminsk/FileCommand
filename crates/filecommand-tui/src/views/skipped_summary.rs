@@ -1,7 +1,10 @@
-//! End-of-job skipped-files summary: shown only when 1+ items were skipped.
+//! End-of-job skipped-files summary: shown when a job finished with 1+
+//! skipped items and/or 1+ metadata-restore warnings (error-diagnostics;
+//! operation-dialogs "End-of-job skipped-files summary", "Metadata-restore
+//! failures are reported in the end-of-job summary").
 
 use filecommand_core::dialogs::overlay_rect;
-use filecommand_core::fs_ops::SkippedItem;
+use filecommand_core::fs_ops::{ItemKind, SkippedItem};
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
 use filecommand_core::update::ButtonId;
@@ -16,11 +19,34 @@ const MIN_INNER_W: usize = 32;
 /// footer row.
 const CHROME_ROWS: u16 = 3;
 
+/// The dialog's title and body rows (design D5): skipped items first, each
+/// `{path}: {reason}`, then a `Warnings` group — a header row followed by
+/// the warning rows in the same format. The title carries both counts:
+/// `Skipped N item(s)`, `N warning(s)`, or `Skipped N item(s), M
+/// warning(s)`. Shared by [`render_skipped_summary`] and [`hit_buttons`] so
+/// their geometry never drifts apart.
+fn rows_and_title(items: &[SkippedItem]) -> (String, Vec<String>) {
+    let skipped_count = items.iter().filter(|i| i.kind == ItemKind::Skipped).count();
+    let warning_count = items.len() - skipped_count;
+    let title = match (skipped_count, warning_count) {
+        (_, 0) => format!(" Skipped {skipped_count} item(s) "),
+        (0, _) => format!(" {warning_count} warning(s) "),
+        _ => format!(" Skipped {skipped_count} item(s), {warning_count} warning(s) "),
+    };
+    let mut rows: Vec<String> = Vec::new();
+    rows.extend(items.iter().filter(|i| i.kind == ItemKind::Skipped).map(|s| format!("{}: {}", s.path.display(), s.reason)));
+    if warning_count > 0 {
+        rows.push("Warnings".to_string());
+        rows.extend(items.iter().filter(|i| i.kind == ItemKind::Warning).map(|s| format!("{}: {}", s.path.display(), s.reason)));
+    }
+    (title, rows)
+}
+
 pub fn render_skipped_summary(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, skipped: &[SkippedItem]) {
     let body = role_style(theme, Role::DialogPrimary, depth);
 
-    let title = format!(" Skipped {} item(s) ", skipped.len());
-    let all_rows: Vec<String> = skipped.iter().take(MAX_ROWS).map(|s| format!("{}: {}", s.path.display(), s.reason)).collect();
+    let (title, rows) = rows_and_title(skipped);
+    let all_rows: Vec<String> = rows.into_iter().take(MAX_ROWS).collect();
     let preferred_inner_w = all_rows.iter().map(|r| display_width(r)).max().unwrap_or(0).max(display_width(&title)).max(30) + 2;
     let preferred_h = CHROME_ROWS + all_rows.len() as u16;
     let r = overlay_rect((preferred_inner_w as u16 + 2, preferred_h), (MIN_INNER_W as u16, 5), (area.width, area.height));
@@ -58,8 +84,8 @@ pub fn render_skipped_summary(buf: &mut Buffer, area: Rect, theme: &Theme, depth
 /// `Command::FileOpConfirm`, which is what any key already does here).
 /// Mirrors the renderer's own row-count/`overlay_rect` geometry exactly.
 pub fn hit_buttons(area: Rect, skipped: &[SkippedItem]) -> Vec<(Rect, ButtonId)> {
-    let title = format!(" Skipped {} item(s) ", skipped.len());
-    let all_rows: Vec<String> = skipped.iter().take(MAX_ROWS).map(|s| format!("{}: {}", s.path.display(), s.reason)).collect();
+    let (title, rows) = rows_and_title(skipped);
+    let all_rows: Vec<String> = rows.into_iter().take(MAX_ROWS).collect();
     let preferred_inner_w = all_rows.iter().map(|r| display_width(r)).max().unwrap_or(0).max(display_width(&title)).max(30) + 2;
     let preferred_h = CHROME_ROWS + all_rows.len() as u16;
     let r = overlay_rect((preferred_inner_w as u16 + 2, preferred_h), (MIN_INNER_W as u16, 5), (area.width, area.height));

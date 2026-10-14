@@ -31,6 +31,7 @@ OPTIONS:
     --nosplash          Skip the startup splash screen
     --noanimations      Disable decorative UI animations
     --config-dir <path>  Use <path> for config.toml, history.json, usermenu.toml
+    --log <path>        Append diagnostic messages to <path> (or set FILECOMMAND_LOG)
 
 Press F1 inside the application for the full keyboard reference.
 

@@ -159,7 +159,11 @@ pub enum UiPhase {
     /// A job is running on the worker thread; `dialog` shows progress, or a
     /// conflict/error the worker is blocked waiting on.
     FileOpRunning { source_dir: PathBuf, dest_dir: PathBuf, dialog: RunningDialog },
-    /// End-of-job summary, shown only when the job skipped 1+ items.
+    /// End-of-job summary, shown when the job skipped 1+ items or recorded
+    /// 1+ metadata-restore warnings — the two kinds share this vector and
+    /// are told apart by `SkippedItem::kind` (operation-dialogs "End-of-job
+    /// skipped-files summary", "Metadata-restore failures are reported in
+    /// the end-of-job summary"; error-diagnostics design D5).
     FileOpSummary(Vec<SkippedItem>),
     /// The F3 viewer, open full-screen in place of the panels (viewer:
     /// Frame-less full-screen chrome — "Viewer owns focus while open").

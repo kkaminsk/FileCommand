@@ -641,7 +641,7 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
     });
     state.left.cwd = PathBuf::from("/left");
     state.right.cwd = PathBuf::from("/right"); // unaffected panel: must not be re-read
-    let skipped = vec![SkippedItem { path: PathBuf::from("/left/a.txt"), reason: "denied".to_string() }];
+    let skipped = vec![SkippedItem::skipped(PathBuf::from("/left/a.txt"), "denied".to_string())];
     let (state, effects) = update(
         state,
         Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
@@ -651,6 +651,47 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
 
     let (state, _) = update(state, Command::FileOpConfirm);
     assert_eq!(state.phase, UiPhase::Panels);
+}
+
+/// operation-dialogs "End-of-job skipped-files summary" scenario "Summary
+/// shown for warnings alone" (error-diagnostics): a `JobDone` whose
+/// `skipped` vector holds only warnings still moves to the summary phase
+/// and still emits the panel re-reads.
+#[test]
+fn job_done_with_only_warnings_shows_summary_and_rereads_panels() {
+    let mut state = test_state(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/right"),
+        dialog: RunningDialog::Progress { kind: JobKind::Copy, progress: ProgressInfo::starting(1, 10) },
+    });
+    state.left.cwd = PathBuf::from("/left");
+    state.right.cwd = PathBuf::from("/right");
+    let warnings = vec![SkippedItem::warning(PathBuf::from("/right/report.docx"), "modification time not restored: denied".to_string())];
+    let (state, effects) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: warnings.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
+    );
+    assert_eq!(state.phase, UiPhase::FileOpSummary(warnings));
+    assert_eq!(
+        without_git_info_effects(effects),
+        vec![
+            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
+            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+        ]
+    );
+}
+
+/// The unchanged half of "No summary when nothing was skipped": a job with
+/// neither skips nor warnings returns to the panels with no summary.
+#[test]
+fn job_done_with_no_skips_and_no_warnings_shows_no_summary() {
+    let state = running_progress_state(JobKind::Copy, "/left", "/right");
+    let (state, _) = update(
+        state,
+        Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/right") },
+    );
+    assert_eq!(state.phase, UiPhase::Panels, "no summary when nothing was skipped and no warnings were recorded");
+    assert!(!matches!(state.phase, UiPhase::FileOpSummary(_)));
 }
 
 #[test]

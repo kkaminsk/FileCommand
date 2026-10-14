@@ -5,6 +5,7 @@
 //! additionally exposing a cancel flag and a reply channel so the main loop
 //! can answer conflict/error dialogs the worker thread blocks on.
 
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
@@ -12,7 +13,7 @@ use std::time::Duration;
 
 use filecommand_core::drives;
 use filecommand_core::fs_ops::{
-    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
+    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, RealFs,
 };
 use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
@@ -22,7 +23,38 @@ use filecommand_core::viewer::search::{find_forward, DEFAULT_CHUNK_SIZE};
 use filecommand_core::viewer::ByteSource;
 use filecommand_core::{Command, PanelSide};
 
+use crate::diag;
+
 const CHUNK_SIZE: usize = 256;
+
+/// Send a worker result to the event loop, logging a failure rather than
+/// dropping it silently (error-diagnostics design D3): the send can only
+/// fail once the loop's receiver is gone, i.e. during shutdown. Returns
+/// `false` on failure so the caller can stop early — there is no point
+/// streaming more into the void.
+pub(crate) fn deliver(tx: &Sender<Command>, kind: &str, cmd: Command) -> bool {
+    if tx.send(cmd).is_err() {
+        diag::log("channel", format_args!("{kind} not delivered: event loop gone"));
+        return false;
+    }
+    true
+}
+
+/// The name a status-line error identifies its target by (error-diagnostics
+/// design D4): `path.file_name()`, or the whole path when there is none
+/// (`C:\`, `\\server\share`).
+pub(crate) fn name_or_path(path: &Path) -> String {
+    path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// The `ListingFailed` status-line message, `Cannot read <name>: <err>`
+/// (filesystem-error-handling "Error messages name the affected path";
+/// design D4): the name rather than the full path, because the panel's
+/// mini-status is about half the terminal width and truncates from the
+/// right — the panel title directly above already shows the directory.
+fn listing_failed_message(path: &Path, err: &io::Error) -> String {
+    format!("Cannot read {}: {err}", name_or_path(path))
+}
 
 /// How long one git status query may run before its panel's slot reports
 /// "no info" and moves on (git-info "Silent absence on timeout and
@@ -39,7 +71,7 @@ const GIT_INFO_TIMEOUT: Duration = Duration::from_secs(3);
 pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let label = drives::volume_info(letter).map(|(label, _serial)| label);
-        let _ = tx.send(Command::DriveLabelResolved { target, letter, label, generation });
+        deliver(&tx, "drive label", Command::DriveLabelResolved { target, letter, label, generation });
     });
 }
 
@@ -51,7 +83,7 @@ pub fn spawn_drive_label(target: PanelSide, letter: char, generation: u64, tx: S
 pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let values = gather_info(&StdFsReader, &path);
-        let _ = tx.send(Command::InfoResolved { panel, path, request, values });
+        deliver(&tx, "info query", Command::InfoResolved { panel, path, request, values });
     });
 }
 
@@ -161,7 +193,7 @@ where
     let mut current = Some(first);
     while let Some((path, request)) = current {
         let (info, timed_out_root) = run_one_git_query(timeout, &path, &query);
-        let _ = tx.send(Command::GitInfoResolved { panel, path, request, info, timed_out_root: timed_out_root.clone() });
+        deliver(&tx, "git info", Command::GitInfoResolved { panel, path, request, info, timed_out_root: timed_out_root.clone() });
 
         let mut state = slot.lock().unwrap();
         current = state.pending.take();
@@ -293,7 +325,7 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
             Some((start, end)) => (Some(start), Some((start, end))),
             None => (None, None),
         };
-        let _ = tx.send(Command::ViewerSearchResult { offset, match_range, request });
+        deliver(&tx, "viewer search result", Command::ViewerSearchResult { offset, match_range, request });
     });
 }
 
@@ -308,7 +340,7 @@ pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, r
 pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
     std::thread::spawn(move || {
         let children = filecommand_core::listing::list_child_dirs(&StdFsReader, &path).unwrap_or_default();
-        let _ = tx.send(Command::TreeNodeExpanded { panel, path, children });
+        deliver(&tx, "tree expansion", Command::TreeNodeExpanded { panel, path, children });
     });
 }
 
@@ -322,9 +354,9 @@ pub fn spawn_tree_expand(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
 pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>) {
     std::thread::spawn(move || {
         find_in_subtree(&StdFsReader, &root, &pattern, |m| {
-            let _ = tx.send(Command::FindFileMatch { request, m });
+            deliver(&tx, "find match", Command::FindFileMatch { request, m });
         });
-        let _ = tx.send(Command::FindFileSearchDone { request });
+        deliver(&tx, "find done", Command::FindFileSearchDone { request });
     });
 }
 
@@ -334,22 +366,25 @@ pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>) {
 
         if parent_path(&path).is_some() {
             total += 1;
-            if tx.send(Command::ListingChunk { panel, entries: vec![Entry::parent_dir()] }).is_err() {
+            if !deliver(&tx, "listing chunk", Command::ListingChunk { panel, entries: vec![Entry::parent_dir()] }) {
                 return;
             }
         }
 
         let reader = StdFsReader;
         let result = list_dir_chunked(&reader, &path, CHUNK_SIZE, |chunk| {
-            let _ = tx.send(Command::ListingChunk { panel, entries: chunk });
+            deliver(&tx, "listing chunk", Command::ListingChunk { panel, entries: chunk });
         });
 
         match result {
             Ok(fs_count) => {
-                let _ = tx.send(Command::ListingComplete { panel, total: total + fs_count });
+                deliver(&tx, "listing complete", Command::ListingComplete { panel, total: total + fs_count });
             }
             Err(e) => {
-                let _ = tx.send(Command::ListingFailed { panel, message: e.to_string() });
+                // The message names the directory it could not read
+                // (filesystem-error-handling "Error messages name the
+                // affected path"), not just the bare OS error.
+                deliver(&tx, "listing failure", Command::ListingFailed { panel, message: listing_failed_message(&path, &e) });
             }
         }
     });
@@ -381,11 +416,11 @@ struct ChannelSink {
 
 impl JobSink for ChannelSink {
     fn progress(&mut self, info: ProgressInfo) {
-        let _ = self.tx.send(Command::JobProgress(info));
+        deliver(&self.tx, "job progress", Command::JobProgress(info));
     }
 
     fn conflict(&mut self, info: ConflictInfo) -> ConflictChoice {
-        if self.tx.send(Command::JobConflict(info)).is_err() {
+        if !deliver(&self.tx, "conflict prompt", Command::JobConflict(info)) {
             return ConflictChoice::Skip;
         }
         // Blocks until the main loop answers via `JobHandle::reply_tx` after
@@ -397,7 +432,7 @@ impl JobSink for ChannelSink {
     }
 
     fn error(&mut self, info: ErrorInfo) -> ErrorChoice {
-        if self.tx.send(Command::JobError(info)).is_err() {
+        if !deliver(&self.tx, "error prompt", Command::JobError(info)) {
             return ErrorChoice::Abort;
         }
         match self.reply_rx.recv() {
@@ -407,7 +442,20 @@ impl JobSink for ChannelSink {
     }
 
     fn done(&mut self, outcome: JobOutcome) {
-        let _ = self.tx.send(Command::JobDone { outcome, source_dir: self.source_dir.clone(), dest_dir: self.dest_dir.clone() });
+        // Metadata-restore warnings the engine recorded are logged under
+        // `copy`, so a partial failure leaves a diagnostic trail even when
+        // the user dismisses the end-of-job summary unread
+        // (error-diagnostics design D3; operation-dialogs "Metadata-restore
+        // failures are reported in the end-of-job summary").
+        let items = match &outcome {
+            JobOutcome::Completed { skipped } | JobOutcome::Cancelled { skipped } => skipped,
+        };
+        for item in items {
+            if item.kind == ItemKind::Warning {
+                diag::log("copy", format_args!("{}: {}", item.path.display(), item.reason));
+            }
+        }
+        deliver(&self.tx, "job outcome", Command::JobDone { outcome, source_dir: self.source_dir.clone(), dest_dir: self.dest_dir.clone() });
     }
 
     fn is_cancelled(&self) -> bool {
@@ -742,6 +790,52 @@ mod tests {
         assert_eq!(request, 2);
         assert_eq!(info.branch.as_deref(), Some("ok-branch"));
         assert_eq!(timed_out_root, None);
+    }
+
+    // -------------------------------------------------------------
+    // error-diagnostics: the listing failure message names the directory
+    // (filesystem-error-handling "Error messages name the affected path";
+    // task 4.3)
+    // -------------------------------------------------------------
+
+    #[test]
+    fn listing_failed_message_names_the_directory() {
+        // Scenario "Access-denied listing names the directory": `Cannot
+        // read <directory>: <OS message>`.
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "Access is denied. (os error 5)");
+        let dir = Path::new("Windows").join("CSC");
+        assert_eq!(listing_failed_message(&dir, &err), "Cannot read CSC: Access is denied. (os error 5)");
+    }
+
+    #[test]
+    fn listing_failed_message_keeps_the_whole_path_for_a_root() {
+        // A drive root (`C:\`) or share root (`\\server\share`) has no file
+        // name, so the whole path stands in (design D4).
+        let root = if cfg!(windows) { r"C:\" } else { "/" };
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "denied");
+        assert_eq!(listing_failed_message(Path::new(root), &err), format!("Cannot read {root}: denied"));
+    }
+
+    #[test]
+    fn spawn_listing_of_a_missing_directory_reports_cannot_read_naming_it() {
+        // End to end through the worker thread: the `ListingFailed` command
+        // carries the prefixed message, not a bare OS error.
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-worker-listing-fail-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let name = dir.file_name().unwrap().to_string_lossy().into_owned();
+        let (tx, rx) = mpsc::channel();
+        spawn_listing(PanelSide::Left, dir, tx);
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Command::ListingChunk { .. }) => continue, // the synthetic `..` entry
+                Ok(Command::ListingFailed { panel, message }) => {
+                    assert_eq!(panel, PanelSide::Left);
+                    assert!(message.starts_with(&format!("Cannot read {name}: ")), "names the directory and the OS reason: {message}");
+                    break;
+                }
+                other => panic!("expected ListingChunk or ListingFailed, got {other:?}"),
+            }
+        }
     }
 
     #[test]

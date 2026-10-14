@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::SystemTime;
 
@@ -94,6 +94,12 @@ pub trait FileSystem: Send + Sync {
     /// Always empty on platforms/filesystems without ADS support.
     fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>>;
     fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, chunk_bytes: usize) -> io::Result<u64>;
+    /// Whether the volume holding `path` supports named alternate data
+    /// streams (Windows: `GetVolumeInformationW`'s `FILE_NAMED_STREAMS`
+    /// flag). The copy engine asks once per job; an error is treated as
+    /// "supported" so genuine per-file stream failures still surface
+    /// individually (error-diagnostics design D5).
+    fn supports_named_streams(&self, path: &Path) -> io::Result<bool>;
     /// Whether `a` and `b` reside on the same volume — governs whether a
     /// move is an instant rename or a copy-then-delete.
     fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool>;
@@ -232,6 +238,10 @@ mod windows_impl {
             let from_stream = super::stream_enum::stream_path(&to_extended_path(from), stream);
             let to_stream = super::stream_enum::stream_path(&to_extended_path(to), stream);
             copy_chunked_impl(&from_stream, &to_stream, chunk_bytes, &mut |_| ChunkControl::Continue)
+        }
+
+        fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
+            super::volume_caps::supports_named_streams(&to_extended_path(path))
         }
 
         fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
@@ -382,6 +392,13 @@ mod portable_impl {
             Ok(0)
         }
 
+        fn supports_named_streams(&self, _path: &Path) -> io::Result<bool> {
+            // ADS is Windows-only; with `list_streams` always empty here, no
+            // file ever carries streams, so this answer never produces a
+            // warning off-Windows.
+            Ok(false)
+        }
+
         fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
             let ma = self.metadata_follow(a)?;
             let mb = self.metadata_follow(b)?;
@@ -390,6 +407,54 @@ mod portable_impl {
                 _ => Ok(false),
             }
         }
+    }
+}
+
+#[cfg(windows)]
+mod volume_caps {
+    //! `GetVolumeInformationW` for the per-volume `FILE_NAMED_STREAMS`
+    //! capability flag, used by the copy engine to detect destinations with
+    //! no ADS support at all (FAT32/exFAT) and report one aggregated warning
+    //! per job instead of one per file (error-diagnostics design D5). Raw
+    //! FFI like the `identity`/`stream_enum` modules above — no external
+    //! crate.
+    use std::io;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    const FILE_NAMED_STREAMS: u32 = 0x0004_0000;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetVolumeInformationW(
+            root_path_name: *const u16,
+            volume_name_buffer: *mut u16,
+            volume_name_size: u32,
+            volume_serial_number: *mut u32,
+            maximum_component_length: *mut u32,
+            file_system_flags: *mut u32,
+            file_system_name_buffer: *mut u16,
+            file_system_name_size: u32,
+        ) -> i32;
+    }
+
+    /// Whether the volume holding `path` supports named streams.
+    /// `GetVolumeInformationW` wants the volume root (`C:\` or a UNC share,
+    /// trailing backslash included), which is the path's longest — i.e.
+    /// last — ancestor.
+    pub fn supports_named_streams(path: &Path) -> io::Result<bool> {
+        let root = path.ancestors().last().unwrap_or(path);
+        let wide: Vec<u16> = root.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut flags = 0u32;
+        // SAFETY: `wide` is null-terminated and outlives the call; the only
+        // non-null out pointer is `flags`, a live local.
+        let ok = unsafe {
+            GetVolumeInformationW(wide.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut flags, std::ptr::null_mut(), 0)
+        };
+        if ok == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(flags & FILE_NAMED_STREAMS != 0)
     }
 }
 
@@ -602,6 +667,13 @@ pub enum InjectableOp {
     RemoveFile,
     RemoveDir,
     SetReadonly,
+    /// Metadata-restore fault injection (error-diagnostics task 5.4):
+    /// `SetModified` and `ListStreams` key on the path they are called
+    /// with; `CopyStream` keys on the *destination* path, mirroring
+    /// `CopyAfterChunks`.
+    SetModified,
+    ListStreams,
+    CopyStream,
 }
 
 #[derive(Debug, Clone)]
@@ -621,6 +693,10 @@ pub struct FakeFs {
     ids: Mutex<BTreeMap<PathBuf, u64>>,
     next_id: AtomicU64,
     injections: Mutex<Vec<Injection>>,
+    /// Whether every volume answers `supports_named_streams` with `true`
+    /// (the default). Flipped to model a FAT32/exFAT destination
+    /// (error-diagnostics design D5).
+    named_streams: AtomicBool,
 }
 
 impl Default for FakeFs {
@@ -637,6 +713,7 @@ impl FakeFs {
             ids: Mutex::new(BTreeMap::new()),
             next_id: AtomicU64::new(1),
             injections: Mutex::new(Vec::new()),
+            named_streams: AtomicBool::new(true),
         }
     }
 
@@ -672,6 +749,13 @@ impl FakeFs {
     /// with no matching prefix default to volume `0`.
     pub fn set_volume(&self, prefix: &Path, volume: u64) {
         self.volumes.lock().unwrap().insert(Self::norm(prefix), volume);
+    }
+
+    /// Test toggle for destinations without ADS support (error-diagnostics
+    /// design D5): with `false`, the copy engine skips per-file stream
+    /// copies and records one job-level warning.
+    pub fn set_named_streams_supported(&self, supported: bool) {
+        self.named_streams.store(supported, Ordering::SeqCst);
     }
 
     fn volume_of(&self, path: &Path) -> u64 {
@@ -912,6 +996,9 @@ impl FileSystem for FakeFs {
     }
 
     fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
+        if let Some(kind) = self.take_injection(InjectableOp::SetModified, path) {
+            return Err(io::Error::from(kind));
+        }
         let p = Self::norm(path);
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get_mut(&p) {
@@ -924,6 +1011,9 @@ impl FileSystem for FakeFs {
     }
 
     fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
+        if let Some(kind) = self.take_injection(InjectableOp::ListStreams, path) {
+            return Err(io::Error::from(kind));
+        }
         let p = Self::norm(path);
         let nodes = self.nodes.lock().unwrap();
         match nodes.get(&p) {
@@ -933,6 +1023,9 @@ impl FileSystem for FakeFs {
     }
 
     fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, _chunk_bytes: usize) -> io::Result<u64> {
+        if let Some(kind) = self.take_injection(InjectableOp::CopyStream, to) {
+            return Err(io::Error::from(kind));
+        }
         let pf = Self::norm(from);
         let size = {
             let nodes = self.nodes.lock().unwrap();
@@ -951,6 +1044,10 @@ impl FileSystem for FakeFs {
 
     fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
         Ok(self.volume_of(a) == self.volume_of(b))
+    }
+
+    fn supports_named_streams(&self, _path: &Path) -> io::Result<bool> {
+        Ok(self.named_streams.load(Ordering::SeqCst))
     }
 }
 

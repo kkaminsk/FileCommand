@@ -24,6 +24,7 @@ use filecommand_core::{config, drives, identity, update, Command, Effect, PanelS
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
+use crate::diag;
 use crate::hitmap::HitMap;
 use crate::input::{self, MouseTracker, ViewerInput};
 use crate::terminal::TerminalGuard;
@@ -111,6 +112,13 @@ pub struct LaunchOptions {
     /// "Configuration profile directory": "Explicit --config-dir
     /// override"). Same absent/empty/value convention as `theme` above.
     pub config_dir: Option<String>,
+    /// `--log <path>` or `--log=<path>`: enable the diagnostic log at
+    /// `path` for this session, winning over the `FILECOMMAND_LOG`
+    /// environment variable. Same absent/empty/value convention as `theme`
+    /// and `config_dir` above; resolution happens in `run` via
+    /// [`resolve_log_path`] (error-diagnostics; application-shell "Optional
+    /// diagnostic log").
+    pub log: Option<String>,
 }
 
 /// Parse launch switches from an argument iterator (excluding the program
@@ -146,6 +154,13 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
             opts.config_dir = Some(iter.next().unwrap_or_default());
         } else if let Some(value) = arg.strip_prefix("--config-dir=") {
             opts.config_dir = Some(value.to_string());
+        } else if arg == "--log" {
+            // Same missing-value convention again (error-diagnostics design
+            // D2): an empty string so startup warns "--log needs a path"
+            // instead of silently disabling the log.
+            opts.log = Some(iter.next().unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--log=") {
+            opts.log = Some(value.to_string());
         }
     }
     opts
@@ -219,6 +234,36 @@ fn config_dir_override(raw: Option<&str>) -> (Option<PathBuf>, Option<String>) {
     }
 }
 
+/// Resolve the diagnostic-log path chosen at launch (error-diagnostics
+/// design D2; application-shell "Optional diagnostic log"): the `--log`
+/// flag wins over `FILECOMMAND_LOG` outright, an empty flag value is a
+/// warning rather than a path, and an empty or unset variable counts as
+/// unset. `Err` is the startup-warning text; `Ok(None)` leaves logging off
+/// and creates nothing ("No log unless asked for").
+fn resolve_log_path(flag: Option<&str>, env: Option<&str>) -> Result<Option<String>, String> {
+    match flag {
+        Some("") => Err("--log needs a path".to_string()),
+        Some(path) => Ok(Some(path.to_string())),
+        None => match env {
+            Some(value) if !value.is_empty() => Ok(Some(value.to_string())),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// Open the log [`resolve_log_path`] chose. Runs before profile resolution
+/// so every startup warning that follows can be recorded (design D2/D3). An
+/// unopenable path downgrades to a startup warning naming the path and the
+/// reason — the session continues without logging ("Unwritable log path
+/// warns and continues").
+fn init_diagnostic_log(path: Option<String>) -> Option<String> {
+    let path = path?;
+    match diag::init(Path::new(&path)) {
+        Ok(()) => None,
+        Err(err) => Some(format!("Diagnostic log disabled: cannot open {path} ({err})")),
+    }
+}
+
 /// Create the profile directory on first run. Failure is soft — the
 /// session runs on in-memory defaults with persistence skipped — and the
 /// returned warning names the path and the error (design D2; scenario
@@ -250,6 +295,16 @@ fn legacy_notice(cwd: &Path, profile: &Path) -> Option<String> {
 
 pub fn run(launch: LaunchOptions) -> io::Result<()> {
     crate::terminal::install_panic_hook();
+    // The diagnostic log is resolved and opened before anything below can
+    // warn, so every startup warning — including ones a later warning
+    // replaces in the single-slot dialog — is recorded (error-diagnostics
+    // design D2/D3; application-shell "Optional diagnostic log"). The flag
+    // wins over FILECOMMAND_LOG; a missing value or an unopenable file
+    // degrades to a startup warning rather than aborting the session.
+    let log_warning = match resolve_log_path(launch.log.as_deref(), std::env::var("FILECOMMAND_LOG").ok().as_deref()) {
+        Ok(path) => init_diagnostic_log(path),
+        Err(warning) => Some(warning),
+    };
     // The profile directory is resolved before anything loads: every
     // configuration file (config.toml, history.json, usermenu.toml) lives
     // there now, never relative to the launch directory
@@ -291,22 +346,29 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
     apply_launch_options(&mut state, &launch);
-    // A `--config-dir` switch with no value and the last-resort cwd
-    // fallback are session-only, in-memory warnings — same convention as
-    // the theme override warning just below.
+    // A `--log` switch with no value, an unopenable log file, a
+    // `--config-dir` switch with no value, and the last-resort cwd fallback
+    // are session-only, in-memory warnings — same convention as the theme
+    // override warning just below. Each goes through `set_startup_warning`
+    // so it lands in the diagnostic log even when a later warning replaces
+    // it in the dialog (error-diagnostics design D3).
+    if let Some(warning) = log_warning {
+        set_startup_warning(&mut state, warning);
+    }
     if let Some(warning) = flag_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
     if let Some(warning) = resolve_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
     // Session-only: this only ever sets `state.startup_warning` in memory,
     // never touches `config.toml` (theme-selection "Override is
     // session-only"; design D4). `apply_user_menu` below may overwrite this
     // with its own warning if both fire at once — matching the pre-existing
-    // single-`startup_warning`-field behavior, not a new decision here.
+    // single-`startup_warning`-field behavior, with the superseded warning
+    // kept in the diagnostic log.
     if let Some(warning) = theme_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
     let history_file = config::load_history_file(&history_path);
     state.history = history_file.commands;
@@ -319,12 +381,13 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     // The legacy notice and the unwritable-profile warning write last, so
     // the persistence-breaking one (design D2) stays visible when several
     // warnings fire at once; still the same single-field, last-writer-wins
-    // behavior (config-profile-directory design D3).
+    // behavior (config-profile-directory design D3), with every superseded
+    // warning kept in the diagnostic log.
     if let Some(warning) = legacy_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
     if let Some(warning) = create_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
     stamp_startup_warning(&mut state);
 
@@ -681,6 +744,17 @@ fn apply_launch_options(state: &mut State, launch: &LaunchOptions) {
     }
 }
 
+/// The one writer of `state.startup_warning` (error-diagnostics design
+/// D3): the dialog slot stays last-writer-wins, but every warning —
+/// including ones a later assignment replaces — is recorded in the
+/// diagnostic log (application-shell "Optional diagnostic log": "Superseded
+/// startup warnings are still recorded"). With the log disabled this is
+/// exactly the old bare assignment.
+fn set_startup_warning(state: &mut State, warning: String) {
+    diag::log("startup", &warning);
+    state.startup_warning = Some(warning);
+}
+
 /// Stamp the startup-warning dialog's open time so it irises in like every
 /// other modal. It is raised here, in `run`, rather than by a reducer
 /// command, so the reducer's own stamping post-condition never sees it open.
@@ -701,7 +775,7 @@ fn stamp_startup_warning(state: &mut State) {
 fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
     state.user_menu_entries = user_menu.entries;
     if user_menu.malformed {
-        state.startup_warning = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+        set_startup_warning(state, format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
     }
 }
 
@@ -827,7 +901,7 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
 /// `Command::UserMenuReloaded` (design D4) — drained before the next frame,
 /// exactly like the `RereadPanel` an external editor's return sends.
 fn reload_user_menu(rt: &Runtime) {
-    let _ = rt.tx.send(Command::UserMenuReloaded(config::load_user_menu(&rt.usermenu_path)));
+    worker::deliver(&rt.tx, "user menu reload", Command::UserMenuReloaded(config::load_user_menu(&rt.usermenu_path)));
 }
 
 /// Drain every queued worker event, including any command an effect fed
@@ -862,12 +936,19 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::SendConflictReply(choice) => {
                 if let Some(handle) = &rt.active_job {
-                    let _ = handle.reply_tx.send(worker::JobReply::Conflict(choice));
+                    // A failed send means the job thread has already ended;
+                    // the answer is lost, so it is logged rather than
+                    // dropped silently (error-diagnostics design D3).
+                    if handle.reply_tx.send(worker::JobReply::Conflict(choice)).is_err() {
+                        diag::log("job", "conflict answer not delivered: job ended");
+                    }
                 }
             }
             Effect::SendErrorReply(choice) => {
                 if let Some(handle) = &rt.active_job {
-                    let _ = handle.reply_tx.send(worker::JobReply::Error(choice));
+                    if handle.reply_tx.send(worker::JobReply::Error(choice)).is_err() {
+                        diag::log("job", "error answer not delivered: job ended");
+                    }
                 }
             }
             Effect::RunShellCommand(invocation, side) => {
@@ -881,7 +962,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // Fed straight back, same as drive enumeration: the panel
                 // that owned the command must show whatever the command did
                 // to its directory the moment the TUI repaints.
-                let _ = rt.tx.send(Command::RereadPanel(side));
+                worker::deliver(&rt.tx, "panel re-read", Command::RereadPanel(side));
             }
             Effect::OpenWithAssociation { path, cwd } => {
                 // Fire-and-forget (open-with-associated-app design D1/D3):
@@ -889,7 +970,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // re-read. Only a launch failure reports back, as the
                 // command that lands the message on the panel's status line.
                 if let Err(message) = open_with_association(&path, &cwd) {
-                    let _ = rt.tx.send(Command::OpenWithAssociationFailed { message });
+                    worker::deliver(&rt.tx, "open-with failure", Command::OpenWithAssociationFailed { message });
                 }
             }
             Effect::ShowScrollback => {
@@ -898,11 +979,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::PersistHistory(file) => {
                 // A history write failing (read-only directory, full disk)
-                // must never take the session down with it. Skipped
-                // entirely when the profile directory is unwritable this
-                // session (config-profile-directory; design D2).
+                // must never take the session down with it — but the failure
+                // is logged rather than silently dropped (error-diagnostics
+                // design D3). Skipped entirely when the profile directory is
+                // unwritable this session (config-profile-directory; design
+                // D2).
                 if rt.persist_enabled {
-                    let _ = config::save_history_file_atomic(&rt.history_path, &file);
+                    diag::log_err("persist", format_args!("history write {}", rt.history_path.display()), config::save_history_file_atomic(&rt.history_path, &file));
                 }
             }
             Effect::PersistTheme(name) => {
@@ -911,21 +994,21 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // in memory either way); likewise skipped when persistence
                 // is off for the session (design D2).
                 if rt.persist_enabled {
-                    let _ = config::save_theme_atomic(&rt.config_path, &name);
+                    diag::log_err("persist", format_args!("config write {}", rt.config_path.display()), config::save_theme_atomic(&rt.config_path, &name));
                 }
             }
             Effect::PersistPanelSplit(percent) => {
                 // Same tolerance as the theme write above (panel-split
                 // "Split persistence to configuration"; design D2).
                 if rt.persist_enabled {
-                    let _ = config::save_panel_split_atomic(&rt.config_path, percent);
+                    diag::log_err("persist", format_args!("config write {}", rt.config_path.display()), config::save_panel_split_atomic(&rt.config_path, percent));
                 }
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
                 // or network probing. Fed straight back so the dialog's
                 // first painted frame already lists every letter.
-                let _ = rt.tx.send(Command::DriveListReady { target, drives: drives::enumerate_drives() });
+                worker::deliver(&rt.tx, "drive list", Command::DriveListReady { target, drives: drives::enumerate_drives() });
             }
             Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
@@ -945,10 +1028,10 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     // thread, exactly like `EnumerateDrives`.
                     let file_len = source.len();
                     rt.viewer_source = Some((path.clone(), source));
-                    let _ = rt.tx.send(Command::ViewerOpened { path, file_len });
+                    worker::deliver(&rt.tx, "viewer opened", Command::ViewerOpened { path, file_len });
                 }
                 Err(e) => {
-                    let _ = rt.tx.send(Command::ViewerOpenFailed { message: e.to_string() });
+                    worker::deliver(&rt.tx, "viewer open failure", Command::ViewerOpenFailed { message: cannot_message("open", &path, &e) });
                 }
             },
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
@@ -963,7 +1046,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                         // panel that owned the cursor entry, mirroring
                         // `RunShellCommand` (external-editor: Synchronous wait
                         // and panel re-read — "Panel refreshed after edit").
-                        let _ = rt.tx.send(Command::RereadPanel(side));
+                        worker::deliver(&rt.tx, "panel re-read", Command::RereadPanel(side));
                         // Commands → Menu file edit returns through here too:
                         // reload the user menu when the file the editor had
                         // open was `usermenu.toml` (design D4). A panel F4
@@ -974,7 +1057,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                         }
                     }
                     Err(message) => {
-                        let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
+                        worker::deliver(&rt.tx, "external editor failure", Command::ExternalEditorSpawnFailed { message });
                     }
                 }
             }
@@ -984,13 +1067,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // input path rather than warranting a worker thread (design
                 // D1).
                 Ok(EditorLoadResult::Loaded(editor)) => {
-                    let _ = rt.tx.send(Command::EditorOpened(Box::new(editor)));
+                    worker::deliver(&rt.tx, "editor opened", Command::EditorOpened(Box::new(editor)));
                 }
                 Ok(EditorLoadResult::TooLarge { size }) => {
-                    let _ = rt.tx.send(Command::EditorTooLarge { path, size });
+                    worker::deliver(&rt.tx, "editor too large", Command::EditorTooLarge { path, size });
                 }
                 Err(e) => {
-                    let _ = rt.tx.send(Command::EditorOpenFailed { message: e.to_string() });
+                    worker::deliver(&rt.tx, "editor open failure", Command::EditorOpenFailed { message: cannot_message("open", &path, &e) });
                 }
             },
             Effect::FindInSubtree { root, pattern, request } => {
@@ -1000,10 +1083,10 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 let mut editor = *editor;
                 match editor.save() {
                     Ok(()) => {
-                        let _ = rt.tx.send(Command::EditorSaved { editor: Box::new(editor), then_quit });
+                        worker::deliver(&rt.tx, "editor saved", Command::EditorSaved { editor: Box::new(editor), then_quit });
                     }
                     Err(e) => {
-                        let _ = rt.tx.send(Command::EditorSaveFailed { message: e.to_string() });
+                        worker::deliver(&rt.tx, "editor save failure", Command::EditorSaveFailed { message: cannot_message("save", &editor.path, &e) });
                     }
                 }
             }
@@ -1024,7 +1107,7 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     ClipboardPayloadKind::Names => (rt.clipboard.set_text(&clipboard::names_text(&items)), false),
                 };
                 let normalized_payload = update::ClipboardPayload { kind: payload.kind, items };
-                let _ = rt.tx.send(Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
+                worker::deliver(&rt.tx, "clipboard result", Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
             }
             Effect::ReadClipboardText => {
                 // The read half of paste (text-field-editing "Paste into a
@@ -1038,13 +1121,23 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 if let Some(text) = rt.clipboard.get_text() {
                     let text = text.replace("\r\n", " ").replace('\r', " ").replace('\n', " ");
                     if !text.is_empty() {
-                        let _ = rt.tx.send(Command::TextEdit(filecommand_core::line_edit::TextEditOp::Paste(text)));
+                        worker::deliver(&rt.tx, "paste", Command::TextEdit(filecommand_core::line_edit::TextEditOp::Paste(text)));
                     }
                 }
             }
         }
     }
     Ok(quit)
+}
+
+/// The status-line error forms of filesystem-error-handling "Error messages
+/// name the affected path" (error-diagnostics design D4): `Cannot
+/// <verb> <name>: <reason>`, where the name is the file's own name — the
+/// panel title directly above already shows the directory, and a full path
+/// would push the reason off the truncated mini-status — or the whole path
+/// when there is no file name (a drive or share root).
+fn cannot_message(verb: &str, path: &Path, reason: impl std::fmt::Display) -> String {
+    format!("Cannot {verb} {}: {reason}", worker::name_or_path(path))
 }
 
 /// Suspend the TUI, run the command on the real terminal, and come back.
@@ -1514,6 +1607,80 @@ mod tests {
         assert_eq!(parse_launch_args(["--nosplash".to_string()]).config_dir, None);
     }
 
+    // -- error-diagnostics "Optional diagnostic log" ----------------------
+
+    /// Parser: `--log <path>` (space-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_log_with_a_space_separated_value() {
+        let opts = parse_launch_args(["--log".to_string(), "D:\\logs\\fc.log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some("D:\\logs\\fc.log"));
+        assert!(!opts.no_splash && !opts.no_mouse && !opts.no_animations);
+        assert_eq!(opts.theme, None);
+        assert_eq!(opts.config_dir, None);
+    }
+
+    /// Parser: `--log=<path>` (equals-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_log_with_an_equals_separated_value() {
+        let opts = parse_launch_args(["--log=fc.log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some("fc.log"));
+    }
+
+    /// Parser: `--log` as the final argument has no value to consume,
+    /// recorded as an empty string (the "--log needs a path" startup warning
+    /// downstream, never a crash) — the same convention as `--theme`
+    /// (design D2).
+    #[test]
+    fn parse_launch_args_records_an_empty_value_when_log_has_no_following_argument() {
+        let opts = parse_launch_args(["--log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some(""));
+    }
+
+    /// Parser: no `--log` switch at all leaves the field unset, distinct
+    /// from the missing-value case above.
+    #[test]
+    fn parse_launch_args_leaves_log_unset_when_the_switch_is_absent() {
+        assert_eq!(parse_launch_args(["--nosplash".to_string()]).log, None);
+    }
+
+    /// Design D2 / "The flag wins over the environment variable": a present
+    /// `--log` beats `FILECOMMAND_LOG`; with no flag the variable applies,
+    /// unless it is empty or unset.
+    #[test]
+    fn resolve_log_path_prefers_the_flag_over_the_environment() {
+        assert_eq!(resolve_log_path(Some("flag.log"), Some("env.log")), Ok(Some("flag.log".to_string())));
+        assert_eq!(resolve_log_path(None, Some("env.log")), Ok(Some("env.log".to_string())), "the variable enables logging without the flag");
+        assert_eq!(resolve_log_path(None, None), Ok(None), "neither set: logging stays off");
+        assert_eq!(resolve_log_path(None, Some("")), Ok(None), "an empty variable counts as unset");
+        assert_eq!(resolve_log_path(Some("flag.log"), None), Ok(Some("flag.log".to_string())));
+    }
+
+    /// Design D2 / "the flag is given without a path": an empty `--log`
+    /// value is a startup warning naming the switch, and it still wins over
+    /// the variable (an empty flag must not silently fall back).
+    #[test]
+    fn resolve_log_path_warns_when_the_flag_has_no_path() {
+        let warning = resolve_log_path(Some(""), Some("env.log")).expect_err("an empty flag value warns");
+        assert!(warning.contains("--log"), "the warning names the switch: {warning}");
+        assert!(warning.contains("path"), "the warning says what is missing: {warning}");
+    }
+
+    /// Design D2 / "Unwritable log path warns and continues": an
+    /// unopenable log path becomes a startup warning naming the path and
+    /// the reason it could not be opened; `None` (no log requested) stays
+    /// silent. The failing call never enables the global log, so this test
+    /// is safe for the other diag tests in the binary.
+    #[test]
+    fn init_diagnostic_log_warns_naming_path_and_reason_when_open_fails() {
+        let missing_dir = std::env::temp_dir().join(format!("filecommand-tui-app-log-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing_dir);
+        let path = missing_dir.join("fc.log");
+        let warning = init_diagnostic_log(Some(path.display().to_string())).expect("an unopenable log path warns");
+        assert!(warning.contains("Diagnostic log disabled"), "{warning}");
+        assert!(warning.contains(&path.display().to_string()), "the warning names the path: {warning}");
+        assert_eq!(init_diagnostic_log(None), None, "no log requested, no warning");
+    }
+
     /// Task 1.1: a missing value becomes a warning and normal resolution
     /// continues; a real value passes through untouched.
     #[test]
@@ -1765,6 +1932,31 @@ mod tests {
         let result = spawn_editor_and_wait(&inv);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("filecommand-definitely-not-a-real-editor-binary"));
+    }
+
+    // -- error-diagnostics: status-line errors name the item (task 4.3) ---
+
+    /// filesystem-error-handling "Error messages name the affected path":
+    /// the viewer and editor open failures read `Cannot open <file>: <OS
+    /// message>` (scenario "Viewer open failure names the file").
+    #[test]
+    fn cannot_message_formats_the_viewer_and_editor_open_failure() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "Access is denied. (os error 5)");
+        let path = Path::new("dir").join("locked.db");
+        assert_eq!(cannot_message("open", &path, &err), "Cannot open locked.db: Access is denied. (os error 5)");
+    }
+
+    /// Scenario "Editor save failure names the file": `Cannot save <file>:
+    /// <reason>`, where the reason may be the editor's own refusal text as
+    /// well as an OS message.
+    #[test]
+    fn cannot_message_formats_the_editor_save_failure() {
+        let err = io::Error::new(io::ErrorKind::StorageFull, "There is not enough space on the disk. (os error 112)");
+        let path = Path::new("dir").join("notes.txt");
+        assert_eq!(cannot_message("save", &path, &err), "Cannot save notes.txt: There is not enough space on the disk. (os error 112)");
+        // A non-`io::Error` reason (the editor's own refusal) formats the
+        // same way around it.
+        assert_eq!(cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"), "Cannot save notes.txt: notes.txt is read-only — not saved");
     }
 
     /// open-with-associated-app design D1 / file-action-menu "Open with the

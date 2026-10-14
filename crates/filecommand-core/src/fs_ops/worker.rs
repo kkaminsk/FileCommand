@@ -79,7 +79,7 @@ fn run_mkdir(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
     let mut error_policy = ErrorPolicy::new();
     let outcome = match attempt_with_recovery(&target, &mut error_policy, sink, || fs.create_dir(&target)) {
         RetryOutcome::Done => JobOutcome::Completed { skipped: vec![] },
-        RetryOutcome::Skip(reason) => JobOutcome::Cancelled { skipped: vec![SkippedItem { path: target.clone(), reason }] },
+        RetryOutcome::Skip(reason) => JobOutcome::Cancelled { skipped: vec![SkippedItem::skipped(target.clone(), reason)] },
         RetryOutcome::Abort => JobOutcome::Cancelled { skipped: vec![] },
     };
     sink.done(outcome);
@@ -101,7 +101,7 @@ fn walk_delete(fs: &dyn FileSystem, abs: &Path, out: &mut Vec<DeleteItem>, skipp
     let md = match fs.metadata(abs) {
         Ok(m) => m,
         Err(e) => {
-            skipped.push(SkippedItem { path: abs.to_path_buf(), reason: e.to_string() });
+            skipped.push(SkippedItem::skipped(abs.to_path_buf(), e.to_string()));
             return;
         }
     };
@@ -117,7 +117,7 @@ fn walk_delete(fs: &dyn FileSystem, abs: &Path, out: &mut Vec<DeleteItem>, skipp
                 }
                 out.push(DeleteItem::Dir { path: abs.to_path_buf() });
             }
-            Err(e) => skipped.push(SkippedItem { path: abs.to_path_buf(), reason: e.to_string() }),
+            Err(e) => skipped.push(SkippedItem::skipped(abs.to_path_buf(), e.to_string())),
         }
     } else {
         out.push(DeleteItem::File { path: abs.to_path_buf(), size: md.size, readonly: md.readonly });
@@ -169,7 +169,7 @@ fn run_delete(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
                 }
                 sink.progress(progress.clone());
             }
-            RetryOutcome::Skip(reason) => skipped.push(SkippedItem { path, reason }),
+            RetryOutcome::Skip(reason) => skipped.push(SkippedItem::skipped(path, reason)),
             RetryOutcome::Abort => {
                 cancelled = true;
                 break 'items;
@@ -210,7 +210,7 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<
     let md = match fs.metadata(abs) {
         Ok(m) => m,
         Err(e) => {
-            plan.skipped.push(SkippedItem { path: abs.to_path_buf(), reason: e.to_string() });
+            plan.skipped.push(SkippedItem::skipped(abs.to_path_buf(), e.to_string()));
             return;
         }
     };
@@ -239,10 +239,7 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<
     // the tree already being copied — via the *real* (followed) identity.
     if let Some(id) = fs.metadata_follow(abs).ok().and_then(|m| m.file_id) {
         if !visited.insert(id) {
-            plan.skipped.push(SkippedItem {
-                path: abs.to_path_buf(),
-                reason: "skipped: reparse point forms a cycle back into the source tree".to_string(),
-            });
+            plan.skipped.push(SkippedItem::skipped(abs.to_path_buf(), "skipped: reparse point forms a cycle back into the source tree".to_string()));
             return;
         }
     }
@@ -254,7 +251,7 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<
                 walk_copy(fs, &abs.join(&entry.name), &rel.join(&entry.name), visited, plan);
             }
         }
-        Err(e) => plan.skipped.push(SkippedItem { path: abs.to_path_buf(), reason: e.to_string() }),
+        Err(e) => plan.skipped.push(SkippedItem::skipped(abs.to_path_buf(), e.to_string())),
     }
 }
 
@@ -274,6 +271,9 @@ fn copy_one_file(
     sink: &mut dyn JobSink,
     progress: &mut ProgressInfo,
     bytes_done_baseline: u64,
+    streams_supported: bool,
+    streams_not_copied: &mut usize,
+    warnings: &mut Vec<SkippedItem>,
 ) -> CopyOneResult {
     loop {
         let result = fs.copy_file_chunked(src, dst, CHUNK_BYTES, &mut |done| {
@@ -287,17 +287,7 @@ fn copy_one_file(
         });
         match result {
             Ok(bytes) => {
-                for name in fs.list_streams(src).unwrap_or_default() {
-                    let _ = fs.copy_stream_chunked(src, &name, dst, CHUNK_BYTES);
-                }
-                if let Ok(md) = fs.metadata_follow(src) {
-                    if let Some(modified) = md.modified {
-                        let _ = fs.set_modified(dst, modified);
-                    }
-                    if md.readonly {
-                        let _ = fs.set_readonly(dst, true);
-                    }
-                }
+                restore_metadata(fs, src, dst, streams_supported, streams_not_copied, warnings);
                 return CopyOneResult::Done(bytes);
             }
             Err(e) if is_cancelled(&e) => return CopyOneResult::Cancelled,
@@ -313,6 +303,54 @@ fn copy_one_file(
                     ErrorChoice::Skip | ErrorChoice::SkipAll => return CopyOneResult::Failed(msg),
                     ErrorChoice::Abort => return CopyOneResult::Aborted,
                 }
+            }
+        }
+    }
+}
+
+/// After a successful content copy, carry over what the plain copy does
+/// not: named alternate streams, the modification time, and the read-only
+/// attribute. Every failure is recorded as a [`SkippedItem`] *warning*
+/// against the destination path rather than silently discarded — the file
+/// itself still counts as copied (error-diagnostics design D5;
+/// operation-dialogs "Metadata-restore failures are reported in the
+/// end-of-job summary").
+///
+/// When the destination volume has no named-stream support at all, per-file
+/// stream copies are skipped entirely and the file is counted in
+/// `streams_not_copied` instead, so the job reports one aggregated warning
+/// rather than one per file.
+fn restore_metadata(
+    fs: &dyn FileSystem,
+    src: &Path,
+    dst: &Path,
+    streams_supported: bool,
+    streams_not_copied: &mut usize,
+    warnings: &mut Vec<SkippedItem>,
+) {
+    match fs.list_streams(src) {
+        Ok(streams) => {
+            if streams_supported {
+                for name in streams {
+                    if let Err(e) = fs.copy_stream_chunked(src, &name, dst, CHUNK_BYTES) {
+                        warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("stream {} not copied: {e}", name.to_string_lossy())));
+                    }
+                }
+            } else if !streams.is_empty() {
+                *streams_not_copied += 1;
+            }
+        }
+        Err(e) => warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("alternate data streams not listed: {e}"))),
+    }
+    if let Ok(md) = fs.metadata_follow(src) {
+        if let Some(modified) = md.modified {
+            if let Err(e) = fs.set_modified(dst, modified) {
+                warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("modification time not restored: {e}")));
+            }
+        }
+        if md.readonly {
+            if let Err(e) = fs.set_readonly(dst, true) {
+                warnings.push(SkippedItem::warning(dst.to_path_buf(), format!("read-only attribute not restored: {e}")));
             }
         }
     }
@@ -376,6 +414,13 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
     let mut error_policy = ErrorPolicy::new();
     let mut skipped = plan.skipped;
     let mut cancelled = false;
+    // Asked once per job (error-diagnostics design D5): a destination
+    // volume without named-stream support (FAT32/exFAT) would otherwise
+    // produce one stream warning per file. An error answers "supported", so
+    // genuine per-file failures still surface individually. The aggregate
+    // count is reported as a single job-level warning below.
+    let streams_supported = fs.supports_named_streams(&job.dest_dir).unwrap_or(true);
+    let mut streams_not_copied = 0usize;
 
     'dirs: for rel_dir in &plan.dirs {
         if sink.is_cancelled() {
@@ -390,7 +435,7 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
         });
         match outcome {
             RetryOutcome::Done => {}
-            RetryOutcome::Skip(reason) => skipped.push(SkippedItem { path: target, reason }),
+            RetryOutcome::Skip(reason) => skipped.push(SkippedItem::skipped(target, reason)),
             RetryOutcome::Abort => {
                 cancelled = true;
                 break 'dirs;
@@ -415,10 +460,7 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
             // file is skipped outright — nothing is written, no conflict is
             // raised, and a move's source removal is never reached.
             if same_file(fs, &planned.src_abs, &target) {
-                skipped.push(SkippedItem {
-                    path: planned.src_abs.clone(),
-                    reason: "source and destination are the same file".to_string(),
-                });
+                skipped.push(SkippedItem::skipped(planned.src_abs.clone(), "source and destination are the same file".to_string()));
                 continue 'files;
             }
 
@@ -447,7 +489,7 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                         let _ = fs.set_readonly(&target, false);
                     }
                     ConflictChoice::Skip | ConflictChoice::SkipAll => {
-                        skipped.push(SkippedItem { path: target, reason: "target already exists".to_string() });
+                        skipped.push(SkippedItem::skipped(target, "target already exists".to_string()));
                         do_copy = false;
                     }
                     ConflictChoice::Rename(new_name) => {
@@ -458,7 +500,7 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
 
             if do_copy {
                 let baseline = progress.bytes_done;
-                match copy_one_file(fs, &planned.src_abs, &final_target, &mut error_policy, sink, &mut progress, baseline) {
+                match copy_one_file(fs, &planned.src_abs, &final_target, &mut error_policy, sink, &mut progress, baseline, streams_supported, &mut streams_not_copied, &mut skipped) {
                     CopyOneResult::Done(bytes) => {
                         progress.files_done += 1;
                         progress.bytes_done = baseline + bytes;
@@ -474,7 +516,7 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                     }
                     CopyOneResult::Failed(reason) => {
                         progress.bytes_done = baseline;
-                        skipped.push(SkippedItem { path: planned.src_abs.clone(), reason });
+                        skipped.push(SkippedItem::skipped(planned.src_abs.clone(), reason));
                     }
                 }
             }
@@ -487,6 +529,18 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
         for rel_dir in plan.dirs.iter().rev() {
             let _ = fs.remove_dir(&job.source_dir.join(rel_dir));
         }
+    }
+
+    // One aggregated warning when the destination volume cannot hold named
+    // streams at all, rather than one warning per file (error-diagnostics
+    // design D5; operation-dialogs "Metadata-restore failures are reported
+    // in the end-of-job summary": "A destination without stream support
+    // yields one warning").
+    if streams_not_copied > 0 {
+        skipped.push(SkippedItem::warning(
+            job.dest_dir.clone(),
+            format!("alternate data streams not supported; streams of {streams_not_copied} file(s) not copied"),
+        ));
     }
 
     sink.done(if cancelled { JobOutcome::Cancelled { skipped } } else { JobOutcome::Completed { skipped } });
@@ -534,7 +588,7 @@ fn run_move_same_volume(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) 
                         let _ = if target_md.is_dir { fs.remove_dir(&target) } else { fs.remove_file(&target) };
                     }
                     ConflictChoice::Skip | ConflictChoice::SkipAll => {
-                        skipped.push(SkippedItem { path: target, reason: "target already exists".to_string() });
+                        skipped.push(SkippedItem::skipped(target, "target already exists".to_string()));
                         continue 'items;
                     }
                     ConflictChoice::Rename(new_name) => final_target = job.dest_dir.join(new_name),
@@ -548,7 +602,7 @@ fn run_move_same_volume(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) 
                 progress.files_done += 1;
                 sink.progress(progress.clone());
             }
-            RetryOutcome::Skip(reason) => skipped.push(SkippedItem { path: src.path.clone(), reason }),
+            RetryOutcome::Skip(reason) => skipped.push(SkippedItem::skipped(src.path.clone(), reason)),
             RetryOutcome::Abort => {
                 cancelled = true;
                 break 'items;
@@ -607,7 +661,7 @@ fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
                     let _ = if target_md.is_dir { fs.remove_dir(&target) } else { fs.remove_file(&target) };
                 }
                 ConflictChoice::Skip | ConflictChoice::SkipAll => {
-                    skipped.push(SkippedItem { path: target, reason: "target already exists".to_string() });
+                    skipped.push(SkippedItem::skipped(target, "target already exists".to_string()));
                     sink.done(JobOutcome::Completed { skipped });
                     return;
                 }
@@ -625,7 +679,7 @@ fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
             JobOutcome::Completed { skipped }
         }
         RetryOutcome::Skip(reason) => {
-            skipped.push(SkippedItem { path: src.path.clone(), reason });
+            skipped.push(SkippedItem::skipped(src.path.clone(), reason));
             JobOutcome::Completed { skipped }
         }
         RetryOutcome::Abort => JobOutcome::Cancelled { skipped },
@@ -636,7 +690,8 @@ fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fs_ops::fs::{FakeFs, FsMetadata, RawEntry};
+    use crate::fs_ops::error::ItemKind;
+    use crate::fs_ops::fs::{FakeFs, FsMetadata, InjectableOp, RawEntry};
     use crate::fs_ops::job::{CancelFlag, SourceItem};
     use std::ffi::{OsStr, OsString};
     use std::sync::{Arc, Mutex};
@@ -1353,6 +1408,9 @@ mod tests {
         ) -> io::Result<u64> {
             self.0.copy_stream_chunked(from, stream, to, chunk_bytes)
         }
+        fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
+            self.0.supports_named_streams(path)
+        }
         fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
             self.0.same_volume(a, b)
         }
@@ -1401,5 +1459,190 @@ mod tests {
         let different_case = Path::new("/work/Report.txt");
         assert!(normalized_paths_equal(with_dot, plain));
         assert!(!normalized_paths_equal(different_case, plain));
+    }
+
+    // -------------------------------------------------------------
+    // error-diagnostics: metadata-restore warnings (task 5.4)
+    // -------------------------------------------------------------
+
+    /// A one-file copy job `/src/<name>` → `/dst`.
+    fn copy_job_of(name: &str) -> Job {
+        Job {
+            kind: JobKind::Copy,
+            sources: vec![source(name, &format!("/src/{name}"))],
+            source_dir: PathBuf::from("/src"),
+            dest_dir: PathBuf::from("/dst"),
+            new_dir_name: None,
+        }
+    }
+
+    /// The pinned source mtime that exercises the modification-time
+    /// restore (a `FakeFs` file starts with `modified: None`, which skips
+    /// the restore entirely).
+    fn pin_modified(fake: &FakeFs, path: &Path) {
+        fake.set_modified(path, SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000)).unwrap();
+    }
+
+    #[test]
+    fn set_modified_failure_becomes_a_warning_and_the_file_still_counts() {
+        // operation-dialogs "Metadata-restore failures are reported in the
+        // end-of-job summary": "Timestamp restore failure becomes a
+        // warning".
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/report.docx"), 10);
+        pin_modified(&fake, Path::new("/src/report.docx"));
+        fake.add_dir(Path::new("/dst"));
+        fake.inject(InjectableOp::SetModified, Path::new("/dst/report.docx"), io::ErrorKind::PermissionDenied);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("report.docx"), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "exactly one warning, and it is not a skip: {skipped:?}");
+                assert_eq!(skipped[0].kind, ItemKind::Warning);
+                assert_eq!(skipped[0].path, PathBuf::from("/dst/report.docx"), "the warning names the destination path");
+                assert!(skipped[0].reason.starts_with("modification time not restored: "), "{}", skipped[0].reason);
+            }
+            other => panic!("expected Completed with one warning, got {other:?}"),
+        }
+        assert!(sink.events.iter().any(|e| e == "progress:1/1"), "the file counts toward completed files");
+        assert!(fake.metadata(Path::new("/dst/report.docx")).is_ok(), "the destination content was written");
+    }
+
+    #[test]
+    fn stream_copy_failure_becomes_a_warning_naming_the_stream() {
+        // "Alternate data stream copy failure becomes a warning".
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file_with_stream(Path::new("/src/photo.jpg"), 100, "Zone.Identifier", 24);
+        fake.add_dir(Path::new("/dst"));
+        fake.inject(InjectableOp::CopyStream, Path::new("/dst/photo.jpg"), io::ErrorKind::PermissionDenied);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("photo.jpg"), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "one warning for the failed stream: {skipped:?}");
+                assert_eq!(skipped[0].kind, ItemKind::Warning);
+                assert_eq!(skipped[0].path, PathBuf::from("/dst/photo.jpg"));
+                assert!(skipped[0].reason.starts_with("stream Zone.Identifier not copied: "), "names the stream: {}", skipped[0].reason);
+            }
+            other => panic!("expected Completed with one warning, got {other:?}"),
+        }
+        assert!(sink.events.iter().any(|e| e == "progress:1/1"));
+        assert_eq!(fake.metadata(Path::new("/dst/photo.jpg")).unwrap().size, 100, "the main content copied");
+    }
+
+    #[test]
+    fn stream_listing_failure_becomes_a_single_warning() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file_with_stream(Path::new("/src/a.txt"), 10, "Zone.Identifier", 3);
+        fake.add_dir(Path::new("/dst"));
+        // The listing is taken on the *source*; the warning is recorded
+        // against the destination (design D5).
+        fake.inject(InjectableOp::ListStreams, Path::new("/src/a.txt"), io::ErrorKind::PermissionDenied);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("a.txt"), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "one warning for the failed listing: {skipped:?}");
+                assert_eq!(skipped[0].kind, ItemKind::Warning);
+                assert_eq!(skipped[0].path, PathBuf::from("/dst/a.txt"));
+                assert!(skipped[0].reason.starts_with("alternate data streams not listed: "), "{}", skipped[0].reason);
+            }
+            other => panic!("expected Completed with one warning, got {other:?}"),
+        }
+        assert!(sink.events.iter().any(|e| e == "progress:1/1"));
+    }
+
+    #[test]
+    fn read_only_restore_failure_becomes_a_warning() {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file(Path::new("/src/ro.txt"), 4);
+        fake.set_readonly(Path::new("/src/ro.txt"), true).unwrap();
+        fake.add_dir(Path::new("/dst"));
+        fake.inject(InjectableOp::SetReadonly, Path::new("/dst/ro.txt"), io::ErrorKind::PermissionDenied);
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("ro.txt"), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "one warning for the failed restore: {skipped:?}");
+                assert_eq!(skipped[0].kind, ItemKind::Warning);
+                assert_eq!(skipped[0].path, PathBuf::from("/dst/ro.txt"));
+                assert!(skipped[0].reason.starts_with("read-only attribute not restored: "), "{}", skipped[0].reason);
+            }
+            other => panic!("expected Completed with one warning, got {other:?}"),
+        }
+        assert!(sink.events.iter().any(|e| e == "progress:1/1"));
+    }
+
+    #[test]
+    fn a_destination_without_stream_support_yields_one_job_level_warning() {
+        // "A destination without stream support yields one warning":
+        // forty-files-on-FAT32, shrunk to three.
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        for (name, size) in [("a.txt", 10u64), ("b.txt", 20), ("c.txt", 30)] {
+            fake.add_file_with_stream(Path::new(&format!("/src/{name}")), size, "Zone.Identifier", 3);
+        }
+        fake.add_dir(Path::new("/dst"));
+        fake.set_named_streams_supported(false);
+
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![source("a.txt", "/src/a.txt"), source("b.txt", "/src/b.txt"), source("c.txt", "/src/c.txt")],
+            source_dir: PathBuf::from("/src"),
+            dest_dir: PathBuf::from("/dst"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "one aggregated warning, not one per file: {skipped:?}");
+                assert_eq!(skipped[0].kind, ItemKind::Warning);
+                assert_eq!(skipped[0].path, PathBuf::from("/dst"), "the warning names the destination");
+                assert_eq!(skipped[0].reason, "alternate data streams not supported; streams of 3 file(s) not copied");
+            }
+            other => panic!("expected Completed with one warning, got {other:?}"),
+        }
+        assert!(sink.events.iter().any(|e| e == "progress:3/3"), "all three files still count as copied");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let dst = PathBuf::from(format!("/dst/{name}"));
+            assert!(fake.metadata(&dst).is_ok(), "{name} was copied");
+            assert!(fake.list_streams(&dst).unwrap().is_empty(), "no per-file stream copy was attempted for {name}");
+        }
+    }
+
+    #[test]
+    fn a_clean_copy_records_no_warnings_and_an_empty_skipped() {
+        // "Clean job shows no summary": a copy whose metadata all restores
+        // leaves the outcome's skipped vector empty.
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/src"));
+        fake.add_file_with_stream(Path::new("/src/a.txt"), 10, "Zone.Identifier", 3);
+        pin_modified(&fake, Path::new("/src/a.txt"));
+        fake.add_dir(Path::new("/dst"));
+
+        let mut sink = RecordingSink::new();
+        run_job(&copy_job_of("a.txt"), &fake, &mut sink);
+
+        assert!(
+            matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()),
+            "no warnings on a clean copy: {:?}",
+            sink.outcome
+        );
+        assert_eq!(fake.list_streams(Path::new("/dst/a.txt")).unwrap(), vec![OsString::from("Zone.Identifier")], "the stream was carried over");
+        assert!(fake.metadata(Path::new("/dst/a.txt")).unwrap().modified.is_some(), "the mtime was restored");
     }
 }

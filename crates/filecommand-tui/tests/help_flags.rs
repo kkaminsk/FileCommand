@@ -60,3 +60,13 @@ fn help_lists_the_noanimations_flag() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("--noanimations"), "--help should list --noanimations:\n{stdout}");
 }
+
+#[test]
+fn help_lists_the_log_flag_and_environment_variable() {
+    // error-diagnostics; application-shell "Optional diagnostic log":
+    // "Usage lists the log options".
+    let out = run("--help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--log <path>"), "--help should list --log <path>:\n{stdout}");
+    assert!(stdout.contains("FILECOMMAND_LOG"), "--help should mention FILECOMMAND_LOG:\n{stdout}");
+}

@@ -30,6 +30,7 @@ and supported.
   - [File operations](#file-operations)
   - [Viewer (F3) and editor (F4)](#viewer-f3-and-editor-f4)
   - [Themes](#themes)
+- [Diagnostics](#diagnostics)
 - [Project layout](#project-layout)
 - [Testing](#testing)
 - [Contributing](#contributing)
@@ -103,6 +104,7 @@ The workspace has two crates:
 | `--nomouse` | Disable mouse capture for this session, overriding `[mouse] enabled` in `config.toml`. |
 | `--noanimations` | Disable the decorative UI animations (splash entrance, menu and dialog openings, panel reveal) for this session, overriding `animations = true` in `config.toml`. |
 | `--config-dir <path>` or `--config-dir=<path>` | Use `<path>` as the profile directory holding `config.toml`, `history.json`, and `usermenu.toml` for this session, overriding portable mode and the platform default (see [Configuration](#configuration)). |
+| `--log <path>` or `--log=<path>` | Append diagnostic messages to `<path>` for this session (see [Diagnostics](#diagnostics)). Overrides the `FILECOMMAND_LOG` environment variable. |
 
 Flags can be combined in any order, e.g. `filecommand --nosplash --theme=purple-lights`.
 
@@ -583,6 +585,32 @@ each theme before you commit) or the F2 user menu; the choice persists to
 without touching the saved default. Every theme defines the full role set,
 including a dedicated `panel.hidden` role — a visibly dimmer variant of the
 theme's file color, used for hidden/system entries in the panels.
+
+## Diagnostics
+
+FileCommand keeps an **opt-in diagnostic log** for troubleshooting. It is
+off by default — nothing is created or written unless you ask for it:
+
+- `filecommand --log C:\temp\fc.log` (also accepted as `--log=<path>`), or
+- set the `FILECOMMAND_LOG` environment variable to the log path.
+
+When both are given, the flag wins. The file is opened in append mode, so
+earlier sessions' lines are kept; each line starts with a UTC timestamp and
+a short category. The log records the failures FileCommand otherwise
+handles quietly:
+
+- `persist` — a failed write of `history.json` or `config.toml`;
+- `channel` / `job` — a result or dialog answer that could not be delivered
+  between a worker thread and the event loop;
+- `copy` — metadata that could not be restored on a copied file (alternate
+  data streams, modification time, read-only attribute);
+- `startup` — every startup warning, including ones a later warning
+  replaced in the startup-warning dialog.
+
+If the log file cannot be opened, the session starts without logging and a
+startup warning names the path and the reason. When reporting an issue,
+attach the log file alongside the error text (see
+[Reporting issues](#reporting-issues)).
 
 ## Project layout
 
