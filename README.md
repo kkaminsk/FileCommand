@@ -221,8 +221,18 @@ defaults — and is never overwritten.
 
 ### `history.json`
 
-Command-line history and fuzzy-jump directory frecency data, written
-atomically so a crash mid-write never corrupts it. Not meant to be hand-edited.
+Command-line history and fuzzy-jump directory frecency data. Not meant to
+be hand-edited. Navigation never waits on the disk: changes are written in
+the background a few seconds after a burst of navigation settles (and
+within ten seconds at most), and anything still pending is written when
+FileCommand quits. Each write goes to a flushed temporary file that then
+atomically replaces `history.json`, so an interruption leaves either the
+previous or the new complete file. Before writing, FileCommand merges its
+history with the file on disk, so two instances sharing a profile keep
+each other's commands and directories. The directory history is capped at
+1,000 entries (the least frecent are dropped first); visit times are
+wall-clock, so Ctrl+J ranking stays meaningful across restarts, and a file
+from an earlier version is migrated on first load.
 
 ## Using FileCommand
 

@@ -27,6 +27,7 @@ use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
 use crate::console;
 use crate::diag;
+use crate::history_writer::HistoryWriter;
 use crate::hitmap::HitMap;
 use crate::input::{self, MouseTracker, ViewerInput};
 use crate::terminal::TerminalGuard;
@@ -56,7 +57,12 @@ const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 struct Runtime {
     tx: Sender<Command>,
     active_job: Option<worker::JobHandle>,
-    history_path: PathBuf,
+    /// The background `history.json` writer `Effect::PersistHistory` hands
+    /// its snapshot to; it owns the history path, and is the disabled no-op
+    /// when persistence is off for the session. Owned here so every exit
+    /// path from `run` flushes it on drop (fuzzy-jump "Quitting flushes
+    /// unwritten history"; history-persistence-hardening design D4).
+    history_writer: HistoryWriter,
     /// Where `Effect::PersistTheme` writes the `theme =` key back
     /// (theme-selection "Applied theme persists to configuration").
     config_path: PathBuf,
@@ -420,7 +426,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     let year = DateTime::from_system_time(SystemTime::now()).year;
     let identity_lines = identity::identity_lines(year);
 
-    let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
+    let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), wall_clock.epoch_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
     apply_launch_options(&mut state, &launch);
     // A `--log` switch with no value, an unopenable log file, a
@@ -447,9 +453,14 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     if let Some(warning) = theme_warning {
         set_startup_warning(&mut state, warning);
     }
-    let history_file = config::load_history_file(&history_path);
-    state.history = history_file.commands;
-    state.dir_history = history_file.directories;
+    // A file from an earlier build (no format marker) carries session-
+    // relative visit times; they are re-stamped to the startup epoch, future
+    // times are clamped, and the index is pruned to its cap (fuzzy-jump
+    // "Legacy history file is migrated at load"; design D2).
+    let mut loaded = config::load_history_document(&history_path);
+    config::migrate_loaded_history(&mut loaded.file, loaded.legacy, state.epoch_ms);
+    state.history = loaded.file.commands;
+    state.dir_history = loaded.file.directories;
     let user_menu = config::load_user_menu(&usermenu_path);
     config_warnings.extend(user_menu.warnings.iter().map(ToString::to_string));
     apply_user_menu(&mut state, user_menu);
@@ -473,10 +484,15 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
+    let history_writer = if persist_enabled {
+        HistoryWriter::spawn(history_path, crate::history_writer::DEBOUNCE, crate::history_writer::MAX_WAIT)
+    } else {
+        HistoryWriter::disabled()
+    };
     let mut rt = Runtime {
         tx,
         active_job: None,
-        history_path,
+        history_writer,
         config_path,
         usermenu_path,
         persist_enabled,
@@ -556,7 +572,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
 
         match next_event {
             Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
                 if quit {
                     return shutdown(&mut rt);
                 }
@@ -573,7 +589,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 }
             }
             Some(Event::Resize(w, h)) => {
-                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
                 if quit {
                     return shutdown(&mut rt);
                 }
@@ -585,7 +601,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 needs_draw = true;
             }
             Some(Event::Mouse(first)) => {
-                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
                 if quit {
                     return shutdown(&mut rt);
                 }
@@ -616,7 +632,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
             // one batch of commands into the field Ctrl+V would paste into,
             // drawn once.
             Some(Event::Paste(text)) => {
-                let (s, quit) = tick_before_input(state, &clock, &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
                 if quit {
                     return shutdown(&mut rt);
                 }
@@ -641,7 +657,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 let core_due = anim::next_wake_ms(&state).is_some_and(|wake| now >= wake);
                 let minute_due = wall_clock.now_local() != drawn_clock;
                 if core_due || minute_due {
-                    let (s, quit) = apply(state, Command::Tick(now), &mut guard, &mut rt)?;
+                    let (s, quit) = apply(state, Command::Tick { now_ms: now, epoch_ms: wall_clock.epoch_ms() }, &mut guard, &mut rt)?;
                     if quit {
                         return shutdown(&mut rt);
                     }
@@ -919,10 +935,13 @@ fn next_timeout(now: u64, core_wake: Option<u64>, minute_wake: Duration, workers
 /// double-click"). A no-op while the clock is already fresh; applies no
 /// transition early (a key during the splash hold still dismisses the
 /// splash, exactly as before).
-fn tick_before_input(state: State, clock: &RealClock, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
+fn tick_before_input(state: State, clock: &RealClock, wall_clock: &RealWallClock, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
     let now = clock.now_ms();
     if now.saturating_sub(state.clock_ms) > POLL_INTERVAL.as_millis() as u64 {
-        apply(state, Command::Tick(now), guard, rt)
+        // Both clocks travel in the tick, so a visit recorded right after an
+        // idle stretch is stamped with fresh wall-clock time too
+        // (history-persistence-hardening design D1).
+        apply(state, Command::Tick { now_ms: now, epoch_ms: wall_clock.epoch_ms() }, guard, rt)
     } else {
         Ok((state, false))
     }
@@ -1389,15 +1408,15 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 rt.mouse_tracker.reset();
             }
             Effect::PersistHistory(file) => {
-                // A history write failing (read-only directory, full disk)
-                // must never take the session down with it — but the failure
-                // is logged rather than silently dropped (error-diagnostics
-                // design D3). Skipped entirely when the profile directory is
-                // unwritable this session (config-profile-directory; design
-                // D2).
-                if rt.persist_enabled {
-                    diag::log_err("persist", format_args!("history write {}", rt.history_path.display()), config::save_history_file_atomic(&rt.history_path, &file));
-                }
+                // Handed to the background writer, which coalesces bursts,
+                // merges with the on-disk file, and writes durably off this
+                // thread (fuzzy-jump "Navigation does not wait for the
+                // history write"; history-persistence-hardening design D4).
+                // The writer is the disabled no-op when the profile
+                // directory is unwritable this session
+                // (config-profile-directory; design D2), and a failed write
+                // is logged there rather than taking the session down.
+                rt.history_writer.submit(file);
             }
             Effect::PersistTheme(name) => {
                 // Same tolerance as history: a failed config write must
@@ -1803,7 +1822,7 @@ mod tests {
         let mut rt = Runtime {
             tx,
             active_job: None,
-            history_path: dir.join("history.json"),
+            history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
             persist_enabled: false,
@@ -2436,7 +2455,7 @@ mod tests {
         assert_eq!(theme.name, Theme::terminal_green().name);
         assert_eq!(warning, None);
 
-        let (state, _) = State::initial(theme, (80, 24), 0, PathBuf::from("."), PathBuf::from("."), false);
+        let (state, _) = State::initial(theme, (80, 24), 0, 0, PathBuf::from("."), PathBuf::from("."), false);
         let (state, _) = update(state, Command::ThemePickerOpen);
         let target = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
         let current = state.theme_picker.as_ref().unwrap().highlight;
@@ -2501,6 +2520,40 @@ mod tests {
         let warning = state.startup_warning.expect("a not-UTF-8 user menu raises the dialog");
         assert!(warning.starts_with("usermenu.toml is not UTF-8 text"), "{warning}");
         assert!(warning.contains("re-save it as UTF-8"), "{warning}");
+    }
+
+    /// history-persistence-hardening design D1: the renderer ranks the
+    /// Ctrl+J list with `state.epoch_ms`, exactly as the reducer's Enter
+    /// does, so the first drawn row is the row Enter navigates to even when
+    /// the monotonic and wall clocks differ by decades.
+    #[test]
+    fn fuzzy_jump_renderer_and_reducer_rank_with_the_same_epoch_clock() {
+        use filecommand_core::quicksearch::FrecencyEntry;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let e = 1_787_000_000_000u64;
+        let day = 24 * 60 * 60 * 1000;
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 500;
+        state.epoch_ms = e + 3 * day + 60_000;
+        state.dir_history = vec![
+            FrecencyEntry { path: PathBuf::from(r"C:\old"), visit_count: 3, last_visited_ms: e },
+            FrecencyEntry { path: PathBuf::from(r"C:\new"), visit_count: 3, last_visited_ms: e + 3 * day },
+        ];
+        let (state, _) = update(state, Command::FuzzyJumpOpen);
+
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let mut buf = Buffer::empty(area);
+        views::fuzzy_jump::render_fuzzy_jump(&mut buf, area, &state.theme, ColorDepth::Ansi16, state.fuzzy_jump.as_ref().unwrap(), &state.dir_history, state.epoch_ms);
+        let first_row = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .find(|row| row.contains("C:\\"))
+            .expect("the list draws at least one directory row");
+        assert!(first_row.contains(r"C:\new"), "the renderer draws the more recently visited directory first: {first_row:?}");
+
+        let (state, effects) = update(state, Command::FuzzyJumpConfirm);
+        assert_eq!(state.left.cwd, PathBuf::from(r"C:\new"), "Enter lands on the row that was drawn first");
+        assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { path, .. } if path == Path::new(r"C:\new"))));
     }
 
     // -- configuration-files: the warning summary and its precedence ------

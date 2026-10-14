@@ -234,10 +234,16 @@ pub struct State {
     /// persisted alongside command history in `history.json` (fuzzy-jump
     /// "Directory history persistence"; design D6).
     pub dir_history: Vec<FrecencyEntry>,
-    /// The most recent clock reading `Command::Tick` delivered. Used to
-    /// timestamp frecency updates so `update` never reads a clock directly
-    /// — the TUI's injected `Clock` is still the only source of "now".
+    /// The most recent monotonic clock reading `Command::Tick` delivered.
+    /// Drives every animation and in-session timing; `update` never reads a
+    /// clock directly — the TUI's injected `Clock` is still the only source
+    /// of "now".
     pub clock_ms: u64,
+    /// The most recent wall-clock reading (Unix-epoch milliseconds)
+    /// `Command::Tick` delivered. Used only to stamp and rank frecency
+    /// visits, so recency stays meaningful across restarts (fuzzy-jump
+    /// "Frecency ranking"; history-persistence-hardening design D1).
+    pub epoch_ms: u64,
     /// The F2 user menu's entries, snapshotted from `usermenu.toml` at
     /// startup (user-menu "Parse label and command entries from
     /// usermenu.toml").
@@ -404,6 +410,7 @@ impl State {
             request_seq: 0,
             dir_history: Vec::new(),
             clock_ms: 0,
+            epoch_ms: 0,
             user_menu_entries: Vec::new(),
             fuzzy_jump: None,
             find_file: None,
@@ -440,11 +447,14 @@ impl State {
     /// Build the initial state and the effects needed to kick off both
     /// panels' first directory listings. `show_splash` should already
     /// account for both the config's `splash` flag and `--nosplash`
-    /// (flag wins).
+    /// (flag wins). `epoch_ms` is the wall-clock reading at startup, so
+    /// visits recorded before the first `Tick` are stamped correctly
+    /// (history-persistence-hardening design D1).
     pub fn initial(
         theme: Theme,
         term_size: (u16, u16),
         now_ms: u64,
+        epoch_ms: u64,
         left_cwd: PathBuf,
         right_cwd: PathBuf,
         show_splash: bool,
@@ -466,6 +476,7 @@ impl State {
             term_size,
             undersized,
             clock_ms: now_ms,
+            epoch_ms,
             ..State::empty(theme)
         };
         let mut effects = vec![
@@ -493,8 +504,11 @@ pub enum Command {
     ConfirmQuit,
     CancelQuit,
     Resize(u16, u16),
-    /// Current time in ms, supplied by the TUI's injected `Clock`.
-    Tick(u64),
+    /// The current time, supplied by the TUI's injected clocks: `now_ms`
+    /// from the monotonic `Clock` (animations, every in-session timing) and
+    /// `epoch_ms` from the `WallClock` (Unix-epoch milliseconds; frecency
+    /// stamps only — history-persistence-hardening design D1).
+    Tick { now_ms: u64, epoch_ms: u64 },
 
     // Adjustable panel split (Ctrl+Left/Ctrl+Right/Ctrl+=; panel-split
     // "Adjust and reset the panel split").
@@ -1283,10 +1297,11 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // as "the next key press" and clears it immediately instead of waiting
     // out the timer — except the two commands that manage the feedback
     // themselves, whose own handling below sets it fresh.
-    if let Command::Tick(now) = cmd {
-        state.clock_ms = now;
+    if let Command::Tick { now_ms, epoch_ms } = cmd {
+        state.clock_ms = now_ms;
+        state.epoch_ms = epoch_ms;
         for side in [PanelSide::Left, PanelSide::Right] {
-            if matches!(&state.panel(side).clipboard_feedback, Some(f) if now >= f.expires_at_ms) {
+            if matches!(&state.panel(side).clipboard_feedback, Some(f) if now_ms >= f.expires_at_ms) {
                 state.panel_mut(side).clipboard_feedback = None;
             }
         }
@@ -1472,8 +1487,8 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
 
     match &state.phase {
         UiPhase::Splash { started_at_ms } => match cmd {
-            Command::Tick(now) => {
-                if now.saturating_sub(*started_at_ms) >= SPLASH_MIN_HOLD_MS {
+            Command::Tick { now_ms, .. } => {
+                if now_ms.saturating_sub(*started_at_ms) >= SPLASH_MIN_HOLD_MS {
                     state.phase = UiPhase::Panels;
                 }
             }
@@ -1815,7 +1830,7 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             Command::DragCancel => state.drag = None,
 
-            Command::Tick(_) => {}
+            Command::Tick { .. } => {}
             Command::ConfirmQuit | Command::CancelQuit | Command::Resize(..) | Command::DialogButtonClick(_) => unreachable!("handled above"),
             _ => {}
         },
@@ -1936,10 +1951,10 @@ fn dispatch_cd(state: &mut State, text: &str, target: &str) -> Vec<Effect> {
     match probe_command_line_target(state, side, &path) {
         Some((true, _)) => {
             config::push_history(&mut state.history, text);
-            let mut effects =
-                vec![Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() })];
-            effects.extend(begin_listing(state, side, path));
-            effects
+            // `begin_listing` snapshots both histories into one
+            // `Effect::PersistHistory` after the push, so no separate
+            // persist is emitted here (history-persistence-hardening D4).
+            begin_listing(state, side, path)
         }
         Some((false, _)) => {
             state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
@@ -3634,14 +3649,16 @@ fn handle_fuzzy_jump(state: &mut State, cmd: Command) -> Vec<Effect> {
         Command::FuzzyJumpMove(delta) => {
             let len = {
                 let fj = state.fuzzy_jump.as_ref().unwrap();
-                quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.clock_ms).len()
+                quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.epoch_ms).len()
             };
             state.fuzzy_jump.as_mut().unwrap().move_cursor(delta, len);
         }
         Command::FuzzyJumpCancel => state.fuzzy_jump = None,
         Command::FuzzyJumpConfirm => {
             let fj = state.fuzzy_jump.take().unwrap();
-            let ranked = quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.clock_ms);
+            // Ranked with the epoch clock, the same one the renderer uses,
+            // so the row Enter acts on is the row that was drawn (design D1).
+            let ranked = quicksearch::rank_directories(&state.dir_history, fj.pattern.text(), state.epoch_ms);
             if let Some(path) = ranked.get(fj.cursor).map(|e| e.path.clone()) {
                 let side = state.active;
                 return begin_listing(state, side, path);
@@ -3983,7 +4000,9 @@ fn handle_help(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// via [`begin_listing_inner`] directly — see its doc comment for the two
 /// non-navigation callers.
 fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effect> {
-    quicksearch::record_visit(&mut state.dir_history, &path, state.clock_ms);
+    // Visits are stamped with wall-clock time so recency survives a restart
+    // (fuzzy-jump "Frecency ranking"; history-persistence-hardening D1).
+    quicksearch::record_visit(&mut state.dir_history, &path, state.epoch_ms);
     let mut effects = begin_listing_inner(state, side, path, true);
     effects.push(Effect::PersistHistory(config::HistoryFile { commands: state.history.clone(), directories: state.dir_history.clone() }));
     effects

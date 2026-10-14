@@ -41,11 +41,19 @@
 //! "Persisted configuration writes are durable", "Configuration rewrites
 //! keep settings in the top-level table").
 //!
-//! Command history persists to `history.json` next to the config, written
-//! atomically (temp file + rename) so a crash mid-write can never leave a
-//! truncated history behind. Its reader shares only the BOM strip with the
-//! TOML-like files; its JSON strings decode losslessly (surrogate pairs
-//! combine, a bad `\u` escape becomes U+FFFD) and never produce warnings.
+//! Command history and the Ctrl+J directory-frecency index persist to
+//! `history.json` next to the config, through the same durable helper
+//! (unique temp file, `sync_all`, atomic replace) so an interrupted write
+//! leaves either the previous or the new complete file. The document
+//! carries a `"version": 2` marker: a file without it was written by an
+//! earlier build whose visit times were session-relative, and
+//! [`migrate_loaded_history`] re-stamps those at load. Before every write
+//! the caller merges its snapshot with the file on disk
+//! ([`merge_history_files`]), so two instances never erase each other's
+//! history (history-persistence-hardening design D2, D5, D6). The reader
+//! shares only the BOM strip with the TOML-like files; its JSON strings
+//! decode losslessly (surrogate pairs combine, a bad `\u` escape becomes
+//! U+FFFD) and never produce warnings.
 //!
 //! The F2 user menu is loaded from `usermenu.toml`, a real (if minimal)
 //! TOML array-of-tables document — unlike `config.toml`/`history.json`
@@ -60,7 +68,7 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::quicksearch::FrecencyEntry;
+use crate::quicksearch::{self, FrecencyEntry};
 use crate::theme::DEFAULT_THEME_NAME;
 
 /// The settings file in the profile directory.
@@ -894,33 +902,24 @@ pub fn load_history(path: &Path) -> Vec<String> {
     }
 }
 
-/// Write history atomically: serialize to a sibling temp file, then rename
-/// over the target. `std::fs::rename` replaces an existing file on both
-/// Windows and Unix, so a reader never observes a partial write.
+/// Write the plain-array history durably through
+/// [`crate::durable::replace_file`] (unique temp file, `sync_all`, atomic
+/// replace), so a reader never observes a partial write and no two
+/// instances share a temp file name.
 pub fn save_history_atomic(path: &Path, entries: &[String]) -> io::Result<()> {
-    let tmp = temp_sibling(path);
+    ensure_parent_dir(path)?;
+    crate::durable::replace_file(path, render_history(entries).as_bytes())
+}
+
+/// Create `path`'s parent directory when it is missing, so a first write
+/// into a fresh profile directory succeeds.
+fn ensure_parent_dir(path: &Path) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(&tmp, render_history(entries))?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-fn temp_sibling(path: &Path) -> std::path::PathBuf {
-    let mut name = path.file_name().map(|n| n.to_os_string()).unwrap_or_else(|| std::ffi::OsString::from("history.json"));
-    name.push(".tmp");
-    match path.parent() {
-        Some(parent) => parent.join(name),
-        None => std::path::PathBuf::from(name),
-    }
+    Ok(())
 }
 
 /// Append `command` as the newest history entry, dropping any earlier
@@ -960,9 +959,14 @@ pub struct HistoryFile {
     pub directories: Vec<FrecencyEntry>,
 }
 
-/// Render a [`HistoryFile`] to its on-disk JSON object form.
+/// The `"version"` a `history.json` written by this build carries. A file
+/// without the key predates wall-clock visit times (design D2).
+pub const HISTORY_FORMAT_VERSION: u32 = 2;
+
+/// Render a [`HistoryFile`] to its on-disk JSON object form, with the
+/// format marker first.
 pub fn render_history_file(file: &HistoryFile) -> String {
-    let mut out = String::from("{\n  \"commands\": ");
+    let mut out = format!("{{\n  \"version\": {HISTORY_FORMAT_VERSION},\n  \"commands\": ");
     out.push_str(&render_string_array(&file.commands));
     out.push_str(",\n  \"directories\": [");
     for (i, d) in file.directories.iter().enumerate() {
@@ -986,39 +990,110 @@ pub fn render_history_file(file: &HistoryFile) -> String {
 /// malformed or hand-edited file degrades gracefully (fuzzy-jump "Missing
 /// or malformed history file").
 pub fn parse_history_file(input: &str) -> HistoryFile {
+    parse_history_document(input).file
+}
+
+/// A parsed `history.json` plus whether it predates the format marker
+/// (design D2): a `legacy` file's `last_visited_ms` values are
+/// session-relative and must be re-stamped by [`migrate_loaded_history`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HistoryLoad {
+    pub file: HistoryFile,
+    pub legacy: bool,
+}
+
+/// [`parse_history_file`] that also reports whether the top-level
+/// `"version"` key was absent. The key is found with the same top-level-only
+/// lookup as the arrays, so a `"version"` inside a command string is never
+/// mistaken for the marker. Tolerance for malformed content is unchanged: a
+/// file that is not an object at all is empty history, and `legacy`, which
+/// is harmless for an empty file.
+pub fn parse_history_document(input: &str) -> HistoryLoad {
     let input = strip_bom(input);
     let commands = extract_value_span(input, "commands").map(parse_history).unwrap_or_default();
     let directories = extract_value_span(input, "directories").map(parse_directories).unwrap_or_default();
-    HistoryFile { commands, directories }
+    let legacy = top_level_value(input, "version").is_none();
+    HistoryLoad { file: HistoryFile { commands, directories }, legacy }
 }
 
 /// Read a combined `history.json`. A missing or unreadable file, or one
 /// that fails to parse at all, is empty history — never an error (fuzzy-jump
 /// "Missing or malformed history file").
 pub fn load_history_file(path: &Path) -> HistoryFile {
+    load_history_document(path).file
+}
+
+/// [`load_history_file`] that also reports the legacy flag (see
+/// [`parse_history_document`]). A missing file is empty and not legacy:
+/// there is nothing to migrate.
+pub fn load_history_document(path: &Path) -> HistoryLoad {
     match std::fs::read_to_string(path) {
-        Ok(contents) => parse_history_file(&contents),
-        Err(_) => HistoryFile::default(),
+        Ok(contents) => parse_history_document(&contents),
+        Err(_) => HistoryLoad::default(),
     }
 }
 
-/// Write a combined `history.json` atomically: temp file + rename, mirroring
-/// [`save_history_atomic`].
+/// Bring a just-loaded history up to date (fuzzy-jump "Legacy history file
+/// is migrated at load", "Future last-visit time is clamped"; design D2):
+///
+/// - for a `legacy` file, every directory's `last_visited_ms` becomes
+///   `now_epoch`, so established directories rank by visit count and then
+///   age normally;
+/// - for any file, a `last_visited_ms` in the future (a corrected system
+///   clock) is clamped to `now_epoch`;
+/// - the directory list is pruned to [`quicksearch::MAX_DIR_HISTORY`].
+pub fn migrate_loaded_history(file: &mut HistoryFile, legacy: bool, now_epoch: u64) {
+    for entry in &mut file.directories {
+        if legacy || entry.last_visited_ms > now_epoch {
+            entry.last_visited_ms = now_epoch;
+        }
+    }
+    quicksearch::prune_to_cap(&mut file.directories, quicksearch::MAX_DIR_HISTORY, now_epoch);
+}
+
+/// Combine the `history.json` on disk with this instance's snapshot before a
+/// write, so concurrently running instances do not discard each other's
+/// entries (fuzzy-jump "Two instances keep each other's history"; design
+/// D5):
+///
+/// - directories are the union by path — a path in both keeps the larger
+///   visit count and the later visit time — this instance's entries first in
+///   their order, then disk-only entries in disk order, pruned to
+///   [`quicksearch::MAX_DIR_HISTORY`];
+/// - commands present only on disk come first, in disk order, then
+///   `mine.commands`, with the oldest dropped to fit [`MAX_HISTORY`].
+///
+/// `max` is idempotent, so repeated flushes never inflate counts.
+pub fn merge_history_files(disk: &HistoryFile, mine: &HistoryFile, now_epoch: u64) -> HistoryFile {
+    let mut directories = mine.directories.clone();
+    for theirs in &disk.directories {
+        match directories.iter_mut().find(|e| e.path == theirs.path) {
+            Some(ours) => {
+                ours.visit_count = ours.visit_count.max(theirs.visit_count);
+                ours.last_visited_ms = ours.last_visited_ms.max(theirs.last_visited_ms);
+            }
+            None => directories.push(theirs.clone()),
+        }
+    }
+    quicksearch::prune_to_cap(&mut directories, quicksearch::MAX_DIR_HISTORY, now_epoch);
+
+    let mut commands: Vec<String> = disk.commands.iter().filter(|c| !mine.commands.contains(c)).cloned().collect();
+    commands.extend(mine.commands.iter().cloned());
+    if commands.len() > MAX_HISTORY {
+        let excess = commands.len() - MAX_HISTORY;
+        commands.drain(0..excess);
+    }
+    HistoryFile { commands, directories }
+}
+
+/// Write a combined `history.json` durably through
+/// [`crate::durable::replace_file`]: a uniquely named temp file in the same
+/// directory, `sync_all`, then an atomic replace, with the temp file removed
+/// on failure (fuzzy-jump "Interrupted write leaves a complete file"; design
+/// D6).
 pub fn save_history_file_atomic(path: &Path, file: &HistoryFile) -> io::Result<()> {
-    let tmp = temp_sibling(path);
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(&tmp, render_history_file(file))?;
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
+    ensure_parent_dir(path)?;
+    crate::durable::replace_file(path, render_history_file(file).as_bytes())
 }
 
 /// Find the value of top-level `key` in the JSON object `object` and return
@@ -2401,6 +2476,146 @@ mod tests {
         save_history_file_atomic(&path, &file2).expect("overwrite combined history");
         assert_eq!(load_history_file(&path), file2);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------------
+    // history-persistence-hardening: format marker, migration, cap, merge,
+    // durable write (fuzzy-jump "Frecency ranking", "Directory history
+    // persistence"; design D2, D3, D5, D6)
+    // -------------------------------------------------------------------
+
+    fn dir(path: &str, count: u32, ms: u64) -> FrecencyEntry {
+        FrecencyEntry { path: PathBuf::from(path), visit_count: count, last_visited_ms: ms }
+    }
+
+    const LEGACY_FILE: &str = "{\n  \"commands\": [\"dir\"],\n  \"directories\": [\n    {\"path\": \"C:\\\\a\", \"visit_count\": 3, \"last_visited_ms\": 12345},\n    {\"path\": \"C:\\\\b\", \"visit_count\": 1, \"last_visited_ms\": 999}\n  ]\n}\n";
+
+    #[test]
+    fn render_writes_the_version_marker_and_a_round_trip_is_not_legacy() {
+        let rendered = render_history_file(&sample_history_file());
+        assert!(rendered.starts_with("{\n  \"version\": 2,\n  \"commands\": "), "{rendered}");
+        let loaded = parse_history_document(&rendered);
+        assert!(!loaded.legacy);
+        assert_eq!(loaded.file, sample_history_file());
+        assert!(!parse_history_document(&render_history_file(&HistoryFile::default())).legacy);
+    }
+
+    #[test]
+    fn a_file_without_the_version_key_is_legacy_and_a_version_inside_a_string_does_not_count() {
+        assert!(parse_history_document(LEGACY_FILE).legacy);
+        assert_eq!(parse_history_document(LEGACY_FILE).file.commands, vec!["dir".to_string()]);
+        let tricky = "{\n  \"commands\": [\"echo \\\"version\\\": 2\"],\n  \"directories\": []\n}\n";
+        assert!(parse_history_document(tricky).legacy, "the marker is only ever a top-level key");
+        assert_eq!(parse_history_document(tricky).file.commands, vec!["echo \"version\": 2".to_string()]);
+        assert!(parse_history_document("not json at all").legacy);
+        assert_eq!(parse_history_document("not json at all").file, HistoryFile::default(), "the existing malformed-file tolerance is unchanged");
+        assert_eq!(load_history_document(Path::new("no/such/history.json")), HistoryLoad::default(), "a missing file is empty and not legacy");
+    }
+
+    #[test]
+    fn migrate_restamps_every_legacy_visit_to_now() {
+        let mut loaded = parse_history_document(LEGACY_FILE);
+        let now = 1_787_000_000_000;
+        migrate_loaded_history(&mut loaded.file, loaded.legacy, now);
+        assert_eq!(loaded.file.directories, vec![dir(r"C:\a", 3, now), dir(r"C:\b", 1, now)], "counts carry over, times become the load time");
+    }
+
+    #[test]
+    fn migrate_keeps_v2_timestamps_except_future_ones_which_clamp_to_now() {
+        let now = 1_787_000_000_000;
+        let mut file = HistoryFile { commands: vec![], directories: vec![dir(r"C:\past", 2, now - 5_000), dir(r"C:\future", 2, now + 60_000), dir(r"C:\now", 1, now)] };
+        migrate_loaded_history(&mut file, false, now);
+        assert_eq!(file.directories, vec![dir(r"C:\past", 2, now - 5_000), dir(r"C:\future", 2, now), dir(r"C:\now", 1, now)]);
+    }
+
+    #[test]
+    fn migrate_prunes_an_oversized_file_to_the_cap() {
+        let now = 1_787_000_000_000;
+        let directories: Vec<FrecencyEntry> = (0..1_250).map(|i| dir(&format!(r"C:\d{i}"), i as u32 + 1, now)).collect();
+        let mut file = HistoryFile { commands: vec![], directories };
+        migrate_loaded_history(&mut file, false, now);
+        assert_eq!(file.directories.len(), quicksearch::MAX_DIR_HISTORY);
+        assert!(file.directories.iter().all(|d| d.visit_count > 250), "the 250 lowest-frecency entries were the ones dropped");
+    }
+
+    #[test]
+    fn merge_unions_disjoint_directories_with_this_instances_entries_first() {
+        let now = 1_000;
+        let disk = HistoryFile { commands: vec![], directories: vec![dir(r"C:\disk-only", 2, 10)] };
+        let mine = HistoryFile { commands: vec![], directories: vec![dir(r"C:\mine-1", 1, 20), dir(r"C:\mine-2", 1, 30)] };
+        let merged = merge_history_files(&disk, &mine, now);
+        assert_eq!(merged.directories, vec![dir(r"C:\mine-1", 1, 20), dir(r"C:\mine-2", 1, 30), dir(r"C:\disk-only", 2, 10)]);
+    }
+
+    /// fuzzy-jump "Merge keeps the larger count and the later visit".
+    #[test]
+    fn merge_takes_max_count_and_max_time_for_an_overlapping_path_and_is_idempotent() {
+        let now = 5_000;
+        let disk = HistoryFile { commands: vec![], directories: vec![dir(r"C:\src", 9, 1_000)] };
+        let mine = HistoryFile { commands: vec![], directories: vec![dir(r"C:\src", 4, 2_000)] };
+        let merged = merge_history_files(&disk, &mine, now);
+        assert_eq!(merged.directories, vec![dir(r"C:\src", 9, 2_000)]);
+        let again = merge_history_files(&merged, &mine, now);
+        assert_eq!(again, merged, "merging the result with `mine` again changes nothing");
+        let and_again = merge_history_files(&again, &mine, now);
+        assert_eq!(and_again, merged);
+    }
+
+    /// fuzzy-jump "Another instance's commands are kept".
+    #[test]
+    fn merge_puts_disk_only_commands_first_without_duplicates_and_keeps_the_newest_two_hundred() {
+        let disk = HistoryFile { commands: vec!["cd D:\\build".to_string(), "shared".to_string(), "older".to_string()], directories: vec![] };
+        let mine = HistoryFile { commands: vec!["shared".to_string(), "mine-newest".to_string()], directories: vec![] };
+        let merged = merge_history_files(&disk, &mine, 0);
+        assert_eq!(merged.commands, vec!["cd D:\\build".to_string(), "older".to_string(), "shared".to_string(), "mine-newest".to_string()]);
+
+        let disk = HistoryFile { commands: (0..150).map(|i| format!("disk{i}")).collect(), directories: vec![] };
+        let mine = HistoryFile { commands: (0..100).map(|i| format!("mine{i}")).collect(), directories: vec![] };
+        let merged = merge_history_files(&disk, &mine, 0);
+        assert_eq!(merged.commands.len(), MAX_HISTORY);
+        assert_eq!(merged.commands.last().unwrap(), "mine99", "the newest command is kept");
+        assert_eq!(merged.commands[0], "disk50", "the oldest disk-only commands are dropped first");
+    }
+
+    #[test]
+    fn merge_prunes_a_directory_union_above_the_cap() {
+        let now = 1_787_000_000_000;
+        let disk = HistoryFile { commands: vec![], directories: (0..700).map(|i| dir(&format!(r"C:\disk{i}"), 5, now)).collect() };
+        let mine = HistoryFile { commands: vec![], directories: (0..700).map(|i| dir(&format!(r"C:\mine{i}"), 1, now)).collect() };
+        let merged = merge_history_files(&disk, &mine, now);
+        assert_eq!(merged.directories.len(), quicksearch::MAX_DIR_HISTORY);
+        assert_eq!(merged.directories.iter().filter(|d| d.visit_count == 5).count(), 700, "the higher-frecency disk entries all survive");
+    }
+
+    /// fuzzy-jump "Interrupted write leaves a complete file": a failure at
+    /// the replace step (the target held open with sharing denied) leaves
+    /// the previous `history.json` byte-identical and no `.fc-tmp` sibling.
+    #[cfg(windows)]
+    #[test]
+    fn save_history_file_atomic_failure_leaves_the_previous_file_and_no_temp() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = temp_dir("history-write-fails");
+        let path = dir.join(HISTORY_FILE);
+        save_history_file_atomic(&path, &sample_history_file()).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).share_mode(0).open(&path).expect("open history.json with sharing denied");
+        save_history_file_atomic(&path, &HistoryFile::default()).expect_err("the replace must fail while the target is locked");
+        drop(lock);
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the previous file is byte-identical");
+        assert_eq!(leftover_temp_files(&dir), Vec::<String>::new(), "no .fc-tmp sibling remains");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn history_writes_leave_no_shared_temp_name_behind() {
+        let dir = temp_dir("history-write-temps");
+        let path = dir.join(HISTORY_FILE);
+        save_history_file_atomic(&path, &sample_history_file()).unwrap();
+        save_history_atomic(&dir.join("plain.json"), &["dir".to_string()]).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names.len(), 2, "{names:?}");
+        assert!(leftover_temp_files(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

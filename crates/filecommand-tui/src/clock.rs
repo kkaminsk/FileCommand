@@ -40,6 +40,12 @@ impl WallClock for RealWallClock {
     fn now_local(&self) -> (u8, u8) {
         platform::now_local()
     }
+
+    /// `SystemTime` since the Unix epoch, saturating to 0 should the clock
+    /// read before it (history-persistence-hardening design D1).
+    fn epoch_ms(&self) -> u64 {
+        now_unix_ms()
+    }
 }
 
 #[cfg(windows)]

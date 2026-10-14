@@ -253,9 +253,9 @@ fn splash_dismissed_immediately_by_key_before_min_hold() {
 #[test]
 fn splash_auto_dismisses_after_min_hold_via_tick() {
     let state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
-    let (state, _) = update(state, Command::Tick(1_799));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_799, epoch_ms: 1_799 });
     assert!(matches!(state.phase, UiPhase::Splash { .. }));
-    let (state, _) = update(state, Command::Tick(1_800));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_800, epoch_ms: 1_800 });
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
@@ -298,14 +298,14 @@ fn too_small_boundary_at_60x16_is_panels() {
 
 #[test]
 fn splash_skipped_when_starting_below_60x16_floor() {
-    let (state, _) = State::initial(Theme::classic(), (59, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    let (state, _) = State::initial(Theme::classic(), (59, 16), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert!(state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
 fn splash_starts_normally_at_exactly_60x16() {
-    let (state, _) = State::initial(Theme::classic(), (60, 16), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    let (state, _) = State::initial(Theme::classic(), (60, 16), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
 }
 
@@ -395,7 +395,7 @@ fn listing_chunk_during_splash_still_updates_panel_state() {
 
 #[test]
 fn initial_builds_start_listing_effects_for_both_panels() {
-    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert_eq!(state.phase, UiPhase::Splash { started_at_ms: 0 });
     assert_eq!(
         without_git_info_effects(effects),
@@ -408,14 +408,14 @@ fn initial_builds_start_listing_effects_for_both_panels() {
 
 #[test]
 fn initial_below_min_size_skips_straight_to_placeholder() {
-    let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    let (state, _) = State::initial(Theme::classic(), (40, 10), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert!(state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
 #[test]
 fn initial_without_splash_starts_at_panels() {
-    let (state, _) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
+    let (state, _) = State::initial(Theme::classic(), (80, 24), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
     assert_eq!(state.phase, UiPhase::Panels);
 }
 
@@ -2614,6 +2614,24 @@ fn a_cd_target_that_fails_asynchronously_after_passing_the_sync_check_surfaces_t
     assert_eq!(state.left.last_error.as_deref(), Some("network path not found"));
 }
 
+/// history-persistence-hardening design D4: a successful `cd` emits exactly
+/// one `Effect::PersistHistory` (the duplicate from `dispatch_cd` is gone),
+/// and that one snapshot already holds the new command and the new visit.
+#[test]
+fn a_successful_cd_emits_exactly_one_persist_history_holding_the_command_and_the_visit() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("share")];
+    state.epoch_ms = 1_787_000_000_000;
+    let state = type_line(state, "cd share");
+    let (state, effects) = update(state, Command::Enter);
+    let persists: Vec<&config::HistoryFile> = effects.iter().filter_map(|e| if let Effect::PersistHistory(f) = e { Some(f) } else { None }).collect();
+    assert_eq!(persists.len(), 1, "exactly one persist, got {effects:?}");
+    assert_eq!(persists[0].commands, vec!["cd share".to_string()]);
+    assert_eq!(persists[0].directories, vec![history_entry("/left/share", 1, 1_787_000_000_000)]);
+    assert_eq!(persists[0].commands, state.history);
+    assert_eq!(persists[0].directories, state.dir_history);
+}
+
 #[test]
 fn cd_dotdot_and_bare_drive_letters_resolve() {
     assert_eq!(resolve_cd_target(Path::new("/a/b"), ".."), Some(PathBuf::from("/a")));
@@ -4225,7 +4243,7 @@ fn a_subsequently_successful_f4_launch_clears_a_stale_last_error_from_an_earlier
 
 #[test]
 fn initial_state_issues_a_git_info_query_for_each_panel() {
-    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
+    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
     let left_request = state.left.git_request.expect("left panel mints a git-info request on startup");
     let right_request = state.right.git_request.expect("right panel mints a git-info request on startup");
     assert_ne!(left_request, right_request);
@@ -5155,6 +5173,38 @@ fn fuzzy_jump_move_clamps_within_the_currently_filtered_list() {
     assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
 }
 
+/// R-13 regression (fuzzy-jump "Recency survives a restart"; history-
+/// persistence-hardening design D1): an earlier session stamped `C:\old`
+/// at epoch E and `C:\new` three days later. A fresh `State` — monotonic
+/// clock back near zero, wall clock a minute after the last visit — ranks
+/// `C:\new` first, because ranking reads `epoch_ms`, not `clock_ms`.
+#[test]
+fn fuzzy_jump_ranks_with_the_epoch_clock_so_recency_survives_a_restart() {
+    let e = 1_787_000_000_000u64;
+    let day = 24 * 60 * 60 * 1000;
+    let mut state = test_state(UiPhase::Panels);
+    state.clock_ms = 500; // a fresh process: the monotonic clock restarted
+    state.epoch_ms = e + 3 * day + 60_000;
+    state.dir_history = vec![history_entry(r"C:\old", 3, e), history_entry(r"C:\new", 3, e + 3 * day)];
+    let (state, _) = update(state, Command::FuzzyJumpOpen);
+    let (state, effects) = update(state, Command::FuzzyJumpConfirm);
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\new"), "Enter on the top row lands on the more recently visited directory");
+    assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { path, .. } if path == Path::new(r"C:\new"))));
+}
+
+/// A tick carries both clocks, and a navigation stamps its visit with the
+/// epoch reading (design D1).
+#[test]
+fn tick_updates_both_clocks_and_visits_are_stamped_with_epoch_time() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_entry("sub")];
+    let (state, _) = update(state, Command::Tick { now_ms: 42, epoch_ms: 1_787_000_000_000 });
+    assert_eq!(state.clock_ms, 42);
+    assert_eq!(state.epoch_ms, 1_787_000_000_000);
+    let (state, _) = update(state, Command::Enter);
+    assert_eq!(state.dir_history, vec![history_entry("/left/sub", 1, 1_787_000_000_000)], "the visit carries wall-clock time, not the monotonic reading");
+}
+
 // ---------------------------------------------------------------------
 // M5: Alt+F7 find file
 // ---------------------------------------------------------------------
@@ -5558,7 +5608,9 @@ fn help_move_does_not_walk_past_the_ends_of_the_topic_list() {
 fn navigating_into_a_directory_records_and_persists_frecency() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
-    state.clock_ms = 5_000;
+    // Visits are stamped with the wall-clock reading (history-persistence-
+    // hardening design D1), not the monotonic one.
+    state.epoch_ms = 5_000;
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.dir_history, vec![history_entry("/left/sub", 1, 5_000)]);
     assert!(effects.iter().any(|e| matches!(e, Effect::PersistHistory(file) if file.directories == state.dir_history)));
@@ -6226,11 +6278,11 @@ fn clipboard_feedback_expires_via_tick_once_the_deadline_passes() {
     assert!(state.left.clipboard_feedback.is_some());
 
     // Not yet at the deadline: still showing.
-    let (state, _) = update(state, Command::Tick(CLIPBOARD_FEEDBACK_MS - 1));
+    let (state, _) = update(state, Command::Tick { now_ms: CLIPBOARD_FEEDBACK_MS - 1, epoch_ms: 0 });
     assert!(state.left.clipboard_feedback.is_some(), "feedback holds until the deadline is reached");
 
     // At the deadline: expired.
-    let (state, _) = update(state, Command::Tick(CLIPBOARD_FEEDBACK_MS));
+    let (state, _) = update(state, Command::Tick { now_ms: CLIPBOARD_FEEDBACK_MS, epoch_ms: 0 });
     assert!(state.left.clipboard_feedback.is_none(), "feedback expires once the clock reaches expires_at_ms");
 }
 
@@ -7246,7 +7298,7 @@ fn stamps_come_from_the_last_tick_reading_not_a_live_clock() {
 #[test]
 fn horizontal_traversal_restamps_the_pulldown_but_not_the_bar() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
-    let (state, _) = update(state, Command::Tick(1_040));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_040, epoch_ms: 1_040 });
     let (state, _) = update(state, Command::MenuNextMenu);
     let menu = state.menu.expect("still open");
     assert_eq!(menu.active, MenuId::Files);
@@ -7259,7 +7311,7 @@ fn horizontal_traversal_restamps_the_pulldown_but_not_the_bar() {
 #[test]
 fn hotkey_jump_and_title_click_restamp_the_pulldown_and_keep_the_bar_stamp() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
-    let (state, _) = update(state, Command::Tick(1_030));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_030, epoch_ms: 1_030 });
     let (jumped, _) = update(state.clone(), Command::MenuHotkey('c'));
     let menu = jumped.menu.expect("open");
     assert_eq!(menu.active, MenuId::Commands);
@@ -7275,14 +7327,14 @@ fn hotkey_jump_and_title_click_restamp_the_pulldown_and_keep_the_bar_stamp() {
 #[test]
 fn moving_the_highlight_stamps_only_the_highlight() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
-    let (state, _) = update(state, Command::Tick(1_200));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_200, epoch_ms: 1_200 });
     let (state, _) = update(state, Command::MenuSelectNext);
     let menu = state.menu.clone().expect("open");
     assert_eq!(menu.selected_at_ms, Some(1_200));
     assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_000));
 
     // A later tick with no selection change leaves the stamp alone.
-    let (state, _) = update(state, Command::Tick(1_500));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_500, epoch_ms: 1_500 });
     assert_eq!(state.menu.unwrap().selected_at_ms, Some(1_200));
 }
 
@@ -7291,7 +7343,7 @@ fn reopening_a_collapsed_pulldown_unfolds_it_again() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuCollapse);
     assert!(!state.menu.as_ref().unwrap().pulldown_open);
-    let (state, _) = update(state, Command::Tick(1_300));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_300, epoch_ms: 1_300 });
     // The hotkey of the *same* menu (`Left`) reopens its pull-down.
     let (state, _) = update(state, Command::MenuHotkey('l'));
     let menu = state.menu.expect("open");
@@ -7396,9 +7448,9 @@ fn the_quit_dialog_has_its_own_stamp_and_never_restamps_the_dialog_beneath() {
 fn leaving_the_splash_for_the_panels_stamps_the_reveal() {
     // By the hold elapsing on a Tick...
     let state = test_state(UiPhase::Splash { started_at_ms: 1_000 });
-    let (state, _) = update(state, Command::Tick(1_799));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_799, epoch_ms: 1_799 });
     assert_eq!(state.panels_revealed_at_ms, None, "still on the splash");
-    let (state, _) = update(state, Command::Tick(1_800));
+    let (state, _) = update(state, Command::Tick { now_ms: 1_800, epoch_ms: 1_800 });
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(state.panels_revealed_at_ms, Some(1_800));
 
@@ -7424,14 +7476,14 @@ fn a_key_during_the_splash_still_dismisses_it_entirely_and_is_consumed() {
 #[test]
 fn no_reveal_is_recorded_when_the_splash_never_showed() {
     // --nosplash / splash = false: frame 1 is the complete panel screen.
-    let (state, _) = State::initial(Theme::classic(), (80, 24), 0, PathBuf::from("/"), PathBuf::from("/"), false);
+    let (state, _) = State::initial(Theme::classic(), (80, 24), 0, 0, PathBuf::from("/"), PathBuf::from("/"), false);
     assert_eq!(state.panels_revealed_at_ms, None);
-    let (state, _) = update(state, Command::Tick(5_000));
+    let (state, _) = update(state, Command::Tick { now_ms: 5_000, epoch_ms: 5_000 });
     assert_eq!(state.panels_revealed_at_ms, None, "later ticks never invent a reveal");
 
     // Below the floor the splash is skipped for the placeholder; growing
     // back to Panels is not a Splash -> Panels transition either.
-    let (state, _) = State::initial(Theme::classic(), (40, 10), 0, PathBuf::from("/"), PathBuf::from("/"), true);
+    let (state, _) = State::initial(Theme::classic(), (40, 10), 0, 0, PathBuf::from("/"), PathBuf::from("/"), true);
     assert!(state.undersized);
     assert_eq!(state.phase, UiPhase::Panels);
     let (state, _) = update(state, Command::Resize(80, 24));
@@ -7686,7 +7738,7 @@ fn undersized_dismisses_the_splash_for_good() {
     assert!(!state.undersized);
     assert_eq!(state.phase, UiPhase::Panels, "enlarging reveals the panels, never the splash");
 
-    let (state, _) = State::initial(Theme::classic(), (50, 12), 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
+    let (state, _) = State::initial(Theme::classic(), (50, 12), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), true);
     assert!(state.undersized);
     assert_eq!(state.phase, UiPhase::Panels, "a start below the floor skips the splash");
 }

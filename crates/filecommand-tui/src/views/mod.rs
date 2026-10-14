@@ -483,7 +483,10 @@ fn render_phase(
             }
             let mut fuzzy_caret = None;
             if let Some(dialog) = &state.fuzzy_jump {
-                iris(buf, now, opened, |b| fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.clock_ms));
+                // Ranked with the epoch clock, as the reducer's Enter and
+                // cursor handlers rank, so the drawn order is the acted-on
+                // order (history-persistence-hardening design D1).
+                iris(buf, now, opened, |b| fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.epoch_ms));
             }
             let mut find_caret = None;
             if let Some(dialog) = &state.find_file {

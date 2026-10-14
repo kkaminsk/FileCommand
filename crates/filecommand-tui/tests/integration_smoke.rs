@@ -126,9 +126,9 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     let workers = worker::WorkerGauge::new();
 
     let (state, effects) =
-        State::initial(filecommand_core::theme::Theme::classic(), (80, 24), 1_000, fx.left(), fx.root.join("right"), false);
+        State::initial(filecommand_core::theme::Theme::classic(), (80, 24), 1_000, 1_000, fx.left(), fx.root.join("right"), false);
     execute(effects, &tx, &git_slots, &workers);
-    let mut state = step(state, Command::Tick(1_000), &tx, &rx, &git_slots, &workers);
+    let mut state = step(state, Command::Tick { now_ms: 1_000, epoch_ms: 1_000 }, &tx, &rx, &git_slots, &workers);
 
     // ---- Sanity: both panels loaded for real -------------------------
     assert!(state.left.entries.iter().any(|e| e.name == "report.txt"), "left panel must have listed report.txt: {:?}", state.left.entries);
