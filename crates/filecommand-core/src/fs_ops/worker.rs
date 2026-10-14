@@ -28,7 +28,7 @@ const CHUNK_BYTES: usize = 256 * 1024;
 /// a temporary partial file"). The suffix keeps a leftover next to its
 /// target in a name-sorted panel, claims no shell association, and is
 /// self-describing and safe to delete.
-pub(crate) const PARTIAL_SUFFIX: &str = ".~fc-partial";
+pub const PARTIAL_SUFFIX: &str = ".~fc-partial";
 /// How many numbered variants (`-2`, `-3`, …) are tried when the plain
 /// temporary name is taken, before the exclusive create is left to refuse.
 const PARTIAL_NAME_ATTEMPTS: u32 = 100;

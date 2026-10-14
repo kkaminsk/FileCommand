@@ -2763,9 +2763,15 @@ mod tests {
         };
         rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token()));
 
-        // Mid-copy: the destination has been created and is being written.
+        // Mid-copy: since durable-file-copy the engine writes a sibling
+        // `<name>.~fc-partial` file and renames it over the target only once
+        // the copy is complete, so the partial file is what shows the copy
+        // is in progress. If the final target appears first the copy already
+        // finished and this run cannot exercise the scenario.
+        let partial = dst_dir.join(format!("big.bin{}", filecommand_core::fs_ops::PARTIAL_SUFFIX));
         let deadline = Instant::now() + Duration::from_secs(30);
-        while !dst.exists() {
+        while !partial.exists() {
+            assert!(!dst.exists(), "the copy finished before it could be interrupted; enlarge the source");
             assert!(Instant::now() < deadline, "the copy never started");
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2774,7 +2780,8 @@ mod tests {
         shutdown(&mut rt).unwrap();
         let elapsed = started.elapsed();
 
-        assert!(!dst.exists(), "the partially written destination was removed before quit returned");
+        assert!(!partial.exists(), "the partially written destination was removed before quit returned");
+        assert!(!dst.exists(), "an interrupted copy never lands on the final name");
         assert!(elapsed < QUIT_JOB_WAIT, "the job ended within the bound rather than being abandoned, took {elapsed:?}");
         let outcomes: Vec<Command> = rx.try_iter().filter(|c| matches!(c, Command::JobDone { .. })).collect();
         assert!(

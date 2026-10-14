@@ -18,3 +18,4 @@ pub use fs::FakeFs;
 pub use fs::{ChunkControl, CopyOptions, CopyReport, FileId, FileSystem, FsMetadata, RawEntry, RealFs, ReparseKind, Unrestored, UnrestoredKind};
 pub use job::{CancelFlag, Job, JobKind, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, SourceItem};
 pub use worker::run_job;
+pub use worker::PARTIAL_SUFFIX;
