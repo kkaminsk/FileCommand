@@ -69,6 +69,13 @@ struct Runtime {
     /// crossterm may otherwise believe a button is still held after a
     /// suspended shell/editor/scrollback run (design D1 risk).
     mouse_tracker: MouseTracker,
+    /// Per-panel git-query slots (left, right) bounding the app to one
+    /// in-flight git status query per panel: a navigation while one is
+    /// running queues only the newest request, and a queued request inside a
+    /// repository that just timed out is never started (git-info "Rapid
+    /// navigation does not pile up queries"; git-info-timeout-memory design
+    /// D3).
+    git_slots: [worker::GitQuerySlot; 2],
 }
 
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
@@ -332,6 +339,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         viewer_source: None,
         clipboard: Box::new(PlatformClipboard::default()),
         mouse_tracker: MouseTracker::new(),
+        git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
@@ -921,7 +929,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
-            Effect::QueryGitInfo { panel, path, request } => worker::spawn_git_info_query(panel, path, request, rt.tx.clone()),
+            Effect::QueryGitInfo { panel, path, request } => {
+                let slot = match panel {
+                    PanelSide::Left => &rt.git_slots[0],
+                    PanelSide::Right => &rt.git_slots[1],
+                };
+                slot.request(panel, path, request, rt.tx.clone());
+            }
             Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone()),
             Effect::OpenViewer { path } => match ByteSource::open(&path) {
                 Ok(source) => {

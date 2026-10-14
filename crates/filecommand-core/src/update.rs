@@ -16,7 +16,7 @@ use crate::external_editor::{self, EditorInvocation};
 use crate::find_file::FindFileState;
 use crate::fs_ops::dialog::{DropButtons, FileOpSetup, RunningDialog};
 use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, ProgressInfo, SkippedItem, SourceItem};
-use crate::git_info::GitInfo;
+use crate::git_info::{self, GitInfo};
 use crate::info::InfoValues;
 use crate::line_edit::{LineEdit, TextEditOp};
 use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
@@ -304,6 +304,13 @@ pub struct State {
     /// placeholder) leaves frame 1 as the complete panel screen with no
     /// wipe.
     pub panels_revealed_at_ms: Option<u64>,
+    /// Working-directory roots of repositories whose git status query timed
+    /// out this session, spelled the way the queried panel path spelled them
+    /// (git-info-timeout-memory design D2). While a root is remembered here,
+    /// no git query is issued for any directory under it and the panel shows
+    /// no git indicators there (git-info "Silent absence on timeout and
+    /// stale-result discarding"). Session-only, never persisted.
+    pub git_no_info_roots: Vec<PathBuf>,
 }
 
 impl State {
@@ -397,6 +404,7 @@ impl State {
             dialog_opened_at_ms: 0,
             quit_opened_at_ms: 0,
             panels_revealed_at_ms: None,
+            git_no_info_roots: Vec::new(),
         }
     }
 
@@ -447,8 +455,8 @@ impl State {
         // Both panels start their git-info query alongside their first
         // listing, exactly as a later navigation does (git-info "Background
         // repository detection").
-        effects.push(git_info_query_effect(&mut state, PanelSide::Left, left_cwd));
-        effects.push(git_info_query_effect(&mut state, PanelSide::Right, right_cwd));
+        effects.extend(git_info_query_effect(&mut state, PanelSide::Left, left_cwd));
+        effects.extend(git_info_query_effect(&mut state, PanelSide::Right, right_cwd));
         (state, effects)
     }
 }
@@ -721,8 +729,15 @@ pub enum Command {
     /// discarding"). `request` is matched against
     /// `PanelState::git_request` the same way `InfoResolved`'s `request` is
     /// matched against `info_request`, so a reply for a directory/generation
-    /// the panel has since moved past is dropped.
-    GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo },
+    /// the panel has since moved past is dropped. `timed_out_root` is `Some`
+    /// only when the query hit its timeout: the repository's
+    /// working-directory root, or the queried directory itself when the
+    /// repository could not even be located in time. It is recorded in
+    /// `State::git_no_info_roots` even when the reply is otherwise stale —
+    /// a timeout is evidence about the repository, not about the panel's
+    /// current directory (git-info "Timeout recorded after the panel moved
+    /// on"; git-info-timeout-memory design D1).
+    GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo, timed_out_root: Option<PathBuf> },
     /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
     /// (viewer: Instant open).
     ViewerOpened { path: PathBuf, file_len: u64 },
@@ -1261,7 +1276,17 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
             return (state, effects);
         }
-        Command::GitInfoResolved { panel, path, request, info } => {
+        Command::GitInfoResolved { panel, path, request, info, timed_out_root } => {
+            // A timeout is evidence about the *repository*, not about the
+            // panel's current directory, so the root is recorded even when
+            // the reply itself is stale (git-info "Timeout recorded after
+            // the panel moved on"). A root already covered by a remembered
+            // one is not stored twice.
+            if let Some(root) = timed_out_root {
+                if !state.git_no_info_roots.iter().any(|existing| git_info::is_under_root(&root, existing)) {
+                    state.git_no_info_roots.push(root);
+                }
+            }
             let p = state.panel_mut(panel);
             if p.cwd == path && p.git_request == Some(request) {
                 p.git_info = info;
@@ -3649,7 +3674,7 @@ fn handle_swap_panels(state: &mut State) -> Vec<Effect> {
             state.panel_mut(side).info_request = Some(request);
             effects.push(Effect::QueryInfo { panel: side, path: path.clone(), request });
         }
-        effects.push(git_info_query_effect(state, side, path));
+        effects.extend(git_info_query_effect(state, side, path));
     }
     effects
 }
@@ -3829,18 +3854,31 @@ fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf, captur
     // Every navigation (and re-read) re-issues the git-info query for
     // wherever the panel just landed, regardless of display mode — the
     // branch suffix and marker column are independent of Info mode (git-info
-    // "Query re-issued on navigation").
-    effects.push(git_info_query_effect(state, side, path));
+    // "Query re-issued on navigation") — unless the path is under a
+    // repository already marked "no info" this session.
+    effects.extend(git_info_query_effect(state, side, path));
     effects
 }
 
 /// Mint a fresh generation id, record it as `side`'s outstanding git-info
 /// request, and build the effect that runs the query on a worker thread
-/// (git-info "Background repository detection"; design D3).
-fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> Effect {
+/// (git-info "Background repository detection"; design D3) — or, for a path
+/// under a repository a timed-out query marked "no info" this session,
+/// `None`: no query is issued there, and the panel's git info is explicitly
+/// reset so a panel swapped in cannot keep showing branch/markers it
+/// resolved before the timeout (git-info "Timed-out repository is not
+/// queried again", "Swapping a panel into a timed-out repository";
+/// git-info-timeout-memory design D1).
+fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> Option<Effect> {
+    if state.git_no_info_roots.iter().any(|root| git_info::is_under_root(&path, root)) {
+        let p = state.panel_mut(side);
+        p.git_info = GitInfo::none();
+        p.git_request = None;
+        return None;
+    }
     let request = state.next_request_id();
     state.panel_mut(side).git_request = Some(request);
-    Effect::QueryGitInfo { panel: side, path, request }
+    Some(Effect::QueryGitInfo { panel: side, path, request })
 }
 
 fn apply_listing_event(state: &mut State, cmd: Command) {

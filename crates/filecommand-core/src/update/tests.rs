@@ -2761,7 +2761,7 @@ fn swap_panels_re_issues_info_and_git_queries_with_fresh_ids() {
     // A reply to a pre-swap request id is stale and dropped.
     let (state2, _) = update(
         state.clone(),
-        Command::GitInfoResolved { panel: PanelSide::Right, path: PathBuf::from("C:\\repo"), request: 11, info: GitInfo::none() },
+        Command::GitInfoResolved { panel: PanelSide::Right, path: PathBuf::from("C:\\repo"), request: 11, info: GitInfo::none(), timed_out_root: None },
     );
     assert_eq!(state2, state, "a pre-swap git reply never applies");
 }
@@ -3532,7 +3532,7 @@ fn a_resolved_git_info_result_is_applied_in_place() {
         statuses: std::collections::HashMap::from([(OsString::from("a.txt"), crate::git_info::FileStatus::Modified)]),
     };
     let (state, effects) =
-        update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, info: info.clone() });
+        update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request, info: info.clone(), timed_out_root: None });
     assert!(effects.is_empty());
     assert_eq!(state.left.git_info, info);
 }
@@ -3543,7 +3543,7 @@ fn a_git_info_result_for_a_directory_the_panel_left_is_discarded() {
     let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
     let request = state.left.git_request.unwrap();
     let info = crate::git_info::GitInfo { branch: Some("main".to_string()), ..Default::default() };
-    let (state, _) = update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), request, info });
+    let (state, _) = update(state, Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/elsewhere"), request, info, timed_out_root: None });
     assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "a result for another directory is dropped");
 }
 
@@ -3566,7 +3566,7 @@ fn a_stale_git_info_result_from_an_out_of_order_reread_is_discarded_but_the_fres
     let stale_info = crate::git_info::GitInfo { branch: Some("stale-branch".to_string()), ..Default::default() };
     let (state, _) = update(
         state,
-        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: first_request, info: stale_info },
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: first_request, info: stale_info, timed_out_root: None },
     );
     assert_eq!(state.left.git_info, crate::git_info::GitInfo::none(), "the stale (first-request) answer is dropped");
 
@@ -3578,6 +3578,7 @@ fn a_stale_git_info_result_from_an_out_of_order_reread_is_discarded_but_the_fres
             path: PathBuf::from("/left"),
             request: second_request,
             info: fresh_info.clone(),
+            timed_out_root: None,
         },
     );
     assert_eq!(state.left.git_info, fresh_info, "the current request's answer applies");
@@ -3600,7 +3601,7 @@ fn a_timed_out_query_answered_late_with_no_info_is_silently_dropped_once_superse
 
     let (state, _) = update(
         state,
-        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: timed_out_request, info: GitInfo::none() },
+        Command::GitInfoResolved { panel: PanelSide::Left, path: PathBuf::from("/left"), request: timed_out_request, info: GitInfo::none(), timed_out_root: None },
     );
     assert_eq!(
         state.left.git_info.branch.as_deref(),
@@ -3608,6 +3609,207 @@ fn a_timed_out_query_answered_late_with_no_info_is_silently_dropped_once_superse
         "the timed-out query's late reply must not overwrite the current request's already-applied result"
     );
     let _ = current_request;
+}
+
+// ---------------------------------------------------------------------
+// git-info-timeout-memory: a timed-out query marks its repository "no
+// info" for the rest of the session (git-info "Silent absence on timeout
+// and stale-result discarding"; design D1)
+// ---------------------------------------------------------------------
+
+/// The spec scenarios spell their repositories with Windows paths
+/// (`D:\mono`); the same shapes are spelled `/mono` on Unix so the
+/// component-wise prefix checks exercise identically on both.
+#[cfg(windows)]
+fn mono_path(sub: &str) -> PathBuf {
+    let mut p = PathBuf::from(r"D:\mono");
+    if !sub.is_empty() {
+        p.push(sub);
+    }
+    p
+}
+
+/// Unix spelling of the spec scenarios' repository (see above).
+#[cfg(not(windows))]
+fn mono_path(sub: &str) -> PathBuf {
+    let mut p = PathBuf::from("/mono");
+    if !sub.is_empty() {
+        p.push(sub);
+    }
+    p
+}
+
+/// A directory inside a *different* repository (`C:\work`, or `/work`).
+#[cfg(windows)]
+fn work_path(sub: &str) -> PathBuf {
+    let mut p = PathBuf::from(r"C:\work");
+    if !sub.is_empty() {
+        p.push(sub);
+    }
+    p
+}
+
+/// Unix spelling of the other repository (see above).
+#[cfg(not(windows))]
+fn work_path(sub: &str) -> PathBuf {
+    let mut p = PathBuf::from("/work");
+    if !sub.is_empty() {
+        p.push(sub);
+    }
+    p
+}
+
+/// Feed a timed-out reply for `path` with root `root` — the worker's report
+/// when a query exceeded its timeout (design D2).
+fn report_timeout(state: State, panel: PanelSide, path: PathBuf, root: PathBuf) -> State {
+    let (state, effects) = update(
+        state,
+        Command::GitInfoResolved { panel, path, request: 1, info: GitInfo::none(), timed_out_root: Some(root) },
+    );
+    assert!(effects.is_empty(), "recording a timeout emits no effects");
+    state
+}
+
+#[test]
+fn a_timed_out_repository_is_not_queried_again_for_the_session() {
+    // git-info "Timed-out repository is not queried again" + the narrowed
+    // "Query re-issued on navigation": once the query for `D:\mono\src`
+    // times out, navigating to `D:\mono\docs` and re-reading there issue no
+    // git query and leave the panel without git info.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = mono_path("src");
+    let mut state = report_timeout(state, PanelSide::Left, mono_path("src"), mono_path(""));
+    assert_eq!(state.git_no_info_roots, vec![mono_path("")]);
+
+    // Navigation into another directory of the same repository ...
+    state.left.cwd = mono_path("");
+    state.left.entries = vec![dir_entry("docs")];
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, mono_path("docs"));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { .. })), "no query under a remembered root: {effects:?}");
+    assert_eq!(state.left.git_info, GitInfo::none());
+    assert_eq!(state.left.git_request, None, "no request is minted for a suppressed query");
+
+    // ... and a re-read there neither.
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { .. })), "no query on re-read either: {effects:?}");
+    assert_eq!(state.left.git_info, GitInfo::none());
+}
+
+#[test]
+fn other_repositories_are_still_queried_after_a_timeout_elsewhere() {
+    // git-info "Other repositories are still queried".
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = mono_path("src");
+    let mut state = report_timeout(state, PanelSide::Left, mono_path("src"), mono_path(""));
+
+    state.left.cwd = work_path("");
+    state.left.entries = vec![dir_entry("app")];
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, work_path("app"));
+    let request = state.left.git_request.expect("a query is minted for the other repository");
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: work_path("app"), request }));
+}
+
+#[test]
+fn a_stale_timeout_reply_still_records_the_root() {
+    // git-info "Timeout recorded after the panel moved on" + "Late result
+    // after navigation is dropped": the panel has already left `D:\mono\src`
+    // when the timeout reply arrives; the root is recorded anyway and the
+    // current directory's rendering state is untouched.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = work_path("app");
+    state.left.git_info = GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    state.left.git_request = Some(9); // the fresher, still-outstanding request
+    let (state, effects) = update(
+        state,
+        Command::GitInfoResolved {
+            panel: PanelSide::Left,
+            path: mono_path("src"),
+            request: 4, // the superseded, timed-out request
+            info: GitInfo::none(),
+            timed_out_root: Some(mono_path("")),
+        },
+    );
+    assert!(effects.is_empty());
+    assert_eq!(state.git_no_info_roots, vec![mono_path("")], "the root is recorded even though the reply is stale");
+    assert_eq!(state.left.git_info.branch.as_deref(), Some("main"), "the current panel is unchanged");
+    assert_eq!(state.left.git_request, Some(9));
+
+    // And the recorded root has teeth: a later navigation into it starts no
+    // query.
+    let mut state = state;
+    state.left.cwd = mono_path("");
+    state.left.entries = vec![dir_entry("docs")];
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, mono_path("docs"));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { .. })), "{effects:?}");
+}
+
+#[test]
+fn a_timeout_before_the_repository_was_located_marks_only_the_queried_directory() {
+    // git-info "Repository not located before the timeout": the queried
+    // directory itself is the remembered root, so its descendants are
+    // covered but its parent (and siblings) are not.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = work_path("proj");
+    let mut state = report_timeout(state, PanelSide::Left, work_path("proj"), work_path("proj"));
+
+    // A descendant of the queried directory: no query.
+    state.left.entries = vec![dir_entry("sub")];
+    let (mut state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, work_path("proj/sub"));
+    assert!(!effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { .. })), "{effects:?}");
+
+    // The parent directory is outside the remembered root: still queried.
+    state.left.cwd = work_path("proj");
+    state.left.entries = vec![Entry::parent_dir()];
+    state.left.cursor = 0;
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, work_path(""));
+    let request = state.left.git_request.expect("the parent is still queried");
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Left, path: work_path(""), request }));
+}
+
+#[test]
+fn swapping_a_panel_into_a_timed_out_repository_issues_no_query_and_clears_its_info() {
+    // git-info "Swapping a panel into a timed-out repository": the right
+    // panel resolved branch info inside `D:\mono` before the timeout;
+    // Ctrl+U must not let it keep showing that info, and must not start a
+    // query for it.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = work_path("app");
+    state.right.cwd = mono_path("lib");
+    state.right.git_info = GitInfo { branch: Some("main".to_string()), ..Default::default() };
+    state.right.git_request = Some(12);
+    complete_panel_listings(&mut state);
+    let state = report_timeout(state, PanelSide::Left, mono_path("src"), mono_path(""));
+
+    let (state, effects) = update(state, Command::SwapPanels);
+    // The panel now showing `D:\mono\lib` (the left panel after the swap)
+    // gets no query and shows no git info ...
+    assert_eq!(state.left.cwd, mono_path("lib"));
+    assert_eq!(state.left.git_info, GitInfo::none(), "branch info resolved before the timeout is cleared");
+    assert_eq!(state.left.git_request, None);
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::QueryGitInfo { panel, path, .. } if *panel == PanelSide::Left || *path == mono_path("lib"))),
+        "no query for the panel inside the timed-out repository: {effects:?}"
+    );
+    // ... while the other panel, outside it, is queried as usual.
+    let request = state.right.git_request.expect("the other panel is re-queried after the swap");
+    assert!(effects.contains(&Effect::QueryGitInfo { panel: PanelSide::Right, path: work_path("app"), request }));
+}
+
+#[test]
+fn a_second_timeout_at_a_covered_root_is_not_recorded_twice() {
+    // Two panels can have a query in flight in the same repository; both
+    // may time out. The set stays deduplicated.
+    let state = test_state(UiPhase::Panels);
+    let state = report_timeout(state, PanelSide::Left, mono_path("src"), mono_path(""));
+    let state = report_timeout(state, PanelSide::Right, mono_path("docs"), mono_path(""));
+    assert_eq!(state.git_no_info_roots, vec![mono_path("")]);
+    let state = report_timeout(state, PanelSide::Right, mono_path("docs"), mono_path("docs"));
+    assert_eq!(state.git_no_info_roots, vec![mono_path("")], "a root under a remembered root is already covered");
 }
 
 // ---------------------------------------------------------------------

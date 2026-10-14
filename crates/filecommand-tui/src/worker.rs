@@ -6,7 +6,8 @@
 //! can answer conflict/error dialogs the worker thread blocks on.
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use filecommand_core::drives;
@@ -23,8 +24,8 @@ use filecommand_core::{Command, PanelSide};
 
 const CHUNK_SIZE: usize = 256;
 
-/// How long `spawn_git_info_query` waits for `git_info::query` before giving
-/// up and reporting "no info" (git-info "Silent absence on timeout and
+/// How long one git status query may run before its panel's slot reports
+/// "no info" and moves on (git-info "Silent absence on timeout and
 /// stale-result discarding"; design D3). Generous enough that a normal
 /// local-repo status call never hits it, short enough that a stalled
 /// network share doesn't leave the branch suffix/marker column in limbo
@@ -54,38 +55,190 @@ pub fn spawn_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sende
     });
 }
 
-/// Run `git_info::query` for `path` on its own dedicated worker thread —
-/// never the shared Info worker, since a slow status call on one panel
-/// must not head-of-line-block the other (design D3; git-info "Background
-/// repository detection"). The result — resolved branch/statuses, or
-/// `GitInfo::none()` for "outside any repository" — is reported back;
-/// `core::update`'s generation-key guard (`PanelState::git_request`) is what
-/// decides whether a stale reply (one for a directory/generation the panel
-/// has since moved past) actually gets applied.
-///
-/// If `git_info::query` (blocking and, being libgit2, not cancellable
-/// mid-call) has not returned within `GIT_INFO_TIMEOUT`, this reports
-/// `GitInfo::none()` immediately instead of waiting further and silently
-/// discards whatever the query eventually returns — never forwarding a
-/// second, late reply for the same `request` (git-info "Silent absence on
-/// timeout and stale-result discarding": "leaving the uncancellable call to
-/// finish" is exactly what `race_with_timeout` does by simply not waiting
-/// on its inner thread any further, not by aborting it).
-pub fn spawn_git_info_query(panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
-    std::thread::spawn(move || {
-        let inner_path = path.clone();
-        let info = race_with_timeout(GIT_INFO_TIMEOUT, move || git_info::query(&inner_path)).unwrap_or_else(GitInfo::none);
-        let _ = tx.send(Command::GitInfoResolved { panel, path, request, info });
-    });
+/// One panel's git-query slot: at most one status query runs per panel at a
+/// time, so rapid navigation cannot pile up concurrent, uncancellable
+/// libgit2 walks that compete for I/O (git-info "Rapid navigation does not
+/// pile up queries"; git-info-timeout-memory design D3). A dedicated runner
+/// per panel — never the shared Info worker — keeps a slow status call on
+/// one panel from head-of-line-blocking the other (design D3; git-info
+/// "Background repository detection"). The result — resolved
+/// branch/statuses, or `GitInfo::none()` for "outside any repository" — is
+/// reported back; `core::update`'s generation-key guard
+/// (`PanelState::git_request`) is what decides whether a stale reply (one
+/// for a directory/generation the panel has since moved past) actually gets
+/// applied.
+#[derive(Clone, Default)]
+pub struct GitQuerySlot {
+    state: Arc<Mutex<GitQuerySlotState>>,
+}
+
+#[derive(Default)]
+struct GitQuerySlotState {
+    /// A runner thread is working through the queue.
+    running: bool,
+    /// The newest request that arrived while the runner was busy; an older
+    /// queued request is *replaced*, never queued — its id is already
+    /// superseded in `PanelState::git_request`, so its reply would be
+    /// dropped anyway.
+    pending: Option<(PathBuf, u64)>,
+}
+
+impl GitQuerySlot {
+    pub fn new() -> GitQuerySlot {
+        GitQuerySlot::default()
+    }
+
+    /// Route one `Effect::QueryGitInfo` through the slot: start the runner
+    /// when the slot is idle, or replace the pending request while a query
+    /// is running.
+    pub fn request(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>) {
+        self.request_with(panel, path, request, tx, GIT_INFO_TIMEOUT, discover_then_query);
+    }
+
+    /// `request` with the timeout and the per-directory query injected, so
+    /// tests can drive the runner with a scripted fake instead of libgit2.
+    /// When a runner is already serving the slot, `query` is unused — the
+    /// runner's own query function drives the pending request too
+    /// (production always passes the same one).
+    fn request_with<F>(&self, panel: PanelSide, path: PathBuf, request: u64, tx: Sender<Command>, timeout: Duration, query: F)
+    where
+        F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
+    {
+        let mut state = self.state.lock().unwrap();
+        if state.running {
+            state.pending = Some((path, request));
+            return;
+        }
+        state.running = true;
+        // A pending left over from a panicked runner is superseded by this
+        // fresher request, so it is dropped rather than started out of
+        // order.
+        state.pending = None;
+        let slot = self.state.clone();
+        std::thread::spawn(move || run_git_query_slot(slot, panel, (path, request), tx, timeout, query));
+    }
+}
+
+/// Clears the slot's `running` flag if the runner thread unwinds before
+/// marking the slot idle itself — otherwise git info for that panel would
+/// silently stop for the rest of the session (design D3). The normal exit
+/// path disarms the guard after clearing the flag under the lock, so the
+/// guard cannot clear it *after* a successor runner has already started.
+struct GitQuerySlotGuard {
+    state: Arc<Mutex<GitQuerySlotState>>,
+    disarmed: bool,
+}
+
+impl GitQuerySlotGuard {
+    fn disarm(mut self) {
+        self.disarmed = true;
+    }
+}
+
+impl Drop for GitQuerySlotGuard {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        // The lock may be poisoned if the panic happened mid-update.
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).running = false;
+    }
+}
+
+/// The slot's runner: serve the first request, then each pending one in
+/// turn, then mark the slot idle. One query at a time per panel; a libgit2
+/// walk that outlives its timeout is left running to completion (there is
+/// no way to cancel it mid-walk) but its result is dropped — git-info
+/// "Silent absence on timeout and stale-result discarding" — and the slot
+/// is released when the timeout reply is *sent*, not when the orphaned walk
+/// eventually returns, which may be minutes later (design D3).
+fn run_git_query_slot<F>(slot: Arc<Mutex<GitQuerySlotState>>, panel: PanelSide, first: (PathBuf, u64), tx: Sender<Command>, timeout: Duration, query: F)
+where
+    F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
+{
+    let guard = GitQuerySlotGuard { state: slot.clone(), disarmed: false };
+    let query = Arc::new(query);
+    let mut current = Some(first);
+    while let Some((path, request)) = current {
+        let (info, timed_out_root) = run_one_git_query(timeout, &path, &query);
+        let _ = tx.send(Command::GitInfoResolved { panel, path, request, info, timed_out_root: timed_out_root.clone() });
+
+        let mut state = slot.lock().unwrap();
+        current = state.pending.take();
+        // A request queued before this query timed out on root R must not
+        // start a second walk of the slow repository — exactly the pile-up
+        // this change removes. Its panel shows no git info there, which is
+        // what the reducer decides anyway once R is recorded (design D3).
+        if let (Some(root), Some((pending_path, _))) = (&timed_out_root, &current) {
+            if git_info::is_under_root(pending_path, root) {
+                current = None;
+            }
+        }
+        if current.is_none() {
+            state.running = false;
+        }
+    }
+    guard.disarm();
+}
+
+/// The cell a running query publishes its repository's working-directory
+/// root into — *before* the potentially slow status walk starts — so a
+/// timeout can report which repository is slow, not just that it is
+/// (design D2). `None` while discovery has not finished.
+type PublishedRoot = Arc<Mutex<Option<PathBuf>>>;
+
+/// The real per-directory query the runner drives: repository discovery
+/// publishes the workdir root (in the queried path's own spelling) before
+/// the status walk begins, then branch + status resolve as one blocking
+/// libgit2 call sequence (git-info "Background repository detection").
+fn discover_then_query(path: &Path, published: &PublishedRoot) -> GitInfo {
+    let Some((repo, depth)) = git_info::discover(path) else {
+        return GitInfo::none();
+    };
+    let root = git_info::root_in_dir_spelling(path, depth).unwrap_or_else(|| path.to_path_buf());
+    *published.lock().unwrap_or_else(|e| e.into_inner()) = Some(root);
+    git_info::query_in_repo(&repo, path)
+}
+
+/// Run one query under the timeout on a throwaway inner thread and turn the
+/// outcome into the reply's `(info, timed_out_root)`: the resolved info when
+/// it finished in time; on timeout `GitInfo::none()` plus the published root
+/// (or the queried directory itself when discovery never finished — then
+/// only that directory and its descendants are remembered, design D2); on a
+/// panicked inner thread `GitInfo::none()` with `timed_out_root: None`, so a
+/// one-off panic is not mistaken for a timeout and does not silence a
+/// repository for the session.
+fn run_one_git_query<F>(timeout: Duration, path: &Path, query: &Arc<F>) -> (GitInfo, Option<PathBuf>)
+where
+    F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
+{
+    let published: PublishedRoot = Arc::new(Mutex::new(None));
+    let outcome = {
+        let published = published.clone();
+        let path = path.to_path_buf();
+        let query = query.clone();
+        race_with_timeout(timeout, move || query(&path, &published))
+    };
+    match outcome {
+        Ok(info) => (info, None),
+        Err(RecvTimeoutError::Timeout) => {
+            let root = published.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_else(|| path.to_path_buf());
+            (GitInfo::none(), Some(root))
+        }
+        Err(RecvTimeoutError::Disconnected) => (GitInfo::none(), None),
+    }
 }
 
 /// Run `f` on a fresh thread and wait up to `timeout` for its result.
-/// `Some(value)` if `f` finished in time; `None` on timeout — `f`'s thread
-/// is simply left running to completion in the background (there is no way
-/// to cancel an arbitrary blocking call), and its eventual result is
-/// dropped rather than delivered late, since nothing is listening for it
-/// past the timeout.
-fn race_with_timeout<T, F>(timeout: Duration, f: F) -> Option<T>
+/// `Ok(value)` if `f` finished in time; `Err(RecvTimeoutError::Timeout)`
+/// when it did not — `f`'s thread is simply left running to completion in
+/// the background (there is no way to cancel an arbitrary blocking call),
+/// and its eventual result is dropped rather than delivered late, since
+/// nothing is listening for it past the timeout;
+/// `Err(RecvTimeoutError::Disconnected)` when `f`'s thread died without
+/// sending (a panic), so callers can tell a crash apart from a genuine
+/// timeout (git-info-timeout-memory design D2).
+fn race_with_timeout<T, F>(timeout: Duration, f: F) -> Result<T, RecvTimeoutError>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -94,7 +247,7 @@ where
     std::thread::spawn(move || {
         let _ = tx.send(f());
     });
-    rx.recv_timeout(timeout).ok()
+    rx.recv_timeout(timeout)
 }
 
 /// The blocking half of an Info query, factored out so it can be driven
@@ -358,16 +511,237 @@ mod tests {
     #[test]
     fn race_with_timeout_returns_the_value_when_it_finishes_in_time() {
         let result = race_with_timeout(std::time::Duration::from_secs(5), || 42);
-        assert_eq!(result, Some(42));
+        assert_eq!(result, Ok(42));
     }
 
     #[test]
-    fn race_with_timeout_gives_up_and_returns_none_on_a_slow_call() {
+    fn race_with_timeout_gives_up_and_reports_timeout_on_a_slow_call() {
         let result = race_with_timeout(std::time::Duration::from_millis(20), || {
             std::thread::sleep(std::time::Duration::from_secs(5));
             "too slow"
         });
-        assert_eq!(result, None);
+        assert!(matches!(result, Err(RecvTimeoutError::Timeout)));
+    }
+
+    #[test]
+    fn race_with_timeout_reports_a_panicked_call_as_disconnected_not_timeout() {
+        // design D2: a crash must be distinguishable from a genuine timeout.
+        let result = race_with_timeout(std::time::Duration::from_secs(5), || panic!("boom"));
+        assert!(matches!(result, Err(RecvTimeoutError::Disconnected)));
+    }
+
+    // -----------------------------------------------------------------
+    // git-info-timeout-memory: one query in flight per panel, and timeout
+    // memory (design D2/D3)
+    // -----------------------------------------------------------------
+
+    /// A scripted stand-in for the real per-directory git query: records the
+    /// order queries start in and runs a per-path script, so slot-runner
+    /// tests can block, publish roots, and panic on cue without libgit2.
+    struct FakeGitQuery {
+        started: Sender<PathBuf>,
+        scripts: Mutex<std::collections::HashMap<PathBuf, FakeScript>>,
+    }
+
+    enum FakeScript {
+        /// Return this info immediately.
+        Ready(GitInfo),
+        /// Publish `root` as the discovered repository root, then block
+        /// until the gate fires (a slow status walk).
+        PublishThenBlock(PathBuf, mpsc::Receiver<()>),
+        /// Block on the gate without publishing anything (discovery itself
+        /// is the slow part).
+        Block(mpsc::Receiver<()>),
+        /// Die without answering (a panic inside the query).
+        Panic,
+    }
+
+    impl FakeGitQuery {
+        fn new(started: Sender<PathBuf>, scripts: Vec<(PathBuf, FakeScript)>) -> Arc<FakeGitQuery> {
+            Arc::new(FakeGitQuery { started, scripts: Mutex::new(scripts.into_iter().collect()) })
+        }
+
+        fn run(&self, path: &Path, published: &PublishedRoot) -> GitInfo {
+            let _ = self.started.send(path.to_path_buf());
+            // Bound ahead of the match so the lock guard's temporary is
+            // dropped before any script runs — a `Panic` script must not
+            // poison the map for the next runner.
+            let script = self.scripts.lock().unwrap().remove(path);
+            match script {
+                Some(FakeScript::Ready(info)) => info,
+                Some(FakeScript::PublishThenBlock(root, gate)) => {
+                    *published.lock().unwrap() = Some(root);
+                    let _ = gate.recv();
+                    GitInfo { branch: Some("late".to_string()), ..Default::default() }
+                }
+                Some(FakeScript::Block(gate)) => {
+                    let _ = gate.recv();
+                    GitInfo { branch: Some("late".to_string()), ..Default::default() }
+                }
+                Some(FakeScript::Panic) => panic!("scripted query panic"),
+                None => GitInfo::none(),
+            }
+        }
+    }
+
+    fn fake_query(fake: &Arc<FakeGitQuery>) -> impl Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static {
+        let fake = fake.clone();
+        move |path, published| fake.run(path, published)
+    }
+
+    /// Receive the next `GitInfoResolved` reply, panicking on anything else.
+    fn recv_git_reply(rx: &mpsc::Receiver<Command>) -> (PathBuf, u64, GitInfo, Option<PathBuf>) {
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Ok(Command::GitInfoResolved { panel: _, path, request, info, timed_out_root }) => (path, request, info, timed_out_root),
+            other => panic!("expected GitInfoResolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_superseded_pending_request_is_never_started() {
+        // git-info "Rapid navigation does not pile up queries": with the
+        // first query still running, two more navigations queue; when the
+        // first reports, only the *last* queued directory is queried.
+        let (started_tx, started_rx) = mpsc::channel::<PathBuf>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let fake = FakeGitQuery::new(
+            started_tx,
+            vec![
+                (PathBuf::from("/first"), FakeScript::Block(gate_rx)),
+                (PathBuf::from("/third"), FakeScript::Ready(GitInfo { branch: Some("third-branch".to_string()), ..Default::default() })),
+            ],
+        );
+        let slot = GitQuerySlot::new();
+        let (tx, rx) = mpsc::channel();
+        let timeout = std::time::Duration::from_secs(5);
+
+        slot.request_with(PanelSide::Left, PathBuf::from("/first"), 1, tx.clone(), timeout, fake_query(&fake));
+        assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/first")), "the first query starts");
+        slot.request_with(PanelSide::Left, PathBuf::from("/second"), 2, tx.clone(), timeout, fake_query(&fake));
+        slot.request_with(PanelSide::Left, PathBuf::from("/third"), 3, tx.clone(), timeout, fake_query(&fake));
+        gate_tx.send(()).unwrap(); // let the first query finish within its timeout
+
+        let (path, request, _info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!((path, request, timed_out_root), (PathBuf::from("/first"), 1, None), "the first query reports normally");
+        assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/third")), "the newest queued request runs next");
+        let (path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!((path, request, timed_out_root), (PathBuf::from("/third"), 3, None));
+        assert_eq!(info.branch.as_deref(), Some("third-branch"));
+        assert!(
+            matches!(started_rx.recv_timeout(std::time::Duration::from_millis(300)), Err(RecvTimeoutError::Timeout)),
+            "the superseded second request is never started"
+        );
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "and never answered");
+    }
+
+    #[test]
+    fn a_pending_request_inside_the_timed_out_repository_is_never_started() {
+        // git-info "Waiting query inside the timed-out repository is not
+        // started": the running query publishes root R and then times out;
+        // the request queued under R meanwhile is discarded rather than
+        // starting a second walk of the slow repository (design D3).
+        let (started_tx, started_rx) = mpsc::channel::<PathBuf>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let fake =
+            FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
+        let slot = GitQuerySlot::new();
+        let (tx, rx) = mpsc::channel();
+        let timeout = std::time::Duration::from_millis(300);
+
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx.clone(), timeout, fake_query(&fake));
+        assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/repo/src")));
+        // Queued while the first query is still walking (before it times
+        // out), inside the about-to-be-remembered repository.
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/docs"), 2, tx, timeout, fake_query(&fake));
+
+        let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!(request, 1);
+        assert_eq!(info, GitInfo::none(), "a timeout degrades to no info");
+        assert_eq!(timed_out_root, Some(PathBuf::from("/repo")), "the published root is reported");
+        assert!(
+            matches!(started_rx.recv_timeout(std::time::Duration::from_millis(500)), Err(RecvTimeoutError::Timeout)),
+            "the queued request inside the timed-out repository never starts"
+        );
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "and it is never answered");
+        drop(gate_tx); // let the orphaned fake walk finish
+    }
+
+    #[test]
+    fn a_timeout_reports_the_published_repository_root() {
+        // design D2: discovery finished — the root was published — before
+        // the status walk stalled.
+        let (started_tx, _started_rx) = mpsc::channel::<PathBuf>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let fake =
+            FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
+        let slot = GitQuerySlot::new();
+        let (tx, rx) = mpsc::channel();
+        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx, std::time::Duration::from_millis(100), fake_query(&fake));
+
+        let (path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!(path, PathBuf::from("/repo/src"));
+        assert_eq!(request, 1);
+        assert_eq!(info, GitInfo::none());
+        assert_eq!(timed_out_root, Some(PathBuf::from("/repo")));
+        drop(gate_tx);
+    }
+
+    #[test]
+    fn a_timeout_before_discovery_finishes_reports_the_queried_directory() {
+        // git-info "Repository not located before the timeout": with no
+        // root published, the queried directory itself is reported (only it
+        // and its descendants are remembered).
+        let (started_tx, _started_rx) = mpsc::channel::<PathBuf>();
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let fake = FakeGitQuery::new(started_tx, vec![(PathBuf::from("/slow/deep"), FakeScript::Block(gate_rx))]);
+        let slot = GitQuerySlot::new();
+        let (tx, rx) = mpsc::channel();
+        slot.request_with(PanelSide::Left, PathBuf::from("/slow/deep"), 1, tx, std::time::Duration::from_millis(100), fake_query(&fake));
+
+        let (path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!(path, PathBuf::from("/slow/deep"));
+        assert_eq!(request, 1);
+        assert_eq!(info, GitInfo::none());
+        assert_eq!(timed_out_root, Some(PathBuf::from("/slow/deep")), "the queried directory stands in for the unlocated root");
+        drop(gate_tx);
+    }
+
+    #[test]
+    fn a_panicked_query_reports_no_timed_out_root_and_leaves_the_slot_idle() {
+        // design D2/D3: a crash is not a timeout (`timed_out_root: None`),
+        // and the slot is usable for the next request afterwards.
+        let (started_tx, started_rx) = mpsc::channel::<PathBuf>();
+        let fake = FakeGitQuery::new(
+            started_tx,
+            vec![
+                (PathBuf::from("/panic"), FakeScript::Panic),
+                (PathBuf::from("/ok"), FakeScript::Ready(GitInfo { branch: Some("ok-branch".to_string()), ..Default::default() })),
+            ],
+        );
+        let slot = GitQuerySlot::new();
+        let (tx, rx) = mpsc::channel();
+        let timeout = std::time::Duration::from_secs(5);
+
+        slot.request_with(PanelSide::Left, PathBuf::from("/panic"), 1, tx.clone(), timeout, fake_query(&fake));
+        assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/panic")), "the first query starts");
+        let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!(request, 1);
+        assert_eq!(info, GitInfo::none());
+        assert_eq!(timed_out_root, None, "a panic is not a timeout");
+
+        // With nothing queued, the runner marks the slot idle and exits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while slot.state.lock().unwrap().running {
+            assert!(std::time::Instant::now() < deadline, "the slot is marked idle after the panicked query");
+            std::thread::yield_now();
+        }
+
+        slot.request_with(PanelSide::Left, PathBuf::from("/ok"), 2, tx, timeout, fake_query(&fake));
+        assert_eq!(started_rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(PathBuf::from("/ok")), "an idle slot serves the next request");
+        let (_path, request, info, timed_out_root) = recv_git_reply(&rx);
+        assert_eq!(request, 2);
+        assert_eq!(info.branch.as_deref(), Some("ok-branch"));
+        assert_eq!(timed_out_root, None);
     }
 
     #[test]
