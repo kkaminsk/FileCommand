@@ -5,8 +5,9 @@
 use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::io;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use unicode_width::UnicodeWidthStr;
 
@@ -64,9 +65,14 @@ impl DateTime {
     }
 }
 
-/// One directory entry as displayed in a panel.
+/// One directory entry as displayed in a panel. Built only through
+/// [`Entry::new`], [`Entry::parent_dir`] and `From<RawDirEntry>`, so the
+/// private lowercase [`Entry::sort_key`] is always consistent with `name`
+/// (streaming-listing-performance design D4).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
+    /// The on-disk name. Readable everywhere; nothing mutates it after
+    /// construction, since `sort_key` is derived from it once.
     pub name: OsString,
     pub kind: EntryKind,
     pub size: u64,
@@ -85,15 +91,36 @@ pub struct Entry {
     /// and F8 on one asks a single confirmation because Delete removes only
     /// the link (design D4/D5). The synthetic `..` entry is never a link.
     pub link: bool,
+    /// `name` lowercased once at construction (`to_string_lossy()` then
+    /// `str::to_lowercase`): the key every name-based comparator and the
+    /// quick filter read instead of allocating per comparison
+    /// (streaming-listing-performance design D4; panel-navigation "Large
+    /// directories stream progressively and stay responsive"). Private so
+    /// no struct literal can build an `Entry` whose key disagrees with its
+    /// name.
+    sort_key: Box<str>,
 }
 
 impl Entry {
+    /// The one way to build an entry from its parts; computes the lowercase
+    /// sort key once (design D4).
+    pub fn new(name: impl Into<OsString>, kind: EntryKind, size: u64, modified: Option<DateTime>, hidden: bool, link: bool) -> Entry {
+        let name = name.into();
+        let sort_key = name.to_string_lossy().to_lowercase().into_boxed_str();
+        Entry { name, kind, size, modified, hidden, link, sort_key }
+    }
+
     pub fn parent_dir() -> Entry {
-        Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }
+        Entry::new("..", EntryKind::ParentDir, 0, None, false, false)
     }
 
     pub fn is_dir_like(&self) -> bool {
         matches!(self.kind, EntryKind::Directory | EntryKind::ParentDir)
+    }
+
+    /// The lowercase name key computed when the entry was built (design D4).
+    pub fn sort_key(&self) -> &str {
+        &self.sort_key
     }
 }
 
@@ -155,10 +182,6 @@ pub fn sort_arrow(descending: bool) -> &'static str {
     }
 }
 
-fn lower_name(entry: &Entry) -> String {
-    entry.name.to_string_lossy().to_lowercase()
-}
-
 /// The DOS-style extension of a name: everything after the last `.`, except
 /// that a leading dot is part of the name (`.gitignore` has no extension).
 pub fn extension_of(name: &str) -> &str {
@@ -169,28 +192,30 @@ pub fn extension_of(name: &str) -> &str {
 }
 
 /// Case-insensitive name order. Directories and files interleave, matching
-/// classic Norton Commander behavior.
+/// classic Norton Commander behavior. Compares the precomputed
+/// [`Entry::sort_key`]s — no allocation per comparison (streaming-listing-
+/// performance design D4).
 pub fn cmp_by_name(a: &Entry, b: &Entry) -> Ordering {
-    lower_name(a).cmp(&lower_name(b))
+    a.sort_key().cmp(b.sort_key())
 }
 
 /// Extension order, falling back to name so entries sharing an extension
 /// stay in a predictable (total) order.
 pub fn cmp_by_extension(a: &Entry, b: &Entry) -> Ordering {
-    let (an, bn) = (lower_name(a), lower_name(b));
-    extension_of(&an).cmp(extension_of(&bn)).then_with(|| an.cmp(&bn))
+    let (an, bn) = (a.sort_key(), b.sort_key());
+    extension_of(an).cmp(extension_of(bn)).then_with(|| an.cmp(bn))
 }
 
 /// Modification-time order, oldest first; entries with no timestamp sort
 /// before any timestamped entry. Ties break on name.
 pub fn cmp_by_time(a: &Entry, b: &Entry) -> Ordering {
-    a.modified.cmp(&b.modified).then_with(|| lower_name(a).cmp(&lower_name(b)))
+    a.modified.cmp(&b.modified).then_with(|| a.sort_key().cmp(b.sort_key()))
 }
 
 /// Size order, smallest first, ties breaking on name. Directories carry
 /// size 0 and therefore group at the front.
 pub fn cmp_by_size(a: &Entry, b: &Entry) -> Ordering {
-    a.size.cmp(&b.size).then_with(|| lower_name(a).cmp(&lower_name(b)))
+    a.size.cmp(&b.size).then_with(|| a.sort_key().cmp(b.sort_key()))
 }
 
 /// The comparator for `mode`, before `..`-first and direction handling.
@@ -211,11 +236,104 @@ mod sort_tests {
     use super::*;
 
     fn f(name: &str, size: u64, modified: Option<DateTime>) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified, hidden: false, link: false }
+        Entry::new(name, EntryKind::File, size, modified, false, false)
     }
 
     fn dt(day: u8) -> DateTime {
         DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }
+    }
+
+    #[test]
+    fn the_sort_key_is_the_lowercased_lossy_name_for_every_constructor() {
+        assert_eq!(f("ReadMe.TXT", 0, None).sort_key(), "readme.txt");
+        assert_eq!(Entry::parent_dir().sort_key(), "..");
+        let raw = RawDirEntry { name: "ÄRger.Log".into(), is_dir: false, size: 1, modified: None, hidden: false, link: false };
+        assert_eq!(Entry::from(raw).sort_key(), "ärger.log");
+    }
+
+    /// streaming-listing-performance design D4 / panel-navigation "Orders
+    /// are unchanged by precomputed keys": the keyed comparators agree with
+    /// the allocating ones they replaced, for every mode and direction.
+    mod key_proptests {
+        use super::*;
+        use crate::panel::{cmp_entries, SortDirection};
+        use proptest::prelude::*;
+
+        // The previous implementation, kept verbatim as the oracle.
+        fn lower_name(entry: &Entry) -> String {
+            entry.name.to_string_lossy().to_lowercase()
+        }
+        fn old_cmp_by_name(a: &Entry, b: &Entry) -> Ordering {
+            lower_name(a).cmp(&lower_name(b))
+        }
+        fn old_cmp_by_extension(a: &Entry, b: &Entry) -> Ordering {
+            let (an, bn) = (lower_name(a), lower_name(b));
+            extension_of(&an).cmp(extension_of(&bn)).then_with(|| an.cmp(&bn))
+        }
+        fn old_cmp_by_time(a: &Entry, b: &Entry) -> Ordering {
+            a.modified.cmp(&b.modified).then_with(|| lower_name(a).cmp(&lower_name(b)))
+        }
+        fn old_cmp_by_size(a: &Entry, b: &Entry) -> Ordering {
+            a.size.cmp(&b.size).then_with(|| lower_name(a).cmp(&lower_name(b)))
+        }
+        fn old_cmp_by_mode(a: &Entry, b: &Entry, mode: SortMode) -> Ordering {
+            match mode {
+                SortMode::Name => old_cmp_by_name(a, b),
+                SortMode::Extension => old_cmp_by_extension(a, b),
+                SortMode::Time => old_cmp_by_time(a, b),
+                SortMode::Size => old_cmp_by_size(a, b),
+                SortMode::Unsorted => Ordering::Equal,
+            }
+        }
+        fn old_cmp_entries(a: &Entry, b: &Entry, mode: SortMode, dir: SortDirection) -> Ordering {
+            match (a.kind == EntryKind::ParentDir, b.kind == EntryKind::ParentDir) {
+                (true, true) => return Ordering::Equal,
+                (true, false) => return Ordering::Less,
+                (false, true) => return Ordering::Greater,
+                (false, false) => {}
+            }
+            let ord = old_cmp_by_mode(a, b, mode);
+            match dir {
+                SortDirection::Asc => ord,
+                SortDirection::Desc => ord.reverse(),
+            }
+        }
+
+        fn arb_entry() -> impl Strategy<Value = Entry> {
+            // Mixed case, dots, a Greek final sigma (whose lowercase differs
+            // from its simple case fold), and a short size/time range so
+            // ties are common.
+            (
+                "[A-Za-z0-9._ ΣσςÄä-]{0,8}",
+                prop_oneof![Just(EntryKind::File), Just(EntryKind::Directory), Just(EntryKind::ParentDir)],
+                0u64..4,
+                proptest::option::of(1u8..4),
+            )
+                .prop_map(|(name, kind, size, day)| Entry::new(name, kind, size, day.map(dt), false, false))
+        }
+
+        fn arb_mode() -> impl Strategy<Value = SortMode> {
+            prop_oneof![Just(SortMode::Name), Just(SortMode::Extension), Just(SortMode::Time), Just(SortMode::Size), Just(SortMode::Unsorted)]
+        }
+
+        proptest! {
+            #[test]
+            fn keyed_comparators_agree_with_the_allocating_ones(a in arb_entry(), b in arb_entry(), mode in arb_mode(), desc in any::<bool>()) {
+                let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+                prop_assert_eq!(cmp_by_mode(&a, &b, mode), old_cmp_by_mode(&a, &b, mode));
+                prop_assert_eq!(cmp_entries(&a, &b, mode, dir), old_cmp_entries(&a, &b, mode, dir));
+            }
+
+            #[test]
+            fn keyed_sort_orders_match_the_allocating_sort_orders(entries in prop::collection::vec(arb_entry(), 0..12), mode in arb_mode(), desc in any::<bool>()) {
+                let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+                let mut new = entries.clone();
+                new.sort_by(|a, b| cmp_entries(a, b, mode, dir));
+                let mut old = entries;
+                old.sort_by(|a, b| old_cmp_entries(a, b, mode, dir));
+                prop_assert_eq!(new, old);
+            }
+        }
     }
 
     #[test]
@@ -465,6 +583,25 @@ pub struct RawDirListing {
 /// cases) without touching the real filesystem.
 pub trait FsReader {
     fn read_dir(&self, path: &Path) -> io::Result<RawDirListing>;
+
+    /// Hand `path`'s entries to `f` one at a time, as the enumeration
+    /// yields them, until it returns `ControlFlow::Break` or the directory
+    /// is exhausted. Returns how many entries were skipped as unreadable
+    /// (the [`RawDirListing::unreadable`] count; link-aware-listing design
+    /// D6). The default collects through [`FsReader::read_dir`], so fakes
+    /// keep implementing only that; [`StdFsReader`] overrides it with the
+    /// real per-entry loop so the listing worker can deliver entries while
+    /// the OS is still enumerating, and stop mid-enumeration when its cancel
+    /// flag is set (streaming-listing-performance design D1).
+    fn for_each_entry(&self, path: &Path, f: &mut dyn FnMut(RawDirEntry) -> ControlFlow<()>) -> io::Result<usize> {
+        let listing = self.read_dir(path)?;
+        for entry in listing.entries {
+            if f(entry).is_break() {
+                break;
+            }
+        }
+        Ok(listing.unreadable)
+    }
 }
 
 /// What a reader learns about one enumerated entry from a single metadata
@@ -541,44 +678,63 @@ fn facts_of(name: &std::ffi::OsStr, metadata: &std::fs::Metadata) -> EntryFacts 
 }
 
 impl FsReader for StdFsReader {
-    /// Enumerate `path`. An error from the enumeration itself (`entry?`:
-    /// `FindNextFileW`/`readdir` failing) is still returned as `Err` — it
-    /// identifies no single entry, and continuing could repeat it forever.
-    /// An entry whose own metadata cannot be read is skipped and counted
-    /// instead of failing the whole listing (link-aware-listing design D6).
-    /// A link is followed with one `std::fs::metadata` call so that a
-    /// junction or symlink to a directory lists as a directory (design D1).
+    /// Enumerate `path` into one listing by collecting through
+    /// [`StdFsReader::for_each_entry`] — the `Vec` API Tree mode, find-file
+    /// and the Info gatherer keep using (streaming-listing-performance
+    /// design D1).
     fn read_dir(&self, path: &Path) -> io::Result<RawDirListing> {
+        let mut entries = Vec::new();
+        let unreadable = self.for_each_entry(path, &mut |raw| {
+            entries.push(raw);
+            ControlFlow::Continue(())
+        })?;
+        Ok(RawDirListing { entries, unreadable })
+    }
+
+    /// The real per-entry loop over `std::fs::read_dir`, handing each entry
+    /// to `f` as the OS returns it (design D1). An error from the
+    /// enumeration itself (`entry?`: `FindNextFileW`/`readdir` failing) is
+    /// still returned as `Err` — it identifies no single entry, and
+    /// continuing could repeat it forever. An entry whose own metadata
+    /// cannot be read is skipped and counted instead of failing the whole
+    /// listing (link-aware-listing design D6). A link is followed with one
+    /// `std::fs::metadata` call so that a junction or symlink to a directory
+    /// lists as a directory (design D1).
+    fn for_each_entry(&self, path: &Path, f: &mut dyn FnMut(RawDirEntry) -> ControlFlow<()>) -> io::Result<usize> {
         let long = to_long_path(path);
-        let mut listing = RawDirListing::default();
+        let mut unreadable = 0usize;
         for entry in std::fs::read_dir(&long)? {
             let entry = entry?;
             let name = entry.file_name();
             let own = entry.metadata().map(|m| facts_of(&name, &m));
             let follow = || std::fs::metadata(long.join(&name)).map(|m| facts_of(&name, &m));
             match classify_entry(name.clone(), own, follow) {
-                Some(raw) => listing.entries.push(raw),
-                None => listing.unreadable += 1,
+                Some(raw) => {
+                    if f(raw).is_break() {
+                        break;
+                    }
+                }
+                None => unreadable += 1,
             }
         }
-        Ok(listing)
+        Ok(unreadable)
     }
 }
 
 impl From<RawDirEntry> for Entry {
     fn from(raw: RawDirEntry) -> Self {
-        Entry {
-            name: raw.name,
-            kind: if raw.is_dir { EntryKind::Directory } else { EntryKind::File },
-            size: raw.size,
-            modified: raw.modified.map(DateTime::from_system_time),
-            hidden: raw.hidden,
-            link: raw.link,
-        }
+        Entry::new(
+            raw.name,
+            if raw.is_dir { EntryKind::Directory } else { EntryKind::File },
+            raw.size,
+            raw.modified.map(DateTime::from_system_time),
+            raw.hidden,
+            raw.link,
+        )
     }
 }
 
-/// What [`list_dir_chunked`] delivered: the entries handed to `on_chunk`,
+/// What [`list_dir_streaming`] delivered: the entries handed to `on_chunk`,
 /// and the entries the reader skipped as unreadable (link-aware-listing
 /// design D6). The caller reports the latter on the mini-status.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -587,37 +743,93 @@ pub struct ListingTotals {
     pub unreadable: usize,
 }
 
-/// Read a directory and deliver entries in chunks via `on_chunk`, returning
+/// When [`list_dir_streaming`] hands the batch it is accumulating to its
+/// caller (streaming-listing-performance design D2; panel-navigation "Large
+/// directories stream progressively and stay responsive"): once the batch
+/// holds `clamp(sent / 4, min, max)` entries — the size grows with what has
+/// already been sent, so a fast enumeration produces O(log n) batches and
+/// the panel's per-batch merge stays near-linear overall, while `max`
+/// bounds the largest single merge — or once `max_age` has passed since the
+/// last flush when the next entry arrives, so slow media still show
+/// progress at ~20 Hz.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchPolicy {
+    /// The smallest batch that is flushed on count alone.
+    pub min: usize,
+    /// The largest batch ever accumulated.
+    pub max: usize,
+    /// How long a non-empty batch may wait, measured between flushes.
+    pub max_age: Duration,
+}
+
+impl Default for BatchPolicy {
+    fn default() -> Self {
+        BatchPolicy { min: 256, max: 16_384, max_age: Duration::from_millis(50) }
+    }
+}
+
+impl BatchPolicy {
+    /// The count bound for the next batch after `sent` entries have gone out.
+    pub fn target_len(&self, sent: usize) -> usize {
+        (sent / 4).clamp(self.min, self.max.max(self.min))
+    }
+
+    /// Whether a batch of `batch_len` entries, with `sent` entries already
+    /// delivered and `since_last_flush` elapsed since the previous flush,
+    /// goes out now. Pure, so it is tested without a clock; an empty batch
+    /// is never flushed.
+    pub fn should_flush(&self, batch_len: usize, sent: usize, since_last_flush: Duration) -> bool {
+        batch_len > 0 && (batch_len >= self.target_len(sent) || since_last_flush >= self.max_age)
+    }
+}
+
+/// Enumerate a directory through `reader` and deliver its entries to
+/// `on_chunk` in batches while the enumeration is still running, returning
 /// the number delivered and the number the reader skipped as unreadable.
 /// Designed to be called from a worker thread by `filecommand-tui`; core
-/// never spawns threads itself. `cancel` is the listing's stop signal
-/// (panel-navigation "Superseded reader stops"; listing-request-guard design
-/// D5): it is checked before the read and before each chunk, and once set no
-/// further chunk is delivered — the returned count then covers only what was
-/// delivered. Until the streaming reader lands, the one `read_dir` call
-/// itself still runs to completion; a superseded listing costs that
-/// enumeration and nothing more.
-pub fn list_dir_chunked<F: FnMut(Vec<Entry>)>(
+/// never spawns threads itself (streaming-listing-performance design D1/D2).
+///
+/// A batch is flushed when `policy` says so — `now` is the clock it is
+/// judged against, injected so the policy's time bound is testable without
+/// sleeping — and whatever remains is flushed once the enumeration ends.
+/// `cancel` is the listing's stop signal (panel-navigation "Superseded
+/// directory listings are discarded and cancelled"; listing-request-guard
+/// design D5): it is checked before the read and as every entry arrives, and
+/// once set the enumeration is broken off and nothing further is delivered,
+/// not even the partial batch — the returned count then covers only what
+/// was delivered.
+pub fn list_dir_streaming<F: FnMut(Vec<Entry>)>(
     reader: &dyn FsReader,
     path: &Path,
-    chunk_size: usize,
     cancel: &CancelFlag,
+    policy: BatchPolicy,
+    now: &dyn Fn() -> Instant,
     mut on_chunk: F,
 ) -> io::Result<ListingTotals> {
     if cancel.is_cancelled() {
         return Ok(ListingTotals::default());
     }
-    let raw = reader.read_dir(path)?;
-    let mut totals = ListingTotals { entries: 0, unreadable: raw.unreadable };
-    for chunk in raw.entries.chunks(chunk_size.max(1)) {
+    let mut sent = 0usize;
+    let mut batch: Vec<Entry> = Vec::with_capacity(policy.min);
+    let mut last_flush = now();
+    let unreadable = reader.for_each_entry(path, &mut |raw| {
         if cancel.is_cancelled() {
-            break;
+            return ControlFlow::Break(());
         }
-        let entries: Vec<Entry> = chunk.iter().cloned().map(Entry::from).collect();
-        totals.entries += entries.len();
-        on_chunk(entries);
+        batch.push(Entry::from(raw));
+        let at = now();
+        if policy.should_flush(batch.len(), sent, at.saturating_duration_since(last_flush)) {
+            sent += batch.len();
+            on_chunk(std::mem::replace(&mut batch, Vec::with_capacity(policy.min)));
+            last_flush = at;
+        }
+        ControlFlow::Continue(())
+    })?;
+    if !cancel.is_cancelled() && !batch.is_empty() {
+        sent += batch.len();
+        on_chunk(batch);
     }
-    Ok(totals)
+    Ok(ListingTotals { entries: sent, unreadable })
 }
 
 // ---------------------------------------------------------------------
@@ -749,7 +961,7 @@ mod tests {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
             let raw = OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]); // "fo\x80o", invalid utf8
-            let entry = Entry { name: raw.to_os_string(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false };
+            let entry = Entry::new(raw.to_os_string(), EntryKind::File, 0, None, false, false);
             let shown = display_name_lossy(&entry);
             assert!(shown.contains('\u{FFFD}'));
             assert_eq!(display_width(&shown), shown.chars().count());
@@ -769,7 +981,7 @@ mod tests {
 
     #[test]
     fn entry_status_line_marks_dirs_and_parent() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false };
+        let dir = Entry::new("sub", EntryKind::Directory, 0, None, false, false);
         assert_eq!(entry_status_line(&dir), "sub  SUB-DIR");
         assert_eq!(entry_status_line(&Entry::parent_dir()), "..  UP--DIR");
     }
@@ -777,7 +989,7 @@ mod tests {
     #[test]
     fn entry_status_parts_splits_file_fields() {
         let dt = DateTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4 };
-        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt), hidden: false, link: false };
+        let file = Entry::new("a.txt", EntryKind::File, 100, Some(dt), false, false);
         let (name, size, date, time) = entry_status_parts(&file);
         assert_eq!(name, "a.txt");
         assert_eq!(size.as_deref(), Some("100"));
@@ -787,7 +999,7 @@ mod tests {
 
     #[test]
     fn entry_status_parts_marks_dirs_and_parent_with_no_date_or_time() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false };
+        let dir = Entry::new("sub", EntryKind::Directory, 0, None, false, false);
         assert_eq!(entry_status_parts(&dir), ("sub".to_string(), Some("SUB-DIR".to_string()), None, None));
         assert_eq!(entry_status_parts(&Entry::parent_dir()), ("..".to_string(), Some("UP--DIR".to_string()), None, None));
     }
@@ -839,16 +1051,174 @@ mod tests {
         }
     }
 
+    /// A clock that never advances, so only the count bound governs.
+    fn fixed_clock() -> impl Fn() -> Instant {
+        let t = Instant::now();
+        move || t
+    }
+
+    /// A clock that advances `step` on every reading.
+    fn stepping_clock(step: Duration) -> impl Fn() -> Instant {
+        let t = Instant::now();
+        let reads = std::cell::Cell::new(0u32);
+        move || {
+            reads.set(reads.get() + 1);
+            t + step * reads.get()
+        }
+    }
+
+    /// Batches of exactly `size` entries, no time bound.
+    fn fixed_batches(size: usize) -> BatchPolicy {
+        BatchPolicy { min: size, max: size, max_age: Duration::MAX }
+    }
+
+    /// Everything `list_dir_streaming` delivers under `policy` on a fixed
+    /// clock: the batches in order, and the totals.
+    fn stream_all(reader: &dyn FsReader, cancel: &CancelFlag, policy: BatchPolicy) -> (Vec<Vec<Entry>>, ListingTotals) {
+        let mut batches = Vec::new();
+        let totals = list_dir_streaming(reader, Path::new("."), cancel, policy, &fixed_clock(), |b| batches.push(b)).unwrap();
+        (batches, totals)
+    }
+
+    fn raw_files(n: usize) -> Vec<RawDirEntry> {
+        (0..n).map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None, hidden: false, link: false }).collect()
+    }
+
     #[test]
-    fn list_dir_chunked_delivers_chunks_and_total() {
-        let entries: Vec<RawDirEntry> = (0..10)
-            .map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None, hidden: false, link: false })
-            .collect();
-        let reader = FakeReader(entries);
-        let mut chunks = Vec::new();
-        let total = list_dir_chunked(&reader, Path::new("."), 3, &CancelFlag::new(), |c| chunks.push(c.len())).unwrap();
+    fn list_dir_streaming_delivers_batches_and_total() {
+        let reader = FakeReader(raw_files(10));
+        let (batches, total) = stream_all(&reader, &CancelFlag::new(), fixed_batches(3));
         assert_eq!(total, ListingTotals { entries: 10, unreadable: 0 });
-        assert_eq!(chunks, vec![3, 3, 3, 1]);
+        assert_eq!(batches.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 3, 3, 1]);
+        let names: Vec<String> = batches.concat().iter().map(|e| e.name.to_string_lossy().into_owned()).collect();
+        assert_eq!(names, (0..10).map(|i| format!("f{i}")).collect::<Vec<_>>(), "enumeration order, nothing lost or duplicated");
+    }
+
+    // -----------------------------------------------------------------
+    // streaming-listing-performance: the batch policy (design D2) and the
+    // streaming enumeration (design D1; panel-navigation "First entries
+    // appear before enumeration finishes")
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn batch_policy_count_bound_grows_with_what_was_sent_between_min_and_max() {
+        let p = BatchPolicy::default();
+        assert_eq!(p.target_len(0), 256, "the floor applies until 1,024 entries have gone out");
+        assert_eq!(p.target_len(1_023), 256);
+        assert_eq!(p.target_len(1_024), 256);
+        assert_eq!(p.target_len(4_000), 1_000, "sent / 4");
+        assert_eq!(p.target_len(65_536), 16_384, "the cap");
+        assert_eq!(p.target_len(10_000_000), 16_384);
+    }
+
+    #[test]
+    fn batch_policy_flushes_on_count_or_age_and_never_an_empty_batch() {
+        let p = BatchPolicy::default();
+        let fresh = Duration::ZERO;
+        assert!(!p.should_flush(255, 0, fresh), "below the floor, nothing goes out on count");
+        assert!(p.should_flush(256, 0, fresh), "the floor is reached");
+        assert!(!p.should_flush(256, 4_000, fresh), "with 4,000 sent the bound is 1,000");
+        assert!(p.should_flush(1_000, 4_000, fresh));
+        assert!(!p.should_flush(1, 0, Duration::from_millis(49)), "younger than the age bound");
+        assert!(p.should_flush(1, 0, Duration::from_millis(50)), "the age bound is inclusive");
+        assert!(p.should_flush(1, 1_000_000, Duration::from_secs(1)));
+        assert!(!p.should_flush(0, 0, Duration::from_secs(10)), "an empty batch is never flushed, however old");
+    }
+
+    #[test]
+    fn fast_enumeration_produces_geometrically_growing_batches() {
+        let n = 100_000;
+        let reader = FakeReader(raw_files(n));
+        let (batches, total) = stream_all(&reader, &CancelFlag::new(), BatchPolicy::default());
+        assert_eq!(total.entries, n);
+        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), n);
+        let sizes: Vec<usize> = batches.iter().map(Vec::len).collect();
+        assert_eq!(&sizes[..5], &[256, 256, 256, 256, 256], "the floor until 1,024 have gone out, then 1,280 / 4 = 320");
+        assert_eq!(sizes[5], 320);
+        let mut sent = 0;
+        for (i, &size) in sizes.iter().enumerate() {
+            if i + 1 < sizes.len() {
+                assert_eq!(size, BatchPolicy::default().target_len(sent), "batch {i} is exactly the policy's bound for {sent} sent");
+            } else {
+                assert!(size <= BatchPolicy::default().target_len(sent), "the remainder is at most the bound");
+            }
+            sent += size;
+        }
+        assert!(sizes.len() < 50, "O(log n) batches for 100k entries, not ~390 fixed chunks: {}", sizes.len());
+        assert!(sizes.iter().all(|&s| s <= 16_384));
+    }
+
+    #[test]
+    fn a_slow_enumeration_flushes_on_age_so_every_entry_shows_promptly() {
+        // The clock advances 60 ms per reading, so by the time each entry
+        // arrives the 50 ms bound has passed since the last flush: every
+        // entry goes out on its own (panel-navigation "First entries appear
+        // before enumeration finishes").
+        let reader = FakeReader(raw_files(5));
+        let mut batches = Vec::new();
+        let total = list_dir_streaming(&reader, Path::new("."), &CancelFlag::new(), BatchPolicy::default(), &stepping_clock(Duration::from_millis(60)), |b| {
+            batches.push(b.len())
+        })
+        .unwrap();
+        assert_eq!(total.entries, 5);
+        assert_eq!(batches, vec![1, 1, 1, 1, 1]);
+    }
+
+    /// A reader that hands out entries one by one and counts how many it
+    /// produced, so a test can show enumeration stopped at the cancel.
+    struct CountingStreamReader {
+        entries: Vec<RawDirEntry>,
+        produced: std::cell::Cell<usize>,
+    }
+
+    impl FsReader for CountingStreamReader {
+        fn read_dir(&self, _path: &Path) -> io::Result<RawDirListing> {
+            unreachable!("the streaming path must go through for_each_entry")
+        }
+        fn for_each_entry(&self, _path: &Path, f: &mut dyn FnMut(RawDirEntry) -> ControlFlow<()>) -> io::Result<usize> {
+            for e in &self.entries {
+                self.produced.set(self.produced.get() + 1);
+                if f(e.clone()).is_break() {
+                    break;
+                }
+            }
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn a_flag_set_mid_enumeration_stops_reading_and_sends_nothing_further() {
+        let reader = CountingStreamReader { entries: raw_files(10), produced: std::cell::Cell::new(0) };
+        let cancel = CancelFlag::new();
+        let mut batches = Vec::new();
+        let total = list_dir_streaming(&reader, Path::new("."), &cancel, fixed_batches(3), &fixed_clock(), |b| {
+            batches.push(b.len());
+            // The reducer's `CancelRequest` lands while the next batch is
+            // accumulating.
+            cancel.cancel();
+        })
+        .unwrap();
+        assert_eq!(batches, vec![3], "the batch in flight when the flag was set is the last one; the partial batch is dropped");
+        assert_eq!(total.entries, 3, "the count covers only what was delivered");
+        assert_eq!(reader.produced.get(), 4, "the entry after the flush saw the flag and broke the enumeration; nothing more was read");
+    }
+
+    #[test]
+    fn the_default_for_each_entry_streams_a_read_dir_result_and_honours_break() {
+        let reader = FakeReader(raw_files(5));
+        let mut seen = 0;
+        let unreadable = reader
+            .for_each_entry(Path::new("."), &mut |_| {
+                seen += 1;
+                if seen == 2 {
+                    ControlFlow::Break(())
+                } else {
+                    ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert_eq!(seen, 2);
+        assert_eq!(unreadable, 0);
     }
 
     // -----------------------------------------------------------------
@@ -881,8 +1251,8 @@ mod tests {
         // `Entry`, and sorting reorders whole entries without dropping it
         // (hidden-entry-styling tasks.md 1.3).
         let reader = FakeReader(vec![raw_file("zeta.txt"), raw_hidden("desktop.ini", false), raw_hidden(".git", true), raw_dir("alpha")]);
-        let mut entries = Vec::new();
-        let total = list_dir_chunked(&reader, Path::new("."), 100, &CancelFlag::new(), |chunk| entries.extend(chunk)).unwrap();
+        let (batches, total) = stream_all(&reader, &CancelFlag::new(), BatchPolicy::default());
+        let mut entries: Vec<Entry> = batches.concat();
         assert_eq!(total.entries, 4);
         let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
         assert_eq!(flags, vec![("zeta.txt", false), ("desktop.ini", true), (".git", true), ("alpha", false)], "enumeration order");
@@ -1072,29 +1442,27 @@ mod tests {
     }
 
     #[test]
-    fn list_dir_chunked_with_a_pre_set_flag_delivers_nothing() {
-        let entries: Vec<RawDirEntry> = (0..10).map(|i| raw_file(&format!("f{i}"))).collect();
-        let reader = FakeReader(entries);
+    fn list_dir_streaming_with_a_pre_set_flag_delivers_nothing() {
+        let reader = CountingStreamReader { entries: raw_files(10), produced: std::cell::Cell::new(0) };
         let cancel = CancelFlag::new();
         cancel.cancel();
-        let mut chunks = 0usize;
-        let total = list_dir_chunked(&reader, Path::new("."), 3, &cancel, |_| chunks += 1).unwrap();
-        assert_eq!(chunks, 0, "a superseded reader delivers no chunk");
+        let (batches, total) = stream_all(&reader, &cancel, fixed_batches(3));
+        assert!(batches.is_empty(), "a superseded reader delivers no batch");
         assert_eq!(total.entries, 0);
+        assert_eq!(reader.produced.get(), 0, "the check precedes the enumeration");
     }
 
     #[test]
-    fn list_dir_chunked_stops_delivering_once_cancelled_between_chunks() {
-        let entries: Vec<RawDirEntry> = (0..10).map(|i| raw_file(&format!("f{i}"))).collect();
-        let reader = FakeReader(entries);
+    fn list_dir_streaming_stops_delivering_once_cancelled_between_batches() {
+        let reader = FakeReader(raw_files(10));
         let cancel = CancelFlag::new();
         let mut chunks = Vec::new();
-        let total = list_dir_chunked(&reader, Path::new("."), 3, &cancel, |c| {
+        let total = list_dir_streaming(&reader, Path::new("."), &cancel, fixed_batches(3), &fixed_clock(), |c| {
             chunks.push(c.len());
             cancel.cancel();
         })
         .unwrap();
-        assert_eq!(chunks, vec![3], "the chunk in flight when the flag was set is the last one");
+        assert_eq!(chunks, vec![3], "the batch in flight when the flag was set is the last one");
         assert_eq!(total.entries, 3, "the count covers only what was delivered");
     }
 
@@ -1173,10 +1541,10 @@ mod tests {
     }
 
     #[test]
-    fn list_dir_chunked_reports_the_skipped_count_and_the_link_flag_survives_conversion_and_sorting() {
+    fn list_dir_streaming_reports_the_skipped_count_and_the_link_flag_survives_conversion_and_sorting() {
         let reader = SkippingReader(RawDirListing { entries: vec![raw_file("zeta.txt"), raw_dir_link("lnk"), raw_dir("alpha")], unreadable: 2 });
-        let mut entries = Vec::new();
-        let totals = list_dir_chunked(&reader, Path::new("."), 100, &CancelFlag::new(), |chunk| entries.extend(chunk)).unwrap();
+        let (batches, totals) = stream_all(&reader, &CancelFlag::new(), BatchPolicy::default());
+        let mut entries: Vec<Entry> = batches.concat();
         assert_eq!(totals, ListingTotals { entries: 3, unreadable: 2 });
 
         let flags: Vec<(&str, EntryKind, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.kind, e.link)).collect();

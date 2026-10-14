@@ -52,11 +52,11 @@ fn start_listing(state: &State, side: PanelSide, path: impl Into<PathBuf>) -> Ef
 }
 
 fn file_entry(name: &str, size: u64) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false, link: false }
+    Entry::new(OsString::from(name), EntryKind::File, size, None, false, false)
 }
 
 fn dir_entry(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
+    Entry::new(OsString::from(name), EntryKind::Directory, 0, None, false, false)
 }
 
 /// Every navigation/re-read now also issues `Effect::QueryGitInfo`
@@ -211,7 +211,7 @@ fn request_quit_opens_mid_command_line_and_cancel_restores_the_buffer() {
 #[test]
 fn request_quit_opens_under_an_active_quick_filter_and_cancel_restores_it() {
     let mut before = test_state(UiPhase::Panels);
-    before.left.quick_filter = Some("rep".to_string());
+    before.left.set_quick_filter(Some("rep".to_string()));
     let (state, _) = update(before.clone(), Command::RequestQuit);
     assert!(state.quit_confirm);
     assert_eq!(state.left.quick_filter.as_deref(), Some("rep"));
@@ -1380,7 +1380,7 @@ fn jump_to_prefix_only_lands_within_the_active_quick_filter() {
     // not "berry", so the filtered jump must land on "berry" instead.
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("beta", 1), file_entry("berry", 2)];
-    state.left.quick_filter = Some("rr".to_string());
+    state.left.set_quick_filter(Some("rr".to_string()));
     let (state, _) = update(state, Command::QuickSearchStart('b'));
     assert_eq!(
         state.left.entries[state.left.cursor].name.to_string_lossy(),
@@ -1400,7 +1400,7 @@ fn filtered_out_root_state() -> State {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from("/");
     state.left.entries = vec![file_entry("pagefile.sys", 1), file_entry("notes.txt", 1)];
-    state.left.quick_filter = Some("zzzz".to_string());
+    state.left.set_quick_filter(Some("zzzz".to_string()));
     state
 }
 
@@ -1467,7 +1467,7 @@ fn five_selected_two_hidden_state() -> State {
     for name in ["a.txt", "b.txt", "c.txt", "x.log", "y.log"] {
         state.left.selected.insert(OsString::from(name));
     }
-    state.left.quick_filter = Some(".txt".to_string());
+    state.left.set_quick_filter(Some(".txt".to_string()));
     state
 }
 
@@ -1544,7 +1544,7 @@ fn a_drop_computes_the_hidden_count_against_the_source_panel() {
     for name in ["a.txt", "b.txt", "x.log"] {
         state.right.selected.insert(OsString::from(name));
     }
-    state.right.quick_filter = Some(".txt".to_string()); // hides x.log
+    state.right.set_quick_filter(Some(".txt".to_string())); // hides x.log
     state.left.entries = vec![dir_entry("dest")];
     let (state, _) = update(state, Command::DragBegin { side: PanelSide::Right, name: OsString::from("a.txt"), op: JobKind::Copy });
     let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("dest") }) });
@@ -4505,7 +4505,7 @@ fn f4_passes_the_original_os_string_file_name_through_without_lossy_conversion()
         let raw = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).to_os_string();
         let mut state = test_state(UiPhase::Panels);
         state.editor = Some("notepad".to_string());
-        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }];
+        state.left.entries = vec![Entry::new(raw.clone(), EntryKind::File, 0, None, false, false)];
         let (_, effects) = update(state, Command::RequestExternalEditor);
         match effects.as_slice() {
             [Effect::RunExternalEditor(inv, _)] => assert_eq!(inv.file_arg, raw),
@@ -5577,7 +5577,7 @@ fn set_display_mode_switches_the_named_panel_and_clears_tree_state() {
 fn set_display_mode_clears_an_active_quick_filter_on_the_named_panel() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("report.txt", 1), file_entry("readme.md", 2)];
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
     assert_eq!(state.left.display_mode, DisplayMode::Brief);
     assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Brief mode");
@@ -5587,7 +5587,7 @@ fn set_display_mode_clears_an_active_quick_filter_on_the_named_panel() {
 fn set_display_mode_does_not_clear_the_opposite_panels_quick_filter() {
     let mut state = test_state(UiPhase::Panels);
     state.right.entries = vec![file_entry("report.txt", 1)];
-    state.right.quick_filter = Some("rep".to_string());
+    state.right.set_quick_filter(Some("rep".to_string()));
     let (state, _) = update(state, Command::SetDisplayMode { side: PanelSide::Left, mode: DisplayMode::Brief });
     assert_eq!(state.right.quick_filter.as_deref(), Some("rep"), "the opposite panel's filter must be untouched");
 }
@@ -5596,7 +5596,7 @@ fn set_display_mode_does_not_clear_the_opposite_panels_quick_filter() {
 fn entering_tree_mode_clears_an_active_quick_filter() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("report.txt", 1)];
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     let (state, _) = update(state, Command::EnterTreeMode(PanelSide::Left));
     assert_eq!(state.left.display_mode, DisplayMode::Tree);
     assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Tree mode");
@@ -5606,7 +5606,7 @@ fn entering_tree_mode_clears_an_active_quick_filter() {
 fn toggling_into_info_mode_clears_an_active_quick_filter() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("report.txt", 1)];
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     let (state, _) = update(state, Command::ToggleInfoMode(PanelSide::Left));
     assert_eq!(state.left.display_mode, DisplayMode::Info);
     assert_eq!(state.left.quick_filter, None, "a stale filter must not linger invisibly into Info mode");
@@ -5709,7 +5709,7 @@ fn find_match(rel: &str, name: &str) -> FindMatch {
 }
 
 fn dir_entry_named(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }
+    Entry::new(OsString::from(name), EntryKind::File, 0, None, false, false)
 }
 
 #[test]
@@ -6989,7 +6989,7 @@ fn ctrl_click_toggles_selection_and_moves_the_cursor() {
 #[test]
 fn ctrl_click_on_parent_entry_never_selects_it() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }];
+    state.left.entries = vec![Entry::new(OsString::from(".."), EntryKind::ParentDir, 0, None, false, false)];
     let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from(".."), mods: ClickMods::Ctrl });
     assert!(state.left.selected.is_empty());
     assert_eq!(state.left.cursor, 0, "the cursor still moves to `..`");
@@ -7234,7 +7234,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
 #[test]
 fn open_action_menu_at_on_the_parent_entry_is_a_no_op() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }];
+    state.left.entries = vec![Entry::new(OsString::from(".."), EntryKind::ParentDir, 0, None, false, false)];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("..") });
     assert!(state.file_action_menu.is_none(), "`..` is never a valid action-menu target");
 }
@@ -8290,7 +8290,7 @@ fn undersized_preserves_every_overlay_over_the_panels() {
         ("theme picker", Box::new(|s| s.theme_picker = Some(ThemePickerState::open("nc-classic")))),
         ("file-action menu", Box::new(|s| s.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false)))),
         ("help", Box::new(|s| s.help = Some(HelpState::new()))),
-        ("quick filter", Box::new(|s| s.left.quick_filter = Some("rep".to_string()))),
+        ("quick filter", Box::new(|s| s.left.set_quick_filter(Some("rep".to_string())))),
         ("type-ahead", Box::new(|s| s.quick_search = Some("no".to_string()))),
         ("command-line text", Box::new(|s| s.command_line = LineEdit::from("dir /w"))),
     ];
@@ -8802,11 +8802,11 @@ fn swap_panels_is_still_refused_while_a_panel_streams_even_though_replies_carry_
 // ---------------------------------------------------------------------
 
 fn dir_link_entry(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: true }
+    Entry::new(OsString::from(name), EntryKind::Directory, 0, None, false, true)
 }
 
 fn dangling_link_entry(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: true }
+    Entry::new(OsString::from(name), EntryKind::File, 0, None, false, true)
 }
 
 #[test]

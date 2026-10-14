@@ -29,7 +29,9 @@ pub fn type_ahead_match(entries: &[Entry], pattern: &str) -> Option<usize> {
         return None;
     }
     let needle = pattern.to_lowercase();
-    entries.iter().position(|e| e.name.to_string_lossy().to_lowercase().starts_with(&needle))
+    // The precomputed lowercase key is exactly `to_string_lossy().to_lowercase()`
+    // (streaming-listing-performance design D4), so no name is lowercased here.
+    entries.iter().position(|e| e.sort_key().starts_with(&needle))
 }
 
 // ---------------------------------------------------------------------
@@ -243,7 +245,7 @@ mod tests {
     use std::ffi::OsString;
 
     fn entry(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }
+        Entry::new(OsString::from(name), EntryKind::File, 0, None, false, false)
     }
 
     fn dir_entry(path: &str) -> FrecencyEntry {

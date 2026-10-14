@@ -121,6 +121,11 @@ struct Runtime {
     /// cadence only while this is nonzero, and sleeps until the next
     /// time-driven deadline otherwise.
     workers: worker::WorkerGauge,
+    /// The one worker message a budgeted [`drain_events`] took from the
+    /// channel but did not apply because its budget had run out — applied
+    /// first by the next drain, since `mpsc::Receiver` cannot peek
+    /// (streaming-listing-performance design D7).
+    held: Option<Command>,
 }
 
 /// The cancel flags of the background requests the reducer can supersede
@@ -576,6 +581,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         mouse_tracker: MouseTracker::new(),
         git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
         workers: worker::WorkerGauge::new(),
+        held: None,
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
@@ -605,9 +611,16 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     let mut events = CrosstermEvents;
 
     loop {
-        let (s, applied) = drain_events(state, &rx, &mut guard, &mut rt)?;
+        // Budgeted (streaming-listing-performance design D7): at most ~8 ms
+        // or 64 messages before input is read and the frame drawn, so a
+        // worker flood — a 100k-entry directory streaming in — never starves
+        // the keyboard (panel-navigation "Input stays responsive while a
+        // 100,000-entry directory streams in"). What remains is a `backlog`
+        // the poll below must not sleep on.
+        let (s, drained) = drain_events(state, &rx, &mut guard, &mut rt)?;
         state = s;
-        needs_draw |= applied;
+        needs_draw |= drained.applied;
+        let mut backlog = drained.backlog;
 
         // Design D3's race: a worker can post its last message and drop its
         // gauge token between the drain above and this gauge read. The send
@@ -616,9 +629,10 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         // it the loop could sleep a whole deadline with it unapplied.
         let workers_alive = rt.workers.live() > 0;
         if !workers_alive {
-            let (s, applied) = drain_events(state, &rx, &mut guard, &mut rt)?;
+            let (s, drained) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
-            needs_draw |= applied;
+            needs_draw |= drained.applied;
+            backlog = drained.backlog;
         }
 
         // While a draw is already pending there is no sleeping: poll with a
@@ -633,9 +647,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 anim::next_wake_ms(&state),
                 Duration::from_millis(crate::clock::ms_until_next_minute(crate::clock::now_unix_ms())),
                 workers_alive,
-                // `streaming-listing-performance`'s drain backlog forces a
-                // zero timeout here once it lands; until then there is none.
-                false,
+                backlog,
             )
         };
 
@@ -745,7 +757,9 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
         if needs_draw {
             // Effects that feed a command straight back (drive enumeration)
             // must land before the frame, so the dialog paints complete on
-            // its very first appearance rather than a frame later.
+            // its very first appearance rather than a frame later. Under the
+            // same budget: a backlog left here is picked up by the next
+            // iteration's drain, after this frame has been shown.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
             hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
@@ -981,8 +995,8 @@ impl EventSource for CrosstermEvents {
 
 /// The poll timeout for one loop iteration (idle-aware-event-loop design
 /// D2/D3), factored pure for tests. Zero while a drained worker backlog is
-/// still pending (`streaming-listing-performance` supplies that signal once
-/// it lands — always `false` until then); at most `POLL_INTERVAL` while
+/// still pending (`backlog`, from the budgeted [`drain_events`];
+/// streaming-listing-performance design D7); at most `POLL_INTERVAL` while
 /// worker threads that can still post results are alive, so results keep
 /// today's latency; otherwise the earliest of the reducer's next wake
 /// (`core_wake`, on the same monotonic-millisecond axis as `now`) and the
@@ -1428,20 +1442,72 @@ fn reload_user_menu(rt: &Runtime) {
     worker::deliver(&rt.tx, "user menu reload", Command::UserMenuReloaded(config::load_user_menu(&rt.usermenu_path)));
 }
 
-/// Drain every queued worker event, including any command an effect fed
-/// straight back. The `bool` is `true` if anything was applied, so the
-/// caller knows to redraw.
-fn drain_events(mut state: State, rx: &Receiver<Command>, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
-    let mut applied = false;
-    while let Ok(cmd) = rx.try_recv() {
-        applied = true;
-        let (s, quit) = apply(state, cmd, guard, rt)?;
+/// How many queued worker messages one [`drain_events`] call applies before
+/// the loop reads input and redraws (streaming-listing-performance design
+/// D7; panel-navigation "Input stays responsive while a 100,000-entry
+/// directory streams in").
+const DRAIN_BUDGET_MESSAGES: usize = 64;
+
+/// How long one [`drain_events`] call may spend applying messages — about a
+/// frame — before it stops and lets input and the frame through (design D7).
+const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// What one budgeted drain did (streaming-listing-performance design D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DrainOutcome {
+    /// Something was applied, so the caller redraws.
+    applied: bool,
+    /// The budget ran out with messages still queued — the one taken by the
+    /// budget check is held for the next drain — so the loop polls input
+    /// with a zero timeout and draws before draining further.
+    backlog: bool,
+}
+
+/// Drain queued worker events, including any command an effect fed straight
+/// back, under the drain budget: at most [`DRAIN_BUDGET_MESSAGES`] messages
+/// or [`DRAIN_BUDGET`] of wall time, whichever comes first (design D7). A
+/// message taken from the channel when the budget turns out to be spent is
+/// parked in [`Runtime::held`] and applied first next time, so nothing is
+/// lost or reordered.
+fn drain_events(state: State, rx: &Receiver<Command>, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, DrainOutcome)> {
+    let mut held = rt.held.take();
+    let result = drain_budgeted(state, rx, &mut held, &Instant::now, |state, cmd| apply(state, cmd, guard, rt));
+    rt.held = held;
+    result
+}
+
+/// The budgeted drain behind [`drain_events`], factored over the state type,
+/// the one-slot `held` buffer, the clock and the application step so tests
+/// can drive it with a scripted channel and no terminal (design D7). Stops
+/// when the channel is empty (no backlog), after `apply` reports quit, or
+/// when a message is taken with the budget already spent — that message is
+/// placed in `held` and `backlog` is reported. The `held` message is always
+/// the first one applied.
+fn drain_budgeted<S>(
+    mut state: S,
+    rx: &Receiver<Command>,
+    held: &mut Option<Command>,
+    now: &dyn Fn() -> Instant,
+    mut apply: impl FnMut(S, Command) -> io::Result<(S, bool)>,
+) -> io::Result<(S, DrainOutcome)> {
+    let start = now();
+    let mut outcome = DrainOutcome::default();
+    let mut applied_count = 0usize;
+    while let Some(cmd) = held.take().or_else(|| rx.try_recv().ok()) {
+        if applied_count >= DRAIN_BUDGET_MESSAGES || now().saturating_duration_since(start) >= DRAIN_BUDGET {
+            *held = Some(cmd);
+            outcome.backlog = true;
+            break;
+        }
+        applied_count += 1;
+        outcome.applied = true;
+        let (s, quit) = apply(state, cmd)?;
         state = s;
         if quit {
             break;
         }
     }
-    Ok((state, applied))
+    Ok((state, outcome))
 }
 
 /// Execute effects returned by `update`. Returns `true` if the caller should
@@ -1934,6 +2000,7 @@ mod tests {
             mouse_tracker: MouseTracker::new(),
             git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
             workers: worker::WorkerGauge::new(),
+            held: None,
         };
         (rt, rx)
     }
@@ -2836,6 +2903,7 @@ mod tests {
             mouse_tracker: MouseTracker::new(),
             git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
             workers: worker::WorkerGauge::new(),
+            held: None,
         };
         (rt, rx)
     }
@@ -3072,6 +3140,145 @@ mod tests {
         assert_eq!(next_timeout(1_000, Some(900), Duration::from_millis(42_000), false, false), Duration::ZERO);
     }
 
+    // -----------------------------------------------------------------
+    // streaming-listing-performance: the budgeted drain (design D7; task 5.3)
+    // -----------------------------------------------------------------
+
+    fn tick(n: u64) -> Command {
+        Command::Tick { now_ms: n, epoch_ms: 0 }
+    }
+
+    fn tick_value(cmd: &Command) -> u64 {
+        match cmd {
+            Command::Tick { now_ms, .. } => *now_ms,
+            other => panic!("expected a Tick, got {other:?}"),
+        }
+    }
+
+    /// A clock that never advances: only the message budget governs.
+    fn frozen_clock() -> impl Fn() -> Instant {
+        let t = Instant::now();
+        move || t
+    }
+
+    #[test]
+    fn a_prefilled_channel_drains_in_budgeted_slices_in_order_without_loss() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..1_000u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let mut slices = Vec::new();
+        loop {
+            let before = applied.len();
+            let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+                applied.push(tick_value(&cmd));
+                Ok((s, false))
+            })
+            .unwrap();
+            slices.push(applied.len() - before);
+            assert!(outcome.applied);
+            if !outcome.backlog {
+                break;
+            }
+            assert!(held.is_some(), "a backlog always comes with the message the budget check took");
+        }
+        assert_eq!(applied, (0..1_000).collect::<Vec<_>>(), "order preserved, nothing lost or duplicated");
+        assert_eq!(slices.len(), 16, "15 full slices of 64 and the remainder");
+        assert!(slices[..15].iter().all(|&n| n == DRAIN_BUDGET_MESSAGES), "{slices:?}");
+        assert_eq!(slices[15], 1_000 - 15 * DRAIN_BUDGET_MESSAGES);
+        assert!(held.is_none(), "nothing is held once the channel is drained");
+    }
+
+    #[test]
+    fn the_held_message_is_applied_first_by_the_next_drain() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..70u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: true });
+        assert_eq!(applied.len(), 64);
+        assert_eq!(held.as_ref().map(tick_value), Some(64), "the 65th message was taken by the budget check and parked");
+
+        // More arrive behind it; the parked one still goes first.
+        tx.send(tick(70)).unwrap();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: false });
+        assert_eq!(applied[64..], [64, 65, 66, 67, 68, 69, 70]);
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn the_time_budget_stops_a_drain_and_holds_the_message_it_took() {
+        // The clock advances 5 ms per reading: the start reading, then one
+        // per message taken — the first message is checked at +5 ms (within
+        // 8 ms) and applied, the second at +10 ms is parked.
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..10u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let t0 = Instant::now();
+        let reads = std::cell::Cell::new(0u32);
+        let clock = move || {
+            reads.set(reads.get() + 1);
+            t0 + Duration::from_millis(5) * reads.get()
+        };
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: true });
+        assert_eq!(applied, vec![0]);
+        assert_eq!(held.as_ref().map(tick_value), Some(1));
+    }
+
+    #[test]
+    fn an_empty_channel_reports_nothing_applied_and_no_backlog() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Command>();
+        let clock = frozen_clock();
+        let mut held = None;
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, _| Ok((s, false))).unwrap();
+        assert_eq!(outcome, DrainOutcome::default());
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn a_quit_ends_the_drain_without_a_backlog_claim() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..5u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            let v = tick_value(&cmd);
+            applied.push(v);
+            Ok((s, v == 2))
+        })
+        .unwrap();
+        assert_eq!(applied, vec![0, 1, 2]);
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: false });
+        assert!(held.is_none());
+    }
+
     /// A scripted `EventSource`: `poll` reports "ready" while the queue is
     /// non-empty, `read` pops it.
     struct ScriptedEvents {
@@ -3154,14 +3361,9 @@ mod tests {
         // state matches one-at-a-time application.
         let mut state = State::empty(Theme::classic());
         state.term_size = (80, 24);
-        let entries: Vec<_> = (0..500).map(|i| filecommand_core::listing::Entry {
-            name: OsString::from(format!("f{i:03}.txt")),
-            kind: filecommand_core::listing::EntryKind::File,
-            size: 1,
-            modified: None,
-            hidden: false,
-            link: false,
-        }).collect();
+        let entries: Vec<_> = (0..500)
+            .map(|i| filecommand_core::listing::Entry::new(format!("f{i:03}.txt"), filecommand_core::listing::EntryKind::File, 1, None, false, false))
+            .collect();
         state.left.listing_request = Some(1);
         let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: 1 });
         state = s;

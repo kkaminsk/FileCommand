@@ -3,7 +3,7 @@
 //! values produced by the `listing` module.
 
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -234,6 +234,18 @@ pub struct RereadAnchor {
     /// since that offset counted rows of the narrowed list that
     /// `begin_new_listing` discards (design D3).
     pub scroll_offset: usize,
+    /// Each captured name's priority in the resolution order — `names[cursor]`
+    /// is 0, then `names[cursor + 1..]`, then `names[..cursor]` reversed — so
+    /// a streamed batch can be checked against the anchor in O(batch) rather
+    /// than O(names × entries) (streaming-listing-performance design D6).
+    pub rank: HashMap<OsString, usize>,
+    /// The best-ranked captured name present in the listing so far, as
+    /// `(rank, entry index)`, maintained by [`PanelState::merge_streamed`]
+    /// across batches. `None` until one arrives, and after anything that
+    /// re-orders the entries without going through the merge (a re-sort), in
+    /// which case [`PanelState::apply_reread_anchor`] re-finds it with one
+    /// linear scan (design D6).
+    pub resolved: Option<(usize, usize)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -283,8 +295,29 @@ pub struct PanelState {
     /// active. While `Some`, the panel body is narrowed to entries whose
     /// displayed name contains the pattern as a substring (plus `..`), and
     /// cursor movement is restricted to the narrowed set (quick-filter all
-    /// requirements).
+    /// requirements). Read freely; write it only through
+    /// [`Self::activate_quick_filter`], [`Self::quick_filter_push`],
+    /// [`Self::quick_filter_backspace`], [`Self::clear_quick_filter`] or
+    /// [`Self::set_quick_filter`], which keep the visible-index cache below
+    /// in step with it.
     pub quick_filter: Option<String>,
+    /// The entry indices visible under `quick_filter`, in ascending order,
+    /// or `None` while no filter is active — the visible list is then the
+    /// identity and is never materialized (streaming-listing-performance
+    /// design D5). Rebuilt by every method that changes the entries or the
+    /// pattern; read through [`Self::visible_len`], [`Self::visible_at`],
+    /// [`Self::visible_position`] and [`Self::visible_window`], so drawing,
+    /// hit-testing and cursor movement cost the rows shown rather than the
+    /// directory's size (panel-navigation "Large directories stream
+    /// progressively and stay responsive").
+    filtered: Option<Vec<usize>>,
+    /// The output buffer [`Self::merge_streamed`] merges into, kept between
+    /// batches (always empty outside the merge, so it never affects equality)
+    /// so the two buffers a merge needs are allocated and page-faulted
+    /// O(log n) times over a listing rather than once per batch
+    /// (streaming-listing-performance design D3). Released by
+    /// [`Self::begin_new_listing`]; a stashed tab keeps its own.
+    merge_scratch: Vec<Entry>,
     /// Other tabs belonging to this panel, in list order, with the
     /// currently active tab's slot omitted — its state lives inline in the
     /// fields above rather than duplicated here. See [`TabData`] and
@@ -366,6 +399,8 @@ impl PanelState {
             clipboard_feedback: None,
             selected: HashSet::new(),
             quick_filter: None,
+            filtered: None,
+            merge_scratch: Vec::new(),
             tabs: Vec::new(),
             active_tab_index: 0,
             git_info: GitInfo::none(),
@@ -387,14 +422,14 @@ impl PanelState {
     /// command treats `None` as "do nothing", so none of them ever acts on
     /// an entry the filter hides (quick-filter "Cursor and mini-status
     /// behavior under an active filter"; filter-selection-safety design D1).
-    /// The visibility check matches the single cursor entry rather than
-    /// allocating `visible_indices()`.
+    /// The visibility check is one `visible_position` lookup — O(log n) in
+    /// the cached visible list — rather than allocating `visible_indices()`.
     pub fn selected(&self) -> Option<&Entry> {
         let entry = self.entries.get(self.cursor)?;
-        match &self.quick_filter {
-            Some(pattern) if !Self::matches_quick_filter(entry, pattern) => None,
-            _ => Some(entry),
+        if self.quick_filter.is_some() && self.visible_position(self.cursor).is_none() {
+            return None;
         }
+        Some(entry)
     }
 
     pub fn clamp_cursor(&mut self) {
@@ -441,12 +476,11 @@ impl PanelState {
     /// offset is core panel state").
     pub fn ensure_cursor_visible(&mut self, rows: usize) {
         let rows = rows.max(1);
-        let visible = self.visible_indices();
-        if visible.is_empty() {
+        if self.visible_len() == 0 {
             self.scroll_offset = 0;
             return;
         }
-        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        let pos = self.visible_position(self.cursor).unwrap_or(0);
         if pos < self.scroll_offset {
             self.scroll_offset = pos;
         } else if pos >= self.scroll_offset + rows {
@@ -467,12 +501,11 @@ impl PanelState {
     pub fn ensure_cursor_visible_brief(&mut self, rows: usize, cols: usize) {
         let rows = rows.max(1);
         let cols = cols.max(1);
-        let visible = self.visible_indices();
-        if visible.is_empty() {
+        if self.visible_len() == 0 {
             self.scroll_offset = 0;
             return;
         }
-        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        let pos = self.visible_position(self.cursor).unwrap_or(0);
         let pos_col = pos / rows;
         let mut start_col = self.scroll_offset / rows;
         if pos_col < start_col {
@@ -487,28 +520,104 @@ impl PanelState {
     /// leaves visible — a no-op when nothing is visible (quick-filter
     /// "Navigation is restricted to matching entries").
     fn move_cursor_filtered(&mut self, m: CursorMove) {
-        let visible = self.visible_indices();
-        let Some(last) = visible.len().checked_sub(1) else { return };
-        let pos = visible.iter().position(|&i| i == self.cursor).unwrap_or(0);
+        let Some(last) = self.visible_len().checked_sub(1) else { return };
+        let pos = self.visible_position(self.cursor).unwrap_or(0);
         let new_pos = match m {
             CursorMove::Up(n) => pos.saturating_sub(n),
             CursorMove::Down(n) => (pos + n).min(last),
             CursorMove::Home => 0,
             CursorMove::End => last,
         };
-        self.cursor = visible[new_pos];
+        self.cursor = self.visible_at(new_pos).unwrap_or(self.cursor);
         self.cursor_user_moved = true;
     }
 
-    /// Insert a freshly streamed entry in sorted position, then re-pin the
-    /// cursor to row 0 if the user hasn't moved it yet.
-    pub fn insert_streamed(&mut self, entry: Entry) {
-        insert_sorted(&mut self.entries, entry, self.sort_mode, self.sort_direction);
-        if !self.cursor_user_moved {
+    /// Merge one streamed batch into the sorted listing in a single pass
+    /// (streaming-listing-performance design D3; panel-navigation "Large
+    /// directories stream progressively and stay responsive"): the batch is
+    /// stable-sorted under the current mode, then merged with the existing
+    /// entries in O(n + k) — never by inserting entries one at a time into
+    /// the middle of the list. Ties keep existing entries first, matching
+    /// what per-entry `insert_sorted` produced, so the result equals a bulk
+    /// stable sort of everything received so far; in `Unsorted` mode that
+    /// is enumeration order with `..` floated to the top.
+    ///
+    /// The cursor stays pinned to row 0 until the user moves it; once moved,
+    /// it is advanced by the number of batch entries that landed before it,
+    /// so it stays on its entry while entries stream in around it
+    /// (panel-navigation "Cursor stays on its entry while entries stream
+    /// in"). A same-directory re-read anchor, when one is pending, has its
+    /// best-ranked present name tracked from the batch alone (design D6);
+    /// `core::update` applies it right after this call, as before. The
+    /// quick-filter cache is rebuilt when a filter is active.
+    pub fn merge_streamed(&mut self, mut batch: Vec<Entry>) {
+        if batch.is_empty() {
+            return;
+        }
+        let mode = self.sort_mode;
+        let dir = self.sort_direction;
+        batch.sort_by(|a, b| cmp_entries(a, b, mode, dir));
+
+        let n = self.entries.len();
+        let k = batch.len();
+        let old_cursor = self.cursor;
+        let mut new_cursor = old_cursor;
+        let anchor = self.reread_anchor.as_mut();
+        let mut tracked = anchor.as_ref().and_then(|a| a.resolved);
+        // Merge into the retained scratch buffer, then swap it in: the old
+        // buffer (drained, capacity kept) becomes the next merge's scratch.
+        let mut merged = std::mem::take(&mut self.merge_scratch);
+        merged.clear();
+        merged.reserve(n + k);
+        let mut old_iter = self.entries.drain(..).enumerate().peekable();
+        let mut batch_iter = batch.into_iter().peekable();
+        loop {
+            let take_old = match (old_iter.peek(), batch_iter.peek()) {
+                (None, None) => break,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                // Existing first on ties (`!= Greater` in `insert_sorted`).
+                (Some((_, o)), Some(b)) => cmp_entries(o, b, mode, dir) != Ordering::Greater,
+            };
+            let out_idx = merged.len();
+            if take_old {
+                let (i, entry) = old_iter.next().expect("peeked");
+                if i == old_cursor {
+                    new_cursor = out_idx;
+                }
+                if let Some((_, idx)) = tracked.as_mut() {
+                    if *idx == i {
+                        *idx = out_idx;
+                    }
+                }
+                merged.push(entry);
+            } else {
+                let entry = batch_iter.next().expect("peeked");
+                if let Some(a) = anchor.as_deref() {
+                    if let Some(&rank) = a.rank.get(&entry.name) {
+                        if tracked.is_none_or(|(best, _)| rank < best) {
+                            tracked = Some((rank, out_idx));
+                        }
+                    }
+                }
+                merged.push(entry);
+            }
+        }
+        // The tracked index above was shifted while walking the old entries,
+        // so by now it is current for the merged list.
+        if let Some(a) = anchor {
+            a.resolved = tracked;
+        }
+        drop(old_iter);
+        std::mem::swap(&mut self.entries, &mut merged);
+        self.merge_scratch = merged;
+        if !self.cursor_user_moved || n == 0 {
             self.cursor = 0;
         } else {
-            self.clamp_cursor();
+            self.cursor = new_cursor;
         }
+        self.clamp_cursor();
+        self.rebuild_filtered();
     }
 
     /// Announce a request outstanding for this panel on the mini-status
@@ -522,10 +631,38 @@ impl PanelState {
 
     /// Re-sort the entries already in hand under the current mode. Stable,
     /// and it issues no directory read and no per-entry metadata query.
+    /// Rebuilds the quick-filter cache (its indices moved) and drops any
+    /// in-flight re-read anchor's tracked index — the next
+    /// [`Self::apply_reread_anchor`] re-finds it with one linear scan
+    /// (streaming-listing-performance design D5/D6).
     pub fn resort(&mut self) {
         let mode = self.sort_mode;
         let dir = self.sort_direction;
         self.entries.sort_by(|a, b| cmp_entries(a, b, mode, dir));
+        if let Some(anchor) = self.reread_anchor.as_mut() {
+            anchor.resolved = None;
+        }
+        self.rebuild_filtered();
+    }
+
+    /// Free the buffer [`Self::merge_streamed`] keeps between batches — called
+    /// by `core::update` once a listing has completed or failed, so a panel
+    /// at rest holds its entries once, not twice (design D3).
+    pub fn release_merge_scratch(&mut self) {
+        self.merge_scratch = Vec::new();
+    }
+
+    /// Replace the whole entry list — tests and benchmarks setting up a
+    /// panel — keeping the quick-filter cache in step (streaming-listing-
+    /// performance design D5). Production code streams entries in through
+    /// [`Self::merge_streamed`] instead; the cursor is left for the caller
+    /// to place.
+    pub fn set_entries(&mut self, entries: Vec<Entry>) {
+        self.entries = entries;
+        if let Some(anchor) = self.reread_anchor.as_mut() {
+            anchor.resolved = None;
+        }
+        self.rebuild_filtered();
     }
 
     /// Set the sort mode and re-sort in place, keeping the cursor on the
@@ -550,8 +687,15 @@ impl PanelState {
         if cwd != self.cwd {
             self.reread_anchor = None;
         }
+        // A kept anchor's tracked index referred to the entries cleared
+        // below; the re-read's batches rebuild it (streaming-listing-
+        // performance design D6).
+        if let Some(anchor) = self.reread_anchor.as_mut() {
+            anchor.resolved = None;
+        }
         self.cwd = cwd;
         self.entries.clear();
+        self.merge_scratch = Vec::new();
         self.cursor = 0;
         self.cursor_user_moved = false;
         // A fresh directory has an entirely different entry set, so any
@@ -578,6 +722,7 @@ impl PanelState {
         // documented way to clear it deliberately, but a directory change
         // clears it implicitly too.
         self.quick_filter = None;
+        self.filtered = None;
         // Directory-scoped git info (like `info` above) no longer describes
         // what the panel shows; `update::begin_listing` mints a fresh
         // request and issues `Effect::QueryGitInfo` for wherever the panel
@@ -601,18 +746,42 @@ impl PanelState {
     /// half-loaded list.
     pub fn capture_reread_anchor(&mut self) {
         self.reread_anchor = match self.progress {
-            ListingProgress::Complete { .. } => Some(RereadAnchor {
-                names: self.entries.iter().map(|e| e.name.clone()).collect(),
-                cursor: self.cursor,
-                // The offset counts rows of the quick-filter-narrowed list
-                // and `begin_new_listing` clears that filter, so with a
-                // filter active there is no meaningful offset to restore —
-                // capture 0 and let the post-restore reconcile scroll the
-                // re-anchored cursor into view (design D3).
-                scroll_offset: if self.quick_filter.is_some() { 0 } else { self.scroll_offset },
-            }),
+            ListingProgress::Complete { .. } => {
+                let names: Vec<OsString> = self.entries.iter().map(|e| e.name.clone()).collect();
+                let cursor = self.cursor;
+                Some(RereadAnchor {
+                    rank: Self::anchor_ranks(&names, cursor),
+                    resolved: None,
+                    names,
+                    cursor,
+                    // The offset counts rows of the quick-filter-narrowed list
+                    // and `begin_new_listing` clears that filter, so with a
+                    // filter active there is no meaningful offset to restore —
+                    // capture 0 and let the post-restore reconcile scroll the
+                    // re-anchored cursor into view (design D3).
+                    scroll_offset: if self.quick_filter.is_some() { 0 } else { self.scroll_offset },
+                })
+            }
             ListingProgress::Streaming { .. } => None,
         };
+    }
+
+    /// Each captured name's priority in the anchor's resolution order —
+    /// `names[cursor]` first, then `names[cursor + 1..]`, then
+    /// `names[..cursor]` reversed (reread-preserves-cursor design D1) — as
+    /// a map for O(1) lookups per streamed entry (streaming-listing-
+    /// performance design D6). Empty for an empty capture.
+    fn anchor_ranks(names: &[OsString], cursor: usize) -> HashMap<OsString, usize> {
+        let mut rank = HashMap::with_capacity(names.len());
+        if names.is_empty() {
+            return rank;
+        }
+        let at = cursor.min(names.len() - 1);
+        let order = std::iter::once(&names[at]).chain(names[at + 1..].iter()).chain(names[..at].iter().rev());
+        for (r, name) in order.enumerate() {
+            rank.entry(name.clone()).or_insert(r);
+        }
+        rank
     }
 
     /// Re-anchor the cursor and scroll offset of a listing that is
@@ -637,23 +806,33 @@ impl PanelState {
     /// anchor, or no captured name present in the entries so far) leaves
     /// the panel untouched.
     pub fn apply_reread_anchor(&mut self, rows: usize) -> bool {
-        let Some(anchor) = &self.reread_anchor else { return false };
+        let Some(anchor) = self.reread_anchor.as_mut() else { return false };
         if anchor.names.is_empty() {
             return false;
         }
-        let at = anchor.cursor.min(anchor.names.len() - 1);
-        let resolved = std::iter::once(&anchor.names[at])
-            .chain(anchor.names[at + 1..].iter())
-            .chain(anchor.names[..at].iter().rev())
-            .find_map(|name| self.entries.iter().position(|e| &e.name == name));
+        // `merge_streamed` keeps `resolved` current across batches
+        // (streaming-listing-performance design D6). It is re-found with one
+        // linear scan — O(n) with a hash lookup per entry, never O(names ×
+        // entries) — when nothing has tracked it yet or the entries were
+        // re-ordered behind its back (a re-sort, or a wholesale replacement).
+        let tracked_is_current =
+            anchor.resolved.is_some_and(|(rank, idx)| self.entries.get(idx).is_some_and(|e| anchor.rank.get(&e.name) == Some(&rank)));
+        if !tracked_is_current {
+            anchor.resolved = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, e)| anchor.rank.get(&e.name).map(|&rank| (rank, idx)))
+                .min_by_key(|&(rank, _)| rank);
+        }
         let offset = anchor.scroll_offset;
-        let Some(idx) = resolved else { return false };
+        let Some((_, idx)) = anchor.resolved else { return false };
         self.cursor = idx;
         self.cursor_user_moved = true;
         if self.display_mode == DisplayMode::Brief {
             self.scroll_offset = offset;
         } else {
-            let visible_len = self.visible_indices().len();
+            let visible_len = self.visible_len();
             self.scroll_offset = offset.min(visible_len.saturating_sub(rows));
         }
         true
@@ -743,10 +922,11 @@ impl PanelState {
     /// Always 0 with no active filter.
     pub fn hidden_selected_count(&self, sources: &[crate::fs_ops::SourceItem]) -> usize {
         let Some(pattern) = &self.quick_filter else { return 0 };
+        let pattern_lower = pattern.to_lowercase();
         sources
             .iter()
             .filter(|s| s.path.parent() == Some(self.cwd.as_path()) && self.selected.contains(&s.original_name))
-            .filter(|s| self.entries.iter().any(|e| e.name == s.original_name && !Self::matches_quick_filter(e, pattern)))
+            .filter(|s| self.entries.iter().any(|e| e.name == s.original_name && !Self::matches_quick_filter(e, &pattern_lower)))
             .count()
     }
 
@@ -754,27 +934,112 @@ impl PanelState {
     // Quick filter (Ctrl+P)
     // -------------------------------------------------------------------
 
-    /// Whether `entry` is shown under the current `quick_filter` pattern.
-    /// The `..` parent entry always matches so upward navigation is never
-    /// blocked (quick-filter "Substring narrowing as the pattern is
+    /// Whether `entry` is shown under the quick-filter pattern
+    /// `pattern_lower`, which the caller has already lowercased once. The
+    /// match reads the entry's precomputed [`Entry::sort_key`], so no name
+    /// is lowercased per entry per call (streaming-listing-performance
+    /// design D4). The `..` parent entry always matches so upward navigation
+    /// is never blocked (quick-filter "Substring narrowing as the pattern is
     /// typed").
-    fn matches_quick_filter(entry: &Entry, pattern: &str) -> bool {
-        entry.kind == EntryKind::ParentDir || entry.name.to_string_lossy().to_lowercase().contains(&pattern.to_lowercase())
+    fn matches_quick_filter(entry: &Entry, pattern_lower: &str) -> bool {
+        entry.kind == EntryKind::ParentDir || entry.sort_key().contains(pattern_lower)
+    }
+
+    /// Recompute the cached visible-index list from the current entries and
+    /// pattern — one O(n) pass over precomputed keys, `None` when no filter
+    /// is active (streaming-listing-performance design D5). Called by every
+    /// mutator of either.
+    fn rebuild_filtered(&mut self) {
+        self.filtered = self.quick_filter.as_ref().map(|pattern| {
+            let pattern_lower = pattern.to_lowercase();
+            self.entries.iter().enumerate().filter(|(_, e)| Self::matches_quick_filter(e, &pattern_lower)).map(|(i, _)| i).collect()
+        });
+    }
+
+    /// The cache's consistency checks, for the debug builds tests run under:
+    /// a filter and its cache exist together, and every cached index is in
+    /// range — catching an `entries` or `quick_filter` write that bypassed
+    /// [`Self::set_entries`] / the quick-filter mutators (design D5).
+    #[inline]
+    fn debug_check_filtered(&self) {
+        debug_assert_eq!(self.filtered.is_some(), self.quick_filter.is_some(), "quick_filter was written without rebuilding the visible-index cache; use set_quick_filter or the quick-filter mutators");
+        if let Some(cached) = &self.filtered {
+            debug_assert!(cached.last().is_none_or(|&i| i < self.entries.len()), "the visible-index cache is stale: entries were replaced without set_entries");
+        }
+    }
+
+    /// How many entries the panel body shows: every entry without a filter,
+    /// the cached matching subset with one (design D5). O(1).
+    pub fn visible_len(&self) -> usize {
+        self.debug_check_filtered();
+        match &self.filtered {
+            None => self.entries.len(),
+            Some(cached) => cached.len(),
+        }
+    }
+
+    /// The entry index at visible position `pos`, or `None` past the end.
+    /// O(1).
+    pub fn visible_at(&self, pos: usize) -> Option<usize> {
+        self.debug_check_filtered();
+        match &self.filtered {
+            None => (pos < self.entries.len()).then_some(pos),
+            Some(cached) => cached.get(pos).copied(),
+        }
+    }
+
+    /// The visible position of entry `index`, or `None` when the filter
+    /// hides it (or it is out of range). The identity without a filter, a
+    /// binary search in the ascending cache with one: O(log n).
+    pub fn visible_position(&self, index: usize) -> Option<usize> {
+        self.debug_check_filtered();
+        match &self.filtered {
+            None => (index < self.entries.len()).then_some(index),
+            Some(cached) => cached.binary_search(&index).ok(),
+        }
+    }
+
+    /// The entry indices at visible positions `start..start + len`, in
+    /// order, stopping at the end of the visible list — what the renderer
+    /// and hit-tester iterate for the rows on screen, costing the rows shown
+    /// rather than the directory's size (design D5).
+    pub fn visible_window(&self, start: usize, len: usize) -> impl Iterator<Item = usize> + '_ {
+        self.debug_check_filtered();
+        let end = start.saturating_add(len).min(self.visible_len());
+        let range = start.min(end)..end;
+        match &self.filtered {
+            None => VisibleWindow::Identity(range),
+            Some(cached) => VisibleWindow::Cached(cached[range].iter().copied()),
+        }
     }
 
     /// Indices into `entries` visible under the active `quick_filter`, or
-    /// every index when no filter is active.
+    /// every index when no filter is active. Allocates a fresh `Vec` on every
+    /// call — a convenience for tests and one-off checks, not for per-frame
+    /// or per-keystroke use, which go through [`Self::visible_len`],
+    /// [`Self::visible_at`], [`Self::visible_position`] and
+    /// [`Self::visible_window`] (streaming-listing-performance design D5).
     pub fn visible_indices(&self) -> Vec<usize> {
-        match &self.quick_filter {
+        self.debug_check_filtered();
+        match &self.filtered {
             None => (0..self.entries.len()).collect(),
-            Some(pattern) => self.entries.iter().enumerate().filter(|(_, e)| Self::matches_quick_filter(e, pattern)).map(|(i, _)| i).collect(),
+            Some(cached) => cached.clone(),
         }
     }
 
     /// Ctrl+P: enter quick-filter mode with an empty pattern (quick-filter
     /// "Activating the quick filter").
     pub fn activate_quick_filter(&mut self) {
-        self.quick_filter = Some(String::new());
+        self.set_quick_filter(Some(String::new()));
+        self.rebuild_filtered();
+    }
+
+    /// Set (or clear) the whole pattern at once, keeping the visible-index
+    /// cache in step — the one way to write `quick_filter` from outside the
+    /// typing mutators (tests, tab restore). Does not move the cursor.
+    pub fn set_quick_filter(&mut self, pattern: Option<String>) {
+        self.quick_filter = pattern;
+        self.rebuild_filtered();
     }
 
     /// Append `c` to the quick-filter pattern and re-narrow (quick-filter
@@ -783,6 +1048,7 @@ impl PanelState {
         if let Some(pattern) = &mut self.quick_filter {
             pattern.push(c);
         }
+        self.rebuild_filtered();
         self.snap_cursor_to_visible();
     }
 
@@ -794,6 +1060,7 @@ impl PanelState {
         if let Some(pattern) = &mut self.quick_filter {
             pattern.pop();
         }
+        self.rebuild_filtered();
         self.snap_cursor_to_visible();
     }
 
@@ -802,19 +1069,35 @@ impl PanelState {
     /// shown (quick-filter "Clearing the quick filter").
     pub fn clear_quick_filter(&mut self) {
         self.quick_filter = None;
+        self.filtered = None;
     }
 
     /// After a pattern change, move the cursor onto the nearest still-
     /// visible entry if the one it was on got filtered out (quick-filter
-    /// "Cursor and mini-status behavior under an active filter").
+    /// "Cursor and mini-status behavior under an active filter"). Reads the
+    /// cache: a binary search finds the neighbours on either side, and the
+    /// lower index wins a tie, as the old linear `min_by_key` did.
     fn snap_cursor_to_visible(&mut self) {
-        let visible = self.visible_indices();
-        if visible.is_empty() || visible.contains(&self.cursor) {
+        if self.visible_len() == 0 || self.visible_position(self.cursor).is_some() {
             return;
         }
-        if let Some(&nearest) = visible.iter().min_by_key(|&&i| i.abs_diff(self.cursor)) {
-            self.cursor = nearest;
-        }
+        let Some(cached) = &self.filtered else { return };
+        let ip = cached.partition_point(|&i| i < self.cursor);
+        let below = ip.checked_sub(1).map(|p| cached[p]);
+        let above = cached.get(ip).copied();
+        let nearest = match (below, above) {
+            (Some(b), Some(a)) => {
+                if self.cursor.abs_diff(b) <= self.cursor.abs_diff(a) {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(b), None) => b,
+            (None, Some(a)) => a,
+            (None, None) => return,
+        };
+        self.cursor = nearest;
     }
 
     // -------------------------------------------------------------------
@@ -890,6 +1173,10 @@ impl PanelState {
         // that completes after it is reactivated still restores its place
         // (reread-preserves-cursor design D4).
         self.reread_anchor = data.reread_anchor;
+        // The visible-index cache is not stashed in `TabData`; it is rebuilt
+        // from the restored entries and pattern (streaming-listing-
+        // performance design D5).
+        self.rebuild_filtered();
         // Restored as-is; it may no longer fit the current viewport height
         // (the panel may have been resized, or the split/tab-strip state
         // differs from when this tab was stashed) — `core::update` re-clamps
@@ -994,6 +1281,32 @@ impl PanelState {
             if tab.cwd == dir {
                 tab.stale = true;
             }
+        }
+    }
+}
+
+/// The iterator behind [`PanelState::visible_window`]: a plain index range
+/// while no quick filter is active, a slice of the cached visible indices
+/// with one (streaming-listing-performance design D5).
+enum VisibleWindow<'a> {
+    Identity(std::ops::Range<usize>),
+    Cached(std::iter::Copied<std::slice::Iter<'a, usize>>),
+}
+
+impl Iterator for VisibleWindow<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        match self {
+            VisibleWindow::Identity(range) => range.next(),
+            VisibleWindow::Cached(iter) => iter.next(),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            VisibleWindow::Identity(range) => range.size_hint(),
+            VisibleWindow::Cached(iter) => iter.size_hint(),
         }
     }
 }
@@ -1130,10 +1443,10 @@ mod tests {
     use std::ffi::OsString;
 
     fn file(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }
+        Entry::new(OsString::from(name), EntryKind::File, 0, None, false, false)
     }
     fn dir(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
+        Entry::new(OsString::from(name), EntryKind::Directory, 0, None, false, false)
     }
 
     #[test]
@@ -1200,8 +1513,8 @@ mod tests {
     #[test]
     fn cursor_pinned_to_top_while_streaming_until_user_moves() {
         let mut p = PanelState::new(PathBuf::from("/"));
-        p.insert_streamed(file("m"));
-        p.insert_streamed(file("a")); // sorts before "m" -> cursor should stay at 0
+        p.merge_streamed(vec![file("m")]);
+        p.merge_streamed(vec![file("a")]); // sorts before "m" -> cursor should stay at 0
         assert_eq!(p.cursor, 0);
         assert_eq!(p.entries[p.cursor].name, OsString::from("a"));
 
@@ -1209,9 +1522,9 @@ mod tests {
         assert_eq!(p.cursor, 1);
         let selected_name = p.entries[p.cursor].name.clone();
 
-        // Further streamed inserts must not yank the cursor back now that
-        // the user has moved it; re-clamp only if out of range.
-        p.insert_streamed(dir("z"));
+        // Further streamed batches must not yank the cursor back now that
+        // the user has moved it, nor move it off its entry.
+        p.merge_streamed(vec![dir("z")]);
         assert_eq!(p.entries[p.cursor].name, selected_name);
     }
 
@@ -1295,8 +1608,8 @@ mod tests {
     fn selection_status_counts_files_and_zeros_directories() {
         let mut p = PanelState::new(PathBuf::from("/"));
         p.entries = vec![
-            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None, hidden: false, link: false },
-            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
+            Entry::new("a.txt", EntryKind::File, 100, None, false, false),
+            Entry::new("sub", EntryKind::Directory, 0, None, false, false),
         ];
         assert_eq!(p.selection_status(), None);
         p.select_matching("*");
@@ -1455,18 +1768,11 @@ mod tests {
     }
 
     fn sized(name: &str, size: u64) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false, link: false }
+        Entry::new(OsString::from(name), EntryKind::File, size, None, false, false)
     }
 
     fn timed(name: &str, day: u8) -> Entry {
-        Entry {
-            name: OsString::from(name),
-            kind: EntryKind::File,
-            size: 0,
-            modified: Some(DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }),
-            hidden: false,
-            link: false,
-        }
+        Entry::new(OsString::from(name), EntryKind::File, 0, Some(DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }), false, false)
     }
 
     fn names(p: &PanelState) -> Vec<String> {
@@ -1558,9 +1864,8 @@ mod tests {
     fn streamed_inserts_follow_the_active_sort_mode() {
         let mut p = PanelState::new(PathBuf::from("/"));
         p.sort_mode = SortMode::Size;
-        p.insert_streamed(sized("big", 100));
-        p.insert_streamed(sized("small", 1));
-        p.insert_streamed(sized("mid", 50));
+        p.merge_streamed(vec![sized("big", 100)]);
+        p.merge_streamed(vec![sized("small", 1), sized("mid", 50)]);
         assert_eq!(names(&p), vec!["small", "mid", "big"]);
     }
 
@@ -1593,14 +1898,8 @@ mod tests {
         }
 
         fn arb_entry() -> impl Strategy<Value = Entry> {
-            (arb_name(), any::<bool>()).prop_map(|(name, is_dir)| Entry {
-                name: OsString::from(name),
-                kind: if is_dir { EntryKind::Directory } else { EntryKind::File },
-                size: 0,
-                modified: None,
-                hidden: false,
-                link: false,
-            })
+            (arb_name(), any::<bool>())
+                .prop_map(|(name, is_dir)| Entry::new(OsString::from(name), if is_dir { EntryKind::Directory } else { EntryKind::File }, 0, None, false, false))
         }
 
         proptest! {
@@ -1615,7 +1914,7 @@ mod tests {
             fn insert_sorted_preserves_sorted_order(names in prop::collection::vec(arb_name(), 0..15)) {
                 let mut entries: Vec<Entry> = Vec::new();
                 for name in names {
-                    let e = Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false };
+                    let e = Entry::new(OsString::from(name), EntryKind::File, 0, None, false, false);
                     insert_sorted(&mut entries, e, SortMode::Name, SortDirection::Asc);
                 }
                 for w in entries.windows(2) {
@@ -1647,13 +1946,15 @@ mod tests {
         const MODES: [SortMode; 4] = [SortMode::Name, SortMode::Extension, SortMode::Time, SortMode::Size];
 
         fn arb_sortable_entry() -> impl Strategy<Value = Entry> {
-            ("[a-c]{1,3}(\\.[a-c]{1,3})?", 0u64..4, prop::option::of(1u8..4), any::<bool>()).prop_map(|(name, size, day, is_dir)| Entry {
-                name: OsString::from(name),
-                kind: if is_dir { EntryKind::Directory } else { EntryKind::File },
-                size,
-                modified: day.map(|d| DateTime { year: 2026, month: 1, day: d, hour: 0, minute: 0 }),
-                hidden: false,
-                link: false,
+            ("[a-c]{1,3}(\\.[a-c]{1,3})?", 0u64..4, prop::option::of(1u8..4), any::<bool>()).prop_map(|(name, size, day, is_dir)| {
+                Entry::new(
+                    OsString::from(name),
+                    if is_dir { EntryKind::Directory } else { EntryKind::File },
+                    size,
+                    day.map(|d| DateTime { year: 2026, month: 1, day: d, hour: 0, minute: 0 }),
+                    false,
+                    false,
+                )
             })
         }
 
@@ -1825,8 +2126,8 @@ mod tests {
             let mut p = PanelState::new(PathBuf::from("/"));
             p.entries = vec![
                 Entry::parent_dir(),
-                Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
-                Entry { name: OsString::from("readme.md"), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false },
+                Entry::new(OsString::from("desktop.ini"), EntryKind::File, 0, None, true, false),
+                Entry::new(OsString::from("readme.md"), EntryKind::File, 0, None, false, false),
             ];
             p.activate_quick_filter();
             for c in "desktop".chars() {
@@ -2090,7 +2391,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
+            ListEntry::new(OsString::from(name), EntryKind::Directory, 0, None, false, false)
         }
 
         #[test]
@@ -2289,14 +2590,14 @@ mod tests {
 
             // Narrow to only even-numbered entries: "e25" is filtered out
             // and the cursor snaps to the nearest still-visible entry.
-            p.quick_filter = Some(String::new());
+            p.set_quick_filter(Some(String::new()));
             p.activate_quick_filter();
             for c in "e2".chars() {
                 p.quick_filter_push(c);
             }
             // "e2","e20".."e29" all contain "e2"; narrow further to land on
             // a single, known entry.
-            p.quick_filter = Some("e24".to_string());
+            p.set_quick_filter(Some("e24".to_string()));
             let visible = p.visible_indices();
             assert_eq!(visible.len(), 1, "exactly \"e24\" should match");
             p.cursor = visible[0];
@@ -2331,7 +2632,7 @@ mod tests {
             let mut p = PanelState::new(PathBuf::from("/"));
             p.sort_mode = SortMode::Name;
             for i in 0..15 {
-                p.insert_streamed(file(&format!("e{i:02}")));
+                p.merge_streamed(vec![file(&format!("e{i:02}"))]);
                 // Mirrors what `update::apply_listing_event` does after
                 // every `ListingChunk`: re-clamp with a fixed 10-row window.
                 p.ensure_cursor_visible(10);
@@ -2404,7 +2705,7 @@ mod tests {
             // `begin_new_listing` discards — so only the cursor entry is
             // restorable, not the offset (design D3).
             let mut p = complete_panel_of(30);
-            p.quick_filter = Some("e1".to_string());
+            p.set_quick_filter(Some("e1".to_string()));
             p.cursor = 10;
             p.scroll_offset = 7;
             p.capture_reread_anchor();
@@ -2541,6 +2842,449 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // streaming-listing-performance: the per-batch merge (design D3) and
+    // the batch-proportional re-read anchor (design D6)
+    // -----------------------------------------------------------------
+
+    mod streaming_merge_tests {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_entry() -> impl Strategy<Value = Entry> {
+            ("[a-c]{1,3}(\\.[a-c]{1,3})?", 0u64..4, prop::option::of(1u8..4), 0u8..3).prop_map(|(name, size, day, kind)| {
+                let kind = match kind {
+                    0 => EntryKind::File,
+                    1 => EntryKind::Directory,
+                    _ => EntryKind::ParentDir,
+                };
+                let name = if kind == EntryKind::ParentDir { "..".to_string() } else { name };
+                Entry::new(OsString::from(name), kind, size, day.map(|d| DateTime { year: 2026, month: 1, day: d, hour: 0, minute: 0 }), false, false)
+            })
+        }
+
+        fn arb_mode() -> impl Strategy<Value = SortMode> {
+            prop_oneof![Just(SortMode::Name), Just(SortMode::Extension), Just(SortMode::Time), Just(SortMode::Size), Just(SortMode::Unsorted)]
+        }
+
+        proptest! {
+            /// Random entries (ties included) split at random points into
+            /// batches, under every mode and direction: the merged listing is
+            /// exactly one bulk stable sort of everything received.
+            #[test]
+            fn merging_batches_equals_one_bulk_stable_sort(items in prop::collection::vec((arb_entry(), any::<bool>()), 0..24), mode in arb_mode(), desc in any::<bool>()) {
+                let dir = if desc { SortDirection::Desc } else { SortDirection::Asc };
+                let mut expected: Vec<Entry> = items.iter().map(|(e, _)| e.clone()).collect();
+                expected.sort_by(|a, b| cmp_entries(a, b, mode, dir));
+
+                let mut p = PanelState::new(PathBuf::from("/"));
+                p.sort_mode = mode;
+                p.sort_direction = dir;
+                let mut batch = Vec::new();
+                for (e, cut) in items {
+                    batch.push(e);
+                    if cut {
+                        p.merge_streamed(std::mem::take(&mut batch));
+                    }
+                }
+                p.merge_streamed(batch);
+                prop_assert_eq!(p.entries, expected);
+                prop_assert_eq!(p.cursor, 0, "pinned to the top while the user has not moved");
+            }
+
+            /// Once the user has moved, the cursor follows its entry through
+            /// every later batch.
+            #[test]
+            fn a_moved_cursor_stays_on_its_entry_through_every_batch(first in prop::collection::vec(arb_entry(), 1..8), later in prop::collection::vec((arb_entry(), any::<bool>()), 0..24), pick in 0usize..8, mode in arb_mode()) {
+                let mut p = PanelState::new(PathBuf::from("/"));
+                p.sort_mode = mode;
+                p.merge_streamed(first);
+                p.move_cursor(CursorMove::Down(pick));
+                let on = p.entries[p.cursor].clone();
+                let mut batch = Vec::new();
+                for (e, cut) in later {
+                    batch.push(e);
+                    if cut {
+                        p.merge_streamed(std::mem::take(&mut batch));
+                        prop_assert_eq!(&p.entries[p.cursor], &on);
+                    }
+                }
+                p.merge_streamed(batch);
+                prop_assert_eq!(&p.entries[p.cursor], &on);
+            }
+        }
+
+        #[test]
+        fn cursor_stays_on_its_entry_when_a_batch_sorts_before_it() {
+            // panel-navigation "Cursor stays on its entry while entries
+            // stream in".
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![Entry::parent_dir(), file("report.txt"), file("zeta.txt")]);
+            p.move_cursor(CursorMove::Down(1));
+            assert_eq!(p.entries[p.cursor].name, OsString::from("report.txt"));
+            p.merge_streamed(vec![file("zz.txt"), file("alpha.txt"), file("readme.md"), file("beta.txt")]);
+            assert_eq!(p.entries[p.cursor].name, OsString::from("report.txt"), "three entries landed above it; the cursor index moved with it");
+            assert_eq!(p.cursor, 4);
+            assert_eq!(names(&p), vec!["..", "alpha.txt", "beta.txt", "readme.md", "report.txt", "zeta.txt", "zz.txt"]);
+        }
+
+        #[test]
+        fn cursor_stays_pinned_to_row_zero_until_the_user_moves() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![file("m")]);
+            p.merge_streamed(vec![file("z"), file("a")]);
+            assert_eq!(p.cursor, 0);
+            assert_eq!(p.entries[0].name, OsString::from("a"));
+            assert!(!p.cursor_user_moved);
+        }
+
+        #[test]
+        fn unsorted_mode_appends_in_arrival_order_with_the_parent_first() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.sort_mode = SortMode::Unsorted;
+            p.merge_streamed(vec![file("zebra"), file("apple")]);
+            p.merge_streamed(vec![Entry::parent_dir()]);
+            p.merge_streamed(vec![file("mango"), file("banana")]);
+            assert_eq!(names(&p), vec!["..", "zebra", "apple", "mango", "banana"]);
+        }
+
+        #[test]
+        fn an_empty_batch_changes_nothing() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![file("a"), file("b")]);
+            p.move_cursor(CursorMove::Down(1));
+            let before = p.clone();
+            p.merge_streamed(Vec::new());
+            assert_eq!(p, before);
+        }
+
+        #[test]
+        fn merging_with_an_active_filter_keeps_the_visible_list_current() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![Entry::parent_dir(), file("report.txt"), file("notes.md")]);
+            p.activate_quick_filter();
+            p.quick_filter_push('r');
+            p.quick_filter_push('e');
+            p.merge_streamed(vec![file("readme.md"), file("alpha")]);
+            let visible: Vec<String> = p.visible_indices().into_iter().map(|i| p.entries[i].name.to_string_lossy().into_owned()).collect();
+            assert_eq!(visible, vec!["..", "readme.md", "report.txt"]);
+        }
+
+        // --- the re-read anchor, resolved from each batch (design D6) ---
+
+        /// The resolution the anchor made before this change — a full scan of
+        /// the captured names against the entries — as the oracle.
+        fn old_resolve(names: &[OsString], cursor: usize, entries: &[Entry]) -> Option<usize> {
+            if names.is_empty() {
+                return None;
+            }
+            let at = cursor.min(names.len() - 1);
+            std::iter::once(&names[at])
+                .chain(names[at + 1..].iter())
+                .chain(names[..at].iter().rev())
+                .find_map(|name| entries.iter().position(|e| &e.name == name))
+        }
+
+        /// A `Complete`, `Unsorted` panel of `e0..e{n}` with the cursor on
+        /// `e{cursor}`, with its anchor captured and a same-directory re-read
+        /// begun — ready to receive the re-read's batches.
+        fn rereading(n: usize, cursor: usize, mode: SortMode) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from("/a"));
+            p.sort_mode = mode;
+            p.set_entries((0..n).map(|i| file(&format!("e{i}"))).collect());
+            p.resort();
+            p.progress = ListingProgress::Complete { count: n };
+            p.cursor = p.entries.iter().position(|e| e.name == OsString::from(format!("e{cursor}"))).unwrap();
+            p.capture_reread_anchor();
+            p.begin_new_listing(PathBuf::from("/a"));
+            p
+        }
+
+        fn cursor_name(p: &PanelState) -> String {
+            p.entries[p.cursor].name.to_string_lossy().into_owned()
+        }
+
+        #[test]
+        fn the_anchored_entry_arriving_in_the_last_of_many_batches_restores_the_cursor() {
+            let mut p = rereading(100, 57, SortMode::Unsorted);
+            let anchor_names = p.reread_anchor.as_ref().unwrap().names.clone();
+            // Everything but e57 streams in first, in batches of ten; e57
+            // arrives alone in the last batch.
+            let others: Vec<Entry> = (0..100).filter(|&i| i != 57).map(|i| file(&format!("e{i}"))).collect();
+            for chunk in others.chunks(10) {
+                p.merge_streamed(chunk.to_vec());
+                assert!(p.apply_reread_anchor(10));
+                // Until e57 lands the forward survivor (e58) holds the cursor,
+                // exactly as the full scan decided before.
+                let expected = old_resolve(&anchor_names, 57, &p.entries).unwrap();
+                assert_eq!(p.cursor, expected);
+            }
+            assert_eq!(cursor_name(&p), "e58");
+            p.merge_streamed(vec![file("e57")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e57");
+            assert!(p.cursor_user_moved);
+        }
+
+        #[test]
+        fn a_better_ranked_name_arriving_after_a_worse_ranked_one_moves_the_cursor_to_it() {
+            // Resolution order from a cursor on e5: e5, e6, e7, ..., then e4,
+            // e3, ... (reread-preserves-cursor design D1).
+            let mut p = rereading(10, 5, SortMode::Unsorted);
+            p.merge_streamed(vec![file("e7")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7");
+            p.merge_streamed(vec![file("e3")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7", "a name behind the cursor ranks below one ahead of it");
+            p.merge_streamed(vec![file("e6")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e6");
+            p.merge_streamed(vec![file("e5")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e5");
+            p.merge_streamed(vec![file("e4"), file("e8")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e5", "nothing outranks the cursor's own entry");
+        }
+
+        #[test]
+        fn a_user_move_during_the_re_read_stream_is_overridden_by_the_next_batch_as_before() {
+            let mut p = rereading(10, 5, SortMode::Unsorted);
+            p.merge_streamed(vec![file("e0"), file("e7")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7");
+            p.move_cursor(CursorMove::Home);
+            assert_eq!(cursor_name(&p), "e0");
+            // The next batch's application re-applies the anchor (panel-
+            // navigation "No jump while the re-read streams" keeps the anchor
+            // in charge until completion).
+            p.merge_streamed(vec![file("e9")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7");
+        }
+
+        #[test]
+        fn a_re_sort_mid_re_read_still_resolves_the_anchor() {
+            // Ctrl+F3..F6 while the re-read streams invalidates the tracked
+            // index; the next application re-finds it with one scan, and
+            // later batches track it again (design D6).
+            let mut p = rereading(10, 5, SortMode::Name);
+            p.merge_streamed(vec![file("e7"), file("e1")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7");
+            p.set_sort_mode(SortMode::Size);
+            p.sort_direction = SortDirection::Desc;
+            p.resort();
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e7", "re-found after the re-order");
+            p.merge_streamed(vec![file("e5"), file("e2")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e5");
+            p.set_sort_mode(SortMode::Name);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e5");
+        }
+
+        #[test]
+        fn a_tab_round_trip_mid_re_read_keeps_the_tracked_anchor_usable() {
+            let mut p = rereading(10, 5, SortMode::Unsorted);
+            p.merge_streamed(vec![file("e6")]);
+            assert!(p.apply_reread_anchor(10));
+            p.open_tab();
+            p.switch_tab(1);
+            p.merge_streamed(vec![file("e5")]);
+            assert!(p.apply_reread_anchor(10));
+            assert_eq!(cursor_name(&p), "e5");
+        }
+
+        proptest! {
+            /// Any subset of the captured names arriving in any order and any
+            /// batching, under `Unsorted` or `Name` order: after every batch
+            /// the anchor lands where the old full scan would have.
+            #[test]
+            fn batch_tracked_resolution_matches_the_full_scan(items in prop::collection::vec((any::<bool>(), 0u8..=255, any::<bool>()), 1..14), cursor_pick in 0usize..14, by_name in any::<bool>(), extra in prop::collection::vec("[x-z]{1,2}", 0..4)) {
+                let n = items.len();
+                let cursor = cursor_pick % n;
+                let mode = if by_name { SortMode::Name } else { SortMode::Unsorted };
+                let mut p = rereading(n, cursor, mode);
+                let anchor_names = p.reread_anchor.as_ref().unwrap().names.clone();
+                let anchor_cursor = p.reread_anchor.as_ref().unwrap().cursor;
+
+                // Present captured names in shuffle-key order, with some
+                // uncaptured newcomers mixed in, cut into batches.
+                let mut arrivals: Vec<(u8, Entry, bool)> = items
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (present, _, _))| *present)
+                    .map(|(i, (_, key, cut))| (*key, file(&format!("e{i}")), *cut))
+                    .collect();
+                for (j, name) in extra.iter().enumerate() {
+                    arrivals.push(((j * 37) as u8, file(name), j % 2 == 0));
+                }
+                arrivals.sort_by_key(|(key, _, _)| *key);
+
+                let mut batch = Vec::new();
+                let flush = |p: &mut PanelState, batch: &mut Vec<Entry>| -> Result<(), TestCaseError> {
+                    p.merge_streamed(std::mem::take(batch));
+                    let hit = p.apply_reread_anchor(10);
+                    let expected = old_resolve(&anchor_names, anchor_cursor, &p.entries);
+                    prop_assert_eq!(hit, expected.is_some());
+                    if let Some(idx) = expected {
+                        prop_assert_eq!(p.cursor, idx);
+                    }
+                    Ok(())
+                };
+                for (_, e, cut) in arrivals {
+                    batch.push(e);
+                    if cut {
+                        flush(&mut p, &mut batch)?;
+                    }
+                }
+                flush(&mut p, &mut batch)?;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // streaming-listing-performance: the cached visible list (design D5)
+    // -----------------------------------------------------------------
+
+    mod visible_cache_tests {
+        use super::*;
+
+        /// The visible list computed the way `visible_indices()` did before
+        /// the cache existed.
+        fn from_scratch(p: &PanelState) -> Vec<usize> {
+            match &p.quick_filter {
+                None => (0..p.entries.len()).collect(),
+                Some(pattern) => p
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, e)| e.kind == EntryKind::ParentDir || e.name.to_string_lossy().to_lowercase().contains(&pattern.to_lowercase()))
+                    .map(|(i, _)| i)
+                    .collect(),
+            }
+        }
+
+        /// Every accessor agrees with a from-scratch filter.
+        fn assert_cache_consistent(p: &PanelState) {
+            let expected = from_scratch(p);
+            assert_eq!(p.visible_indices(), expected, "visible_indices");
+            assert_eq!(p.visible_len(), expected.len(), "visible_len");
+            for (pos, &i) in expected.iter().enumerate() {
+                assert_eq!(p.visible_at(pos), Some(i), "visible_at({pos})");
+                assert_eq!(p.visible_position(i), Some(pos), "visible_position({i})");
+            }
+            assert_eq!(p.visible_at(expected.len()), None);
+            for i in 0..p.entries.len() {
+                if !expected.contains(&i) {
+                    assert_eq!(p.visible_position(i), None, "a hidden entry has no visible position");
+                }
+            }
+            assert_eq!(p.visible_position(p.entries.len()), None);
+            assert_eq!(p.visible_window(0, usize::MAX).collect::<Vec<_>>(), expected, "the whole window");
+            if expected.len() >= 3 {
+                assert_eq!(p.visible_window(1, 2).collect::<Vec<_>>(), expected[1..3].to_vec(), "an inner window");
+            }
+            assert_eq!(p.visible_window(expected.len().saturating_sub(1), 10).count(), expected.len().min(1), "a window running off the end is clipped");
+            assert_eq!(p.visible_window(expected.len() + 5, 3).count(), 0, "a window past the end is empty");
+        }
+
+        #[test]
+        fn the_cache_matches_a_from_scratch_filter_after_every_mutator() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![Entry::parent_dir(), file("Report.txt"), file("readme.md"), file("notes.txt"), dir("repo")]);
+            assert_cache_consistent(&p);
+            p.activate_quick_filter();
+            assert_cache_consistent(&p);
+            for c in "RE".chars() {
+                p.quick_filter_push(c);
+                assert_cache_consistent(&p);
+            }
+            assert_eq!(p.visible_len(), 4, "`..`, Report.txt, readme.md, repo — case-insensitively");
+            p.merge_streamed(vec![file("reply.txt"), file("zebra")]);
+            assert_cache_consistent(&p);
+            p.set_sort_mode(SortMode::Size);
+            assert_cache_consistent(&p);
+            p.sort_direction = SortDirection::Desc;
+            p.resort();
+            assert_cache_consistent(&p);
+            p.quick_filter_backspace();
+            assert_cache_consistent(&p);
+            p.set_entries(vec![Entry::parent_dir(), file("alpha.txt"), file("rho")]);
+            assert_cache_consistent(&p);
+            p.set_quick_filter(Some("txt".to_string()));
+            assert_cache_consistent(&p);
+            assert_eq!(p.visible_indices(), vec![0, 1]);
+            p.clear_quick_filter();
+            assert_cache_consistent(&p);
+            assert_eq!(p.visible_len(), p.entries.len());
+            p.set_quick_filter(Some("zzz".to_string()));
+            assert_cache_consistent(&p);
+            p.begin_new_listing(PathBuf::from("/other"));
+            assert_cache_consistent(&p);
+            assert_eq!(p.quick_filter, None);
+        }
+
+        #[test]
+        fn the_cache_follows_a_tab_switch() {
+            let mut p = PanelState::new(PathBuf::from("/"));
+            p.merge_streamed(vec![Entry::parent_dir(), file("report.txt"), file("notes.md")]);
+            p.set_quick_filter(Some("re".to_string()));
+            p.open_tab(); // the new, active tab inherits the filter
+            assert_cache_consistent(&p);
+            p.set_quick_filter(Some("notes".to_string()));
+            p.merge_streamed(vec![file("notes2.md")]);
+            assert_cache_consistent(&p);
+            assert_eq!(p.visible_len(), 3);
+            assert!(p.switch_tab(1));
+            assert_cache_consistent(&p);
+            assert_eq!(p.quick_filter.as_deref(), Some("re"));
+            assert_eq!(p.visible_len(), 2);
+            assert!(p.switch_tab(2));
+            assert_cache_consistent(&p);
+            assert_eq!(p.visible_len(), 3);
+            assert!(p.close_tab() || true);
+            assert_cache_consistent(&p);
+        }
+
+        #[test]
+        fn snapping_prefers_the_lower_index_on_a_tie_as_before() {
+            // Visible entries at indices 1 and 3 with the cursor on 2: the old
+            // linear `min_by_key` kept the first minimum, index 1.
+            let mut p = PanelState::new(PathBuf::from(r"C:\"));
+            p.set_entries(vec![file("a0"), file("x1"), file("a2"), file("x3"), file("a4")]);
+            p.cursor = 2;
+            p.activate_quick_filter();
+            p.quick_filter_push('x');
+            assert_eq!(p.cursor, 1);
+            // Nearer on one side wins regardless of order.
+            p.clear_quick_filter();
+            p.set_entries(vec![file("x0"), file("a1"), file("a2"), file("x3"), file("a4")]);
+            p.cursor = 2;
+            p.activate_quick_filter();
+            p.quick_filter_push('x');
+            assert_eq!(p.cursor, 3);
+            p.cursor = 4;
+            p.quick_filter_backspace();
+            p.quick_filter_push('x');
+            assert_eq!(p.cursor, 3, "only a lower neighbour exists");
+        }
+
+        #[test]
+        fn selected_uses_the_cache_to_hide_a_filtered_cursor_entry() {
+            let mut p = PanelState::new(PathBuf::from(r"C:\"));
+            p.set_entries(vec![file("pagefile.sys"), file("notes.txt")]);
+            p.cursor = 1;
+            p.set_quick_filter(Some("zzzz".to_string()));
+            assert!(p.selected().is_none());
+            p.set_quick_filter(Some("notes".to_string()));
+            assert_eq!(p.selected().map(|e| e.name.to_string_lossy().into_owned()), Some("notes.txt".to_string()));
+        }
+    }
+
+    // -----------------------------------------------------------------
     // Brief column-window and Tree scrolling (panel-scrolling task 2.3)
     // -----------------------------------------------------------------
 
@@ -2665,7 +3409,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
+            ListEntry::new(OsString::from(name), EntryKind::Directory, 0, None, false, false)
         }
 
         /// A flattened tree of `n` top-level directories under `C:\`.

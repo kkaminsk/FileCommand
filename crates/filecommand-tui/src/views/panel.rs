@@ -382,10 +382,12 @@ pub fn hit_test(area: Rect, panel: &PanelState) -> crate::hitmap::PanelHits {
         DisplayMode::Full => {
             let rows_start = body_y0 + 1;
             let rows_h = body_h.saturating_sub(1);
-            let visible = panel.visible_indices();
-            for row in 0..rows_h {
-                let y = rows_start + row;
-                let Some(entry) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i)) else { continue };
+            // Only the rows on screen, through the cached visible window —
+            // no per-frame allocation of every visible index (streaming-
+            // listing-performance design D5).
+            for (row, i) in panel.visible_window(panel.scroll_offset, rows_h as usize).enumerate() {
+                let y = rows_start + row as u16;
+                let Some(entry) = panel.entries.get(i) else { continue };
                 let rect = Rect { x: x0 + 1, y, width: right_x.saturating_sub(x0 + 1), height: 1 };
                 hits.rows.push((rect, entry.name.clone()));
             }
@@ -603,21 +605,24 @@ pub fn render_panel(
     buf.set_string(right_x, body_y0, "\u{2551}", frame_style);
 
     // Entry rows. When a quick filter is active the body is narrowed to
-    // `visible_indices()` (`..` plus name-matching entries) rather than the
-    // full `entries` list, matching `move_cursor`'s cursor-restriction and
-    // the spec's "the panel body is narrowed to entries whose displayed
-    // name contains the pattern" requirement (quick-filter "Substring
-    // narrowing as the pattern is typed").
-    let visible = panel.visible_indices();
+    // the panel's cached visible list (`..` plus name-matching entries)
+    // rather than the full `entries` list, matching `move_cursor`'s
+    // cursor-restriction and the spec's "the panel body is narrowed to
+    // entries whose displayed name contains the pattern" requirement
+    // (quick-filter "Substring narrowing as the pattern is typed"). Only
+    // the window of rows on screen is walked, so a frame costs the rows
+    // shown rather than the directory's size (streaming-listing-performance
+    // design D5).
     let rows_start = body_y0 + 1;
     let rows_h = body_h.saturating_sub(1); // header row
     let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
-    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, visible.len(), panel.scroll_offset);
+    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, panel.visible_len(), panel.scroll_offset);
+    let mut window = panel.visible_window(panel.scroll_offset, rows_h as usize);
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
         draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
-        if let Some((entry, is_cursor)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
+        if let Some((entry, is_cursor)) = window.next().and_then(|i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
             // The drag's target row (mouse-panel-drag "Drag feedback")
             // outranks the ordinary selected/dir/file styling — but never a
             // *source* row, since a dragged item's own directory/descendant
@@ -733,15 +738,16 @@ fn render_brief_body(
         *last += inner_w - base_w * n_cols;
     }
     let rows_h = body_h as usize;
-    // Narrow to the active quick filter's `visible_indices()` (`..` plus
+    // Narrow to the active quick filter's cached visible list (`..` plus
     // name-matching entries), exactly like Full mode above (quick-filter
-    // "Substring narrowing as the pattern is typed").
-    let visible = panel.visible_indices();
+    // "Substring narrowing as the pattern is typed"); each cell is one O(1)
+    // `visible_at` lookup, column-major (streaming-listing-performance
+    // design D5).
     // The overflow-only scrollbar reflects the cursor window's linear
     // position through the whole visible list, not one column's share of it
     // — window_capacity is every position the `n_cols`-wide window shows at
     // once (additional-panel-modes "Brief mode column scrolling").
-    let thumb = scrollbar_thumb(rows_h, n_cols * rows_h, visible.len(), panel.scroll_offset);
+    let thumb = scrollbar_thumb(rows_h, n_cols * rows_h, panel.visible_len(), panel.scroll_offset);
 
     for row in 0..rows_h {
         let y = body_y0 + row as u16;
@@ -749,7 +755,7 @@ fn render_brief_body(
         let mut x = x0 + 1;
         for (c, &cw) in col_widths.iter().enumerate() {
             let pos = panel.scroll_offset + c * rows_h + row;
-            if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
+            if let Some((entry, idx)) = panel.visible_at(pos).and_then(|i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
                 // Same precedence as Full mode (hidden-entry-styling design
                 // D3): drag target, cursor bar, Ins-selection, hidden
@@ -1056,8 +1062,8 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None, hidden: false, link: false },
+            Entry::new(OsString::from("src"), EntryKind::Directory, 0, None, false, false),
+            Entry::new(OsString::from("a.txt"), EntryKind::File, 10, None, false, false),
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         let mut right = PanelState::new(PathBuf::from(r"C:\right"));
@@ -1294,7 +1300,7 @@ mod tests {
         let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt), hidden: false, link: false },
+            Entry::new(OsString::from("docs"), EntryKind::Directory, 0, Some(dt), false, false),
         ]);
         // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
         let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
@@ -1317,8 +1323,8 @@ mod tests {
         // their last-digit cell column.
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None, hidden: false, link: false },
-            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None, hidden: false, link: false },
+            Entry::new(OsString::from("a.txt"), EntryKind::File, 87, None, false, false),
+            Entry::new(OsString::from("b.txt"), EntryKind::File, 35 * 1024, None, false, false),
         ]);
         // Interior layout: 13-cell Name, `│`, then the 9-cell Size column —
         // cells 15..24 of the 40-cell row.
@@ -1348,11 +1354,11 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from(".git"), kind: EntryKind::Directory, size: 0, modified: None, hidden: true, link: false },
-            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
-            Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
-            Entry { name: OsString::from("secret.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
-            Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false },
+            Entry::new(OsString::from(".git"), EntryKind::Directory, 0, None, true, false),
+            Entry::new(OsString::from("docs"), EntryKind::Directory, 0, None, false, false),
+            Entry::new(OsString::from("desktop.ini"), EntryKind::File, 0, None, true, false),
+            Entry::new(OsString::from("secret.txt"), EntryKind::File, 0, None, true, false),
+            Entry::new(OsString::from("readme.txt"), EntryKind::File, 0, None, false, false),
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         left.cursor = 1; // on the hidden `.git` directory

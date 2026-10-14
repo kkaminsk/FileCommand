@@ -49,9 +49,9 @@ fn fixed_date() -> DateTime {
 fn fixed_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false, link: false },
-        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false, link: false },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry::new("docs", EntryKind::Directory, 0, Some(fixed_date()), false, false),
+        Entry::new("Cargo.toml", EntryKind::File, 612, Some(fixed_date()), false, false),
+        Entry::new("readme.txt", EntryKind::File, 12_345, Some(fixed_date()), false, false),
     ]
 }
 
@@ -1143,7 +1143,7 @@ fn snapshot_brief_mode_three_name_columns() {
     let mut panel = complete_panel(r"C:\Users\demo\left", 0);
     panel.display_mode = DisplayMode::Brief;
     panel.entries = std::iter::once(Entry::parent_dir())
-        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }))
+        .chain((0..8).map(|i| Entry::new(format!("f{i}.txt"), EntryKind::File, 0, None, false, false)))
         .collect();
     state.left = panel;
     // A short panel (6 body rows, after the command line and F-key bar
@@ -1165,8 +1165,8 @@ fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
     tree.insert_children(
         &PathBuf::from(r"C:\"),
         vec![
-            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
-            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
+            Entry::new("Alpha", EntryKind::Directory, 0, None, false, false),
+            Entry::new("Beta", EntryKind::Directory, 0, None, false, false),
         ],
     );
     tree.cursor = cursor;
@@ -1221,7 +1221,7 @@ fn quick_view_previews_the_opposite_cursor_file() {
     state.left = left;
 
     let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
-    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None, hidden: false, link: false }];
+    right.entries = vec![Entry::new("preview.txt", EntryKind::File, 34, None, false, false)];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -1243,7 +1243,7 @@ fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
     state.left = left;
 
     let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
-    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }];
+    right.entries = vec![Entry::new("docs", EntryKind::Directory, 0, None, false, false)];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -1302,11 +1302,11 @@ fn snapshot_git_info_absent_reserves_no_marker_column() {
 fn hidden_entries_fixture() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: ".git".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: true, link: false },
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false, link: false },
-        Entry { name: "desktop.ini".into(), kind: EntryKind::File, size: 87, modified: Some(fixed_date()), hidden: true, link: false },
-        Entry { name: "secret.txt".into(), kind: EntryKind::File, size: 35_840, modified: Some(fixed_date()), hidden: true, link: false },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry::new(".git", EntryKind::Directory, 0, Some(fixed_date()), true, false),
+        Entry::new("docs", EntryKind::Directory, 0, Some(fixed_date()), false, false),
+        Entry::new("desktop.ini", EntryKind::File, 87, Some(fixed_date()), true, false),
+        Entry::new("secret.txt", EntryKind::File, 35_840, Some(fixed_date()), true, false),
+        Entry::new("readme.txt", EntryKind::File, 612, Some(fixed_date()), false, false),
     ]
 }
 
@@ -1387,7 +1387,7 @@ fn mini_status_row(text: &str) -> &str {
 #[test]
 fn snapshot_quick_filter_mini_status_replaces_normal_content() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let row = mini_status_row(&text);
     assert!(row.contains("rep"), "`{row}`");
@@ -1403,7 +1403,7 @@ fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
     // (quick-filter "the panel body is narrowed to entries whose displayed
     // name contains the pattern").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(left_half.contains(".."), "`..` must always stay visible: {left_half}");
@@ -1415,7 +1415,7 @@ fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
 #[test]
 fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let right_half: String = text.lines().map(|l| l.chars().skip(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(right_half.contains("docs"), "the opposite panel's body must stay unfiltered: {right_half}");
@@ -1426,7 +1426,7 @@ fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
 fn quick_filter_narrows_the_brief_mode_body_to_matching_entries() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left.display_mode = filecommand_core::panel::DisplayMode::Brief;
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
@@ -1562,7 +1562,7 @@ fn clipboard_feedback_takes_precedence_over_the_quick_filter_mini_status() {
     // the same frame; the feedback must win (clipboard-export "Clipboard
     // feedback").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     state.left.clipboard_feedback =
         Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -1605,7 +1605,7 @@ fn snapshot_find_file_dialog_with_streamed_results() {
         1,
         filecommand_core::listing::FindMatch {
             relative_path: PathBuf::from(r"docs\readme.txt"),
-            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false, link: false },
+            entry: Entry::new("readme.txt", EntryKind::File, 12_345, Some(fixed_date()), false, false),
         },
     );
     dialog.mark_done(1);

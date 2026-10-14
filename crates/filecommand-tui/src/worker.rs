@@ -23,15 +23,13 @@ use filecommand_core::fs_ops::{
 };
 use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
-use filecommand_core::listing::{find_in_subtree, list_dir_chunked, Entry, FsReader, StdFsReader};
+use filecommand_core::listing::{find_in_subtree, list_dir_streaming, BatchPolicy, Entry, FsReader, StdFsReader};
 use filecommand_core::panel::parent_path;
 use filecommand_core::viewer::search::{find_forward, DEFAULT_CHUNK_SIZE};
 use filecommand_core::viewer::ByteSource;
 use filecommand_core::{Command, PanelSide, ProbeKind};
 
 use crate::diag;
-
-const CHUNK_SIZE: usize = 256;
 
 /// Send a worker result to the event loop, logging a failure rather than
 /// dropping it silently (error-diagnostics design D3): the send can only
@@ -877,10 +875,14 @@ where
 /// so the reducer can match it against the panel's current listing
 /// (panel-navigation "Superseded directory listings are discarded and
 /// cancelled"; listing-request-guard design D1). `cancel` is the listing's
-/// stop signal (design D5): checked before the `..` chunk, before each chunk
-/// (inside `list_dir_chunked`), and before the final reply — once set,
-/// nothing further is sent, not even a terminal reply, since the reducer has
-/// already superseded this id and would drop it.
+/// stop signal (design D5): checked before the `..` chunk, as every entry
+/// arrives (inside `list_dir_streaming`, which breaks off the enumeration),
+/// and before the final reply — once set, nothing further is sent, not even
+/// a terminal reply, since the reducer has already superseded this id and
+/// would drop it. Entries go out in batches bounded by a growing count and
+/// ~50 ms of enumeration time (streaming-listing-performance design D2), so
+/// the first entries and a live `Reading… N` count appear while the
+/// directory is still being enumerated.
 pub fn spawn_listing(panel: PanelSide, path: PathBuf, request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken) {
     spawn_listing_with(panel, path, request, cancel, tx, token, read_listing);
 }
@@ -905,7 +907,7 @@ fn read_listing(panel: PanelSide, path: &Path, request: u64, cancel: &CancelFlag
     }
 
     let reader = StdFsReader;
-    let result = list_dir_chunked(&reader, path, CHUNK_SIZE, cancel, |chunk| {
+    let result = list_dir_streaming(&reader, path, cancel, BatchPolicy::default(), &Instant::now, |chunk| {
         deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: chunk, request });
     });
 

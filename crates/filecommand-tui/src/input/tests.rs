@@ -816,7 +816,7 @@ fn entries_are_irrelevant_to_key_mapping() {
     // The mapper reads modes, not contents: a populated panel maps the same
     // keys as an empty one.
     let mut state = panels();
-    state.left.entries = vec![Entry { name: "a.txt".into(), kind: EntryKind::File, size: 1, modified: None, hidden: false, link: false }];
+    state.left.entries = vec![Entry::new("a.txt", EntryKind::File, 1, None, false, false)];
     assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::TextEdit(TextEditOp::Insert('d'))));
 }
 
@@ -1002,7 +1002,7 @@ fn ctrl_p_and_ctrl_j_open_quick_filter_and_fuzzy_jump_by_default() {
 #[test]
 fn quick_filter_owns_printables_and_backspace_but_not_esc_or_movement() {
     let mut state = panels();
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(plain(KeyCode::Char('p')), &state), Some(Command::QuickFilterChar('p')));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::QuickFilterBackspace));
     // Esc no longer exits the filter — it falls through to the unconditional
@@ -1024,14 +1024,14 @@ fn quick_filter_activation_key_toggles_the_filter_off_when_active() {
     // key toggles the filter").
     let mut state = panels();
     assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Left)));
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterEnd));
 }
 
 #[test]
 fn quick_filter_is_scoped_to_the_active_panel_only() {
     let mut state = panels();
-    state.right.quick_filter = Some("x".to_string()); // right is inactive here
+    state.right.set_quick_filter(Some("x".to_string())); // right is inactive here
     assert_eq!(
         map(plain(KeyCode::Char('a')), &state),
         Some(Command::TextEdit(TextEditOp::Insert('a'))),
@@ -1047,7 +1047,7 @@ fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
     // the activation key toggling the filter off is the documented way out
     // of the filter first (quick-filter "Clearing the quick filter").
     let mut state = panels();
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(
         map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state),
         None,
@@ -1075,7 +1075,7 @@ fn ctrl_c_copies_files_from_panels_in_any_command_line_state() {
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &typing("dir")), files);
 
     let mut filtering = panels();
-    filtering.left.quick_filter = Some("re".to_string());
+    filtering.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &filtering), files);
 }
 
@@ -1403,7 +1403,7 @@ fn paste_with_an_active_quick_filter_still_lands_in_the_command_line() {
     // The quick filter claims only plain printables; Ctrl+V keeps its
     // command-line meaning while it is active, so a terminal paste does too.
     let mut state = panels();
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(
         map_paste("report.txt", &state),
         vec![Command::TextEdit(TextEditOp::Paste("report.txt".to_string()))]

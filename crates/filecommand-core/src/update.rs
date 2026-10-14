@@ -2482,9 +2482,15 @@ fn jump_to_prefix(state: &mut State, pattern: &str) {
     let side = state.active;
     let panel = state.panel(side);
     let found = if panel.quick_filter.is_some() {
-        let visible = panel.visible_indices();
-        let visible_entries: Vec<Entry> = visible.iter().map(|&i| panel.entries[i].clone()).collect();
-        crate::quicksearch::type_ahead_match(&visible_entries, pattern).map(|pos| visible[pos])
+        // The same prefix test as `type_ahead_match`, over the cached visible
+        // window and without cloning an entry (streaming-listing-performance
+        // design D5).
+        if pattern.is_empty() {
+            None
+        } else {
+            let needle = pattern.to_lowercase();
+            panel.visible_window(0, panel.visible_len()).find(|&i| panel.entries[i].sort_key().starts_with(&needle))
+        }
     } else {
         crate::quicksearch::type_ahead_match(&panel.entries, pattern)
     };
@@ -4561,9 +4567,10 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
         Command::ListingChunk { panel, entries, .. } => {
             let term_size = state.term_size;
             let p = state.panel_mut(panel);
-            for e in entries {
-                p.insert_streamed(e);
-            }
+            // One sort-and-merge per batch, never a per-entry insertion
+            // (panel-navigation "Large directories stream progressively and
+            // stay responsive"; streaming-listing-performance design D3).
+            p.merge_streamed(entries);
             if let crate::panel::ListingProgress::Streaming { count } = &mut p.progress {
                 *count = p.entries.len();
             }
@@ -4576,7 +4583,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             let rows = panel_viewport_rows(term_size, p.display_mode, p.tab_count());
             p.apply_reread_anchor(rows);
             // Keeps the pinned-to-top offset (0) while the user hasn't moved
-            // the cursor, exactly as `insert_streamed` already pins the
+            // the cursor, exactly as `merge_streamed` already pins the
             // cursor itself; re-clamps if the user had already moved it
             // (panel-navigation "Streamed listing keeps the top pinned until
             // the user moves"). In Brief mode this same call routes the
@@ -4589,6 +4596,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             let term_size = state.term_size;
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: total };
+            p.release_merge_scratch();
             // Entries the reader skipped are reported through the existing
             // inline-message surface, in place of the cursored entry's
             // details the mini-status otherwise restores on completion;
@@ -4628,6 +4636,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
         Command::ListingFailed { panel, message, .. } => {
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: p.entries.len() };
+            p.release_merge_scratch();
             p.last_error = Some(message);
         }
         _ => unreachable!("apply_listing_event only called for listing events"),
