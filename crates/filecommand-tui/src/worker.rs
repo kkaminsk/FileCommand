@@ -476,16 +476,32 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
 /// positioned-read open is cheap and keeps the two paths independent. The
 /// source is a local, so the worker's handle is released when the search
 /// returns (viewer: Instant open — "Closing the viewer releases the file").
-pub fn spawn_viewer_search(path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64, tx: Sender<Command>, token: WorkerToken) {
-    spawn_viewer_search_with(request, tx, token, move || match ByteSource::open(&path) {
-        Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE),
+///
+/// `cancel` is the search's stop signal (viewer "Search stops when
+/// superseded or when the viewer closes"; listing-request-guard design D5):
+/// once set, `find_forward` returns at its next chunk boundary and no
+/// `ViewerSearchResult` is sent — the reducer has already superseded this
+/// id, so a reply would be dropped anyway.
+pub fn spawn_viewer_search(
+    path: PathBuf,
+    start_offset: u64,
+    pattern: Vec<u8>,
+    request: u64,
+    cancel: CancelFlag,
+    tx: Sender<Command>,
+    token: WorkerToken,
+) {
+    let scan_cancel = cancel.clone();
+    spawn_viewer_search_with(request, cancel, tx, token, move || match ByteSource::open(&path) {
+        Ok(source) => find_forward(&source, start_offset, &pattern, DEFAULT_CHUNK_SIZE, &scan_cancel),
         Err(_) => None,
     });
 }
 
-/// `spawn_viewer_search` with the scan injected (design D6): a panicked
-/// scan reports "no match", the same reply as an unopenable file.
-fn spawn_viewer_search_with<B>(request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+/// `spawn_viewer_search` with the scan injected (process-lifecycle-hardening
+/// design D6): a panicked scan reports "no match", the same reply as an
+/// unopenable file. A cancelled search sends nothing at all.
+fn spawn_viewer_search_with<B>(request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken, body: B)
 where
     B: FnOnce() -> Option<(u64, u64)> + Send + 'static,
 {
@@ -494,6 +510,9 @@ where
             log_worker_panic("viewer search", &msg);
             None
         });
+        if cancel.is_cancelled() {
+            return;
+        }
         let (offset, match_range) = match found {
             Some((start, end)) => (Some(start), Some((start, end))),
             None => (None, None),
@@ -540,19 +559,28 @@ where
 /// itself performs its own I/O per directory, so results reach the UI
 /// incrementally rather than only once the whole subtree has been walked
 /// (find-file "Non-blocking search with static progress", "UI stays
-/// responsive during a large walk").
-pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>, token: WorkerToken) {
-    spawn_find_subtree_with(root, pattern, request, tx, token, move |root, pattern, tx| {
-        find_in_subtree(&StdFsReader, root, pattern, |m| {
-            deliver(tx, "find match", Command::FindFileMatch { request, m });
+/// responsive during a large walk"). `cancel` is the walk's stop signal
+/// (find-file "Dismissed or superseded searches stop"; listing-request-guard
+/// design D5): `find_in_subtree` checks it before each directory read and
+/// between entries, and once set the walk returns and no further
+/// `FindFileMatch` or `FindFileSearchDone` is sent.
+pub fn spawn_find_subtree(root: PathBuf, pattern: String, request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken) {
+    let walk_cancel = cancel.clone();
+    spawn_find_subtree_with(root, pattern, request, cancel, tx, token, move |root, pattern, tx| {
+        find_in_subtree(&StdFsReader, root, pattern, &walk_cancel, |m| {
+            if !walk_cancel.is_cancelled() {
+                deliver(tx, "find match", Command::FindFileMatch { request, m });
+            }
         });
     });
 }
 
-/// `spawn_find_subtree` with the walk injected (design D6): whether the
-/// walk returns or panics, the search is reported done, so the find dialog
-/// never shows a search still in progress.
-fn spawn_find_subtree_with<B>(root: PathBuf, pattern: String, request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+/// `spawn_find_subtree` with the walk injected (process-lifecycle-hardening
+/// design D6): whether the walk returns or panics, the search is reported
+/// done, so the find dialog never shows a search still in progress — unless
+/// it was cancelled, in which case nothing is sent (listing-request-guard
+/// design D5).
+fn spawn_find_subtree_with<B>(root: PathBuf, pattern: String, request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken, body: B)
 where
     B: FnOnce(&Path, &str, &Sender<Command>) + Send + 'static,
 {
@@ -564,63 +592,89 @@ where
             if let Err(msg) = result {
                 log_worker_panic("find", &msg);
             }
+            if cancel.is_cancelled() {
+                return;
+            }
             deliver(&tx, "find done", Command::FindFileSearchDone { request });
         },
     );
 }
 
-pub fn spawn_listing(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
-    spawn_listing_with(panel, path, tx, token, read_listing);
+/// Fulfil `Effect::StartListing`: stream `path`'s entries back as
+/// `ListingChunk`s (a synthetic `..` first when the directory has a parent),
+/// then `ListingComplete` or `ListingFailed`, every reply echoing `request`
+/// so the reducer can match it against the panel's current listing
+/// (panel-navigation "Superseded directory listings are discarded and
+/// cancelled"; listing-request-guard design D1). `cancel` is the listing's
+/// stop signal (design D5): checked before the `..` chunk, before each chunk
+/// (inside `list_dir_chunked`), and before the final reply — once set,
+/// nothing further is sent, not even a terminal reply, since the reducer has
+/// already superseded this id and would drop it.
+pub fn spawn_listing(panel: PanelSide, path: PathBuf, request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken) {
+    spawn_listing_with(panel, path, request, cancel, tx, token, read_listing);
 }
 
 /// The listing worker's body: stream the synthetic `..` and every chunk of
 /// `path`, then return the closing message — `ListingComplete`, or
 /// `ListingFailed` naming the directory. `None` when a chunk could not be
 /// delivered (the event loop is gone), since nothing is listening for the
-/// closing message either.
-fn read_listing(panel: PanelSide, path: &Path, tx: &Sender<Command>) -> Option<Command> {
+/// closing message either, and `None` once `cancel` is set, since the
+/// reducer has superseded this request.
+fn read_listing(panel: PanelSide, path: &Path, request: u64, cancel: &CancelFlag, tx: &Sender<Command>) -> Option<Command> {
     let mut total = 0usize;
 
+    if cancel.is_cancelled() {
+        return None;
+    }
     if parent_path(path).is_some() {
         total += 1;
-        if !deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: vec![Entry::parent_dir()] }) {
+        if !deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: vec![Entry::parent_dir()], request }) {
             return None;
         }
     }
 
     let reader = StdFsReader;
-    let result = list_dir_chunked(&reader, path, CHUNK_SIZE, |chunk| {
-        deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: chunk });
+    let result = list_dir_chunked(&reader, path, CHUNK_SIZE, cancel, |chunk| {
+        deliver(tx, "listing chunk", Command::ListingChunk { panel, entries: chunk, request });
     });
 
+    if cancel.is_cancelled() {
+        return None;
+    }
     Some(match result {
-        Ok(fs_count) => Command::ListingComplete { panel, total: total + fs_count },
+        Ok(fs_count) => Command::ListingComplete { panel, total: total + fs_count, request },
         // The message names the directory it could not read
         // (filesystem-error-handling "Error messages name the affected
         // path"), not just the bare OS error.
-        Err(e) => Command::ListingFailed { panel, message: listing_failed_message(path, &e) },
+        Err(e) => Command::ListingFailed { panel, message: listing_failed_message(path, &e), request },
     })
 }
 
-/// `spawn_listing` with the read injected (design D6): a panicked read ends
-/// as a failed listing naming the directory, so the panel leaves `Reading…
-/// N` and shows the error instead of waiting forever (application-shell "A
-/// panicked listing ends as a failed listing").
-fn spawn_listing_with<B>(panel: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken, body: B)
+/// `spawn_listing` with the read injected (process-lifecycle-hardening
+/// design D6): a panicked read ends as a failed listing naming the
+/// directory, so the panel leaves `Reading… N` and shows the error instead
+/// of waiting forever (application-shell "A panicked listing ends as a
+/// failed listing"). A cancelled listing sends nothing, panicked or not.
+fn spawn_listing_with<B>(panel: PanelSide, path: PathBuf, request: u64, cancel: CancelFlag, tx: Sender<Command>, token: WorkerToken, body: B)
 where
-    B: FnOnce(PanelSide, &Path, &Sender<Command>) -> Option<Command> + Send + 'static,
+    B: FnOnce(PanelSide, &Path, u64, &CancelFlag, &Sender<Command>) -> Option<Command> + Send + 'static,
 {
     let body_tx = tx.clone();
     let body_path = path.clone();
+    let body_cancel = cancel.clone();
     spawn_worker(
         token,
-        move || body(panel, &body_path, &body_tx),
+        move || body(panel, &body_path, request, &body_cancel, &body_tx),
         move |result| {
             let closing = match result {
                 Ok(closing) => closing,
                 Err(msg) => {
                     log_worker_panic("listing", &msg);
-                    Some(Command::ListingFailed { panel, message: format!("Internal error while reading {}: {msg}", path.display()) })
+                    if cancel.is_cancelled() {
+                        None
+                    } else {
+                        Some(Command::ListingFailed { panel, message: format!("Internal error while reading {}: {msg}", path.display()), request })
+                    }
                 }
             };
             if let Some(cmd) = closing {
@@ -779,7 +833,7 @@ mod tests {
     fn spawn_viewer_search_reports_the_match_back_on_the_channel() {
         let path = temp_file("found", b"the quick brown fox jumps over the lazy dog");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, tx, WorkerGauge::new().token());
+        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, CancelFlag::new(), tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset, match_range, request }) => {
                 assert_eq!(offset, Some(10));
@@ -794,7 +848,7 @@ mod tests {
     fn spawn_viewer_search_reports_no_match_as_none() {
         let path = temp_file("not-found", b"the quick brown fox");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, tx, WorkerGauge::new().token());
+        spawn_viewer_search(path, 0, b"zebra".to_vec(), 1, CancelFlag::new(), tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -805,7 +859,7 @@ mod tests {
     fn spawn_viewer_search_on_an_unopenable_path_reports_no_match_instead_of_panicking() {
         let missing = std::env::temp_dir().join("filecommand-tui-worker-viewer-test-does-not-exist.bin");
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, tx, WorkerGauge::new().token());
+        spawn_viewer_search(missing, 0, b"x".to_vec(), 1, CancelFlag::new(), tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -828,7 +882,7 @@ mod tests {
         let path = temp_file("release", &contents);
         let dir = path.parent().unwrap().to_path_buf();
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search(path.clone(), 0, b"zebra".to_vec(), 1, tx, WorkerGauge::new().token());
+        spawn_viewer_search(path.clone(), 0, b"zebra".to_vec(), 1, CancelFlag::new(), tx, WorkerGauge::new().token());
         match rx.recv_timeout(std::time::Duration::from_secs(30)) {
             Ok(Command::ViewerSearchResult { offset: None, match_range: None, request: 1 }) => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),
@@ -1143,11 +1197,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let name = dir.file_name().unwrap().to_string_lossy().into_owned();
         let (tx, rx) = mpsc::channel();
-        spawn_listing(PanelSide::Left, dir, tx, WorkerGauge::new().token());
+        spawn_listing(PanelSide::Left, dir, 7, CancelFlag::new(), tx, WorkerGauge::new().token());
         loop {
             match rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(Command::ListingChunk { .. }) => continue, // the synthetic `..` entry
-                Ok(Command::ListingFailed { panel, message }) => {
+                Ok(Command::ListingFailed { panel, message, .. }) => {
                     assert_eq!(panel, PanelSide::Left);
                     assert!(message.starts_with(&format!("Cannot read {name}: ")), "names the directory and the OS reason: {message}");
                     break;
@@ -1167,7 +1221,7 @@ mod tests {
         std::fs::write(dir.join("other.txt"), b"x").unwrap();
 
         let (tx, rx) = mpsc::channel();
-        spawn_find_subtree(dir.clone(), "report".to_string(), 7, tx, WorkerGauge::new().token());
+        spawn_find_subtree(dir.clone(), "report".to_string(), 7, CancelFlag::new(), tx, WorkerGauge::new().token());
 
         let mut matched_names = Vec::new();
         let saw_done;
@@ -1189,6 +1243,85 @@ mod tests {
         assert_eq!(matched_names, vec!["report.txt".to_string(), "report2.txt".to_string()]);
         assert!(saw_done);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -------------------------------------------------------------
+    // listing-request-guard: workers echo the request id and go silent
+    // once cancelled (design D1/D5; task 5.13)
+    // -------------------------------------------------------------
+
+    fn listing_fixture(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-worker-guard-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("report.txt"), b"x").unwrap();
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+        dir
+    }
+
+    /// A cancelled worker sends nothing: the first thing the receiver sees
+    /// is the channel closing when the thread returns — never a message.
+    fn assert_silent(rx: &mpsc::Receiver<Command>) {
+        match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+            Err(RecvTimeoutError::Disconnected) | Err(RecvTimeoutError::Timeout) => {}
+            Ok(msg) => panic!("a cancelled worker must send nothing, got {msg:?}"),
+        }
+    }
+
+    #[test]
+    fn spawn_listing_echoes_the_request_id_on_every_reply() {
+        let dir = listing_fixture("echo");
+        let (tx, rx) = mpsc::channel();
+        spawn_listing(PanelSide::Left, dir.clone(), 42, CancelFlag::new(), tx, WorkerGauge::new().token());
+        let mut chunks = 0;
+        loop {
+            match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+                Ok(Command::ListingChunk { panel: PanelSide::Left, request, .. }) => {
+                    assert_eq!(request, 42);
+                    chunks += 1;
+                }
+                Ok(Command::ListingComplete { panel: PanelSide::Left, total, request }) => {
+                    assert_eq!(request, 42);
+                    assert_eq!(total, 4, "`..` plus three entries");
+                    break;
+                }
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        assert!(chunks >= 2, "the synthetic `..` chunk and at least one directory chunk");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_listing_with_a_pre_cancelled_flag_sends_nothing() {
+        let dir = listing_fixture("cancelled");
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        spawn_listing(PanelSide::Left, dir.clone(), 7, cancel, tx, WorkerGauge::new().token());
+        assert_silent(&rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_find_subtree_with_a_pre_cancelled_flag_sends_nothing() {
+        let dir = listing_fixture("find-cancelled");
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        spawn_find_subtree(dir.clone(), "report".to_string(), 7, cancel, tx, WorkerGauge::new().token());
+        assert_silent(&rx);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spawn_viewer_search_with_a_pre_cancelled_flag_sends_nothing() {
+        let path = temp_file("search-cancelled", b"the quick brown fox");
+        let (tx, rx) = mpsc::channel();
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        spawn_viewer_search(path, 0, b"brown".to_vec(), 7, cancel, tx, WorkerGauge::new().token());
+        assert_silent(&rx);
     }
 
     // -------------------------------------------------------------
@@ -1392,10 +1525,11 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let gauge = WorkerGauge::new();
         let dir = PathBuf::from(if cfg!(windows) { r"C:\data\reports" } else { "/data/reports" });
-        spawn_listing_with(PanelSide::Right, dir.clone(), tx, gauge.token(), |_, _, _| panic!("scripted listing panic"));
+        spawn_listing_with(PanelSide::Right, dir.clone(), 7, CancelFlag::new(), tx, gauge.token(), |_, _, _, _, _| panic!("scripted listing panic"));
         match recv(&rx) {
-            Command::ListingFailed { panel, message } => {
+            Command::ListingFailed { panel, message, request } => {
                 assert_eq!(panel, PanelSide::Right);
+                assert_eq!(request, 7, "the failure echoes the listing request id");
                 assert_eq!(message, format!("Internal error while reading {}: scripted listing panic", dir.display()));
             }
             other => panic!("expected ListingFailed, got {other:?}"),
@@ -1469,7 +1603,7 @@ mod tests {
     #[test]
     fn a_panicked_find_walk_still_reports_the_search_done() {
         let (tx, rx) = mpsc::channel();
-        spawn_find_subtree_with(PathBuf::from("/root"), "x".to_string(), 11, tx, WorkerGauge::new().token(), |_, _, _| panic!("scripted find panic"));
+        spawn_find_subtree_with(PathBuf::from("/root"), "x".to_string(), 11, CancelFlag::new(), tx, WorkerGauge::new().token(), |_, _, _| panic!("scripted find panic"));
         match recv(&rx) {
             Command::FindFileSearchDone { request } => assert_eq!(request, 11),
             other => panic!("expected FindFileSearchDone, got {other:?}"),
@@ -1479,7 +1613,7 @@ mod tests {
     #[test]
     fn a_panicked_viewer_search_reports_no_match() {
         let (tx, rx) = mpsc::channel();
-        spawn_viewer_search_with(5, tx, WorkerGauge::new().token(), || panic!("scripted search panic"));
+        spawn_viewer_search_with(5, CancelFlag::new(), tx, WorkerGauge::new().token(), || panic!("scripted search panic"));
         match recv(&rx) {
             Command::ViewerSearchResult { offset: None, match_range: None, request: 5 } => {}
             other => panic!("expected a no-match ViewerSearchResult, got {other:?}"),

@@ -5,12 +5,50 @@ use crate::menu::MenuEntry;
 use std::ffi::OsString;
 
 fn test_state(phase: UiPhase) -> State {
-    State {
-        left: PanelState::new(PathBuf::from("/left")),
-        right: PanelState::new(PathBuf::from("/right")),
-        phase,
-        ..State::empty(Theme::classic())
-    }
+    // Both panels carry a listing request id, as `State::initial` would have
+    // minted for their first listing (listing-request-guard design D1), so
+    // the listing helpers below have an id to echo; `request_seq` sits past
+    // them so the next minted id never collides.
+    let mut left = PanelState::new(PathBuf::from("/left"));
+    left.listing_request = Some(1);
+    let mut right = PanelState::new(PathBuf::from("/right"));
+    right.listing_request = Some(2);
+    State { left, right, phase, request_seq: 2, ..State::empty(Theme::classic()) }
+}
+
+/// The id of `side`'s current listing — what a worker reply must echo to be
+/// applied (listing-request-guard design D8).
+fn listing_request(state: &State, side: PanelSide) -> u64 {
+    state.panel(side).listing_request.expect("the panel has a current listing request")
+}
+
+/// Feed one `ListingChunk` for `side`'s *current* listing — the request id
+/// the panel recorded when the listing began — so the test exercises the
+/// accepted path exactly as the worker for that listing would (listing-
+/// request-guard design D8). Tests about superseded replies construct their
+/// mismatched `Command::ListingChunk { request, .. }` explicitly.
+fn listing_chunk(state: State, side: PanelSide, entries: Vec<Entry>) -> (State, Vec<Effect>) {
+    let request = listing_request(&state, side);
+    update(state, Command::ListingChunk { panel: side, entries, request })
+}
+
+/// `ListingComplete` for `side`'s current listing; see [`listing_chunk`].
+fn listing_complete(state: State, side: PanelSide, total: usize) -> (State, Vec<Effect>) {
+    let request = listing_request(&state, side);
+    update(state, Command::ListingComplete { panel: side, total, request })
+}
+
+/// `ListingFailed` for `side`'s current listing; see [`listing_chunk`].
+fn listing_failed(state: State, side: PanelSide, message: String) -> (State, Vec<Effect>) {
+    let request = listing_request(&state, side);
+    update(state, Command::ListingFailed { panel: side, message, request })
+}
+
+/// The `Effect::StartListing` the reducer just issued for `side`: its
+/// `request` is whatever `begin_listing_inner` recorded on the panel, read
+/// back from the post-`update` state (listing-request-guard design D8).
+fn start_listing(state: &State, side: PanelSide, path: impl Into<PathBuf>) -> Effect {
+    Effect::StartListing { panel: side, path: path.into(), request: listing_request(state, side) }
 }
 
 fn file_entry(name: &str, size: u64) -> Entry {
@@ -23,13 +61,19 @@ fn dir_entry(name: &str) -> Entry {
 
 /// Every navigation/re-read now also issues `Effect::QueryGitInfo`
 /// alongside `Effect::StartListing` (git-info "Query re-issued on
-/// navigation"), and `Effect::PersistHistory` (fuzzy-jump "Navigation
-/// records history"; design D6). Tests that predate M5 and only care about
-/// the listing-related effects filter both out with this helper rather than
-/// asserting on request ids/frecency bookkeeping that are incidental to
-/// what they're testing.
+/// navigation"), `Effect::PersistHistory` (fuzzy-jump "Navigation
+/// records history"; design D6), and — when the panel's previous listing
+/// was still streaming, as `test_state`'s fresh panels always are —
+/// `Effect::CancelRequest` for that listing (listing-request-guard design
+/// D4). Tests that predate those changes and only care about the
+/// listing-related effects filter all three out with this helper rather
+/// than asserting on request ids/frecency bookkeeping that are incidental
+/// to what they're testing; tests about cancellation read the raw effects.
 fn without_git_info_effects(effects: Vec<Effect>) -> Vec<Effect> {
-    effects.into_iter().filter(|e| !matches!(e, Effect::QueryGitInfo { .. } | Effect::PersistHistory(_))).collect()
+    effects
+        .into_iter()
+        .filter(|e| !matches!(e, Effect::QueryGitInfo { .. } | Effect::PersistHistory(_) | Effect::CancelRequest(_)))
+        .collect()
 }
 
 // ---------------------------------------------------------------------
@@ -51,7 +95,7 @@ fn directory_read_returns_intent_effect_without_io() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left/sub")]);
     // The panel's own entries were reset locally — no filesystem was touched.
     assert!(state.left.entries.is_empty());
     assert!(matches!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }));
@@ -61,10 +105,10 @@ fn directory_read_returns_intent_effect_without_io() {
 fn worker_events_reenter_through_update() {
     let state = test_state(UiPhase::Panels);
     let entries = vec![file_entry("a", 1)];
-    let (state, effects) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone() });
+    let (state, effects) = listing_chunk(state, PanelSide::Left, entries.clone());
     assert!(effects.is_empty());
     assert_eq!(state.left.entries, entries);
-    let (state, effects) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1 });
+    let (state, effects) = listing_complete(state, PanelSide::Left, 1);
     assert!(effects.is_empty());
     assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 1 });
 }
@@ -86,7 +130,7 @@ fn enter_on_parent_dir_navigates_up_and_resets_cursor() {
     state.left.entries = vec![Entry::parent_dir()];
     state.left.cursor = 0;
     let (state, effects) = update(state, Command::Enter);
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/a") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/a")]);
     assert_eq!(state.left.cursor, 0);
 }
 
@@ -388,7 +432,7 @@ fn split_change_persists_via_effect() {
 fn listing_chunk_during_splash_still_updates_panel_state() {
     let state = test_state(UiPhase::Splash { started_at_ms: 0 });
     let entries = vec![file_entry("a", 0)];
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone() });
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries.clone());
     assert_eq!(state.left.entries, entries);
     assert!(matches!(state.phase, UiPhase::Splash { .. }));
 }
@@ -400,8 +444,8 @@ fn initial_builds_start_listing_effects_for_both_panels() {
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/l") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/r") },
+            start_listing(&state, PanelSide::Left, "/l"),
+            start_listing(&state, PanelSide::Right, "/r"),
         ]
     );
 }
@@ -574,7 +618,7 @@ fn a_parent_relative_destination_is_resolved_and_normalized() {
     }
     let mut state = state;
     state.right.cwd = PathBuf::from(r"C:\work\archive");
-    let (_, effects) = update(
+    let (state, effects) = update(
         state,
         Command::JobDone {
             outcome: JobOutcome::Completed { skipped: vec![] },
@@ -583,7 +627,7 @@ fn a_parent_relative_destination_is_resolved_and_normalized() {
         },
     );
     assert!(
-        effects.contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\work\archive") }),
+        effects.contains(&start_listing(&state, PanelSide::Right, r"C:\work\archive")),
         "the panel showing the resolved destination re-reads on completion, got {effects:?}"
     );
 }
@@ -682,7 +726,7 @@ fn a_make_directory_name_with_a_parent_path_creates_it_where_it_points() {
         }
         other => panic!("expected exactly one RunJob, got {other:?}"),
     }
-    let (_, effects) = update(
+    let (state, effects) = update(
         state,
         Command::JobDone {
             outcome: JobOutcome::Completed { skipped: vec![] },
@@ -691,7 +735,7 @@ fn a_make_directory_name_with_a_parent_path_creates_it_where_it_points() {
         },
     );
     assert!(
-        effects.contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\work") }),
+        effects.contains(&start_listing(&state, PanelSide::Right, r"C:\work")),
         "a panel showing the new directory's parent re-reads on completion, got {effects:?}"
     );
 }
@@ -879,8 +923,8 @@ fn job_done_with_no_skips_rereads_matching_panels_and_returns_to_panels() {
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+            start_listing(&state, PanelSide::Left, "/left"),
+            start_listing(&state, PanelSide::Right, "/right"),
         ]
     );
 }
@@ -900,7 +944,7 @@ fn job_done_with_skips_shows_summary_instead_of_panels() {
         Command::JobDone { outcome: JobOutcome::Completed { skipped: skipped.clone() }, source_dir: PathBuf::from("/left"), dest_dir: PathBuf::from("/left") },
     );
     assert_eq!(state.phase, UiPhase::FileOpSummary(skipped));
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left")]);
 
     let (state, _) = update(state, Command::FileOpConfirm);
     assert_eq!(state.phase, UiPhase::Panels);
@@ -930,8 +974,8 @@ fn job_done_cancelled_with_an_internal_error_item_shows_the_summary_and_rereads_
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+            start_listing(&state, PanelSide::Left, "/left"),
+            start_listing(&state, PanelSide::Right, "/right"),
         ],
         "both affected panels re-read"
     );
@@ -950,10 +994,10 @@ fn job_done_cancelled_with_an_internal_error_item_shows_the_summary_and_rereads_
 fn listing_failed_after_chunks_clears_the_streaming_state() {
     let mut state = test_state(UiPhase::Panels);
     state.left.progress = crate::panel::ListingProgress::Streaming { count: 0 };
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a.txt", 1), file_entry("b.txt", 2)] });
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a.txt", 1), file_entry("b.txt", 2)], request: 1 });
     assert!(state.left.progress.is_streaming(), "setup precondition: still reading after the first chunk");
 
-    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "Internal error while reading /left: boom".to_string() });
+    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "Internal error while reading /left: boom".to_string(), request: 1 });
     assert!(!state.left.progress.is_streaming(), "no longer `Reading… N`: {:?}", state.left.progress);
     assert_eq!(state.left.progress.count(), state.left.entries.len(), "the entries that did arrive are kept and counted");
     assert_eq!(state.left.last_error.as_deref(), Some("Internal error while reading /left: boom"));
@@ -981,8 +1025,8 @@ fn job_done_with_only_warnings_shows_summary_and_rereads_panels() {
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+            start_listing(&state, PanelSide::Left, "/left"),
+            start_listing(&state, PanelSide::Right, "/right"),
         ]
     );
 }
@@ -1009,7 +1053,7 @@ fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
     });
     state.left.cwd = PathBuf::from("/left");
     state.right.cwd = PathBuf::from("/right"); // does not match dest_dir
-    let (_, effects) = update(
+    let (state, effects) = update(
         state,
         Command::JobDone {
             outcome: JobOutcome::Completed { skipped: vec![] },
@@ -1017,7 +1061,7 @@ fn job_done_only_rereads_panels_whose_cwd_matches_source_or_dest() {
             dest_dir: PathBuf::from("/somewhere/else"),
         },
     );
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left")]);
 }
 
 #[test]
@@ -1061,8 +1105,8 @@ fn job_done_delete_rereads_both_panels_when_both_browse_the_same_directory() {
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/shared") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/shared") },
+            start_listing(&state, PanelSide::Left, "/shared"),
+            start_listing(&state, PanelSide::Right, "/shared"),
         ]
     );
 
@@ -1071,9 +1115,9 @@ fn job_done_delete_rereads_both_panels_when_both_browse_the_same_directory() {
     // place" — on *both* panels browsing the affected directory).
     let survivors: Vec<Entry> = (0..30).filter(|i| *i != 10).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
     for side in [PanelSide::Left, PanelSide::Right] {
-        let (next, _) = update(state, Command::ListingChunk { panel: side, entries: survivors.clone() });
+        let (next, _) = listing_chunk(state, side, survivors.clone());
         state = next;
-        let (next, _) = update(state, Command::ListingComplete { panel: side, total: 29 });
+        let (next, _) = listing_complete(state, side, 29);
         state = next;
     }
 
@@ -1121,7 +1165,7 @@ fn listing_complete_reconciles_selection_against_fresh_entries() {
     state.left.selected.insert(OsString::from("gone.txt"));
     state.left.selected.insert(OsString::from("stays.txt"));
     state.left.entries = vec![file_entry("stays.txt", 1)];
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1 });
+    let (state, _) = listing_complete(state, PanelSide::Left, 1);
     assert_eq!(state.left.selected, std::collections::HashSet::from([OsString::from("stays.txt")]));
 }
 
@@ -1145,7 +1189,7 @@ fn reread_reissues_start_listing_and_clears_the_error() {
     state.left.last_error = Some("boom".to_string());
     state.left.cwd = PathBuf::from("/left");
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left")]);
     assert!(state.left.last_error.is_none());
 }
 
@@ -1599,8 +1643,13 @@ fn switch_tab_to_stale_tab_issues_fresh_read_and_clears_the_flag() {
     let mut state = test_state(UiPhase::Panels);
     state.active = PanelSide::Left;
     state.left.cwd = PathBuf::from("/left");
+    // The listing had finished when the tab was left — a tab stashed
+    // mid-listing is stale for a second reason (listing-request-guard).
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 0 };
     state.left.open_tab(); // tab 0 stashed at "/left" (background); tab 1 (active) also starts at "/left"
     state.left.begin_new_listing(PathBuf::from("/left/other")); // active tab moves elsewhere
+    let (state, _) = listing_complete(state, PanelSide::Left, 0);
+    let mut state = state;
     state.left.mark_background_tabs_stale(Path::new("/left"));
     assert!(state.left.tabs[0].stale);
 
@@ -1608,9 +1657,11 @@ fn switch_tab_to_stale_tab_issues_fresh_read_and_clears_the_flag() {
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "activated the previously-stale background tab");
     assert_eq!(
         without_git_info_effects(effects),
-        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }],
+        vec![start_listing(&state, PanelSide::Left, "/left")],
         "activating a stale tab must issue a fresh read"
     );
+    // The fresh read finishes before the tab is left again.
+    let (state, _) = listing_complete(state, PanelSide::Left, 0);
 
     // The flag must be consumed, not left set: switching away and back
     // must not trigger a second read.
@@ -1634,22 +1685,27 @@ fn close_tab_falling_back_to_stale_neighbor_issues_fresh_read() {
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "fell back to the previously-stale background tab");
     assert_eq!(
         without_git_info_effects(effects),
-        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }],
+        vec![start_listing(&state, PanelSide::Left, "/left")],
         "falling back to a stale neighbor must issue a fresh read"
     );
 }
 
 #[test]
 fn switch_tab_to_non_stale_tab_issues_no_listing_effects() {
+    // panel-tabs "Switching to a tab with no pending staleness is
+    // unchanged": untouched by any job *and* fully listed when it was left.
     let mut state = test_state(UiPhase::Panels);
     state.active = PanelSide::Left;
     state.left.cwd = PathBuf::from("/left");
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 0 };
     state.left.open_tab();
     state.left.begin_new_listing(PathBuf::from("/left/other"));
     // No mark_background_tabs_stale call: tab 0 is not stale.
+    assert!(!state.left.tabs[0].stale, "a tab left with a complete listing is not stale");
 
     let (state, effects) = update(state, Command::SwitchTab(1));
     assert_eq!(state.left.cwd, PathBuf::from("/left"));
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "no listing at all is started, got {effects:?}");
     assert!(without_git_info_effects(effects).is_empty(), "switching to a tab with no pending staleness must not re-read (unchanged behavior)");
 }
 
@@ -2013,8 +2069,8 @@ fn f2_user_menu_entry_uses_the_configured_shell() {
 fn enter_with_an_empty_buffer_still_navigates() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
-    let (_, effects) = update(state, Command::Enter);
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left/sub")]);
 }
 
 // Superseded by the file-action menu (BREAKING, command-line "Enter on an
@@ -2122,7 +2178,7 @@ fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
     state.left.entries = vec![dir_entry("sub")];
     let (state, effects) = update(state, Command::Enter);
     assert!(state.file_action_menu.is_none(), "Enter on a directory must not open the menu");
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left/sub")]);
 }
 
 #[test]
@@ -2187,7 +2243,7 @@ fn file_action_menu_targets_the_entry_it_opened_on_even_if_the_cursor_drifts_fro
 
     // A background listing chunk inserts a.txt, which sorts ahead of
     // b.txt, and re-pins the (not-yet-user-moved) cursor to row 0.
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a.txt", 1)] });
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("a.txt", 1)]);
     assert_eq!(state.left.cursor, 0, "setup precondition: the cursor drifted onto a.txt");
     assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("a.txt"));
 
@@ -2499,7 +2555,7 @@ fn rename_success_rereads_the_affected_panel() {
     );
     assert_eq!(state.phase, UiPhase::Panels);
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, path } if path.as_path() == std::path::Path::new("/left"))),
+        effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, path, .. } if path.as_path() == std::path::Path::new("/left"))),
         "the panel showing the renamed entry's directory is re-read, got {effects:?}"
     );
 }
@@ -2555,7 +2611,7 @@ fn cd_navigates_the_panel_instead_of_spawning_a_shell() {
         !effects.iter().any(|e| matches!(e, Effect::RunShellCommand(..))),
         "`cd` in a fresh child would be a no-op, so it must not reach the shell"
     );
-    assert!(effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left/sub") }));
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left/sub")));
     assert_eq!(state.history, vec!["cd sub".to_string()], "`cd` is still a history entry");
 }
 
@@ -2610,7 +2666,7 @@ fn a_cd_target_that_fails_asynchronously_after_passing_the_sync_check_surfaces_t
     let state = type_line(state, "cd share");
     let (state, effects) = update(state, Command::Enter);
     assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { .. })), "the sync check passed, so a listing began");
-    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "network path not found".into() });
+    let (state, _) = listing_failed(state, PanelSide::Left, "network path not found".into());
     assert_eq!(state.left.last_error.as_deref(), Some("network path not found"));
 }
 
@@ -2714,7 +2770,7 @@ fn cd_with_a_parent_relative_path_lists_the_normalized_directory() {
     let expected = root.join("work").join("x");
     assert_eq!(state.left.cwd, expected, "the panel lands on the normalized directory");
     assert!(
-        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: expected }),
+        without_git_info_effects(effects).contains(&start_listing(&state, PanelSide::Left, expected)),
         "the listing targets the resolved path"
     );
     let _ = std::fs::remove_dir_all(&root);
@@ -2735,7 +2791,7 @@ fn cd_with_a_drive_relative_path_resolves_against_the_panel_or_the_drive_root() 
     assert_eq!(state.left.cwd, PathBuf::from(r"D:\work\old"));
     let effects = without_git_info_effects(effects);
     assert!(
-        effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"D:\work\old") }),
+        effects.contains(&start_listing(&state, PanelSide::Left, r"D:\work\old")),
         "the listing targets the panel-relative resolution, got {effects:?}"
     );
 
@@ -2949,7 +3005,7 @@ fn reread_preserves_the_sort_mode() {
     state.left.sort_mode = SortMode::Size;
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
     assert_eq!(state.left.sort_mode, SortMode::Size);
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left")]);
     assert!(state.left.entries.is_empty(), "a re-read discards the current entries and streams fresh ones");
     assert!(state.left.progress.is_streaming());
 }
@@ -3720,7 +3776,7 @@ fn selecting_a_drive_switches_the_target_panel_to_its_root() {
     let (state, effects) = update(state, Command::DriveSelectConfirm);
     assert!(state.drive_select.is_none(), "confirming closes the dialog");
     assert_eq!(state.right.cwd, PathBuf::from(r"D:\"));
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"D:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Right, r"D:\")]);
 }
 
 #[test]
@@ -3730,10 +3786,10 @@ fn selecting_an_unavailable_drive_surfaces_the_panel_error_state() {
         Command::DriveListReady { target: PanelSide::Left, drives: vec!['A'] },
     );
     let (state, effects) = update(state, Command::DriveSelectConfirm);
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"A:\") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, r"A:\")]);
     // The worker's read fails and comes back as a normal listing failure —
     // no dedicated hang-prone path.
-    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Left, message: "device not ready".into() });
+    let (state, _) = listing_failed(state, PanelSide::Left, "device not ready".into());
     assert_eq!(state.left.last_error.as_deref(), Some("device not ready"));
 }
 
@@ -5005,7 +5061,7 @@ fn moving_the_tree_cursor_relists_the_opposite_panel_at_the_highlighted_director
     let (state, effects) = update(state, Command::MoveCursor(CursorMove::Down(1)));
     assert_eq!(state.left.tree.as_ref().unwrap().cursor, 1);
     assert!(
-        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\alpha") }),
+        without_git_info_effects(effects).contains(&start_listing(&state, PanelSide::Right, r"C:\alpha")),
         "the opposite (right) panel must be re-listed at the newly highlighted directory"
     );
     // Landing on "alpha" (not yet expanded) also requests its children.
@@ -5051,7 +5107,7 @@ fn enter_on_a_tree_node_restores_the_prior_mode_and_navigates_this_panel_there()
     assert_eq!(state.left.display_mode, DisplayMode::Brief, "Enter restores the pre-Tree display mode");
     assert!(state.left.tree.is_none(), "leaving Tree mode clears the tree state");
     assert!(
-        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"C:\alpha") }),
+        without_git_info_effects(effects).contains(&start_listing(&state, PanelSide::Left, r"C:\alpha")),
         "Enter navigates *this* panel to the highlighted directory, not the opposite one"
     );
 }
@@ -5284,24 +5340,98 @@ fn find_file_cancel_abandons_the_search_without_navigating() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
     let (state, effects) = update(state, Command::FindFileCancel);
     assert!(state.find_file.is_none());
-    assert!(effects.is_empty());
+    // The running walk is told to stop (find-file "Esc stops the walk");
+    // nothing else — in particular no navigation — happens.
+    assert_eq!(effects, vec![Effect::CancelRequest(request)]);
     assert_eq!(state.left.cwd, PathBuf::from("/left"));
+}
+
+// ---------------------------------------------------------------------
+// listing-request-guard: find-file and viewer searches stop when dismissed
+// or superseded (find-file "Dismissed or superseded searches stop"; viewer
+// "Search stops when superseded or when the viewer closes"; tasks 5.8/5.9)
+// ---------------------------------------------------------------------
+
+#[test]
+fn find_file_cancel_and_confirm_stop_a_running_walk_but_not_a_finished_one() {
+    // Esc while the walk runs: `CancelRequest(request)`.
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, _) = update(state, Command::FindFileSubmit);
+    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let (_, effects) = update(state.clone(), Command::FindFileCancel);
+    assert_eq!(effects, vec![Effect::CancelRequest(request)], "Esc stops the walk");
+
+    // Enter on a result while the walk runs: the cancel precedes the
+    // navigation's own effects (find-file "Confirming a result while the
+    // walk is running stops it").
+    let (state, _) = update(state, Command::FindFileMatch { request, m: find_match(r"sub\report.txt", "report.txt") });
+    let (confirmed, effects) = update(state.clone(), Command::FindFileConfirm);
+    assert_eq!(effects.first(), Some(&Effect::CancelRequest(request)), "the running walk is stopped first, got {effects:?}");
+    assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })), "the navigation still happens");
+    assert_eq!(confirmed.left.cwd, PathBuf::from("/left/sub"));
+
+    // Once the walk has reported done there is nothing to stop: neither
+    // Esc nor Enter cancels it. (Enter's navigation still cancels the
+    // panel's own still-streaming *listing* — a different request.)
+    let (state, _) = update(state, Command::FindFileSearchDone { request });
+    let (_, effects) = update(state.clone(), Command::FindFileCancel);
+    assert!(effects.is_empty(), "a finished walk is not cancelled: {effects:?}");
+    let (_, effects) = update(state, Command::FindFileConfirm);
+    assert!(!effects.contains(&Effect::CancelRequest(request)), "a finished walk is not cancelled: {effects:?}");
+}
+
+#[test]
+fn find_file_cancel_before_any_search_was_submitted_emits_nothing() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = update(state, Command::FindFileOpen);
+    let (state, effects) = update(state, Command::FindFileCancel);
+    assert!(state.find_file.is_none());
+    assert!(effects.is_empty(), "no walk was ever started, so there is nothing to stop");
+}
+
+#[test]
+fn closing_the_viewer_or_starting_a_newer_search_stops_the_earlier_one() {
+    // viewer "A newer search supersedes a running one": the second F7
+    // confirm cancels the first id before minting its own.
+    let state = opened_viewer_state(1000);
+    let (state, first) = viewer_with_pattern_confirmed(state, "ab");
+    let (state, _) = update(state, Command::ViewerSearchStart);
+    let (state, _) = update(state, Command::ViewerSearchChar('c'));
+    let (state, effects) = update(state, Command::ViewerSearchConfirm);
+    let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
+    let second = v.search_request.expect("the second search mints its own id");
+    assert_ne!(first, second);
+    assert_eq!(
+        effects,
+        vec![
+            Effect::CancelRequest(first),
+            Effect::RunViewerSearch { path: PathBuf::from("/left/f.txt"), start_offset: 0, pattern: b"c".to_vec(), request: second },
+        ]
+    );
+
+    // viewer "Closing the viewer stops a running search": F10 cancels the
+    // outstanding id. The id stays recorded after a result arrives, so the
+    // cancel is emitted then too — the TUI's registry treats an id with no
+    // running worker as a no-op (design D3).
+    let (state, effects) = update(state, Command::ViewerClose);
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(effects, vec![Effect::CancelRequest(second)]);
+
+    // A viewer that never searched has nothing to cancel.
+    let (_, effects) = update(opened_viewer_state(1000), Command::ViewerClose);
+    assert!(effects.is_empty());
 }
 
 #[test]
 fn listing_complete_settles_the_cursor_on_a_pending_find_file_target() {
     let mut state = test_state(UiPhase::Panels);
     state.left.pending_cursor_target = Some(OsString::from("b.txt"));
-    let (state, _) = update(
-        state,
-        Command::ListingChunk {
-            panel: PanelSide::Left,
-            entries: vec![dir_entry_named("a.txt"), dir_entry_named("b.txt"), dir_entry_named("c.txt")],
-        },
-    );
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 3 });
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![dir_entry_named("a.txt"), dir_entry_named("b.txt"), dir_entry_named("c.txt")]);
+    let (state, _) = listing_complete(state, PanelSide::Left, 3);
     assert_eq!(state.left.cursor, 1);
     assert!(state.left.pending_cursor_target.is_none(), "consumed once applied");
 }
@@ -5741,6 +5871,10 @@ fn tab_restore_re_clamps_against_the_current_viewport_through_the_reducer() {
     state.left.entries = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
     state.left.cursor = 18;
     state.left.scroll_offset = 10; // valid at 19 rows: window [10, 29)
+    // The listing had finished before the tab was stashed: a tab stashed
+    // mid-listing is stale and re-read on activation (listing-request-guard),
+    // which would reset the cursor this test is about.
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 30 };
 
     // Stash this as tab 1; the new (now-active) tab inherits the same
     // cursor/offset and is left untouched from here on.
@@ -5770,7 +5904,7 @@ fn streamed_chunk_keeps_the_offset_pinned_to_zero_via_the_reducer() {
     state.left.sort_mode = SortMode::Name;
     let entries: Vec<Entry> = (0..30).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
 
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries);
 
     assert_eq!(state.left.cursor, 0, "the cursor stays pinned to the top while the user hasn't moved it");
     assert_eq!(state.left.scroll_offset, 0, "the window stays pinned to the top right along with the cursor (panel-navigation \"Streamed listing keeps the top pinned\")");
@@ -5784,8 +5918,8 @@ fn find_file_settle_on_listing_complete_lands_the_cursor_in_view() {
     state.left.pending_cursor_target = Some(OsString::from("e25"));
     let entries: Vec<Entry> = (0..30).map(|i| file_entry(&format!("e{i}"), 0)).collect();
 
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries);
+    let (state, _) = listing_complete(state, PanelSide::Left, 30);
 
     assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e25"), "find-file's deferred settle lands the cursor on the matched entry");
     assert_eq!(state.left.cursor, 25);
@@ -5829,13 +5963,13 @@ fn finish_delete(state: State, dir: &str, survivors: &[String]) -> State {
     );
     assert_eq!(
         without_git_info_effects(effects),
-        vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(dir) }],
+        vec![start_listing(&state, PanelSide::Left, dir)],
         "the deleted-from panel re-reads"
     );
     let entries: Vec<Entry> = survivors.iter().map(|n| file_entry(n, 0)).collect();
     let total = entries.len();
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total });
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries);
+    let (state, _) = listing_complete(state, PanelSide::Left, total);
     state
 }
 
@@ -5934,13 +6068,13 @@ fn reread_panel_keeps_the_cursors_entry_and_offset() {
     state.left.scroll_offset = 5;
 
     let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
-    assert_eq!(without_git_info_effects(effects), vec![Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") }]);
+    assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left")]);
     assert!(state.left.reread_anchor.is_some(), "a same-directory re-read captures the anchor before resetting");
 
     // The unchanged directory streams back.
     let entries: Vec<Entry> = names.iter().map(|n| file_entry(n, 0)).collect();
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries);
+    let (state, _) = listing_complete(state, PanelSide::Left, 30);
 
     assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("report.txt"));
     assert_eq!(state.left.cursor, 15);
@@ -5964,14 +6098,14 @@ fn the_first_chunk_containing_the_anchored_entry_already_places_the_cursor_on_it
 
     // First chunk: e00..e14 — it contains the anchored "e12".
     let first: Vec<Entry> = names[..15].iter().map(|n| file_entry(n, 0)).collect();
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: first });
+    let (state, _) = listing_chunk(state, PanelSide::Left, first);
     assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e12"), "the cursor is on the anchored entry as soon as its chunk lands, not on the first entry");
     assert_ne!(state.left.cursor, 0);
 
     // The rest of the listing must not move it again.
     let rest: Vec<Entry> = names[15..].iter().map(|n| file_entry(n, 0)).collect();
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: rest });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 30 });
+    let (state, _) = listing_chunk(state, PanelSide::Left, rest);
+    let (state, _) = listing_complete(state, PanelSide::Left, 30);
     assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("e12"));
     assert_eq!(state.left.cursor, 12);
     assert_eq!(state.left.scroll_offset, 4, "the offset is restored once the whole list is back");
@@ -5996,8 +6130,8 @@ fn navigating_into_a_subdirectory_after_a_reread_still_starts_at_the_top() {
     let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
     let mut again: Vec<Entry> = names_of("e", 30).iter().map(|n| file_entry(n, 0)).collect();
     again.push(dir_entry("sub"));
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: again });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 31 });
+    let (state, _) = listing_chunk(state, PanelSide::Left, again);
+    let (state, _) = listing_complete(state, PanelSide::Left, 31);
     assert_eq!(state.left.scroll_offset, 10, "the re-read kept the user's place");
 
     // ...then Enter on "sub" navigates away: cursor and offset reset, and no
@@ -6011,7 +6145,7 @@ fn navigating_into_a_subdirectory_after_a_reread_still_starts_at_the_top() {
     assert!(state.left.reread_anchor.is_none(), "navigation to a different directory clears any anchor");
 
     // The streamed fresh listing stays pinned to the top.
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("x", 1), file_entry("y", 2)] });
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("x", 1), file_entry("y", 2)]);
     assert_eq!(state.left.cursor, 0);
     assert_eq!(state.left.scroll_offset, 0);
 }
@@ -6035,7 +6169,7 @@ fn reread_issued_while_the_previous_listing_is_still_streaming_captures_no_ancho
     assert_eq!(state.left.scroll_offset, 0);
 
     // ...and the fresh stream stays pinned to the top, as before.
-    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("a", 1), file_entry("b", 2)] });
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("a", 1), file_entry("b", 2)]);
     assert_eq!(state.left.cursor, 0);
     assert_eq!(state.left.scroll_offset, 0);
 }
@@ -7150,7 +7284,7 @@ fn drag_clears_on_listing_failure() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("a.txt", 1)];
     let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
-    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Right, message: "boom".to_string() });
+    let (state, _) = listing_failed(state, PanelSide::Right, "boom".to_string());
     assert!(state.drag.is_none());
 }
 
@@ -7212,7 +7346,12 @@ mod drag_proptests {
             Just(Command::FileOpConfirm),
             arb_verb().prop_map(Command::FileOpConfirmAs),
             Just(Command::FileOpCancel),
-            arb_side().prop_map(|panel| Command::ListingFailed { panel, message: "boom".to_string() }),
+            // Both the seeded panels' current listing ids (1 and 2, from
+            // `test_state`) and a superseded one: an accepted failure clears
+            // the drag, a stale one is dropped — neither may break the
+            // invariant (listing-request-guard design D2).
+            (arb_side(), prop_oneof![Just(1u64), Just(2u64), Just(999u64)])
+                .prop_map(|(panel, request)| Command::ListingFailed { panel, message: "boom".to_string(), request }),
             (10u16..200, 4u16..80).prop_map(|(w, h)| Command::Resize(w, h)),
         ]
     }
@@ -7795,8 +7934,8 @@ fn undersized_job_done_still_rereads_the_panels() {
     assert_eq!(
         without_git_info_effects(effects),
         vec![
-            Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/left") },
-            Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/right") },
+            start_listing(&state, PanelSide::Left, "/left"),
+            start_listing(&state, PanelSide::Right, "/right"),
         ]
     );
 
@@ -7915,4 +8054,302 @@ fn undersized_refuses_a_new_drag() {
     let state = shrunk(state);
     let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
     assert!(state.drag.is_none());
+}
+
+// ---------------------------------------------------------------------
+// listing-request-guard: superseded listings are discarded and cancelled
+// (panel-navigation "Superseded directory listings are discarded and
+// cancelled"; panel-tabs "Switching or closing a tab mid-listing never
+// mixes listings"; tasks 5.2–5.7)
+// ---------------------------------------------------------------------
+
+fn entry_names(state: &State, side: PanelSide) -> Vec<String> {
+    state.panel(side).entries.iter().map(|e| e.name.to_string_lossy().into_owned()).collect()
+}
+
+/// A left panel showing a complete listing of `/left` with the one
+/// directory `big` in it, so `Enter` starts a listing that the test then
+/// leaves unfinished.
+fn complete_left_with_big() -> State {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.entries = vec![dir_entry("big")];
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 1 };
+    state
+}
+
+#[test]
+fn initial_state_tags_both_first_listings_with_distinct_request_ids() {
+    let (state, effects) = State::initial(Theme::classic(), (80, 24), 0, 0, PathBuf::from("/l"), PathBuf::from("/r"), false);
+    let left = state.left.listing_request.expect("the left panel's first listing is tagged");
+    let right = state.right.listing_request.expect("the right panel's first listing is tagged");
+    assert_ne!(left, right);
+    assert!(effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from("/l"), request: left }));
+    assert!(effects.contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from("/r"), request: right }));
+}
+
+#[test]
+fn backspace_out_of_a_slow_directory_mid_listing_drops_every_reply_of_the_old_listing() {
+    // panel-navigation "Backspace out of a slow directory mid-listing" and
+    // "Superseded completion does not complete the new listing".
+    let (state, _) = update(complete_left_with_big(), Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left/big"));
+    let old = listing_request(&state, PanelSide::Left);
+
+    // Backspace on the empty command line before `/left/big` finished.
+    let (state, effects) = update(state, Command::ParentDir);
+    assert_eq!(state.left.cwd, PathBuf::from("/left"));
+    let new = listing_request(&state, PanelSide::Left);
+    assert_ne!(old, new, "the parent listing is a new generation");
+    assert!(effects.contains(&Effect::CancelRequest(old)), "the read of /left/big is signalled to stop: {effects:?}");
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left")));
+
+    // The old worker's chunk — including its own `..` — arrives late.
+    let stale = vec![Entry::parent_dir(), file_entry("in-big.txt", 1)];
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: stale, request: old });
+    assert!(state.left.entries.is_empty(), "no entry of /left/big, not even its `..`, reaches /left");
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }, "the Reading… count covers only /left's entries");
+
+    // Its completion must not complete the new listing either.
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, request: old });
+    assert!(state.left.progress.is_streaming(), "the mini-status keeps showing Reading… for the new listing");
+
+    // The new listing's own replies are applied as usual.
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![Entry::parent_dir(), dir_entry("big")]);
+    let (state, _) = listing_complete(state, PanelSide::Left, 2);
+    assert_eq!(entry_names(&state, PanelSide::Left), vec!["..", "big"]);
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 2 });
+}
+
+#[test]
+fn a_stale_listing_failure_sets_no_error_and_leaves_an_active_drag_alone() {
+    // panel-navigation "Superseded failure does not mark the new listing
+    // failed"; design D2: only an accepted failure clears a drag.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Left, name: OsString::from("a.txt"), op: JobKind::Copy });
+    assert!(state.drag.is_some());
+
+    // The right panel re-reads; the listing it supersedes then fails late.
+    let old = listing_request(&state, PanelSide::Right);
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Right));
+    let (state, _) = update(state, Command::ListingFailed { panel: PanelSide::Right, message: "Cannot read old: access denied".into(), request: old });
+    assert_eq!(state.right.last_error, None, "no error is shown for the current directory");
+    assert!(state.right.progress.is_streaming(), "the current listing continues normally");
+    assert!(state.drag.is_some(), "a stale failure from a directory the user left does not cancel the drag");
+
+    // The current listing's own failure still does both.
+    let (state, _) = listing_failed(state, PanelSide::Right, "Cannot read right: access denied".into());
+    assert_eq!(state.right.last_error.as_deref(), Some("Cannot read right: access denied"));
+    assert!(state.drag.is_none(), "an accepted listing failure clears the drag (mouse-drag)");
+}
+
+#[test]
+fn two_quick_rereads_list_each_entry_exactly_once() {
+    // panel-navigation "Two quick re-reads do not duplicate entries".
+    let mut state = test_state(UiPhase::Panels);
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 0 };
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    assert!(effects.iter().all(|e| !matches!(e, Effect::CancelRequest(_))), "a complete listing has no reader left to stop: {effects:?}");
+    let first = listing_request(&state, PanelSide::Left);
+
+    let (state, effects) = update(state, Command::RereadPanel(PanelSide::Left));
+    let second = listing_request(&state, PanelSide::Left);
+    assert_ne!(first, second);
+    assert!(effects.contains(&Effect::CancelRequest(first)), "the first re-read, still streaming, is cancelled: {effects:?}");
+
+    let entries: Vec<Entry> = (0..500).map(|i| file_entry(&format!("e{i:03}"), 0)).collect();
+    // Both readers deliver everything before the first one noticed its flag.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone(), request: first });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, request: first });
+    assert!(state.left.entries.is_empty() && state.left.progress.is_streaming(), "the first generation's replies are dropped");
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: second });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, request: second });
+
+    let names = entry_names(&state, PanelSide::Left);
+    assert_eq!(names.len(), 500);
+    let distinct: std::collections::HashSet<&String> = names.iter().collect();
+    assert_eq!(distinct.len(), 500, "each of the 500 entries is listed exactly once");
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 500 });
+}
+
+#[test]
+fn switching_tabs_mid_listing_cancels_it_and_the_interrupted_tab_rereads_on_return() {
+    // panel-tabs "Switching tabs mid-listing" and "Returning to an
+    // interrupted tab re-reads it".
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.left.entries = vec![dir_entry("big"), dir_entry("work")];
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 2 };
+    // Tab 2 (opened with Ctrl+T) goes to /left/work and finishes listing it.
+    let (state, _) = update(state, Command::OpenTab(PanelSide::Left));
+    let mut state = state;
+    state.left.cursor = 1; // "work"
+    let (state, _) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left/work"));
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("w.txt", 1)]);
+    let (state, _) = listing_complete(state, PanelSide::Left, 1);
+    // Back on tab 1 (complete, untouched: no read), enter /left/big and
+    // leave it streaming.
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. } | Effect::CancelRequest(_))), "tab 1 was complete: {effects:?}");
+    let (state, _) = update(state, Command::Enter); // cursor 0: "big"
+    assert_eq!(state.left.cwd, PathBuf::from("/left/big"));
+    let old = listing_request(&state, PanelSide::Left);
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("b1.txt", 1)]);
+
+    // Alt+2 while /left/big is still streaming.
+    let (state, effects) = update(state, Command::SwitchTab(2));
+    assert_eq!(state.left.cwd, PathBuf::from("/left/work"));
+    assert!(effects.contains(&Effect::CancelRequest(old)), "the read of /left/big is stopped: {effects:?}");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "tab 2 was fully listed and is not re-read: {effects:?}");
+    assert!(state.left.tabs[0].stale, "the interrupted tab is marked stale");
+    assert_eq!(state.left.tabs[0].listing_request, Some(old), "the stashed tab keeps the id of the listing it was reading");
+
+    // A late chunk of /left/big never reaches tab 2.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("b2.txt", 1)], request: old });
+    assert_eq!(entry_names(&state, PanelSide::Left), vec!["w.txt"], "tab 2 shows only /left/work's entries");
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 1 });
+
+    // Alt+1: the interrupted tab starts a fresh read rather than showing a
+    // partial listing that never completes.
+    let history_before = state.dir_history.clone();
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left/big"));
+    let fresh = listing_request(&state, PanelSide::Left);
+    assert_ne!(fresh, old);
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left/big")), "a fresh read starts: {effects:?}");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::PersistHistory(_))), "the refresh is not a navigation: {effects:?}");
+    assert_eq!(state.dir_history, history_before, "no fuzzy-jump visit is recorded");
+    assert!(state.left.entries.is_empty(), "the partial listing is not shown");
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }, "Reading… until the fresh read completes");
+}
+
+#[test]
+fn an_interrupted_reread_still_keeps_the_users_place_when_its_tab_is_refreshed() {
+    // panel-tabs "An interrupted re-read still keeps the user's place":
+    // the anchor the interrupted re-read captured survives the stale-tab
+    // refresh (design D6: `capture_anchor: false` for a streaming tab).
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Left;
+    state.term_size = (80, 24);
+    state.left.sort_mode = SortMode::Unsorted;
+    let mut names = names_of("e", 30);
+    names[15] = "report.txt".to_string();
+    let entries: Vec<Entry> = names.iter().map(|n| file_entry(n, 0)).collect();
+    state.left.entries = entries.clone();
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 30 };
+    state.left.cursor = 15;
+    state.left.cursor_user_moved = true;
+    state.left.scroll_offset = 5;
+    // A second, complete tab to switch to, then back on tab 1.
+    let (state, _) = update(state, Command::OpenTab(PanelSide::Left));
+    let (state, _) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cursor, 15);
+
+    // Ctrl+R, then Alt+2 before the re-read finishes.
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let old = listing_request(&state, PanelSide::Left);
+    assert!(state.left.reread_anchor.is_some(), "the re-read captured the anchor");
+    let (state, effects) = update(state, Command::SwitchTab(2));
+    assert!(effects.contains(&Effect::CancelRequest(old)));
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "switching to a fully listed, non-stale tab emits no StartListing: {effects:?}");
+    assert!(state.left.tabs[0].stale && state.left.tabs[0].reread_anchor.is_some(), "the stashed tab keeps its anchor");
+
+    // Alt+1: the refresh keeps the anchor and the fresh listing restores it.
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left")));
+    assert!(state.left.reread_anchor.is_some(), "the refresh does not clear the interrupted re-read's anchor");
+    let (state, _) = listing_chunk(state, PanelSide::Left, entries);
+    let (state, _) = listing_complete(state, PanelSide::Left, 30);
+    assert_eq!(state.left.entries[state.left.cursor].name, OsString::from("report.txt"));
+    assert_eq!(state.left.cursor, 15);
+    assert_eq!(state.left.scroll_offset, 5, "the scroll offset from before Ctrl+R is restored");
+}
+
+#[test]
+fn a_tab_interrupted_mid_navigation_refreshes_from_the_top() {
+    // design D6: navigation cleared any anchor, so the fresh read of a
+    // directory that never finished listing starts at the top.
+    let mut state = complete_left_with_big();
+    state.term_size = (80, 24);
+    let (state, _) = update(state, Command::OpenTab(PanelSide::Left));
+    let (state, _) = update(state, Command::SwitchTab(1));
+    let (state, _) = update(state, Command::Enter); // /left/big, streaming
+    let partial: Vec<Entry> = (0..10).map(|i| file_entry(&format!("b{i}"), 0)).collect();
+    let (state, _) = listing_chunk(state, PanelSide::Left, partial);
+    let mut state = state;
+    state.left.cursor = 5;
+    state.left.cursor_user_moved = true;
+    assert!(state.left.reread_anchor.is_none());
+
+    let (state, _) = update(state, Command::SwitchTab(2));
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left/big")));
+    assert!(state.left.reread_anchor.is_none());
+    assert!(state.left.entries.is_empty());
+    assert_eq!((state.left.cursor, state.left.scroll_offset), (0, 0), "a never-completed directory starts from the top");
+}
+
+#[test]
+fn closing_a_tab_mid_listing_cancels_it_and_the_neighbor_receives_none_of_it() {
+    // panel-tabs "Closing a tab mid-listing".
+    let (state, _) = update(complete_left_with_big(), Command::OpenTab(PanelSide::Left));
+    let (state, _) = update(state, Command::Enter); // tab 2 → /left/big, streaming
+    let old = listing_request(&state, PanelSide::Left);
+
+    let (state, effects) = update(state, Command::CloseTab(PanelSide::Left));
+    assert_eq!(state.left.tab_count(), 1);
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the neighbor becomes active");
+    assert!(effects.contains(&Effect::CancelRequest(old)), "the closed tab's read is stopped: {effects:?}");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "the complete neighbor is not re-read: {effects:?}");
+
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("in-big.txt", 1)], request: old });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1, request: old });
+    assert_eq!(entry_names(&state, PanelSide::Left), vec!["big"], "the neighbor receives none of the closed tab's entries");
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 1 });
+
+    // Ctrl+W on the last remaining tab is a no-op and stops nothing.
+    let (state, _) = update(state, Command::Enter); // /left/big again, streaming
+    let (state, effects) = update(state, Command::CloseTab(PanelSide::Left));
+    assert_eq!(state.left.tab_count(), 1);
+    assert!(effects.is_empty(), "nothing happens when only one tab remains: {effects:?}");
+}
+
+#[test]
+fn opening_a_tab_mid_listing_keeps_the_listing_flowing_into_the_new_tab() {
+    // panel-tabs "New tab mid-listing keeps the listing".
+    let (state, _) = update(complete_left_with_big(), Command::Enter); // /left/big, streaming
+    let old = listing_request(&state, PanelSide::Left);
+    let (state, _) = listing_chunk(state, PanelSide::Left, vec![file_entry("b1.txt", 1)]);
+
+    let (state, effects) = update(state, Command::OpenTab(PanelSide::Left));
+    assert!(effects.iter().all(|e| !matches!(e, Effect::CancelRequest(_))), "Ctrl+T stops nothing: {effects:?}");
+    assert_eq!(state.left.tab_count(), 2);
+    assert_eq!(listing_request(&state, PanelSide::Left), old, "the new tab inherits the in-progress listing");
+    assert!(state.left.tabs[0].stale, "the original tab, now in the background, is stale");
+
+    // Later chunks fill the new tab until it completes.
+    let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("b2.txt", 1)], request: old });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, request: old });
+    assert_eq!(entry_names(&state, PanelSide::Left), vec!["b1.txt", "b2.txt"]);
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 2 });
+
+    // Activating the original tab re-reads /left/big instead of showing the
+    // partial listing it held when Ctrl+T was pressed.
+    let (state, effects) = update(state, Command::SwitchTab(1));
+    assert_eq!(state.left.cwd, PathBuf::from("/left/big"));
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left/big")), "{effects:?}");
+    assert!(state.left.entries.is_empty());
+}
+
+#[test]
+fn swap_panels_is_still_refused_while_a_panel_streams_even_though_replies_carry_ids() {
+    // Regression for the unchanged in-flight rule (design D7): the request
+    // ids would make a mid-stream swap safe, but the refusal is kept by spec.
+    let state = test_state(UiPhase::Panels); // both panels still streaming
+    let before = state.clone();
+    let (state, effects) = update(state, Command::SwapPanels);
+    assert_eq!(state, before);
+    assert!(effects.is_empty());
 }

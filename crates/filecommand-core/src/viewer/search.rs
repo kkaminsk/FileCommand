@@ -7,6 +7,7 @@
 //! with chunk-boundary overlap).
 
 use super::byte_source::ByteSource;
+use crate::fs_ops::CancelFlag;
 
 /// The default forward-scan chunk size.
 pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
@@ -18,8 +19,11 @@ pub const DEFAULT_CHUNK_SIZE: usize = 64 * 1024;
 /// search — "Match straddling a chunk boundary is found"). Returns the
 /// match's absolute byte range `[start, end)`, or `None` if the pattern does
 /// not occur before the source's snapshot length. An empty pattern never
-/// matches.
-pub fn find_forward(source: &ByteSource, start_offset: u64, pattern: &[u8], chunk_size: usize) -> Option<(u64, u64)> {
+/// matches. `cancel` is the search's stop signal (viewer "Search stops when
+/// superseded or when the viewer closes"; listing-request-guard design D5):
+/// it is checked before each chunk read, and once set the scan stops at that
+/// chunk boundary and returns `None`.
+pub fn find_forward(source: &ByteSource, start_offset: u64, pattern: &[u8], chunk_size: usize, cancel: &CancelFlag) -> Option<(u64, u64)> {
     if pattern.is_empty() {
         return None;
     }
@@ -29,6 +33,9 @@ pub fn find_forward(source: &ByteSource, start_offset: u64, pattern: &[u8], chun
     let read_len = chunk_size.max(pattern.len());
 
     while pos < file_len {
+        if cancel.is_cancelled() {
+            return None;
+        }
         let chunk = source.read_range(pos, read_len);
         if chunk.is_empty() {
             break;
@@ -77,14 +84,14 @@ mod tests {
     #[test]
     fn finds_a_match_within_a_single_chunk() {
         let src = temp_source("single-chunk", b"the quick brown fox jumps over the lazy dog");
-        let found = find_forward(&src, 0, b"brown", DEFAULT_CHUNK_SIZE);
+        let found = find_forward(&src, 0, b"brown", DEFAULT_CHUNK_SIZE, &CancelFlag::new());
         assert_eq!(found, Some((10, 15)));
     }
 
     #[test]
     fn returns_none_when_pattern_absent() {
         let src = temp_source("absent", b"the quick brown fox");
-        assert_eq!(find_forward(&src, 0, b"zebra", DEFAULT_CHUNK_SIZE), None);
+        assert_eq!(find_forward(&src, 0, b"zebra", DEFAULT_CHUNK_SIZE, &CancelFlag::new()), None);
     }
 
     #[test]
@@ -92,7 +99,7 @@ mod tests {
         let src = temp_source("start-offset", b"aaa needle aaa needle aaa");
         // First "needle" is at offset 4; searching from offset 5 must skip
         // it and find the second occurrence at offset 15.
-        let found = find_forward(&src, 5, b"needle", DEFAULT_CHUNK_SIZE);
+        let found = find_forward(&src, 5, b"needle", DEFAULT_CHUNK_SIZE, &CancelFlag::new());
         assert_eq!(found, Some((15, 21)));
     }
 
@@ -105,14 +112,14 @@ mod tests {
         content.extend_from_slice(b"abcdef");
         content.extend_from_slice(&[b'y'; 20]);
         let src = temp_source("boundary", &content);
-        let found = find_forward(&src, 0, b"abcdef", 8);
+        let found = find_forward(&src, 0, b"abcdef", 8, &CancelFlag::new());
         assert_eq!(found, Some((5, 11)));
     }
 
     #[test]
     fn empty_pattern_never_matches() {
         let src = temp_source("empty-pattern", b"anything");
-        assert_eq!(find_forward(&src, 0, b"", DEFAULT_CHUNK_SIZE), None);
+        assert_eq!(find_forward(&src, 0, b"", DEFAULT_CHUNK_SIZE, &CancelFlag::new()), None);
     }
 
     #[test]
@@ -124,7 +131,7 @@ mod tests {
         let mut content = b"NEEDLE".to_vec();
         content.extend(std::iter::repeat_n(b'z', 5_000_000));
         let src = temp_source("bounded-large", &content);
-        let found = find_forward(&src, 0, b"NEEDLE", DEFAULT_CHUNK_SIZE);
+        let found = find_forward(&src, 0, b"NEEDLE", DEFAULT_CHUNK_SIZE, &CancelFlag::new());
         assert_eq!(found, Some((0, 6)));
     }
 
@@ -140,9 +147,24 @@ mod tests {
         std::fs::write(&path, vec![b'y'; 3 * DEFAULT_CHUNK_SIZE]).unwrap();
         let src = ByteSource::open(&path).unwrap();
         std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(1000).unwrap();
-        assert_eq!(find_forward(&src, 0, b"zebra", DEFAULT_CHUNK_SIZE), None);
+        assert_eq!(find_forward(&src, 0, b"zebra", DEFAULT_CHUNK_SIZE, &CancelFlag::new()), None);
         // Starting past the new end reads empty and returns immediately.
-        assert_eq!(find_forward(&src, 2 * DEFAULT_CHUNK_SIZE as u64, b"zebra", DEFAULT_CHUNK_SIZE), None);
+        assert_eq!(find_forward(&src, 2 * DEFAULT_CHUNK_SIZE as u64, b"zebra", DEFAULT_CHUNK_SIZE, &CancelFlag::new()), None);
+    }
+
+    /// listing-request-guard (viewer "Search stops when superseded or when
+    /// the viewer closes"; design D5): a flag already set when the search
+    /// starts stops it at the very first chunk check — a planted match that
+    /// the first chunk would otherwise find is never reported.
+    #[test]
+    fn a_pre_set_flag_returns_none_before_the_first_chunk_is_scanned() {
+        let src = temp_source("pre-cancelled", b"the quick brown fox jumps over the lazy dog");
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        assert_eq!(find_forward(&src, 0, b"brown", DEFAULT_CHUNK_SIZE, &cancel), None);
+        // The same search with a live flag finds it, so `None` above came
+        // from the flag, not from the content.
+        assert_eq!(find_forward(&src, 0, b"brown", DEFAULT_CHUNK_SIZE, &CancelFlag::new()), Some((10, 15)));
     }
 
     mod proptests {
@@ -175,7 +197,7 @@ mod tests {
                 std::fs::write(&path, &content).unwrap();
                 let src = ByteSource::open(&path).unwrap();
 
-                let found = find_forward(&src, 0, &pattern, chunk_size);
+                let found = find_forward(&src, 0, &pattern, chunk_size, &CancelFlag::new());
                 prop_assert_eq!(found, Some((expected_start, expected_start + pattern.len() as u64)));
             }
         }

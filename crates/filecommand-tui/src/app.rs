@@ -2,6 +2,7 @@
 //! `Command`s, applies `core::update`, executes the returned effects, and
 //! redraws. This is the only place effects are actually performed.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -14,6 +15,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use filecommand_core::clock::{format_clock, Clock, WallClock};
 use filecommand_core::editor::{EditorMove, EditorState, LoadResult as EditorLoadResult};
 use filecommand_core::external_editor::EditorInvocation;
+use filecommand_core::fs_ops::CancelFlag;
 use filecommand_core::line_edit::flatten_line_breaks;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
@@ -57,6 +59,12 @@ const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 struct Runtime {
     tx: Sender<Command>,
     active_job: Option<worker::JobHandle>,
+    /// The cancel flags of the cancellable background requests still running
+    /// — directory listings, find-file walks, viewer searches — keyed by the
+    /// request id the reducer minted for them, so `Effect::CancelRequest`
+    /// can stop one (listing-request-guard design D3). Owned here, like
+    /// `active_job`, because flags are TUI plumbing, not pure state.
+    cancels: CancelRegistry,
     /// The background `history.json` writer `Effect::PersistHistory` hands
     /// its snapshot to; it owns the history path, and is the disabled no-op
     /// when persistence is off for the session. Owned here so every exit
@@ -104,6 +112,45 @@ struct Runtime {
     /// cadence only while this is nonzero, and sleeps until the next
     /// time-driven deadline otherwise.
     workers: worker::WorkerGauge,
+}
+
+/// The cancel flags of the background requests the reducer can supersede
+/// (listing-request-guard design D3): one `fs_ops::job::CancelFlag` — the
+/// same flag that backs job cancellation — per running `StartListing`,
+/// `FindInSubtree`, or `RunViewerSearch`, keyed by request id. The reducer
+/// decides supersession (it mints and compares the ids) and emits
+/// `Effect::CancelRequest(id)`; this registry owns the flags and flips the
+/// right one. Ids are globally unique (`State::next_request_id`), so one map
+/// serves all three request kinds.
+#[derive(Default)]
+struct CancelRegistry {
+    flags: HashMap<u64, CancelFlag>,
+}
+
+impl CancelRegistry {
+    /// A fresh, unset flag for the request `id`, remembered until it is
+    /// cancelled or retired. The clone handed back travels to the worker.
+    fn register(&mut self, id: u64) -> CancelFlag {
+        let flag = CancelFlag::new();
+        self.flags.insert(id, flag.clone());
+        flag
+    }
+
+    /// `Effect::CancelRequest(id)`: set the flag and forget the entry. An
+    /// unknown id — a request that already finished, or one that was never
+    /// cancellable — is a silent no-op, so the reducer never needs to know
+    /// whether a worker is still alive.
+    fn cancel(&mut self, id: u64) {
+        if let Some(flag) = self.flags.remove(&id) {
+            flag.cancel();
+        }
+    }
+
+    /// Forget the entry without setting its flag: the request's final reply
+    /// has passed through, so there is nothing left to stop.
+    fn retire(&mut self, id: u64) {
+        self.flags.remove(&id);
+    }
 }
 
 impl Runtime {
@@ -492,6 +539,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     let mut rt = Runtime {
         tx,
         active_job: None,
+        cancels: CancelRegistry::default(),
         history_writer,
         config_path,
         usermenu_path,
@@ -1305,6 +1353,16 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     if matches!(cmd, Command::ViewerClose) {
         rt.release_viewer_source();
     }
+    // A cancellable request's final reply retires its cancel flag — there is
+    // nothing left to stop (listing-request-guard design D3). Same pre-
+    // `update` interception point as the viewer source above.
+    match &cmd {
+        Command::ListingComplete { request, .. }
+        | Command::ListingFailed { request, .. }
+        | Command::FindFileSearchDone { request }
+        | Command::ViewerSearchResult { request, .. } => rt.cancels.retire(*request),
+        _ => {}
+    }
     // The source must also go whenever the viewer phase *ends* by any other
     // route, and when a `ViewerOpened` is discarded, so the file is held
     // exactly as long as the viewer exists — see
@@ -1356,7 +1414,11 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
     let mut quit = false;
     for effect in effects {
         match effect {
-            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, rt.tx.clone(), rt.workers.token()),
+            Effect::StartListing { panel, path, request } => {
+                let cancel = rt.cancels.register(request);
+                worker::spawn_listing(panel, path, request, cancel, rt.tx.clone(), rt.workers.token());
+            }
+            Effect::CancelRequest(request) => rt.cancels.cancel(request),
             Effect::Quit => quit = true,
             Effect::RunJob(job) => rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token())),
             Effect::CancelJob => {
@@ -1452,7 +1514,8 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone(), rt.workers.token()),
             Effect::OpenViewer { path } => rt.open_viewer_source(path),
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
-                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone(), rt.workers.token());
+                let cancel = rt.cancels.register(request);
+                worker::spawn_viewer_search(path, start_offset, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
             }
             Effect::RunExternalEditor(invocation, side) => {
                 let result = run_external_editor(guard, &invocation)?;
@@ -1497,7 +1560,8 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 }
             },
             Effect::FindInSubtree { root, pattern, request } => {
-                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone(), rt.workers.token());
+                let cancel = rt.cancels.register(request);
+                worker::spawn_find_subtree(root, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
             }
             Effect::SaveEditor { editor, then_quit } => {
                 let mut editor = *editor;
@@ -1804,6 +1868,30 @@ mod tests {
         EditorInvocation { program, leading_args, file_arg: OsString::from(file_arg), cwd: std::env::temp_dir() }
     }
 
+    /// listing-request-guard design D3 (task 5.14): `cancel` sets the
+    /// registered flag and forgets it, an unknown id is a no-op, and
+    /// `retire` forgets without setting.
+    #[test]
+    fn cancel_registry_cancels_retires_and_ignores_unknown_ids() {
+        let mut registry = CancelRegistry::default();
+        let listing = registry.register(1);
+        let walk = registry.register(2);
+        assert!(!listing.is_cancelled() && !walk.is_cancelled(), "fresh flags are unset");
+
+        registry.cancel(1);
+        assert!(listing.is_cancelled(), "cancel sets the worker's clone of the flag");
+        assert!(!registry.flags.contains_key(&1), "and removes the entry");
+        assert!(!walk.is_cancelled(), "other requests are untouched");
+
+        registry.cancel(1);
+        registry.cancel(999);
+        assert_eq!(registry.flags.len(), 1, "an already-finished or unknown id is a silent no-op");
+
+        registry.retire(2);
+        assert!(!walk.is_cancelled(), "retire never sets the flag");
+        assert!(registry.flags.is_empty());
+    }
+
     /// viewer: Instant open — "Closing the viewer releases the file": after
     /// `Effect::OpenViewer` installs the source and `Command::ViewerClose`
     /// clears it, the file and its directory can both be removed — an open
@@ -1822,6 +1910,7 @@ mod tests {
         let mut rt = Runtime {
             tx,
             active_job: None,
+            cancels: CancelRegistry::default(),
             history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
@@ -1853,6 +1942,7 @@ mod tests {
         let rt = Runtime {
             tx,
             active_job: None,
+            cancels: CancelRegistry::default(),
             history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
@@ -1904,7 +1994,8 @@ mod tests {
 
         // A listing chunk already queued ahead of the reply is applied while
         // the phase is still `Panels`: the fresh source must survive it.
-        let state = apply_headless(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![] }, &mut rt);
+        let request = state.left.listing_request.unwrap_or(0);
+        let state = apply_headless(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![], request }, &mut rt);
         assert!(rt.viewer_source.is_some(), "an unrelated command before ViewerOpened must not drop the source");
         let state = apply_headless(state, opened, &mut rt);
         assert!(matches!(state.phase, UiPhase::Viewer(_)));
@@ -2660,6 +2751,7 @@ mod tests {
         let rt = Runtime {
             tx,
             active_job: None,
+            cancels: CancelRegistry::default(),
             history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
@@ -2994,7 +3086,8 @@ mod tests {
             modified: None,
             hidden: false,
         }).collect();
-        let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries });
+        state.left.listing_request = Some(1);
+        let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: 1 });
         state = s;
 
         let keys = [KeyCode::PageDown; 5];

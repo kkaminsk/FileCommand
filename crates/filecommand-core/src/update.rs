@@ -479,9 +479,16 @@ impl State {
             epoch_ms,
             ..State::empty(theme)
         };
+        // Each panel's first listing is tagged like every later one
+        // (listing-request-guard design D1), so a reply from it can be told
+        // apart from the listing a navigation issued before it finished.
+        let left_request = state.next_request_id();
+        state.left.listing_request = Some(left_request);
+        let right_request = state.next_request_id();
+        state.right.listing_request = Some(right_request);
         let mut effects = vec![
-            Effect::StartListing { panel: PanelSide::Left, path: left_cwd.clone() },
-            Effect::StartListing { panel: PanelSide::Right, path: right_cwd.clone() },
+            Effect::StartListing { panel: PanelSide::Left, path: left_cwd.clone(), request: left_request },
+            Effect::StartListing { panel: PanelSide::Right, path: right_cwd.clone(), request: right_request },
         ];
         // Both panels start their git-info query alongside their first
         // listing, exactly as a later navigation does (git-info "Background
@@ -754,9 +761,17 @@ pub enum Command {
     EditorCancelQuit,
 
     // Worker-produced events, re-entering through the same `update` path.
-    ListingChunk { panel: PanelSide, entries: Vec<Entry> },
-    ListingComplete { panel: PanelSide, total: usize },
-    ListingFailed { panel: PanelSide, message: String },
+    /// Replies to `Effect::StartListing`. `request` echoes the id that
+    /// effect was issued with and is matched against the panel's
+    /// `PanelState::listing_request`; a reply from a listing the panel has
+    /// since superseded (a navigation, re-read, drive change, or tab switch
+    /// landed first) is dropped before it touches any panel state, so a
+    /// slow directory's entries never pour into whatever the panel shows
+    /// now (panel-navigation "Superseded directory listings are discarded
+    /// and cancelled"; listing-request-guard design D1/D2).
+    ListingChunk { panel: PanelSide, entries: Vec<Entry>, request: u64 },
+    ListingComplete { panel: PanelSide, total: usize, request: u64 },
+    ListingFailed { panel: PanelSide, message: String, request: u64 },
     JobProgress(ProgressInfo),
     JobConflict(ConflictInfo),
     JobError(ErrorInfo),
@@ -1059,7 +1074,24 @@ pub struct ClipboardPayload {
 /// threads, suspending the terminal, exiting the process, ...).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
-    StartListing { panel: PanelSide, path: PathBuf },
+    /// Read `path` on a worker thread and stream it back as
+    /// `Command::ListingChunk`/`ListingComplete`/`ListingFailed`, each
+    /// echoing `request` — the id minted for this listing and recorded as
+    /// the panel's `PanelState::listing_request` (listing-request-guard
+    /// design D1). The TUI registers a cancel flag under `request` so a
+    /// later `CancelRequest(request)` can stop the read.
+    StartListing { panel: PanelSide, path: PathBuf, request: u64 },
+    /// Stop the background work issued under this request id, if it is
+    /// still running: a directory listing (`StartListing`), a find-file
+    /// subtree walk (`FindInSubtree`), or a viewer F7 search
+    /// (`RunViewerSearch`). The reducer emits it whenever it supersedes or
+    /// abandons one of those requests; the TUI flips the matching cancel
+    /// flag and the worker goes silent — it sends nothing further, not even
+    /// a terminal reply. An id with no running worker (already finished,
+    /// or never cancellable) is a silent no-op, so the reducer never needs
+    /// to know whether the worker is still alive (listing-request-guard
+    /// design D3).
+    CancelRequest(u64),
     Quit,
     RunJob(Job),
     CancelJob,
@@ -1194,7 +1226,12 @@ pub enum Effect {
 /// delays a transition (ui-animations "Render-only motion model driven by the
 /// reducer clock").
 pub fn update(state: State, cmd: Command) -> (State, Vec<Effect>) {
-    let listing_failed = matches!(cmd, Command::ListingFailed { .. });
+    // Only a failure the panel actually accepts counts: a stale
+    // `ListingFailed` from a directory the user already left is dropped by
+    // `apply_listing_event` and must not cancel a drag in progress elsewhere
+    // (panel-navigation "Superseded failure does not mark the new listing
+    // failed"; listing-request-guard design D2).
+    let listing_failed = matches!(cmd, Command::ListingFailed { .. }) && listing_reply_is_current(&state, &cmd);
     let marks = crate::stamps::Snapshot::capture(&state);
     let (mut state, effects) = update_impl(state, cmd);
     marks.apply(&mut state);
@@ -1628,35 +1665,49 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             }
 
             Command::OpenTab(side) => {
-                // The new tab inherits the active tab's own (never-stale)
-                // state, so it can never itself come up stale — no
-                // fresh-read check needed here (panel-tabs "Stale
-                // background tab refresh on activation"). Focus does not
-                // move: the Left/Right menus open a tab on their own panel
-                // (design D1).
+                // The new tab inherits the active tab's state — including
+                // `listing_request`, so a listing still streaming keeps
+                // filling the new tab, which shows the same directory; no
+                // cancel is issued. The original tab, now in the background,
+                // is stamped stale by `to_tab_data` when that listing was
+                // still being read, so it re-reads on its next activation
+                // instead of showing the partial listing it held (panel-tabs
+                // "New tab mid-listing keeps the listing"; listing-request-
+                // guard design D4/D6). Focus does not move: the Left/Right
+                // menus open a tab on their own panel (design D1).
                 state.panel_mut(side).open_tab();
                 reconcile_panel_viewport(&mut state, side);
             }
             Command::CloseTab(side) => {
-                if state.panel_mut(side).close_tab() {
-                    // A stale-activation refresh is not a navigation (the
-                    // user changed tabs, not directories), so it goes
-                    // through `begin_listing_inner`: fresh read without the
-                    // frecency visit or history persist (panel-tabs "Stale
-                    // background tab refresh on activation"). It *is* a
-                    // same-directory re-read of the restored tab, so the
-                    // anchor capture stays on.
-                    let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing_inner(&mut state, side, path, true));
+                let leaving = leaving_tab_listing(&state, side);
+                let tabs_before = state.panel(side).tab_count();
+                let stale = state.panel_mut(side).close_tab();
+                if state.panel(side).tab_count() < tabs_before {
+                    // The closed tab's read, if still running, is stopped;
+                    // its remaining replies carry an id no tab holds any
+                    // more and are dropped (panel-tabs "Closing a tab mid-
+                    // listing"; design D4).
+                    effects.extend(leaving);
+                }
+                if stale {
+                    effects.extend(refresh_activated_stale_tab(&mut state, side));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
             Command::SwitchTab(n) => {
                 let side = state.active;
-                if state.panel_mut(side).switch_tab(n) {
-                    // Same non-navigation refresh as `CloseTab` above.
-                    let path = state.panel(side).cwd.clone();
-                    effects.extend(begin_listing_inner(&mut state, side, path, true));
+                let leaving = leaving_tab_listing(&state, side);
+                let active_before = state.panel(side).active_tab_index;
+                let stale = state.panel_mut(side).switch_tab(n);
+                if state.panel(side).active_tab_index != active_before {
+                    // The leaving tab's read, if still running, is stopped;
+                    // the tab itself was stamped stale by `to_tab_data` and
+                    // re-reads when next activated (panel-tabs "Switching
+                    // tabs mid-listing"; design D4/D6).
+                    effects.extend(leaving);
+                }
+                if stale {
+                    effects.extend(refresh_activated_stale_tab(&mut state, side));
                 }
                 reconcile_panel_viewport(&mut state, side);
             }
@@ -2259,7 +2310,15 @@ fn handle_viewer(state: &mut State, cmd: Command) -> Vec<Effect> {
         unreachable!("handle_viewer only called when phase is Viewer");
     };
     match cmd {
-        Command::ViewerClose => return effects,
+        Command::ViewerClose => {
+            // A search still scanning is stopped with the viewer, releasing
+            // the worker's own handle on the file (viewer "Search stops when
+            // superseded or when the viewer closes"; listing-request-guard
+            // design D4). The id stays `Some` after a result arrives, but
+            // cancelling an id with no running worker is a no-op (D3).
+            effects.extend(viewer.search_request.map(Effect::CancelRequest));
+            return effects;
+        }
         Command::ViewerToggleMode => viewer.toggle_mode(),
         Command::ViewerToggleWrap => viewer.toggle_wrap(),
         Command::ViewerSetTop(offset) => viewer.set_top_offset(offset),
@@ -2287,7 +2346,12 @@ fn handle_viewer(state: &mut State, cmd: Command) -> Vec<Effect> {
                 // against the search that's still outstanding, so an
                 // out-of-order or superseded-session reply is dropped
                 // rather than applied (viewer: F7 streaming search
-                // staleness).
+                // staleness). The previous search, if still scanning, is
+                // stopped rather than left to finish a multi-GB scan whose
+                // result would be dropped anyway (viewer "A newer search
+                // supersedes a running one"; listing-request-guard design
+                // D4).
+                effects.extend(viewer.search_request.map(Effect::CancelRequest));
                 let request = state.next_request_id();
                 viewer.search_request = Some(request);
                 state.phase = UiPhase::Viewer(viewer);
@@ -3706,28 +3770,43 @@ fn handle_find_file(state: &mut State, cmd: Command) -> Vec<Effect> {
         Command::FindFileMatch { request, m } => state.find_file.as_mut().unwrap().push_match(request, m),
         Command::FindFileSearchDone { request } => state.find_file.as_mut().unwrap().mark_done(request),
         Command::FindFileMove(delta) => state.find_file.as_mut().unwrap().move_cursor(delta),
-        // Dismissing abandons any in-progress search: the walk itself has
-        // no cancel signal (like `git_info::query`, it simply finishes and
-        // its late `FindFileMatch`/`FindFileSearchDone` replies find
-        // `state.find_file` already `None` and are silently dropped by the
-        // `state.find_file.is_some()` gate in `update`) (find-file "Esc
+        // Dismissing abandons any in-progress search: the walk is told to
+        // stop (find-file "Dismissed or superseded searches stop";
+        // listing-request-guard design D4), and whatever it already posted
+        // finds `state.find_file` `None` and is dropped by the
+        // `state.find_file.is_some()` gate in `update` (find-file "Esc
         // cancels").
-        Command::FindFileCancel => state.find_file = None,
+        Command::FindFileCancel => {
+            let ff = state.find_file.take().unwrap();
+            return running_find_file_walk(&ff).map(Effect::CancelRequest).into_iter().collect();
+        }
         Command::FindFileConfirm => {
             let ff = state.find_file.take().unwrap();
-            let Some(m) = ff.selected().cloned() else { return vec![] };
+            // Confirming a result while the walk is still running stops it
+            // too (find-file "Confirming a result while the walk is running
+            // stops it"); the navigation below proceeds either way.
+            let mut effects: Vec<Effect> = running_find_file_walk(&ff).map(Effect::CancelRequest).into_iter().collect();
+            let Some(m) = ff.selected().cloned() else { return effects };
             let target_dir = match m.relative_path.parent() {
                 Some(parent) if !parent.as_os_str().is_empty() => ff.root.join(parent),
                 _ => ff.root.clone(),
             };
             let side = state.active;
-            let effects = begin_listing(state, side, target_dir);
+            effects.extend(begin_listing(state, side, target_dir));
             state.panel_mut(side).pending_cursor_target = Some(m.entry.name);
             return effects;
         }
         _ => {}
     }
     vec![]
+}
+
+/// The request id of a find-file walk that was submitted and has not yet
+/// reported `FindFileSearchDone` — the one `FindFileCancel`/`FindFileConfirm`
+/// tell to stop (listing-request-guard design D4). `None` before Enter
+/// submits a search and once the walk has finished.
+fn running_find_file_walk(ff: &FindFileState) -> Option<u64> {
+    ff.request.filter(|_| !ff.done)
 }
 
 // ---------------------------------------------------------------------
@@ -3829,14 +3908,16 @@ fn handle_history_dialog(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// keeping the active side and the split percentage unchanged and without
 /// re-reading either directory.
 ///
-/// Refused while either panel's listing is still streaming: listing chunks
-/// are addressed only by `PanelSide` with no request id, so a mid-stream
-/// swap would misdeliver them (the mini-status already shows `Reading…`).
-/// Info/git replies *do* carry request ids, so after the swap each side's
-/// pending Info-mode and git-info queries are re-issued with fresh ids and
-/// any reply from before the swap is discarded as stale. Ctrl+U during a
-/// mouse drag is ignored (a menu can never be open mid-drag, so the guard
-/// lives here rather than in the menu path).
+/// Refused while either panel's listing is still streaming — a rule the
+/// pulldown-menu-completion requirement keeps by spec (the mini-status
+/// already shows `Reading…`), not a plumbing limitation: listing replies
+/// carry a request id and `listing_request` moves with its panel, so a mid-
+/// stream swap would no longer misdeliver chunks (listing-request-guard
+/// design D7). Info/git replies carry request ids too, so after the swap
+/// each side's pending Info-mode and git-info queries are re-issued with
+/// fresh ids and any reply from before the swap is discarded as stale.
+/// Ctrl+U during a mouse drag is ignored (a menu can never be open
+/// mid-drag, so the guard lives here rather than in the menu path).
 fn handle_swap_panels(state: &mut State) -> Vec<Effect> {
     if state.drag.is_some()
         || state.left.progress.is_streaming()
@@ -4027,11 +4108,27 @@ fn begin_listing(state: &mut State, side: PanelSide, path: PathBuf) -> Vec<Effec
 /// Tree-mode preview, whose opposite-panel re-listing is a navigation of
 /// that panel, not a re-read the user asked for.
 fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf, capture_anchor: bool) -> Vec<Effect> {
+    let mut effects = Vec::new();
+    // A listing still being read is superseded by this one: its reader is
+    // told to stop, and its remaining replies — tagged with the id it was
+    // issued under — will fail the `listing_request` check below (panel-
+    // navigation "Superseded directory listings are discarded and
+    // cancelled"; listing-request-guard design D4). A completed listing has
+    // no worker left to stop.
+    if state.panel(side).progress.is_streaming() {
+        if let Some(previous) = state.panel(side).listing_request {
+            effects.push(Effect::CancelRequest(previous));
+        }
+    }
     if capture_anchor && path == state.panel(side).cwd {
         state.panel_mut(side).capture_reread_anchor();
     }
     state.panel_mut(side).begin_new_listing(path.clone());
-    let mut effects = vec![Effect::StartListing { panel: side, path: path.clone() }];
+    // A fresh id per listing, minted even for a re-read of the same path, so
+    // two quick Ctrl+Rs are two distinguishable generations (design D1).
+    let request = state.next_request_id();
+    state.panel_mut(side).listing_request = Some(request);
+    effects.push(Effect::StartListing { panel: side, path: path.clone(), request });
     // A panel sitting in Info mode needs its drive/directory figures
     // re-gathered for wherever it just landed. A fresh request id is
     // minted even when the path is unchanged (e.g. a re-read), so an
@@ -4049,6 +4146,40 @@ fn begin_listing_inner(state: &mut State, side: PanelSide, path: PathBuf, captur
     // repository already marked "no info" this session.
     effects.extend(git_info_query_effect(state, side, path));
     effects
+}
+
+/// The `CancelRequest` for `side`'s active tab's listing when that listing
+/// is still being read — what `SwitchTab`/`CloseTab` emit once the tab has
+/// actually stopped being active (panel-tabs "Switching or closing a tab
+/// mid-listing never mixes listings"; listing-request-guard design D4).
+/// Empty when the active tab's listing is complete.
+fn leaving_tab_listing(state: &State, side: PanelSide) -> Option<Effect> {
+    let p = state.panel(side);
+    if p.progress.is_streaming() {
+        p.listing_request.map(Effect::CancelRequest)
+    } else {
+        None
+    }
+}
+
+/// The fresh read a stale tab gets the moment it becomes active, on
+/// `SwitchTab`/`CloseTab`. Not a navigation (the user changed tabs, not
+/// directories), so it goes through `begin_listing_inner`: a fresh read
+/// without the frecency visit or history persist (panel-tabs "Stale
+/// background tab refresh on activation"). It *is* a same-directory re-read
+/// of the restored tab, so the anchor capture stays on — except when the
+/// tab was left mid-listing: its progress is still `Streaming`, and
+/// `capture_reread_anchor` would *clear* the anchor an interrupted re-read
+/// stashed with the tab (it only anchors to a `Complete` listing). Skipping
+/// the capture lets `begin_new_listing` keep that anchor for the same `cwd`,
+/// so the refresh restores the place the interrupted re-read was restoring;
+/// a tab interrupted mid-navigation has no anchor and starts from the top
+/// (panel-tabs "An interrupted re-read still keeps the user's place";
+/// listing-request-guard design D6).
+fn refresh_activated_stale_tab(state: &mut State, side: PanelSide) -> Vec<Effect> {
+    let path = state.panel(side).cwd.clone();
+    let capture_anchor = !state.panel(side).progress.is_streaming();
+    begin_listing_inner(state, side, path, capture_anchor)
 }
 
 /// Mint a fresh generation id, record it as `side`'s outstanding git-info
@@ -4072,9 +4203,32 @@ fn git_info_query_effect(state: &mut State, side: PanelSide, path: PathBuf) -> O
     Some(Effect::QueryGitInfo { panel: side, path, request })
 }
 
-fn apply_listing_event(state: &mut State, cmd: Command) {
+/// Whether a listing reply belongs to `panel`'s current listing — the one
+/// whose id `begin_listing_inner` (or `State::initial`) recorded in
+/// `listing_request`. A completed listing keeps its id, so a late reply
+/// from an earlier generation still mismatches (listing-request-guard
+/// design D2).
+fn listing_reply_is_current(state: &State, cmd: &Command) -> bool {
     match cmd {
-        Command::ListingChunk { panel, entries } => {
+        Command::ListingChunk { panel, request, .. }
+        | Command::ListingComplete { panel, request, .. }
+        | Command::ListingFailed { panel, request, .. } => state.panel(*panel).listing_request == Some(*request),
+        _ => false,
+    }
+}
+
+fn apply_listing_event(state: &mut State, cmd: Command) {
+    // A reply from a superseded listing is dropped before any mutation —
+    // entries, progress count, re-read anchor, find-file cursor target,
+    // selection reconcile — so a directory the user has already left never
+    // adds to, completes, or fails the listing that replaced it (panel-
+    // navigation "Superseded directory listings are discarded and
+    // cancelled"; listing-request-guard design D2).
+    if !listing_reply_is_current(state, &cmd) {
+        return;
+    }
+    match cmd {
+        Command::ListingChunk { panel, entries, .. } => {
             let term_size = state.term_size;
             let p = state.panel_mut(panel);
             for e in entries {
@@ -4101,7 +4255,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             // D3).
             reconcile_panel_viewport(state, panel);
         }
-        Command::ListingComplete { panel, total } => {
+        Command::ListingComplete { panel, total, .. } => {
             let term_size = state.term_size;
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: total };
@@ -4131,7 +4285,7 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             p.reread_anchor = None;
             reconcile_panel_viewport(state, panel);
         }
-        Command::ListingFailed { panel, message } => {
+        Command::ListingFailed { panel, message, .. } => {
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: p.entries.len() };
             p.last_error = Some(message);

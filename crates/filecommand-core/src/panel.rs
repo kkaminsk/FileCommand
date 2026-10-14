@@ -298,6 +298,18 @@ pub struct PanelState {
     /// rather than clobbering a fresher one (git-info "Silent absence on
     /// timeout and stale-result discarding").
     pub git_request: Option<u64>,
+    /// The id of the listing this panel is currently showing or reading —
+    /// minted by `update::begin_listing_inner` (and `State::initial`) for
+    /// every `Effect::StartListing`, exactly like [`Self::git_request`].
+    /// `Command::ListingChunk`/`ListingComplete`/`ListingFailed` apply only
+    /// when their `request` matches this, so a listing superseded by a
+    /// navigation, a re-read, or a tab switch never adds entries to,
+    /// completes, or fails the listing that replaced it (panel-navigation
+    /// "Superseded directory listings are discarded and cancelled";
+    /// listing-request-guard design D1/D2). Kept after completion — a late
+    /// reply from an earlier generation still mismatches. `None` only for a
+    /// panel that has never been asked to list anything.
+    pub listing_request: Option<u64>,
     /// Tree-mode navigation state, `Some` only while `display_mode ==
     /// DisplayMode::Tree` — `None` the rest of the time, including before
     /// Tree mode has ever been entered (additional-panel-modes "Tree mode
@@ -348,6 +360,7 @@ impl PanelState {
             active_tab_index: 0,
             git_info: GitInfo::none(),
             git_request: None,
+            listing_request: None,
             tree: None,
             pending_cursor_target: None,
             reread_anchor: None,
@@ -792,9 +805,15 @@ impl PanelState {
     }
 
     /// Snapshot everything a tab independently owns from the fields
-    /// currently inline (i.e. the active tab's state). The active tab is
-    /// never itself stale — a completed job re-reads it immediately rather
-    /// than deferring — so this always snapshots `stale: false`; only
+    /// currently inline (i.e. the active tab's state). A completed job never
+    /// leaves the active tab stale — it re-reads it immediately rather than
+    /// deferring — so the only staleness stamped here is a listing still
+    /// being read when the tab is stashed: that read is cancelled by the
+    /// reducer the moment the tab stops being active, so the stashed entries
+    /// are a partial listing that will never complete, and the tab must be
+    /// re-read when it next becomes active (panel-tabs "Switching or closing
+    /// a tab mid-listing never mixes listings"; listing-request-guard design
+    /// D6). Otherwise `stale: false`, and only
     /// [`Self::mark_background_tabs_stale`] sets the flag, directly on
     /// entries already sitting in `tabs`.
     fn to_tab_data(&self) -> TabData {
@@ -815,11 +834,12 @@ impl PanelState {
             quick_filter: self.quick_filter.clone(),
             git_info: self.git_info.clone(),
             git_request: self.git_request,
+            listing_request: self.listing_request,
             tree: self.tree.clone(),
             pending_cursor_target: self.pending_cursor_target.clone(),
             reread_anchor: self.reread_anchor.clone(),
             scroll_offset: self.scroll_offset,
-            stale: false,
+            stale: self.progress.is_streaming(),
         }
     }
 
@@ -841,6 +861,7 @@ impl PanelState {
         self.quick_filter = data.quick_filter;
         self.git_info = data.git_info;
         self.git_request = data.git_request;
+        self.listing_request = data.listing_request;
         self.tree = data.tree;
         self.pending_cursor_target = data.pending_cursor_target;
         // A tab switched away mid-re-read keeps its anchor so the listing
@@ -978,6 +999,10 @@ pub struct TabData {
     pub quick_filter: Option<String>,
     pub git_info: GitInfo,
     pub git_request: Option<u64>,
+    /// See [`PanelState::listing_request`] — stashed with the tab so a
+    /// background tab's listing id is restored with it; while stashed, its
+    /// listing's replies mismatch the inline id and are dropped.
+    pub listing_request: Option<u64>,
     pub tree: Option<TreeState>,
     pub pending_cursor_target: Option<OsString>,
     /// See [`PanelState::reread_anchor`] — stashed alongside the rest of
@@ -986,12 +1011,15 @@ pub struct TabData {
     pub scroll_offset: usize,
     /// Set when a completed/cancelled-with-partial-changes file-operation
     /// job touched `cwd` while this tab was in the background, so its
-    /// cached `entries` may no longer reflect the on-disk state. Cleared
-    /// (consumed) the moment this tab becomes active again — `switch_tab`/
-    /// `close_tab` read it before reinstating this data and issue a fresh
-    /// read instead of restoring the stale cache (file-operations
-    /// "Automatic panel re-read on completion"; panel-tabs "Stale
-    /// background tab refresh on activation").
+    /// cached `entries` may no longer reflect the on-disk state — or when
+    /// the tab was stashed while its listing was still being read, so its
+    /// cached `entries` are a partial listing whose read has been cancelled
+    /// (panel-tabs "Switching or closing a tab mid-listing never mixes
+    /// listings"). Cleared (consumed) the moment this tab becomes active
+    /// again — `switch_tab`/`close_tab` read it before reinstating this data
+    /// and issue a fresh read instead of restoring the stale cache
+    /// (file-operations "Automatic panel re-read on completion"; panel-tabs
+    /// "Stale background tab refresh on activation").
     pub stale: bool,
 }
 

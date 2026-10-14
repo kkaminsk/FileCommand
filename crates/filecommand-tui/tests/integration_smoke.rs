@@ -13,6 +13,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
 use filecommand_core::editor::EditorState;
+use filecommand_core::fs_ops::CancelFlag;
 use filecommand_core::panel::DisplayMode;
 use filecommand_core::{update, Command, Effect, PanelSide, State, UiPhase};
 use filecommand_tui::worker;
@@ -33,7 +34,9 @@ const QUIET_TIMEOUT: Duration = Duration::from_millis(150);
 fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQuerySlot; 2], workers: &worker::WorkerGauge) {
     for effect in effects {
         match effect {
-            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, tx.clone(), workers.token()),
+            // The smoke test never supersedes a listing or a walk, so each
+            // gets a flag nothing will ever set (listing-request-guard).
+            Effect::StartListing { panel, path, request } => worker::spawn_listing(panel, path, request, CancelFlag::new(), tx.clone(), workers.token()),
             Effect::QueryGitInfo { panel, path, request } => {
                 let slot = match panel {
                     PanelSide::Left => &git_slots[0],
@@ -41,7 +44,7 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
                 };
                 slot.request(panel, path, request, tx.clone(), workers.token());
             }
-            Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, tx.clone(), workers.token()),
+            Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, CancelFlag::new(), tx.clone(), workers.token()),
             // `Effect::OpenEditor`/`SaveEditor` are cheap enough to run
             // synchronously on the input path in the real app too (design
             // D1) — mirrored here rather than spawning a thread for them.

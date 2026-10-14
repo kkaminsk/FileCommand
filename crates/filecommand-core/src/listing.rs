@@ -10,6 +10,8 @@ use std::time::SystemTime;
 
 use unicode_width::UnicodeWidthStr;
 
+use crate::fs_ops::CancelFlag;
+
 /// What kind of thing an [`Entry`] refers to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
@@ -493,18 +495,31 @@ impl From<RawDirEntry> for Entry {
     }
 }
 
-/// Read a directory and deliver entries in chunks via `on_chunk`, followed
-/// by a final `true` on completion. Designed to be called from a worker
-/// thread by `filecommand-tui`; core never spawns threads itself.
+/// Read a directory and deliver entries in chunks via `on_chunk`, returning
+/// the number delivered. Designed to be called from a worker thread by
+/// `filecommand-tui`; core never spawns threads itself. `cancel` is the
+/// listing's stop signal (panel-navigation "Superseded reader stops";
+/// listing-request-guard design D5): it is checked before the read and
+/// before each chunk, and once set no further chunk is delivered — the
+/// returned count then covers only what was delivered. Until the streaming
+/// reader lands, the one `read_dir` call itself still runs to completion; a
+/// superseded listing costs that enumeration and nothing more.
 pub fn list_dir_chunked<F: FnMut(Vec<Entry>)>(
     reader: &dyn FsReader,
     path: &Path,
     chunk_size: usize,
+    cancel: &CancelFlag,
     mut on_chunk: F,
 ) -> io::Result<usize> {
+    if cancel.is_cancelled() {
+        return Ok(0);
+    }
     let raw = reader.read_dir(path)?;
     let mut total = 0usize;
     for chunk in raw.chunks(chunk_size.max(1)) {
+        if cancel.is_cancelled() {
+            break;
+        }
         let entries: Vec<Entry> = chunk.iter().cloned().map(Entry::from).collect();
         total += entries.len();
         on_chunk(entries);
@@ -562,15 +577,25 @@ pub struct FindMatch {
 /// one call; `filecommand-tui` runs it on a worker thread and streams
 /// `on_match` results back to the UI as they arrive so the walk never
 /// blocks the UI thread (find-file "Non-blocking search with static
-/// progress").
-pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, pattern: &str, mut on_match: F) {
+/// progress"). `cancel` is the walk's stop signal (find-file "Dismissed or
+/// superseded searches stop"; listing-request-guard design D5): it is
+/// checked before each directory read and between the entries examined,
+/// and once set the walk returns without reading another directory or
+/// reporting another match.
+pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, pattern: &str, cancel: &CancelFlag, mut on_match: F) {
     let needle = pattern.to_lowercase();
     // Relative sub-paths pending a read, root itself represented as "".
     let mut stack: Vec<PathBuf> = vec![PathBuf::new()];
     while let Some(rel_dir) = stack.pop() {
+        if cancel.is_cancelled() {
+            return;
+        }
         let abs_dir = if rel_dir.as_os_str().is_empty() { root.to_path_buf() } else { root.join(&rel_dir) };
         let Ok(raw_entries) = reader.read_dir(&abs_dir) else { continue };
         for raw in raw_entries {
+            if cancel.is_cancelled() {
+                return;
+            }
             let rel_path = rel_dir.join(&raw.name);
             if !needle.is_empty() && raw.name.to_string_lossy().to_lowercase().contains(&needle) {
                 on_match(FindMatch { relative_path: rel_path.clone(), entry: Entry::from(raw.clone()) });
@@ -725,7 +750,7 @@ mod tests {
             .collect();
         let reader = FakeReader(entries);
         let mut chunks = Vec::new();
-        let total = list_dir_chunked(&reader, Path::new("."), 3, |c| chunks.push(c.len())).unwrap();
+        let total = list_dir_chunked(&reader, Path::new("."), 3, &CancelFlag::new(), |c| chunks.push(c.len())).unwrap();
         assert_eq!(total, 10);
         assert_eq!(chunks, vec![3, 3, 3, 1]);
     }
@@ -761,7 +786,7 @@ mod tests {
         // (hidden-entry-styling tasks.md 1.3).
         let reader = FakeReader(vec![raw_file("zeta.txt"), raw_hidden("desktop.ini", false), raw_hidden(".git", true), raw_dir("alpha")]);
         let mut entries = Vec::new();
-        let total = list_dir_chunked(&reader, Path::new("."), 100, |chunk| entries.extend(chunk)).unwrap();
+        let total = list_dir_chunked(&reader, Path::new("."), 100, &CancelFlag::new(), |chunk| entries.extend(chunk)).unwrap();
         assert_eq!(total, 4);
         let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
         assert_eq!(flags, vec![("zeta.txt", false), ("desktop.ini", true), (".git", true), ("alpha", false)], "enumeration order");
@@ -836,7 +861,7 @@ mod tests {
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
-        find_in_subtree(&reader, Path::new("/root"), "report", |m| matches.push(m));
+        find_in_subtree(&reader, Path::new("/root"), "report", &CancelFlag::new(), |m| matches.push(m));
         matches.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
         let paths: Vec<PathBuf> = matches.iter().map(|m| m.relative_path.clone()).collect();
@@ -858,7 +883,7 @@ mod tests {
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
-        find_in_subtree(&reader, Path::new("/root"), "readme", |m| matches.push(m));
+        find_in_subtree(&reader, Path::new("/root"), "readme", &CancelFlag::new(), |m| matches.push(m));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].entry.name, OsString::from("ReadMe.MD"), "the returned entry must keep the original OsString name");
     }
@@ -871,7 +896,7 @@ mod tests {
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
-        find_in_subtree(&reader, Path::new("/root"), "nonexistent-pattern", |m| matches.push(m));
+        find_in_subtree(&reader, Path::new("/root"), "nonexistent-pattern", &CancelFlag::new(), |m| matches.push(m));
         assert!(matches.is_empty());
     }
 
@@ -887,9 +912,90 @@ mod tests {
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
-        find_in_subtree(&reader, Path::new("/root"), "target", |m| matches.push(m));
+        find_in_subtree(&reader, Path::new("/root"), "target", &CancelFlag::new(), |m| matches.push(m));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].relative_path, PathBuf::from("ok").join("target_match.txt"));
+    }
+
+    // -----------------------------------------------------------------
+    // listing-request-guard: the stop signal (find-file "Esc stops the
+    // walk"; panel-navigation "Superseded reader stops"; design D5)
+    // -----------------------------------------------------------------
+
+    /// A reader that counts how many directories it has been asked to read,
+    /// so a test can show the walk stopped asking once cancelled.
+    struct CountingReader {
+        inner: TreeReader,
+        reads: std::cell::Cell<usize>,
+    }
+
+    impl FsReader for CountingReader {
+        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
+            self.reads.set(self.reads.get() + 1);
+            self.inner.read_dir(path)
+        }
+    }
+
+    #[test]
+    fn find_in_subtree_stops_reading_directories_once_cancelled_from_inside_on_match() {
+        // Three levels, each with a match and a subdirectory below it. The
+        // flag is set from inside the first `on_match`, as the TUI would
+        // when the reducer's `CancelRequest` lands mid-walk: no further
+        // directory is read and no further match is reported.
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_file("report1.txt"), raw_dir("a")]);
+        fixture.insert(PathBuf::from("/root/a"), vec![raw_file("report2.txt"), raw_dir("b")]);
+        fixture.insert(PathBuf::from("/root/a/b"), vec![raw_file("report3.txt")]);
+        let reader = CountingReader { inner: TreeReader(fixture), reads: std::cell::Cell::new(0) };
+
+        let cancel = CancelFlag::new();
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "report", &cancel, |m| {
+            matches.push(m);
+            cancel.cancel();
+        });
+        assert_eq!(matches.len(), 1, "nothing is reported after the flag is set");
+        assert_eq!(reader.reads.get(), 1, "no directory is read after the flag is set");
+    }
+
+    #[test]
+    fn find_in_subtree_with_a_pre_set_flag_reads_nothing() {
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_file("report.txt")]);
+        let reader = CountingReader { inner: TreeReader(fixture), reads: std::cell::Cell::new(0) };
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut matches = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "report", &cancel, |m| matches.push(m));
+        assert!(matches.is_empty());
+        assert_eq!(reader.reads.get(), 0, "the check precedes the first directory read");
+    }
+
+    #[test]
+    fn list_dir_chunked_with_a_pre_set_flag_delivers_nothing() {
+        let entries: Vec<RawDirEntry> = (0..10).map(|i| raw_file(&format!("f{i}"))).collect();
+        let reader = FakeReader(entries);
+        let cancel = CancelFlag::new();
+        cancel.cancel();
+        let mut chunks = 0usize;
+        let total = list_dir_chunked(&reader, Path::new("."), 3, &cancel, |_| chunks += 1).unwrap();
+        assert_eq!(chunks, 0, "a superseded reader delivers no chunk");
+        assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn list_dir_chunked_stops_delivering_once_cancelled_between_chunks() {
+        let entries: Vec<RawDirEntry> = (0..10).map(|i| raw_file(&format!("f{i}"))).collect();
+        let reader = FakeReader(entries);
+        let cancel = CancelFlag::new();
+        let mut chunks = Vec::new();
+        let total = list_dir_chunked(&reader, Path::new("."), 3, &cancel, |c| {
+            chunks.push(c.len());
+            cancel.cancel();
+        })
+        .unwrap();
+        assert_eq!(chunks, vec![3], "the chunk in flight when the flag was set is the last one");
+        assert_eq!(total, 3, "the count covers only what was delivered");
     }
 
     #[cfg(unix)]
@@ -906,7 +1012,7 @@ mod tests {
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
-        find_in_subtree(&reader, Path::new("/root"), "report", |m| matches.push(m));
+        find_in_subtree(&reader, Path::new("/root"), "report", &CancelFlag::new(), |m| matches.push(m));
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].entry.name, name, "matching must not corrupt the original OsString even though it went through lossy conversion");
     }
