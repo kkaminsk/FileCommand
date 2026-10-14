@@ -16,6 +16,8 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use filecommand_core::drives;
+use filecommand_core::editor::{EditorState, LoadResult};
+use filecommand_core::fs_ops::path::to_extended_path;
 use filecommand_core::fs_ops::{
     CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs, SkippedItem,
 };
@@ -25,7 +27,7 @@ use filecommand_core::listing::{find_in_subtree, list_dir_chunked, Entry, FsRead
 use filecommand_core::panel::parent_path;
 use filecommand_core::viewer::search::{find_forward, DEFAULT_CHUNK_SIZE};
 use filecommand_core::viewer::ByteSource;
-use filecommand_core::{Command, PanelSide};
+use filecommand_core::{Command, PanelSide, ProbeKind};
 
 use crate::diag;
 
@@ -524,6 +526,272 @@ where
     });
 }
 
+// ---------------------------------------------------------------------
+// offload-blocking-io: the command-line target probe, the F3/F4 opens, the
+// editor save and the associated-application launch all run here rather
+// than on the event-loop thread (application-shell "The reducer performs no
+// filesystem I/O", "Slow storage never blocks the event loop"). Each worker
+// runs under `spawn_worker`'s `catch_unwind` and turns a panic into its own
+// failure reply carrying the request id (design D8).
+// ---------------------------------------------------------------------
+
+/// The status-line error forms of filesystem-error-handling "Error messages
+/// name the affected path" (error-diagnostics design D4): `Cannot
+/// <verb> <name>: <reason>`, where the name is the file's own name — the
+/// panel title directly above already shows the directory, and a full path
+/// would push the reason off the truncated mini-status — or the whole path
+/// when there is no file name (a drive or share root).
+pub(crate) fn cannot_message(verb: &str, path: &Path, reason: impl std::fmt::Display) -> String {
+    format!("Cannot {verb} {}: {reason}", name_or_path(path))
+}
+
+/// `ByteSource` is created on the viewer-open worker and moved to the UI
+/// thread through the hand-off channel (design D4). This fails to compile
+/// should it ever stop being `Send`.
+const _: () = {
+    fn assert_send<T: Send>() {}
+    let _ = assert_send::<ByteSource>;
+};
+
+/// Check what exists at `path`, the resolved target of a command-line
+/// `cd`/`del`/`rmdir` that is not listed in the panel, and reply with
+/// `Command::PathProbed { request, kind }` (design D1/D2). The check goes
+/// through the `\\?\` long-path abstraction, so a target longer than 260
+/// characters is found (command-line "cd to a path longer than 260
+/// characters"); an unreachable server blocks only this thread.
+pub fn spawn_path_probe(request: u64, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
+    spawn_path_probe_with(request, tx, token, move || probe_kind(&path));
+}
+
+/// The probe itself: `metadata` through `to_extended_path`, links followed
+/// (a junction to a directory is `Dir`), and any error at all is `Missing`,
+/// exactly as the reducer's old synchronous `metadata(..).ok()?` was.
+pub(crate) fn probe_kind(path: &Path) -> ProbeKind {
+    match std::fs::metadata(to_extended_path(path)) {
+        Ok(md) if md.is_dir() => ProbeKind::Dir,
+        Ok(_) => ProbeKind::File,
+        Err(_) => ProbeKind::Missing,
+    }
+}
+
+/// `spawn_path_probe` with the check injected (design D8): a panicked probe
+/// reports `Missing`, the reply the reducer turns into "not found".
+fn spawn_path_probe_with<B>(request: u64, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce() -> ProbeKind + Send + 'static,
+{
+    spawn_worker(token, body, move |result| {
+        let kind = result.unwrap_or_else(|msg| {
+            log_worker_panic("path probe", &msg);
+            ProbeKind::Missing
+        });
+        deliver(&tx, "path probe", Command::PathProbed { request, kind });
+    });
+}
+
+/// What a viewer-open worker hands the UI thread before its `ViewerOpened`
+/// reply: the request id, the path, and the open source (design D4).
+/// `Command` derives `Clone`/`PartialEq`, so the source cannot travel in
+/// the command itself; `Runtime` owns the channel.
+pub type ViewerHandoff = (u64, PathBuf, ByteSource);
+
+/// Open `path` for the F3 viewer off the event loop (design D4/D5). On
+/// success the source goes out on `handoff` *first*, then
+/// `Command::ViewerOpened { request, .. }` on `tx`, so the source is waiting
+/// by the time the command is applied; on failure only
+/// `Command::ViewerOpenFailed { request, .. }` is sent.
+pub fn spawn_viewer_open(request: u64, path: PathBuf, handoff: Sender<ViewerHandoff>, tx: Sender<Command>, token: WorkerToken) {
+    spawn_viewer_open_with(request, path, handoff, tx, token, ByteSource::open);
+}
+
+/// `spawn_viewer_open` with the open injected (design D8): a panicked open
+/// reports `ViewerOpenFailed`.
+fn spawn_viewer_open_with<B>(request: u64, path: PathBuf, handoff: Sender<ViewerHandoff>, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path) -> io::Result<ByteSource> + Send + 'static,
+{
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(&body_path),
+        move |result| {
+            let message = match result {
+                Ok(Ok(source)) => {
+                    let file_len = source.len();
+                    if handoff.send((request, path.clone(), source)).is_err() {
+                        // The runtime (and with it the event loop) is gone;
+                        // the source is dropped here and nothing follows.
+                        diag::log("channel", "viewer source not delivered: event loop gone");
+                        return;
+                    }
+                    deliver(&tx, "viewer opened", Command::ViewerOpened { request, path, file_len });
+                    return;
+                }
+                Ok(Err(e)) => cannot_message("open", &path, &e),
+                Err(msg) => {
+                    log_worker_panic("viewer open", &msg);
+                    format!("Internal error while opening {}: {msg}", name_or_path(&path))
+                }
+            };
+            deliver(&tx, "viewer open failure", Command::ViewerOpenFailed { request, message });
+        },
+    );
+}
+
+/// Open `path` for the F4 built-in editor off the event loop (design D4):
+/// `EditorState::open` — the size cap, the whole-file read and the encoding
+/// classification — with the same replies as before plus the request id.
+pub fn spawn_editor_open(request: u64, path: PathBuf, tx: Sender<Command>, token: WorkerToken) {
+    spawn_editor_open_with(request, path, tx, token, EditorState::open);
+}
+
+/// `spawn_editor_open` with the load injected (design D8): a panicked load
+/// reports `EditorOpenFailed`.
+fn spawn_editor_open_with<B>(request: u64, path: PathBuf, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path) -> io::Result<LoadResult> + Send + 'static,
+{
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(&body_path),
+        move |result| {
+            let cmd = match result {
+                Ok(Ok(LoadResult::Loaded(editor))) => Command::EditorOpened { request, editor: Box::new(editor) },
+                Ok(Ok(LoadResult::TooLarge { size })) => Command::EditorTooLarge { request, path, size },
+                Ok(Ok(LoadResult::NotEditable { reason })) => Command::EditorNotEditable { request, path, reason },
+                Ok(Err(e)) => Command::EditorOpenFailed { request, message: cannot_message("open", &path, &e) },
+                Err(msg) => {
+                    log_worker_panic("editor open", &msg);
+                    Command::EditorOpenFailed { request, message: format!("Internal error while opening {}: {msg}", name_or_path(&path)) }
+                }
+            };
+            deliver(&tx, "editor open", cmd);
+        },
+    );
+}
+
+/// Write the editor buffer `Effect::SaveEditor` carries off the event loop
+/// (design D6): `EditorState::save` on the boxed copy, replying
+/// `Command::EditorSaved` with the post-save state (and `then_quit`
+/// unchanged) or `Command::EditorSaveFailed`. Only one save is ever in
+/// flight — the reducer gates the editor on `save_pending` — so the reply
+/// needs no request id.
+pub fn spawn_editor_save(editor: Box<EditorState>, then_quit: bool, tx: Sender<Command>, token: WorkerToken) {
+    spawn_editor_save_with(editor, then_quit, tx, token, |editor| editor.save());
+}
+
+/// `spawn_editor_save` with the write injected (design D8): a panicked save
+/// reports `EditorSaveFailed`, which also lifts the editor's gate.
+fn spawn_editor_save_with<B>(editor: Box<EditorState>, then_quit: bool, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&mut EditorState) -> io::Result<()> + Send + 'static,
+{
+    let path = editor.path.clone();
+    spawn_worker(
+        token,
+        move || {
+            let mut editor = editor;
+            let outcome = body(&mut editor);
+            (editor, outcome)
+        },
+        move |result| {
+            let cmd = match result {
+                Ok((editor, Ok(()))) => Command::EditorSaved { editor, then_quit },
+                Ok((editor, Err(e))) => Command::EditorSaveFailed { message: cannot_message("save", &editor.path, &e) },
+                Err(msg) => {
+                    log_worker_panic("editor save", &msg);
+                    Command::EditorSaveFailed { message: format!("Internal error while saving {}: {msg}", name_or_path(&path)) }
+                }
+            };
+            deliver(&tx, "editor save", cmd);
+        },
+    );
+}
+
+/// Launch `path` with its associated application off the event loop
+/// (design D7): `app::open_with_association`, bracketed on Windows by
+/// `CoInitializeEx(COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE)` and
+/// `CoUninitialize`, since shell handlers may use COM. Fire-and-forget: a
+/// success sends nothing; a failure sends `OpenWithAssociationFailed` for
+/// `side`, the panel the Open action was invoked on.
+pub fn spawn_open_with_association(side: PanelSide, path: PathBuf, cwd: PathBuf, tx: Sender<Command>, token: WorkerToken) {
+    spawn_open_with_association_with(side, path, tx, token, move |path| launch_with_association(path, &cwd));
+}
+
+/// `spawn_open_with_association` with the launch injected (design D8): a
+/// panicked launch reports a failure on the invoking panel.
+fn spawn_open_with_association_with<B>(side: PanelSide, path: PathBuf, tx: Sender<Command>, token: WorkerToken, body: B)
+where
+    B: FnOnce(&Path) -> Result<(), String> + Send + 'static,
+{
+    let body_path = path.clone();
+    spawn_worker(
+        token,
+        move || body(&body_path),
+        move |result| {
+            let message = match result {
+                Ok(Ok(())) => return,
+                Ok(Err(message)) => message,
+                Err(msg) => {
+                    log_worker_panic("open with association", &msg);
+                    format!("Could not open {} (internal error: {msg})", name_or_path(&path))
+                }
+            };
+            deliver(&tx, "open-with failure", Command::OpenWithAssociationFailed { side, message });
+        },
+    );
+}
+
+/// The platform launch inside its COM bracket (Windows) or as is.
+fn launch_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        with_com_initialized(|| crate::app::open_with_association(path, cwd))
+    }
+    #[cfg(not(windows))]
+    {
+        crate::app::open_with_association(path, cwd)
+    }
+}
+
+/// Run `body` with COM initialized in a single-threaded apartment on this
+/// thread (application-shell "COM is initialized on the launch worker";
+/// design D7): the `COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE`
+/// combination the `ShellExecute` documentation recommends.
+#[cfg(windows)]
+fn with_com_initialized<T>(body: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE};
+    com_bracket(
+        // SAFETY: a null reserved pointer and a valid COINIT combination;
+        // every call on this thread is paired with the `CoUninitialize`
+        // below when it succeeded.
+        || unsafe { CoInitializeEx(std::ptr::null(), (COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) as u32) },
+        || unsafe { CoUninitialize() },
+        body,
+    )
+}
+
+/// `CoInitializeEx`'s success codes: `S_OK` (initialized by this call) and
+/// `S_FALSE` (already initialized on this thread, reference count bumped).
+/// Both must be balanced by one `CoUninitialize`; any failure (such as
+/// `RPC_E_CHANGED_MODE`) must not be.
+const COM_S_OK: i32 = 0;
+const COM_S_FALSE: i32 = 1;
+
+/// The bracket itself, with the two COM calls injected so it is testable on
+/// every platform: `init`, then `body`, then `uninit` only if `init`
+/// succeeded.
+fn com_bracket<T>(init: impl FnOnce() -> i32, uninit: impl FnOnce(), body: impl FnOnce() -> T) -> T {
+    let hr = init();
+    let initialized = hr == COM_S_OK || hr == COM_S_FALSE;
+    let result = body();
+    if initialized {
+        uninit();
+    }
+    result
+}
+
 /// Read `path`'s immediate child directories for Tree-mode expansion
 /// (`listing::list_child_dirs`) on a worker thread, reporting them back via
 /// `Command::TreeNodeExpanded`. A read failure (permission denied, a
@@ -817,6 +1085,7 @@ impl JobSink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use filecommand_core::editor::NotEditableReason;
     use filecommand_core::info::PENDING;
     use filecommand_core::listing::{RawDirEntry, RawDirListing};
     use std::io;
@@ -1536,6 +1805,259 @@ mod tests {
 
     fn recv(rx: &mpsc::Receiver<Command>) -> Command {
         rx.recv_timeout(Duration::from_secs(5)).expect("the worker replies even after a panic")
+    }
+
+    // -------------------------------------------------------------
+    // offload-blocking-io: the command-line probe, the F3/F4 opens, the
+    // editor save and the launch worker (tasks 5.6, 5.7, 5.8; design D1,
+    // D2, D4, D6, D7, D8)
+    // -------------------------------------------------------------
+
+    /// A fresh, empty per-test directory under the system temp dir.
+    fn scratch_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-worker-offload-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn probe(path: PathBuf, request: u64) -> ProbeKind {
+        let (tx, rx) = mpsc::channel();
+        spawn_path_probe(request, path, tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::PathProbed { request: got, kind } => {
+                assert_eq!(got, request, "the request id is echoed back unchanged");
+                kind
+            }
+            other => panic!("expected PathProbed, got {other:?}"),
+        }
+    }
+
+    /// Design D2: a directory, a file and a missing path map to the three
+    /// kinds.
+    #[test]
+    fn spawn_path_probe_reports_dir_file_and_missing() {
+        let dir = scratch_dir("probe");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"x").unwrap();
+        assert_eq!(probe(dir.clone(), 1), ProbeKind::Dir);
+        assert_eq!(probe(file, 2), ProbeKind::File);
+        assert_eq!(probe(dir.join("nope"), 3), ProbeKind::Missing);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// command-line "cd to a path longer than 260 characters": the probe
+    /// goes through `to_extended_path`, so a directory whose absolute path
+    /// exceeds `MAX_PATH` is found rather than reported missing.
+    #[cfg(windows)]
+    #[test]
+    fn spawn_path_probe_finds_a_directory_whose_path_exceeds_260_characters() {
+        let root = scratch_dir("long");
+        let deep = root.join("a".repeat(120)).join("b".repeat(120)).join("c".repeat(60));
+        assert!(deep.as_os_str().len() > 260, "precondition: {} characters", deep.as_os_str().len());
+        std::fs::create_dir_all(to_extended_path(&deep)).expect("created through the \\\\?\\ prefix");
+        assert_eq!(probe(deep, 9), ProbeKind::Dir);
+        let _ = std::fs::remove_dir_all(to_extended_path(&root));
+    }
+
+    /// Design D8: a panicked probe reports `Missing`, with the request id.
+    #[test]
+    fn a_panicked_probe_reports_missing() {
+        let (tx, rx) = mpsc::channel();
+        spawn_path_probe_with(4, tx, WorkerGauge::new().token(), || panic!("scripted probe panic"));
+        assert_eq!(recv(&rx), Command::PathProbed { request: 4, kind: ProbeKind::Missing });
+    }
+
+    /// Design D4: the source is on the hand-off channel before the
+    /// `ViewerOpened` reply is sent, under the same request id.
+    #[test]
+    fn spawn_viewer_open_hands_the_source_over_before_viewer_opened() {
+        let path = temp_file("viewer-open", b"hello world");
+        let (tx, rx) = mpsc::channel();
+        let (handoff_tx, handoff_rx) = mpsc::channel();
+        spawn_viewer_open(4, path.clone(), handoff_tx, tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::ViewerOpened { request: 4, path: opened, file_len: 11 } => assert_eq!(opened, path),
+            other => panic!("expected ViewerOpened, got {other:?}"),
+        }
+        let (request, handed_path, source) = handoff_rx.try_recv().expect("the source was queued before the command");
+        assert_eq!(request, 4);
+        assert_eq!(handed_path, path);
+        assert_eq!(source.len(), 11);
+    }
+
+    #[test]
+    fn spawn_viewer_open_on_a_missing_file_reports_viewer_open_failed() {
+        let missing = std::env::temp_dir().join("filecommand-tui-worker-offload-missing.bin");
+        let (tx, rx) = mpsc::channel();
+        let (handoff_tx, handoff_rx) = mpsc::channel();
+        spawn_viewer_open(5, missing, handoff_tx, tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::ViewerOpenFailed { request: 5, message } => {
+                assert!(message.starts_with("Cannot open filecommand-tui-worker-offload-missing.bin:"), "{message}");
+            }
+            other => panic!("expected ViewerOpenFailed, got {other:?}"),
+        }
+        assert!(handoff_rx.try_recv().is_err(), "nothing is handed over on failure");
+    }
+
+    /// Design D8: a panicked open reports `ViewerOpenFailed`.
+    #[test]
+    fn a_panicked_viewer_open_reports_viewer_open_failed() {
+        let (tx, rx) = mpsc::channel();
+        let (handoff_tx, _handoff_rx) = mpsc::channel();
+        spawn_viewer_open_with(6, PathBuf::from("/x/slow.log"), handoff_tx, tx, WorkerGauge::new().token(), |_| panic!("scripted open panic"));
+        match recv(&rx) {
+            Command::ViewerOpenFailed { request: 6, message } => assert_eq!(message, "Internal error while opening slow.log: scripted open panic"),
+            other => panic!("expected ViewerOpenFailed, got {other:?}"),
+        }
+    }
+
+    /// Design D4: `spawn_editor_open` wraps `EditorState::open` with the
+    /// same replies as before plus the request id.
+    #[test]
+    fn spawn_editor_open_reports_loaded_not_editable_too_large_and_failed() {
+        let dir = scratch_dir("editor-open");
+        let text = dir.join("notes.txt");
+        std::fs::write(&text, b"abc\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_open(8, text.clone(), tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::EditorOpened { request: 8, editor } => {
+                assert_eq!(editor.path, text);
+                assert_eq!(editor.lines, vec!["abc".to_string(), String::new()]);
+            }
+            other => panic!("expected EditorOpened, got {other:?}"),
+        }
+
+        let binary = dir.join("tool.exe");
+        std::fs::write(&binary, b"MZ\0\0").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_open(9, binary.clone(), tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::EditorNotEditable { request: 9, path, reason: NotEditableReason::Binary } => assert_eq!(path, binary),
+            other => panic!("expected EditorNotEditable, got {other:?}"),
+        }
+
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_open_with(10, dir.join("huge.log"), tx, WorkerGauge::new().token(), |_| Ok(LoadResult::TooLarge { size: 20_000_000 }));
+        assert_eq!(recv(&rx), Command::EditorTooLarge { request: 10, path: dir.join("huge.log"), size: 20_000_000 });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_open(11, dir.join("nope.txt"), tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::EditorOpenFailed { request: 11, message } => assert!(message.starts_with("Cannot open nope.txt:"), "{message}"),
+            other => panic!("expected EditorOpenFailed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Design D8: a panicked load reports `EditorOpenFailed`.
+    #[test]
+    fn a_panicked_editor_open_reports_editor_open_failed() {
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_open_with(12, PathBuf::from("/x/notes.txt"), tx, WorkerGauge::new().token(), |_| panic!("scripted load panic"));
+        match recv(&rx) {
+            Command::EditorOpenFailed { request: 12, message } => assert_eq!(message, "Internal error while opening notes.txt: scripted load panic"),
+            other => panic!("expected EditorOpenFailed, got {other:?}"),
+        }
+    }
+
+    /// Design D6: the save runs on the worker and replies with the post-save
+    /// state and `then_quit` unchanged.
+    #[test]
+    fn spawn_editor_save_writes_the_file_and_replies_with_the_saved_state() {
+        let dir = scratch_dir("editor-save");
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"abc\n").unwrap();
+        let mut editor = EditorState::from_bytes(path.clone(), b"abc\n").unwrap();
+        editor.type_char('X');
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_save(Box::new(editor), true, tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::EditorSaved { editor, then_quit: true } => {
+                assert!(!editor.is_modified(), "the reply carries the clean post-save state");
+                assert_eq!(editor.path, path);
+            }
+            other => panic!("expected EditorSaved, got {other:?}"),
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "Xabc\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A failed or panicked save reports `EditorSaveFailed` naming the file
+    /// (design D6, D8).
+    #[test]
+    fn a_failed_or_panicked_editor_save_reports_editor_save_failed() {
+        let editor = EditorState::from_bytes(PathBuf::from("/x/edit.txt"), b"abc\n").unwrap();
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_save_with(Box::new(editor.clone()), false, tx, WorkerGauge::new().token(), |_| Err(io::Error::new(io::ErrorKind::StorageFull, "disk full")));
+        assert_eq!(recv(&rx), Command::EditorSaveFailed { message: "Cannot save edit.txt: disk full".to_string() });
+
+        let (tx, rx) = mpsc::channel();
+        spawn_editor_save_with(Box::new(editor), false, tx, WorkerGauge::new().token(), |_| panic!("scripted save panic"));
+        assert_eq!(recv(&rx), Command::EditorSaveFailed { message: "Internal error while saving edit.txt: scripted save panic".to_string() });
+    }
+
+    /// Design D7: `CoUninitialize` is called only after an initialization
+    /// that returned `S_OK` or `S_FALSE`, and always after the body.
+    #[test]
+    fn com_bracket_uninitializes_only_after_a_successful_initialization() {
+        use std::cell::RefCell;
+        const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
+        for (hr, expect_uninit) in [(COM_S_OK, true), (COM_S_FALSE, true), (RPC_E_CHANGED_MODE, false), (-1, false)] {
+            let log = RefCell::new(Vec::new());
+            let out = com_bracket(
+                || {
+                    log.borrow_mut().push("init");
+                    hr
+                },
+                || log.borrow_mut().push("uninit"),
+                || {
+                    log.borrow_mut().push("body");
+                    42
+                },
+            );
+            assert_eq!(out, 42, "the body's value comes back");
+            let expected: Vec<&str> = if expect_uninit { vec!["init", "body", "uninit"] } else { vec!["init", "body"] };
+            assert_eq!(*log.borrow(), expected, "hr = {hr:#x}");
+        }
+    }
+
+    /// application-shell "Launching a slow handler leaves the panels
+    /// interactive": the failure carries the invoking side. A missing file
+    /// never launches anything, so the real `ShellExecuteW` path is safe to
+    /// exercise here.
+    #[cfg(windows)]
+    #[test]
+    fn spawn_open_with_association_on_a_missing_file_reports_the_failure_on_the_original_side() {
+        let dir = scratch_dir("open-with");
+        let missing = dir.join("missing-report.pdf");
+        let (tx, rx) = mpsc::channel();
+        spawn_open_with_association(PanelSide::Right, missing, dir.clone(), tx, WorkerGauge::new().token());
+        match recv(&rx) {
+            Command::OpenWithAssociationFailed { side: PanelSide::Right, message } => {
+                assert!(message.contains("missing-report.pdf"), "the failure names the target: {message}");
+            }
+            other => panic!("expected OpenWithAssociationFailed for the right panel, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A successful launch sends nothing (fire-and-forget); a panicked one
+    /// reports a failure on the invoking panel (design D7, D8).
+    #[test]
+    fn open_with_association_worker_is_silent_on_success_and_reports_a_panic() {
+        let (tx, rx) = mpsc::channel();
+        spawn_open_with_association_with(PanelSide::Left, PathBuf::from("/x/report.pdf"), tx, WorkerGauge::new().token(), |_| Ok(()));
+        assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a successful launch reports nothing");
+
+        let (tx, rx) = mpsc::channel();
+        spawn_open_with_association_with(PanelSide::Left, PathBuf::from("/x/report.pdf"), tx, WorkerGauge::new().token(), |_| panic!("scripted launch panic"));
+        assert_eq!(
+            recv(&rx),
+            Command::OpenWithAssociationFailed { side: PanelSide::Left, message: "Could not open report.pdf (internal error: scripted launch panic)".to_string() }
+        );
     }
 
     #[test]

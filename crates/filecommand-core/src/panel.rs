@@ -261,6 +261,15 @@ pub struct PanelState {
     /// yanking it back to row 0.
     pub cursor_user_moved: bool,
     pub last_error: Option<String>,
+    /// A non-error note about a request outstanding for this panel:
+    /// `Checking <path>…` while a command-line target probe runs, and
+    /// `Opening <name>…` while an F3/F4 open runs (offload-blocking-io
+    /// design D3). Shown on the mini-status line below any status override
+    /// and above `last_error`. Set through [`Self::set_pending_note`], which
+    /// also clears `last_error` (a new command supersedes an old error);
+    /// cleared when the reply is applied or discarded and by
+    /// [`Self::begin_new_listing`].
+    pub pending_note: Option<String>,
     /// The most recent clipboard action's outcome, or `None` when nothing
     /// is being shown (`clipboard-export` "Clipboard feedback"). Set by
     /// `crate::update`'s `Command::CopyToClipboard`/`Command::ClipboardResult`
@@ -353,6 +362,7 @@ impl PanelState {
             progress: ListingProgress::Streaming { count: 0 },
             cursor_user_moved: false,
             last_error: None,
+            pending_note: None,
             clipboard_feedback: None,
             selected: HashSet::new(),
             quick_filter: None,
@@ -501,6 +511,15 @@ impl PanelState {
         }
     }
 
+    /// Announce a request outstanding for this panel on the mini-status
+    /// line (`Checking <path>…`, `Opening <name>…`). A new command
+    /// supersedes an old error, so `last_error` is cleared at the same time
+    /// (offload-blocking-io design D3).
+    pub fn set_pending_note(&mut self, note: String) {
+        self.last_error = None;
+        self.pending_note = Some(note);
+    }
+
     /// Re-sort the entries already in hand under the current mode. Stable,
     /// and it issues no directory read and no per-entry metadata query.
     pub fn resort(&mut self) {
@@ -542,6 +561,9 @@ impl PanelState {
         self.scroll_offset = 0;
         self.progress = ListingProgress::Streaming { count: 0 };
         self.last_error = None;
+        // A new listing supersedes whatever the panel was waiting on; the
+        // reply, if it still applies, no longer needs announcing (design D3).
+        self.pending_note = None;
         self.selected.clear();
         // Directory-scoped Info values (and the drive's, if the drive
         // changed) no longer describe what the panel shows. The sort mode

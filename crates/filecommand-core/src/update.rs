@@ -176,6 +176,61 @@ pub enum UiPhase {
     Editor(EditorState),
 }
 
+/// What `Effect::ProbePath` found at the probed path (offload-blocking-io
+/// design D2): a directory (links followed, so a junction to a directory is
+/// `Dir`), some other kind of entry, or nothing — any error at all maps to
+/// `Missing`, exactly as the old synchronous `metadata(..).ok()?` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind {
+    Dir,
+    File,
+    Missing,
+}
+
+/// Which command-line builtin an outstanding `Effect::ProbePath` completes
+/// (design D1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeIntent {
+    /// `cd`: on `Dir`, push `text` to command history and navigate.
+    Cd { text: String },
+    /// `del` (`want_dir: false`) / `rmdir` (`want_dir: true`): on a type
+    /// match, open the delete-confirmation dialog.
+    Delete { want_dir: bool },
+}
+
+/// The one command-line target check that may be outstanding (design D1).
+/// `cwd` is the panel's directory when the command was entered: a reply is
+/// applied only while the panel still shows it, so navigating away
+/// invalidates the probe without any explicit cancel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingProbe {
+    pub request: u64,
+    pub side: PanelSide,
+    pub cwd: PathBuf,
+    pub path: PathBuf,
+    pub intent: ProbeIntent,
+}
+
+/// Which kind of open `Effect::OpenViewer`/`OpenEditor` was requested for
+/// (design D4). Recorded for diagnostics and symmetry with the effect pair;
+/// the reply gate itself keys on the request id and the panel phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingOpenKind {
+    Viewer,
+    Editor,
+}
+
+/// The one F3/F4 open that may be outstanding (design D4). A newer request
+/// replaces it, which is what makes the older reply stale. `side` is the
+/// panel the open was requested from, so a late failure lands there and not
+/// on whichever panel is active when the reply arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingOpen {
+    pub request: u64,
+    pub side: PanelSide,
+    pub kind: PendingOpenKind,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct State {
     pub left: PanelState,
@@ -333,6 +388,18 @@ pub struct State {
     /// no git indicators there (git-info "Silent absence on timeout and
     /// stale-result discarding"). Session-only, never persisted.
     pub git_no_info_roots: Vec<PathBuf>,
+    /// The command-line `cd`/`del`/`rmdir` target check in flight on a
+    /// worker thread, or `None`. The reducer itself never touches the
+    /// filesystem: a target that is not already listed in the panel is
+    /// checked through `Effect::ProbePath`, and the command completes when
+    /// the matching `Command::PathProbed` arrives (application-shell "The
+    /// reducer performs no filesystem I/O"; offload-blocking-io design D1).
+    pub command_probe: Option<PendingProbe>,
+    /// The F3/F4 open in flight on a worker thread, or `None`. A reply is
+    /// applied only when its id matches, the panels still own input, and no
+    /// menu, dialog or overlay has opened since (application-shell "Slow
+    /// storage never blocks the event loop"; design D4).
+    pub pending_open: Option<PendingOpen>,
 }
 
 impl State {
@@ -429,6 +496,8 @@ impl State {
             quit_opened_at_ms: 0,
             panels_revealed_at_ms: None,
             git_no_info_roots: Vec::new(),
+            command_probe: None,
+            pending_open: None,
         }
     }
 
@@ -694,21 +763,26 @@ pub enum Command {
     // exercises.
     RequestEditor,
     /// Reply to `Effect::OpenEditor`: the file loaded under the 10 MB cap
-    /// (builtin-editor "Small file opens in the editor").
-    EditorOpened(Box<EditorState>),
+    /// (builtin-editor "Small file opens in the editor"). Every
+    /// `Effect::OpenEditor` reply echoes the effect's `request`, which is
+    /// matched against `State::pending_open` so a reply the user has since
+    /// superseded — a newer F3/F4, a menu or dialog opened meanwhile — is
+    /// discarded instead of pulling them out of what they are doing
+    /// (offload-blocking-io design D4).
+    EditorOpened { request: u64, editor: Box<EditorState> },
     /// Reply to `Effect::OpenEditor`: the file is `size` bytes, at or above
     /// the cap — redirected to the F3 viewer with a notice (builtin-editor
     /// "Large file redirects to the viewer").
-    EditorTooLarge { path: PathBuf, size: u64 },
+    EditorTooLarge { request: u64, path: PathBuf, size: u64 },
     /// Reply to `Effect::OpenEditor`: the file is under the cap but is not
     /// UTF-8 text the editor can write back byte-exactly (UTF-16, NUL
     /// bytes, or invalid UTF-8) — redirected to the F3 viewer with a
     /// reason-specific notice, exactly like `EditorTooLarge` (builtin-editor
     /// "Non-UTF-8 file redirects to the viewer"; editor-encoding-safety
     /// design D2).
-    EditorNotEditable { path: PathBuf, reason: NotEditableReason },
+    EditorNotEditable { request: u64, path: PathBuf, reason: NotEditableReason },
     /// Reply to `Effect::OpenEditor` when the file could not be opened.
-    EditorOpenFailed { message: String },
+    EditorOpenFailed { request: u64, message: String },
 
     // Editor keymap, while `UiPhase::Editor` owns focus.
     EditorChar(char),
@@ -800,12 +874,20 @@ pub enum Command {
     /// on"; git-info-timeout-memory design D1).
     GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo, timed_out_root: Option<PathBuf> },
     /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
-    /// (viewer: Instant open).
-    ViewerOpened { path: PathBuf, file_len: u64 },
+    /// (viewer: Instant open). `request` echoes the effect's id and is
+    /// matched against `State::pending_open` exactly as the editor replies
+    /// are (offload-blocking-io design D4).
+    ViewerOpened { request: u64, path: PathBuf, file_len: u64 },
     /// Reply to `Effect::OpenViewer`: the file could not be opened or
     /// mapped (§7 error policy — surfaced as an inline error, never a
     /// panic).
-    ViewerOpenFailed { message: String },
+    ViewerOpenFailed { request: u64, message: String },
+    /// Reply to `Effect::ProbePath`: what the worker found at the probed
+    /// command-line target. Matched against `State::command_probe` by
+    /// `request`; a stale or superseded reply changes nothing
+    /// (application-shell "The reducer performs no filesystem I/O";
+    /// offload-blocking-io design D1).
+    PathProbed { request: u64, kind: ProbeKind },
     /// Reply to `Effect::RunViewerSearch` (viewer: F7 streaming search).
     /// `request` echoes the id `Effect::RunViewerSearch` was issued with, so
     /// a reply from a search superseded by a since-closed/reopened viewer
@@ -948,11 +1030,13 @@ pub enum Command {
     /// clickable"). `input::map_mouse` is the only source of this.
     FileActionMenuItemClick(usize),
     /// Reply to `Effect::OpenWithAssociation` when the launch failed: the
-    /// message lands on the active panel's status line (`last_error`),
-    /// exactly as `Command::EditorOpenFailed` reports a failed editor open
-    /// (file-action-menu "Open with the associated application": "No
-    /// association is reported inline").
-    OpenWithAssociationFailed { message: String },
+    /// message lands on the status line (`last_error`) of `side`, the panel
+    /// the Open action was invoked on — not whichever panel is active when
+    /// the late reply arrives — exactly as `Command::EditorOpenFailed`
+    /// reports a failed editor open (file-action-menu "Open with the
+    /// associated application": "No association is reported inline";
+    /// offload-blocking-io design D7).
+    OpenWithAssociationFailed { side: PanelSide, message: String },
 
     // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
     // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
@@ -1115,9 +1199,20 @@ pub enum Effect {
     /// as the working directory. Fire-and-forget: the TUI is never
     /// suspended, the launched program is never waited on, and no panel
     /// re-read is scheduled (open-with-associated-app design D1/D3;
-    /// file-action-menu "Open with the associated application"). A launch
-    /// failure comes back as `Command::OpenWithAssociationFailed`.
-    OpenWithAssociation { path: PathBuf, cwd: PathBuf },
+    /// file-action-menu "Open with the associated application"). Runs on a
+    /// worker thread — with COM initialized apartment-threaded on Windows —
+    /// so a slow handler never freezes the panels; a launch failure comes
+    /// back as `Command::OpenWithAssociationFailed` for `side`, the panel
+    /// the menu acted on (offload-blocking-io design D7).
+    OpenWithAssociation { side: PanelSide, path: PathBuf, cwd: PathBuf },
+    /// Check what exists at `path` — the resolved target of a command-line
+    /// `cd`/`del`/`rmdir` that is not already listed in the panel — on a
+    /// worker thread, through the `\\?\` long-path abstraction, and reply
+    /// with `Command::PathProbed { request, .. }`. The reducer never queries
+    /// the filesystem itself, so an unreachable share blocks only the worker
+    /// (application-shell "The reducer performs no filesystem I/O";
+    /// offload-blocking-io design D1/D2).
+    ProbePath { request: u64, path: PathBuf },
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
@@ -1158,13 +1253,15 @@ pub enum Effect {
     /// call, never a recursive scan (additional-panel-modes "Children read
     /// on expand"; design D7).
     ExpandTreeNode { panel: PanelSide, path: PathBuf },
-    /// Open `path` for the F3 viewer: map/open it and report back its
+    /// Open `path` for the F3 viewer on a worker thread and report back its
     /// length via `Command::ViewerOpened`, or the failure via
-    /// `Command::ViewerOpenFailed`. Cheap enough to run synchronously
-    /// before the next repaint, exactly like `EnumerateDrives` — O(1) per
-    /// the "instant open" requirement, never a worker-thread round trip
-    /// (viewer: Instant open).
-    OpenViewer { path: PathBuf },
+    /// `Command::ViewerOpenFailed`, each echoing `request`. The open is O(1)
+    /// in work but not in latency — a dropped SMB session blocks the open
+    /// for the redirector timeout — so it runs off the event loop and the
+    /// panel shows `Opening <name>…` meanwhile (viewer: Instant open;
+    /// application-shell "Slow storage never blocks the event loop";
+    /// offload-blocking-io design D4/D5).
+    OpenViewer { request: u64, path: PathBuf },
     /// Run the F7 streaming search from `start_offset` for `pattern`
     /// against `path`, reporting the match back via
     /// `Command::ViewerSearchResult` (viewer: F7 streaming search).
@@ -1177,19 +1274,22 @@ pub enum Effect {
     /// `RunShellCommand` uses (design D7; external-editor: TUI suspend and
     /// restore, Synchronous wait and panel re-read).
     RunExternalEditor(EditorInvocation, PanelSide),
-    /// Open `path` for the F4 built-in editor: stat it and, under the 10 MB
-    /// cap, read and decode it in full, reporting back via
-    /// `Command::EditorOpened`/`EditorTooLarge`/`EditorOpenFailed`. Run
-    /// synchronously before the next repaint rather than on a worker
-    /// thread — the same "cheap enough for the input path" precedent
-    /// `Effect::OpenViewer` sets, extended here to the whole-file read the
-    /// 10 MB cap explicitly bounds (design D1).
-    OpenEditor { path: PathBuf },
-    /// Write `editor`'s buffer to disk via `EditorState::save`, reporting
-    /// the post-save state back via `Command::EditorSaved` (or the failure
-    /// via `Command::EditorSaveFailed`). `then_quit` travels through
-    /// unchanged so the reply knows whether to close the editor once the
-    /// write lands (builtin-editor "Save in place …", design D9).
+    /// Open `path` for the F4 built-in editor on a worker thread: stat it
+    /// and, under the 10 MB cap, read and decode it in full, reporting back
+    /// via `Command::EditorOpened`/`EditorTooLarge`/`EditorNotEditable`/
+    /// `EditorOpenFailed`, each echoing `request`. The panel shows
+    /// `Opening <name>…` while the read is outstanding (application-shell
+    /// "Slow storage never blocks the event loop"; offload-blocking-io
+    /// design D4).
+    OpenEditor { request: u64, path: PathBuf },
+    /// Write `editor`'s buffer to disk via `EditorState::save` on a worker
+    /// thread, reporting the post-save state back via `Command::EditorSaved`
+    /// (or the failure via `Command::EditorSaveFailed`). `then_quit` travels
+    /// through unchanged so the reply knows whether to close the editor once
+    /// the write lands (builtin-editor "Save in place …", design D9). Only
+    /// one save is ever in flight — `EditorState::save_pending` gates the
+    /// editor until the reply — so no request id is needed (offload-
+    /// blocking-io design D6).
     SaveEditor { editor: Box<EditorState>, then_quit: bool },
     /// Walk `root`'s subtree for entries whose name contains `pattern` on a
     /// worker thread, streaming each match back via `Command::FindFileMatch`
@@ -1404,6 +1504,80 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             // panel-modes "Expanding a directory can overflow and shows the
             // scrollbar").
             reconcile_panel_viewport(&mut state, panel);
+            return (state, effects);
+        }
+        // The command-line target probe and the F3/F4 open replies are
+        // matched against their pending request here, ahead of every
+        // phase- and overlay-specific arm, so a reply that arrives after
+        // the user opened a menu, a dialog, the viewer or the editor is
+        // recognized as superseded and discarded rather than reaching the
+        // Panels arm through an overlay that does not claim it
+        // (offload-blocking-io design D1/D4).
+        Command::PathProbed { request, kind } => {
+            effects.extend(apply_path_probed(&mut state, request, kind));
+            return (state, effects);
+        }
+        Command::ViewerOpened { request, path, file_len } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                // A prior failed F3/F4 attempt may have left `last_error`
+                // set on this panel; a successful open has clearly moved
+                // past it, so the mini-status line must not keep showing
+                // the stale message (§7 error policy — errors are surfaced
+                // until superseded by success, not left to linger).
+                state.panel_mut(side).last_error = None;
+                state.phase = UiPhase::Viewer(ViewerState::new(path, file_len));
+            }
+            return (state, effects);
+        }
+        Command::ViewerOpenFailed { request, message } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                state.panel_mut(side).last_error = Some(message);
+            }
+            return (state, effects);
+        }
+        Command::EditorOpened { request, editor } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                // Mirrors the `Command::ViewerOpened` clear (§7 error policy).
+                state.panel_mut(side).last_error = None;
+                state.phase = UiPhase::Editor(*editor);
+            }
+            return (state, effects);
+        }
+        Command::EditorTooLarge { request, path, size: _ } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                // builtin-editor "Large file redirects to the viewer": the
+                // notice lands on the panel's mini-status (the same surface
+                // `Command::ViewerOpenFailed` uses) since the viewer chrome
+                // itself has no room reserved for a banner; it's visible the
+                // moment the user returns from the viewer to the panels. The
+                // viewer open is a fresh request for the same side (design
+                // D4); its `Opening…` note is set first so it does not wipe
+                // the notice.
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                effects.push(request_open(&mut state, side, PendingOpenKind::Viewer, path));
+                state.panel_mut(side).last_error = Some(format!("{name} is too large for the editor (10 MB limit) — opened in the viewer"));
+            }
+            return (state, effects);
+        }
+        Command::EditorNotEditable { request, path, reason } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                // Same mechanism and notice surface as the size redirect
+                // (design D2); the wording names the reason so a UTF-16
+                // file is not just "not UTF-8".
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                effects.push(request_open(&mut state, side, PendingOpenKind::Viewer, path));
+                state.panel_mut(side).last_error = Some(match reason {
+                    NotEditableReason::Utf16 => format!("{name} is UTF-16 text — the editor only edits UTF-8; opened in the viewer"),
+                    NotEditableReason::Binary => format!("{name} looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer"),
+                    NotEditableReason::NotUtf8 => format!("{name} is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
+                });
+            }
+            return (state, effects);
+        }
+        Command::EditorOpenFailed { request, message } => {
+            if let Some(side) = take_current_open(&mut state, request) {
+                state.panel_mut(side).last_error = Some(message);
+            }
             return (state, effects);
         }
         _ => {}
@@ -1759,55 +1933,19 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
             Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
 
             Command::RequestViewer => effects.extend(handle_request_viewer(&mut state)),
-            Command::ViewerOpened { path, file_len } => {
-                // A prior failed F3/F4 attempt may have left `last_error`
-                // set on this panel; a successful open has clearly moved
-                // past it, so the mini-status line must not keep showing
-                // the stale message (§7 error policy — errors are surfaced
-                // until superseded by success, not left to linger).
-                state.panel_mut(state.active).last_error = None;
-                state.phase = UiPhase::Viewer(ViewerState::new(path, file_len));
-            }
-            Command::ViewerOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
             Command::RequestExternalEditor => effects.extend(handle_request_external_editor(&mut state)),
             Command::ExternalEditorSpawnFailed { message } => state.panel_mut(state.active).last_error = Some(message),
 
             Command::RequestEditor => effects.extend(handle_request_editor(&mut state)),
-            Command::EditorOpened(editor) => {
-                // Mirrors the `Command::ViewerOpened` clear: a prior failed
-                // F3/F4 attempt may have left `last_error` set (§7 error
-                // policy).
-                state.panel_mut(state.active).last_error = None;
-                state.phase = UiPhase::Editor(*editor);
-            }
-            Command::EditorTooLarge { path, size: _ } => {
-                // builtin-editor "Large file redirects to the viewer": the
-                // notice lands on the panel's mini-status (the same surface
-                // `Command::ViewerOpenFailed` uses) since the viewer chrome
-                // itself has no room reserved for a banner; it's visible the
-                // moment the user returns from the viewer to the panels.
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                state.panel_mut(state.active).last_error =
-                    Some(format!("{name} is too large for the editor (10 MB limit) — opened in the viewer"));
-                effects.push(Effect::OpenViewer { path });
-            }
-            Command::EditorNotEditable { path, reason } => {
-                // Same mechanism and notice surface as the size redirect
-                // (design D2); the wording names the reason so a UTF-16
-                // file is not just "not UTF-8".
-                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-                state.panel_mut(state.active).last_error = Some(match reason {
-                    NotEditableReason::Utf16 => format!("{name} is UTF-16 text — the editor only edits UTF-8; opened in the viewer"),
-                    NotEditableReason::Binary => format!("{name} looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer"),
-                    NotEditableReason::NotUtf8 => format!("{name} is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
-                });
-                effects.push(Effect::OpenViewer { path });
-            }
-            Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+            // The `ViewerOpened`/`EditorOpened` family of replies is matched
+            // against `State::pending_open` ahead of every phase arm (see
+            // `take_current_open`), so none of them reach here.
+
             // file-action-menu "Open with the associated application": a
             // failed launch is reported inline, on the status line of the
-            // panel the menu acted on — no dialog opens.
-            Command::OpenWithAssociationFailed { message } => state.panel_mut(state.active).last_error = Some(message),
+            // panel the menu acted on — even if the user has switched panels
+            // since — and no dialog opens (offload-blocking-io design D7).
+            Command::OpenWithAssociationFailed { side, message } => state.panel_mut(side).last_error = Some(message),
 
             Command::SplitGrow => effects.extend(adjust_split(&mut state, panel_split::SPLIT_STEP as i32)),
             Command::SplitShrink => effects.extend(adjust_split(&mut state, -(panel_split::SPLIT_STEP as i32))),
@@ -2005,22 +2143,114 @@ fn dispatch_cd(state: &mut State, text: &str, target: &str) -> Vec<Effect> {
         return vec![];
     };
     match probe_command_line_target(state, side, &path) {
-        Some((true, _)) => {
-            config::push_history(&mut state.history, text);
-            // `begin_listing` snapshots both histories into one
-            // `Effect::PersistHistory` after the push, so no separate
-            // persist is emitted here (history-persistence-hardening D4).
-            begin_listing(state, side, path)
-        }
-        Some((false, _)) => {
+        // Listed in the panel: the listing answers at once (command-line "A
+        // listed subdirectory needs no filesystem check").
+        Some(ProbeKind::Dir) => complete_cd(state, side, text, path),
+        Some(_) => {
             state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
             vec![]
         }
-        None => {
-            state.panel_mut(side).last_error = Some(format!("{} not found", path.display()));
-            vec![]
+        None => start_probe(state, side, path, ProbeIntent::Cd { text: text.to_string() }),
+    }
+}
+
+/// The `cd` outcome once the target is known to be a directory: push the
+/// line to command history and navigate. Shared by the listed-entry fast
+/// path and the asynchronous probe reply so both produce exactly the same
+/// state (offload-blocking-io design D1).
+fn complete_cd(state: &mut State, side: PanelSide, text: &str, path: PathBuf) -> Vec<Effect> {
+    config::push_history(&mut state.history, text);
+    // `begin_listing` snapshots both histories into one
+    // `Effect::PersistHistory` after the push, so no separate persist is
+    // emitted here (history-persistence-hardening D4).
+    begin_listing(state, side, path)
+}
+
+/// Record a pending command-line target check and ask the TUI to run it on
+/// a worker thread (design D1). A newer `cd`/`del`/`rmdir` simply replaces
+/// the pending entry, which supersedes the older request: its reply no
+/// longer matches and is dropped. The panel announces the check on its
+/// mini-status line meanwhile (command-line "cd to an unresponsive UNC path
+/// does not freeze the UI").
+fn start_probe(state: &mut State, side: PanelSide, path: PathBuf, intent: ProbeIntent) -> Vec<Effect> {
+    let request = state.next_request_id();
+    let cwd = state.panel(side).cwd.clone();
+    state.panel_mut(side).set_pending_note(format!("Checking {}…", display_target(&path)));
+    state.command_probe = Some(PendingProbe { request, side, cwd, path: path.clone(), intent });
+    vec![Effect::ProbePath { request, path }]
+}
+
+/// `path` as the pending note shows it: a UNC share root resolves with a
+/// trailing separator (`\\nas\share\`), which the note drops so it reads
+/// `Checking \\nas\share…`; a drive root (`C:\`) keeps its separator.
+fn display_target(path: &Path) -> String {
+    let shown = path.display().to_string();
+    match shown.strip_suffix(['\\', '/']) {
+        Some(trimmed) if !trimmed.is_empty() && !trimmed.ends_with(':') => trimmed.to_string(),
+        _ => shown,
+    }
+}
+
+/// `Command::PathProbed`: complete the `cd`/`del`/`rmdir` whose check this
+/// answers, through the very same code paths and messages the listed-entry
+/// fast path uses, or discard it (design D1). A reply is applied only when
+/// it is still the most recent check, the panel the command was entered for
+/// still shows the directory it showed then, and — for `del`/`rmdir`, which
+/// open a dialog — the panels still own input. The pending entry and the
+/// panel's note are cleared in every case but one: a reply for a request
+/// that is not the pending one belongs to a superseded check, and the
+/// newer, still-outstanding one keeps its note.
+fn apply_path_probed(state: &mut State, request: u64, kind: ProbeKind) -> Vec<Effect> {
+    if state.command_probe.as_ref().map(|p| p.request) != Some(request) {
+        return vec![];
+    }
+    let Some(pending) = state.command_probe.take() else { return vec![] };
+    let PendingProbe { side, cwd, path, intent, .. } = pending;
+    state.panel_mut(side).pending_note = None;
+    if state.panel(side).cwd != cwd {
+        return vec![];
+    }
+    match intent {
+        ProbeIntent::Cd { text } => match kind {
+            ProbeKind::Dir => complete_cd(state, side, &text, path),
+            ProbeKind::File => {
+                state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
+                vec![]
+            }
+            ProbeKind::Missing => {
+                state.panel_mut(side).last_error = Some(format!("{} not found", path.display()));
+                vec![]
+            }
+        },
+        ProbeIntent::Delete { want_dir } => {
+            if !panels_own_input(state) {
+                return vec![];
+            }
+            complete_delete_builtin(state, side, path, want_dir, kind)
         }
     }
+}
+
+/// Whether the panels own input: `UiPhase::Panels` with no menu, dialog or
+/// overlay open and no file operation in progress — the set `drag_allowed`
+/// checks, minus `undersized`: a terminal below the floor hides the panels
+/// but is not "leaving" them, so a reply that arrives then still applies
+/// (resize-preserves-session-state). Gates the replies that would open a
+/// dialog or a full-screen surface over whatever the user has since opened
+/// (offload-blocking-io design D1/D4).
+fn panels_own_input(state: &State) -> bool {
+    matches!(state.phase, UiPhase::Panels)
+        && state.menu.is_none()
+        && state.drive_select.is_none()
+        && state.fuzzy_jump.is_none()
+        && state.find_file.is_none()
+        && state.user_menu.is_none()
+        && state.history_dialog.is_none()
+        && state.theme_picker.is_none()
+        && state.file_action_menu.is_none()
+        && state.help.is_none()
+        && state.startup_warning.is_none()
+        && !state.quit_confirm
 }
 
 /// `del <target>` (`want_dir == false`) / `rmdir <target>`
@@ -2051,44 +2281,71 @@ fn dispatch_delete_builtin(state: &mut State, target: &str, want_dir: bool) -> V
         return vec![];
     };
     match probe_command_line_target(state, side, &path) {
-        Some((is_dir, original_name)) if is_dir == want_dir => {
+        Some(kind) => complete_delete_builtin(state, side, path, want_dir, kind),
+        None => start_probe(state, side, path, ProbeIntent::Delete { want_dir }),
+    }
+}
+
+/// The `del`/`rmdir` outcome once the target's kind is known: open the
+/// delete-confirmation dialog on a type match, otherwise set the matching
+/// rejection. Shared by the listed-entry fast path and the asynchronous
+/// probe reply (offload-blocking-io design D1). The dialog's entry name is
+/// the target's final path component — for a listed entry that is the
+/// on-disk-cased name the listing holds, since the resolved path was built
+/// from the typed text joined onto the panel directory and the lookup
+/// matched it exactly.
+fn complete_delete_builtin(state: &mut State, side: PanelSide, path: PathBuf, want_dir: bool, kind: ProbeKind) -> Vec<Effect> {
+    match kind {
+        ProbeKind::Dir | ProbeKind::File if (kind == ProbeKind::Dir) == want_dir => {
+            let is_dir = kind == ProbeKind::Dir;
+            let original_name = listed_name(state, side, &path).unwrap_or_else(|| path.file_name().map(OsString::from).unwrap_or_else(|| OsString::from(path.display().to_string())));
             enter_delete_confirm_for_sources(state, vec![SourceItem { original_name, path, is_dir }]);
             vec![]
         }
-        Some((true, _)) => {
+        ProbeKind::Dir => {
             state.panel_mut(side).last_error = Some(format!("{} is a directory", path.display()));
             vec![]
         }
-        Some((false, _)) => {
+        ProbeKind::File => {
             state.panel_mut(side).last_error = Some(format!("{} is not a directory", path.display()));
             vec![]
         }
-        None => {
+        ProbeKind::Missing => {
             state.panel_mut(side).last_error = Some(format!("{} not found", path.display()));
             vec![]
         }
     }
 }
 
-/// Whether `path` exists and, if so, whether it's a directory, plus its
-/// on-disk name — preferring the active panel's already-listed entries (no
-/// I/O, and the exact on-disk-cased name) when `path` names a currently
-/// visible direct child of the panel's directory, and otherwise falling
-/// back to a single synchronous filesystem check. `None` means the target
-/// doesn't exist. Shared by `cd`'s existence check and `del`/`rmdir`'s
-/// target resolution (design.md decisions on both).
-fn probe_command_line_target(state: &State, side: PanelSide, path: &Path) -> Option<(bool, OsString)> {
+/// The panel's listed entry for `path`, when `path` names a direct child of
+/// the panel's directory that is currently listed — the only lookup the
+/// reducer performs, with no filesystem access (application-shell "The
+/// reducer performs no filesystem I/O").
+fn listed_entry<'a>(state: &'a State, side: PanelSide, path: &Path) -> Option<&'a Entry> {
     let panel = state.panel(side);
-    if let (Some(name), Some(parent)) = (path.file_name(), path.parent()) {
-        if parent == panel.cwd.as_path() {
-            if let Some(entry) = panel.entries.iter().find(|e| e.name == name) {
-                return Some((entry.is_dir_like(), entry.name.clone()));
-            }
-        }
+    let (name, parent) = (path.file_name()?, path.parent()?);
+    if parent != panel.cwd.as_path() {
+        return None;
     }
-    let metadata = std::fs::metadata(path).ok()?;
-    let name = path.file_name().map(OsString::from).unwrap_or_else(|| OsString::from(path.display().to_string()));
-    Some((metadata.is_dir(), name))
+    panel.entries.iter().find(|e| e.name == name)
+}
+
+/// The exact on-disk-cased name of the listed entry `path` names, if any.
+fn listed_name(state: &State, side: PanelSide, path: &Path) -> Option<OsString> {
+    listed_entry(state, side, path).map(|e| e.name.clone())
+}
+
+/// What the active panel's own listing says `path` is — `Dir` or `File`
+/// when `path` names a currently listed direct child of the panel's
+/// directory, and `None` when the listing cannot answer, in which case the
+/// caller asks the TUI to probe the filesystem on a worker thread
+/// (`start_probe`). This is the listed-entry fast path and the only check
+/// the reducer makes itself: it never touches the filesystem
+/// (application-shell "The reducer performs no filesystem I/O";
+/// offload-blocking-io design D1). Shared by `cd`'s existence check and
+/// `del`/`rmdir`'s target resolution.
+fn probe_command_line_target(state: &State, side: PanelSide, path: &Path) -> Option<ProbeKind> {
+    listed_entry(state, side, path).map(|entry| if entry.is_dir_like() { ProbeKind::Dir } else { ProbeKind::File })
 }
 
 /// The target of a `cd <path>` line, or `None` if this isn't a `cd`.
@@ -2300,7 +2557,43 @@ fn handle_request_viewer(state: &mut State) -> Vec<Effect> {
         return vec![];
     }
     let path = state.panel(side).cwd.join(&entry.name);
-    vec![Effect::OpenViewer { path }]
+    vec![request_open(state, side, PendingOpenKind::Viewer, path)]
+}
+
+/// Record an outstanding F3/F4 open for `side` under a fresh request id and
+/// return the effect that runs it on a worker thread (offload-blocking-io
+/// design D4). The panel announces it as `Opening <name>…` on its
+/// mini-status line, which also clears a stale `last_error` from an earlier
+/// failed attempt (design D3). A newer request replaces the pending entry,
+/// which is what supersedes the older open: its reply no longer matches
+/// (application-shell "A newer F3 supersedes an outstanding open").
+fn request_open(state: &mut State, side: PanelSide, kind: PendingOpenKind, path: PathBuf) -> Effect {
+    let request = state.next_request_id();
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    state.panel_mut(side).set_pending_note(format!("Opening {name}…"));
+    state.pending_open = Some(PendingOpen { request, side, kind });
+    match kind {
+        PendingOpenKind::Viewer => Effect::OpenViewer { request, path },
+        PendingOpenKind::Editor => Effect::OpenEditor { request, path },
+    }
+}
+
+/// Match an F3/F4 open reply against the pending open (design D4). Returns
+/// the panel the open was requested from when the reply is current and the
+/// panels still own input — the caller then applies it. A reply whose id
+/// is not the pending one belongs to a superseded request and is dropped
+/// without touching the newer, still-outstanding one. A reply whose id
+/// matches but arrives after the user left the panels or opened a menu,
+/// dialog or overlay clears the pending state and is discarded
+/// (application-shell "A late open does not pull the user out of a menu").
+/// Either way the panel's `Opening…` note comes down once its reply is in.
+fn take_current_open(state: &mut State, request: u64) -> Option<PanelSide> {
+    if state.pending_open.as_ref().map(|p| p.request) != Some(request) {
+        return None;
+    }
+    let pending = state.pending_open.take()?;
+    state.panel_mut(pending.side).pending_note = None;
+    panels_own_input(state).then_some(pending.side)
 }
 
 /// Drive every command while the viewer is open (gated in [`update`] by
@@ -2443,8 +2736,7 @@ fn handle_request_editor(state: &mut State) -> Vec<Effect> {
         return vec![];
     }
     let path = panel.cwd.join(&entry.name);
-    state.panel_mut(side).last_error = None;
-    vec![Effect::OpenEditor { path }]
+    vec![request_open(state, side, PendingOpenKind::Editor, path)]
 }
 
 /// The editor body's visible row count for a given terminal height: the
@@ -2556,6 +2848,16 @@ fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
         unreachable!("handle_editor only called when phase is Editor");
     };
     let (rows, cols) = editor_viewport(state.term_size);
+    // While a save is in flight on the worker thread, only its own reply
+    // gets through: edits, caret moves and further save/quit commands are
+    // ignored, so the buffer the worker is writing is exactly the buffer
+    // the user sees marked clean when `EditorSaved` lands (application-
+    // shell "Saving to a slow share shows progress and accepts no edits";
+    // offload-blocking-io design D6).
+    if editor.save_pending && !matches!(cmd, Command::EditorSaved { .. } | Command::EditorSaveFailed { .. }) {
+        state.phase = UiPhase::Editor(editor);
+        return effects;
+    }
     match cmd {
         Command::EditorChar(c) => editor.type_char(c),
         Command::EditorNewline => editor.insert_newline(),
@@ -2639,6 +2941,7 @@ fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
 
         Command::EditorSave => {
             effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: false });
+            editor.save_pending = true;
         }
         Command::EditorSaved { editor: saved, then_quit } => {
             if then_quit {
@@ -2647,9 +2950,11 @@ fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
                 return effects;
             }
             editor = *saved;
+            editor.save_pending = false;
             editor.quit_confirm = false;
         }
         Command::EditorSaveFailed { message } => {
+            editor.save_pending = false;
             editor.save_error = Some(message);
             editor.quit_confirm = false;
         }
@@ -2665,6 +2970,7 @@ fn handle_editor(state: &mut State, cmd: Command) -> Vec<Effect> {
         }
         Command::EditorConfirmQuitSave => {
             effects.push(Effect::SaveEditor { editor: Box::new(editor.clone()), then_quit: true });
+            editor.save_pending = true;
         }
         Command::EditorConfirmQuitDiscard => return effects,
         Command::EditorCancelQuit => editor.quit_confirm = false,
@@ -3105,7 +3411,7 @@ fn activate_file_action(state: &mut State, action: FileActionMenuEntry, target_n
         FileActionMenuEntry::Open => {
             let Some(source) = named_entry_source(state, side, &target_name) else { return vec![] };
             let cwd = state.panel(side).cwd.clone();
-            vec![Effect::OpenWithAssociation { path: source.path, cwd }]
+            vec![Effect::OpenWithAssociation { side, path: source.path, cwd }]
         }
         // Run: the same suspended-shell spawn path a typed command line
         // uses, and the only way to reach it now that Enter no longer
@@ -3991,8 +4297,7 @@ fn handle_edit_user_menu_file(state: &mut State) -> Vec<Effect> {
         };
     }
     let side = state.active;
-    state.panel_mut(side).last_error = None;
-    vec![Effect::OpenEditor { path }]
+    vec![request_open(state, side, PendingOpenKind::Editor, path)]
 }
 
 /// `Command::UserMenuReloaded`: the editor over `usermenu.toml` has closed

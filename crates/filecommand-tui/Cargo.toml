@@ -25,7 +25,9 @@ clipboard-win = "5.4"
 # (open-with-associated-app; design D1). `Win32_System_Console` is for the
 # console control handler that keeps Ctrl+C during a suspended child run
 # from ending FileCommand (process-lifecycle-hardening design D1).
-windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Console"] }
+# `Win32_System_Com` is for the CoInitializeEx/CoUninitialize bracket around
+# ShellExecuteW on its worker thread (offload-blocking-io design D7).
+windows-sys = { version = "0.59", features = ["Win32_UI_Shell", "Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_System_Console", "Win32_System_Com"] }
 
 [target.'cfg(not(windows))'.dependencies]
 # Non-Windows fallback: text-only clipboard (Paths/Names; Files falls back

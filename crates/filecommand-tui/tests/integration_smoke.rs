@@ -12,7 +12,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
-use filecommand_core::editor::EditorState;
 use filecommand_core::fs_ops::CancelFlag;
 use filecommand_core::panel::DisplayMode;
 use filecommand_core::{update, Command, Effect, PanelSide, State, UiPhase};
@@ -45,26 +44,10 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
                 slot.request(panel, path, request, tx.clone(), workers.token());
             }
             Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, CancelFlag::new(), tx.clone(), workers.token()),
-            // `Effect::OpenEditor`/`SaveEditor` are cheap enough to run
-            // synchronously on the input path in the real app too (design
-            // D1) — mirrored here rather than spawning a thread for them.
-            Effect::OpenEditor { path } => {
-                let reply = match EditorState::open(&path) {
-                    Ok(filecommand_core::editor::LoadResult::Loaded(editor)) => Command::EditorOpened(Box::new(editor)),
-                    Ok(filecommand_core::editor::LoadResult::TooLarge { size }) => Command::EditorTooLarge { path, size },
-                    Ok(filecommand_core::editor::LoadResult::NotEditable { reason }) => Command::EditorNotEditable { path, reason },
-                    Err(e) => Command::EditorOpenFailed { message: e.to_string() },
-                };
-                let _ = tx.send(reply);
-            }
-            Effect::SaveEditor { editor, then_quit } => {
-                let mut editor = *editor;
-                let reply = match editor.save() {
-                    Ok(()) => Command::EditorSaved { editor: Box::new(editor), then_quit },
-                    Err(e) => Command::EditorSaveFailed { message: e.to_string() },
-                };
-                let _ = tx.send(reply);
-            }
+            // `Effect::OpenEditor`/`SaveEditor` run on the same worker
+            // threads the real app uses (offload-blocking-io design D4/D6).
+            Effect::OpenEditor { request, path } => worker::spawn_editor_open(request, path, tx.clone(), workers.token()),
+            Effect::SaveEditor { editor, then_quit } => worker::spawn_editor_save(editor, then_quit, tx.clone(), workers.token()),
             _ => {}
         }
     }

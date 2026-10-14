@@ -76,6 +76,17 @@ fn without_git_info_effects(effects: Vec<Effect>) -> Vec<Effect> {
         .collect()
 }
 
+/// Record an outstanding F3/F4 open on the active panel under `request`,
+/// exactly as `handle_request_viewer`/`handle_request_editor` do, so a
+/// reply a test injects directly is the current one and is applied rather
+/// than discarded as stale (offload-blocking-io design D4). The id counter
+/// is advanced past `request` so anything minted afterwards is fresh.
+fn with_pending_open(mut state: State, request: u64) -> State {
+    state.request_seq = state.request_seq.max(request);
+    state.pending_open = Some(PendingOpen { request, side: state.active, kind: PendingOpenKind::Viewer });
+    state
+}
+
 // ---------------------------------------------------------------------
 // M1/M2 regression coverage
 // ---------------------------------------------------------------------
@@ -222,7 +233,7 @@ fn request_quit_opens_during_type_ahead_and_cancel_restores_it() {
 #[test]
 fn request_quit_opens_above_the_viewer_and_cancel_restores_it() {
     let (before, _) =
-        update(test_state(UiPhase::Panels), Command::ViewerOpened { path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
+        update(with_pending_open(test_state(UiPhase::Panels), 3), Command::ViewerOpened { request: 3, path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
     assert!(matches!(before.phase, UiPhase::Viewer(_)), "precondition: viewer must be open");
     let (state, effects) = update(before.clone(), Command::RequestQuit);
     assert!(state.quit_confirm, "Ctrl+C/RequestQuit must open the overlay while the viewer is open");
@@ -1438,7 +1449,7 @@ fn widening_the_pattern_restores_cursor_targeted_commands() {
 
     let (state, _) = update(state, Command::QuickFilterBackspace); // "notes"
     let (state, effects) = update(state, Command::RequestViewer);
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/notes.txt") }]);
     assert_eq!(state.phase, UiPhase::Panels, "the viewer opens only once ViewerOpened comes back");
 }
 
@@ -2168,8 +2179,10 @@ fn file_action_menu_does_not_open_when_the_command_buffer_is_non_empty() {
     let state = type_line(state, "cd nosuchdir");
     let (state, effects) = update(state, Command::Enter);
     assert!(state.file_action_menu.is_none(), "a non-empty command buffer takes precedence over the menu");
-    assert!(effects.is_empty(), "the rejected cd spawns and starts nothing, got {effects:?}");
-    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the rejected cd leaves the panel untouched");
+    // The unlisted target is checked asynchronously (offload-blocking-io):
+    // the Enter itself spawns nothing and starts no listing.
+    assert!(matches!(effects.as_slice(), [Effect::ProbePath { .. }]), "the cd only probes its target — it spawns and starts nothing, got {effects:?}");
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the pending cd leaves the panel untouched");
 }
 
 #[test]
@@ -2263,7 +2276,7 @@ fn file_action_menu_view_routes_to_the_f3_viewer_path() {
     let (state, _) = update(state, Command::FileActionMenuMove(1)); // Open is highlighted first; one Down lands on View
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(state.file_action_menu.is_none());
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/notes.txt") }]);
     assert_eq!(state.phase, UiPhase::Panels, "opening is I/O; the phase flips only once ViewerOpened comes back");
 }
 
@@ -2273,7 +2286,7 @@ fn file_action_menu_edit_routes_to_the_f4_edit_path() {
     let (state, _) = update(state, Command::FileActionMenuMove(2)); // Open, View, Edit
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(state.file_action_menu.is_none());
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
 #[test]
@@ -2361,7 +2374,7 @@ fn enter_enter_on_a_document_emits_open_with_association_for_the_target() {
     assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition: Open highlighted");
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
     assert!(state.file_action_menu.is_none(), "activating Open closes the menu");
-    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
     assert_eq!(state.phase, UiPhase::Panels, "the panels stay interactive; no dialog opens");
 }
 
@@ -2372,7 +2385,7 @@ fn file_action_menu_o_hotkey_activates_open() {
     let state = opened_menu_state(&["report.pdf"], "report.pdf");
     let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
     assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
-    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]);
 }
 
 /// "Open on a directory shows it in the file browser": the directory menu
@@ -2385,7 +2398,7 @@ fn open_on_a_directory_hands_the_directory_to_the_file_association_without_navig
     state.left.entries = vec![dir_entry("src")];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("src") });
     let (state, effects) = update(state, Command::FileActionMenuConfirm); // Open is highlighted first
-    assert_eq!(effects, vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/src"), cwd: PathBuf::from("/left") }]);
+    assert_eq!(effects, vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/src"), cwd: PathBuf::from("/left") }]);
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel does not navigate");
 }
 
@@ -2405,33 +2418,43 @@ fn open_on_a_selected_target_emits_one_effect_for_that_target_only() {
     let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
     assert_eq!(
         effects,
-        vec![Effect::OpenWithAssociation { path: PathBuf::from("/left/b.txt"), cwd: PathBuf::from("/left") }],
+        vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/b.txt"), cwd: PathBuf::from("/left") }],
         "one launch effect, for the menu's target only"
     );
     assert_eq!(state.left.selected.len(), 3, "the selection is untouched");
 }
 
 /// "No association is reported inline": the effect's failure reply lands on
-/// the active panel's status line, verbatim, and opens no dialog.
+/// the status line of the panel the Open action was invoked on, verbatim,
+/// and opens no dialog.
 #[test]
-fn open_with_association_failed_lands_on_the_active_panels_last_error() {
+fn open_with_association_failed_lands_on_the_invoking_panels_last_error() {
     let state = test_state(UiPhase::Panels);
-    let (state, effects) = update(state, Command::OpenWithAssociationFailed { message: "No application is associated with data.zzz".to_string() });
+    let (state, effects) =
+        update(state, Command::OpenWithAssociationFailed { side: PanelSide::Left, message: "No application is associated with data.zzz".to_string() });
     assert!(effects.is_empty());
     assert_eq!(state.left.last_error.as_deref(), Some("No application is associated with data.zzz"));
     assert_eq!(state.right.last_error, None);
     assert_eq!(state.phase, UiPhase::Panels, "no dialog opens");
 }
 
-/// A launch failure reported while the right panel is active lands on the
-/// right panel — `state.active`, not a hard-coded side.
+/// application-shell "Launching a slow handler leaves the panels
+/// interactive": a late failure lands on the panel the menu acted on even
+/// though the user has switched panels since — the reply carries the side,
+/// so `state.active` at arrival time is irrelevant (offload-blocking-io
+/// design D7).
 #[test]
-fn open_with_association_failed_uses_the_active_panel() {
+fn open_with_association_failed_lands_on_the_recorded_side_not_the_active_panel() {
     let mut state = test_state(UiPhase::Panels);
-    state.active = PanelSide::Right;
-    let (state, _) = update(state, Command::OpenWithAssociationFailed { message: "boom".to_string() });
-    assert_eq!(state.right.last_error.as_deref(), Some("boom"));
-    assert_eq!(state.left.last_error, None);
+    state.left.entries = vec![file_entry("report.pdf", 1)];
+    let (state, _) = update(state, Command::Enter);
+    let (state, effects) = update(state, Command::FileActionMenuConfirm); // Open
+    assert!(matches!(effects.as_slice(), [Effect::OpenWithAssociation { side: PanelSide::Left, .. }]), "the effect records the invoking panel: {effects:?}");
+    let (state, _) = update(state, Command::ToggleActivePanel);
+    assert_eq!(state.active, PanelSide::Right, "precondition: the user has switched panels");
+    let (state, _) = update(state, Command::OpenWithAssociationFailed { side: PanelSide::Left, message: "boom".to_string() });
+    assert_eq!(state.left.last_error.as_deref(), Some("boom"), "the failure lands on the panel Open was invoked on");
+    assert_eq!(state.right.last_error, None);
 }
 
 // ---------------------------------------------------------------------
@@ -2612,19 +2635,126 @@ fn cd_navigates_the_panel_instead_of_spawning_a_shell() {
         "`cd` in a fresh child would be a no-op, so it must not reach the shell"
     );
     assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/left/sub")));
+    // command-line "A listed subdirectory needs no filesystem check": the
+    // listing answers in the Enter itself, with no probe round trip.
+    assert!(!effects.iter().any(|e| matches!(e, Effect::ProbePath { .. })), "the listed-entry fast path emits no probe: {effects:?}");
+    assert_eq!(state.command_probe, None);
     assert_eq!(state.history, vec!["cd sub".to_string()], "`cd` is still a history entry");
 }
 
+/// application-shell "A command-line target outside the listing produces a
+/// probe request, not a disk read" and command-line "cd to a nonexistent
+/// directory is rejected without navigating": the reducer emits the probe
+/// and leaves the panel alone — the outcome cannot depend on the test
+/// machine's disk — and the `Missing` reply then rejects the command exactly
+/// as the synchronous check used to.
 #[test]
 fn cd_to_a_nonexistent_directory_is_rejected_without_navigating() {
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.last_error = Some("an older error".to_string());
     let state = type_line(state, r"cd \NOSUCHDIR");
     let (state, effects) = update(state, Command::Enter);
+    let expected_path = PathBuf::from(r"C:\NOSUCHDIR");
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: expected_path.clone() }], "the check is a probe request, not a disk read");
     assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"), "the active panel's cwd is left completely unchanged");
+    assert_eq!(
+        state.command_probe,
+        Some(PendingProbe { request: 3, side: PanelSide::Left, cwd: PathBuf::from(r"C:\NORTON"), path: expected_path.clone(), intent: ProbeIntent::Cd { text: r"cd \NOSUCHDIR".to_string() } })
+    );
+    assert_eq!(state.left.pending_note.as_deref(), Some(format!("Checking {}…", expected_path.display()).as_str()));
+    assert_eq!(state.left.last_error, None, "a new command supersedes an old error (design D3)");
+
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Missing });
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"));
     assert!(effects.is_empty(), "no listing read is attempted, got {effects:?}");
-    assert!(state.left.last_error.is_some(), "the panel shows an error indicating the target was not found");
+    let expected = format!("{} not found", expected_path.display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()), "the panel shows an error indicating the target was not found");
     assert!(state.history.is_empty(), "a rejected cd is not recorded in history");
+    assert_eq!(state.command_probe, None, "the pending entry is cleared");
+    assert_eq!(state.left.pending_note, None, "and so is the note");
+}
+
+/// application-shell "The probe reply completes the command": a `Dir`
+/// reply navigates and records history exactly as a synchronous check
+/// would have.
+#[test]
+fn a_dir_probe_reply_navigates_and_records_history() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"cd \\nas\share");
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: PathBuf::from(r"\\nas\share") }]);
+    assert_eq!(state.left.pending_note.as_deref(), Some(r"Checking \\nas\share…"));
+
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
+    assert_eq!(state.left.cwd, PathBuf::from(r"\\nas\share"), "the panel navigates to the probed directory");
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, r"\\nas\share")), "{effects:?}");
+    assert_eq!(state.history, vec![r"cd \\nas\share".to_string()], "the line is recorded in command history");
+    assert!(effects.iter().any(|e| matches!(e, Effect::PersistHistory(f) if f.commands == state.history)), "history is persisted once: {effects:?}");
+    assert_eq!(state.command_probe, None);
+    assert_eq!(state.left.pending_note, None);
+}
+
+/// A `File` reply gives the same rejection the listed-entry path gives for
+/// a listed file.
+#[test]
+fn a_file_probe_reply_rejects_cd_as_not_a_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"cd \tools\readme.txt");
+    let (state, _) = update(state, Command::Enter);
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON"));
+    let expected = format!("{} is not a directory", PathBuf::from(r"C:\tools\readme.txt").display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
+    assert!(state.history.is_empty());
+}
+
+/// application-shell "A superseded probe reply is discarded": a second `cd`
+/// replaces the pending probe, so the first reply changes nothing — no
+/// navigation and no error.
+#[test]
+fn a_probe_reply_superseded_by_a_newer_cd_is_discarded() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"cd \\slow\share");
+    let (state, _) = update(state, Command::Enter);
+    let state = type_line(state, r"cd \\fast\share");
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(effects, vec![Effect::ProbePath { request: 4, path: PathBuf::from(r"\\fast\share") }]);
+    assert_eq!(state.left.pending_note.as_deref(), Some(r"Checking \\fast\share…"), "the newer check owns the note");
+
+    let before = state.clone();
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
+    assert!(effects.is_empty(), "the stale reply starts nothing: {effects:?}");
+    assert_eq!(state, before, "the stale reply changes nothing — the newer check is still outstanding with its note");
+
+    let (state, _) = update(state, Command::PathProbed { request: 4, kind: ProbeKind::Dir });
+    assert_eq!(state.left.cwd, PathBuf::from(r"\\fast\share"), "the current reply still applies");
+}
+
+/// command-line "A late answer after navigating elsewhere is discarded":
+/// the panel no longer shows the directory the command was entered for.
+#[test]
+fn a_probe_reply_after_the_panel_navigated_is_discarded() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![dir_entry("docs")];
+    let state = type_line(state, r"cd \\slow-server\share");
+    let (state, _) = update(state, Command::Enter);
+    assert!(state.command_probe.is_some());
+    // Enter on the listed `docs` directory navigates the panel meanwhile.
+    let (state, _) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON\docs"));
+    assert_eq!(state.left.pending_note, None, "a new listing takes the note down");
+
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Missing });
+    assert!(effects.is_empty());
+    assert_eq!(state.left.cwd, PathBuf::from(r"C:\NORTON\docs"), "the late answer does not navigate");
+    assert_eq!(state.left.last_error, None, "and sets no error");
+    assert_eq!(state.command_probe, None, "the stale entry is cleared");
 }
 
 #[test]
@@ -2740,40 +2870,27 @@ fn resolve_cd_target_removes_dot_and_dotdot_components() {
     assert_eq!(resolve_cd_target(Path::new("/a/b"), "c/../../d"), Some(PathBuf::from("/a/d")));
 }
 
-/// A per-test directory under the system temp dir, pre-cleaned (callers
-/// remove it again at the end; a panicking test just leaves it behind,
-/// like `editor_with_temp_file`).
-#[cfg(windows)]
-fn temp_dir_for(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("filecommand-update-test-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
-}
-
 /// command-line "cd with a parent-relative path lands on the normalized
-/// directory": `cd ..\x` navigates to the *normalized* path, so the
-/// `StartListing` it begins carries no `..` component (a verbatim-prefixed
-/// path with one fails with OS error 123). The existence probe for a `..`
-/// target always consults the real filesystem — the resolved parent is
-/// never the panel's own directory — so this test needs real directories.
+/// directory": `cd ..\x` navigates to the *normalized* path, so both the
+/// probe and the `StartListing` it begins carry no `..` component (a
+/// verbatim-prefixed path with one fails with OS error 123). The resolved
+/// parent is never the panel's own directory, so the check always goes
+/// through the asynchronous probe (offload-blocking-io design D1).
 #[cfg(windows)]
 #[test]
 fn cd_with_a_parent_relative_path_lists_the_normalized_directory() {
-    let root = temp_dir_for("cd-dotdot");
-    std::fs::create_dir_all(root.join("work").join("proj")).unwrap();
-    std::fs::create_dir_all(root.join("work").join("x")).unwrap();
     let mut state = test_state(UiPhase::Panels);
-    state.left.cwd = root.join("work").join("proj");
+    state.left.cwd = PathBuf::from(r"C:\work\proj");
     let state = type_line(state, r"cd ..\x");
     let (state, effects) = update(state, Command::Enter);
-    let expected = root.join("work").join("x");
+    let expected = PathBuf::from(r"C:\work\x");
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: expected.clone() }], "the probe takes the normalized path");
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
     assert_eq!(state.left.cwd, expected, "the panel lands on the normalized directory");
     assert!(
         without_git_info_effects(effects).contains(&start_listing(&state, PanelSide::Left, expected)),
         "the listing targets the resolved path"
     );
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// command-line "cd with a drive-relative path resolves against the panel
@@ -2796,43 +2913,42 @@ fn cd_with_a_drive_relative_path_resolves_against_the_panel_or_the_drive_root() 
     );
 
     // On any other drive there is no per-drive current directory to lean
-    // on, so the target resolves against the drive's root. `D:\old` does
-    // not exist on the test host (same assumption `cd \NOSUCHDIR` makes of
-    // `C:`), so the rejection names exactly the resolved path.
+    // on, so the target resolves against the drive's root: the probe is
+    // issued for exactly the resolved path, and a `Missing` reply names it.
     let mut state = test_state(UiPhase::Panels);
     state.left.cwd = PathBuf::from(r"C:\work");
     let state = type_line(state, "cd D:old");
     let (state, effects) = update(state, Command::Enter);
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: PathBuf::from(r"D:\old") }], "the probe takes the drive-root resolution");
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Missing });
     assert!(effects.is_empty(), "a nonexistent target starts no listing, got {effects:?}");
     let expected = format!("{} not found", PathBuf::from(r"D:\old").display());
     assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
 }
 
 /// command-line "del with a parent-relative path names the resolved file":
-/// the `..` resolves against the panel's directory, so the
-/// delete-confirmation dialog opens for the file the path actually points
-/// at. Same real-filesystem probe caveat as `cd ..\x` above.
+/// the `..` resolves against the panel's directory, so the probe and the
+/// delete-confirmation dialog it opens are for the file the path actually
+/// points at.
 #[cfg(windows)]
 #[test]
 fn del_with_a_parent_relative_path_names_the_resolved_file() {
-    let root = temp_dir_for("del-dotdot");
-    std::fs::create_dir_all(root.join("work").join("proj")).unwrap();
-    std::fs::write(root.join("work").join("old.txt"), b"x").unwrap();
     let mut state = test_state(UiPhase::Panels);
-    state.left.cwd = root.join("work").join("proj");
+    state.left.cwd = PathBuf::from(r"C:\work\proj");
     let state = type_line(state, r"del ..\old.txt");
     let (state, effects) = update(state, Command::Enter);
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: PathBuf::from(r"C:\work\old.txt") }]);
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
     assert!(effects.is_empty(), "nothing is deleted until the dialog is accepted, got {effects:?}");
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, .. }) => {
             assert_eq!(sources.len(), 1);
-            assert_eq!(sources[0].path, root.join("work").join("old.txt"), "the dialog names the resolved, normalized path");
+            assert_eq!(sources[0].path, PathBuf::from(r"C:\work\old.txt"), "the dialog names the resolved, normalized path");
             assert_eq!(sources[0].original_name, OsString::from("old.txt"));
             assert!(!sources[0].is_dir);
         }
         other => panic!("expected the delete-confirmation dialog, got {other:?}"),
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------
@@ -2935,12 +3051,18 @@ fn del_dotdot_sibling_is_not_caught_by_the_dot_target_guard() {
     state.left.cwd = PathBuf::from(r"C:\NORTON");
     let state = type_line(state, r"del ..\sibling.txt");
     let (state, effects) = update(state, Command::Enter);
+    assert!(matches!(effects.as_slice(), [Effect::ProbePath { .. }]), "a multi-component relative target follows the ordinary probe path, got {effects:?}");
+    assert_eq!(state.phase, UiPhase::Panels);
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Missing });
     assert!(effects.is_empty());
     assert_eq!(state.phase, UiPhase::Panels);
     let err = state.left.last_error.unwrap();
     assert!(err.ends_with("not found"), "a multi-component relative target follows the ordinary not-found path, got: {err}");
 }
 
+/// command-line "del/rmdir on a nonexistent target is rejected": the
+/// unlisted target is probed, and the `Missing` reply rejects it with no
+/// dialog.
 #[test]
 fn del_and_rmdir_on_a_nonexistent_target_are_rejected() {
     for verb in ["del", "rmdir"] {
@@ -2948,10 +3070,127 @@ fn del_and_rmdir_on_a_nonexistent_target_are_rejected() {
         state.left.cwd = PathBuf::from(r"C:\NORTON");
         let state = type_line(state, &format!(r"{verb} \NOSUCHFILE.TXT"));
         let (state, effects) = update(state, Command::Enter);
+        assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: PathBuf::from(r"C:\NOSUCHFILE.TXT") }], "{verb}: the unlisted target is probed");
+        assert_eq!(state.phase, UiPhase::Panels, "{verb}: no dialog opens before the reply");
+        assert_eq!(
+            state.command_probe.as_ref().map(|p| p.intent.clone()),
+            Some(ProbeIntent::Delete { want_dir: verb == "rmdir" }),
+            "{verb}: the pending probe records the verb"
+        );
+        let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Missing });
         assert!(effects.is_empty(), "{verb}: nothing spawns and no dialog opens, got {effects:?}");
         assert_eq!(state.phase, UiPhase::Panels, "{verb}: no dialog opens");
-        assert!(state.left.last_error.is_some(), "{verb}: the panel shows a not-found error");
+        let expected = format!("{} not found", PathBuf::from(r"C:\NOSUCHFILE.TXT").display());
+        assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()), "{verb}: the panel shows a not-found error");
     }
+}
+
+/// command-line "del on an unlisted target on a slow share does not freeze
+/// the UI": the probe reply of the matching type opens the dialog naming
+/// the target, and a mismatched type gives the verb's own rejection.
+#[test]
+fn del_and_rmdir_on_an_unlisted_target_open_the_dialog_on_a_type_match() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"del \\nas\share\old.log");
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(effects, vec![Effect::ProbePath { request: 3, path: PathBuf::from(r"\\nas\share\old.log") }]);
+    assert_eq!(state.left.pending_note.as_deref(), Some(r"Checking \\nas\share\old.log…"));
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
+    assert!(effects.is_empty(), "nothing is deleted until the dialog is accepted");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, needs_second_confirm, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("old.log"));
+            assert_eq!(sources[0].path, PathBuf::from(r"\\nas\share\old.log"));
+            assert!(!sources[0].is_dir);
+            assert!(!needs_second_confirm);
+        }
+        other => panic!("expected the delete-confirmation dialog, got {other:?}"),
+    }
+    assert_eq!(state.left.pending_note, None);
+
+    // `rmdir` on a directory reply: the dialog, with its second confirmation.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"rmdir \\nas\share\tmp");
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, needs_second_confirm, .. }) => {
+            assert_eq!(sources[0].original_name, OsString::from("tmp"));
+            assert!(sources[0].is_dir);
+            assert!(needs_second_confirm);
+        }
+        other => panic!("expected the delete-confirmation dialog, got {other:?}"),
+    }
+
+    // Type mismatches give the verb's own rejection and open nothing.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"del \\nas\share\tmp");
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.last_error.as_deref(), Some(format!("{} is a directory", PathBuf::from(r"\\nas\share\tmp").display()).as_str()));
+
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"rmdir \\nas\share\old.log");
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
+    assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.left.last_error.as_deref(), Some(format!("{} is not a directory", PathBuf::from(r"\\nas\share\old.log").display()).as_str()));
+}
+
+/// command-line "A late answer does not open the dialog over a menu": the
+/// panels no longer own input, so the reply is discarded — no dialog, no
+/// error — and the pending entry is cleared.
+#[test]
+fn a_delete_probe_reply_after_the_menu_opened_opens_no_dialog() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"rmdir \\nas\share\tmp");
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::MenuOpen);
+    assert!(state.menu.is_some());
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
+    assert!(effects.is_empty());
+    assert!(state.menu.is_some(), "the menu stays open");
+    assert_eq!(state.phase, UiPhase::Panels, "the delete-confirmation dialog does not open");
+    assert_eq!(state.left.last_error, None, "no error either: the reply is simply dropped");
+    assert_eq!(state.command_probe, None);
+    assert_eq!(state.left.pending_note, None);
+}
+
+/// A `del`/`rmdir` reply superseded by a newer command-line check, or one
+/// arriving after the panel navigated, is ignored.
+#[test]
+fn a_delete_probe_reply_that_is_stale_or_whose_panel_navigated_is_ignored() {
+    // Superseded by a newer probe.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    let state = type_line(state, r"del \\nas\share\a.log");
+    let (state, _) = update(state, Command::Enter);
+    let state = type_line(state, r"del \\nas\share\b.log");
+    let (state, _) = update(state, Command::Enter);
+    let before = state.clone();
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
+    assert!(effects.is_empty());
+    assert_eq!(state, before, "the stale reply changes nothing");
+
+    // The panel navigated meanwhile.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\NORTON");
+    state.left.entries = vec![dir_entry("docs")];
+    let state = type_line(state, r"del \\nas\share\a.log");
+    let (state, _) = update(state, Command::Enter);
+    let (state, _) = update(state, Command::Enter); // into `docs`
+    let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::File });
+    assert!(effects.is_empty());
+    assert_eq!(state.phase, UiPhase::Panels, "no dialog opens for a panel that moved on");
+    assert_eq!(state.left.last_error, None);
+    assert_eq!(state.command_probe, None);
 }
 
 #[test]
@@ -3196,7 +3435,7 @@ fn files_menu_view_follows_the_f3_path() {
     assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
     let (state, effects) = update(state, Command::MenuActivate);
     assert!(state.menu.is_none(), "activating an item closes the whole overlay");
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
 /// Files → Edit follows the F4 path: with no external editor configured, the
@@ -3210,7 +3449,7 @@ fn files_menu_edit_follows_the_f4_path() {
     let (state, _) = update(state, Command::MenuSelectNext); // Edit
     let (state, effects) = update(state, Command::MenuActivate);
     assert!(state.menu.is_none());
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
 /// pulldown-menus "Right → Filter on the inactive panel": the filter starts
@@ -3313,7 +3552,7 @@ fn commands_menu_menu_file_edit_opens_the_user_menu_file_in_the_editor() {
     state.menu.as_mut().unwrap().selected = edit_index;
     let (state, effects) = update(state, Command::MenuActivate);
     assert!(state.menu.is_none());
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/profile/usermenu.toml") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/profile/usermenu.toml") }]);
 }
 
 // ---------------------------------------------------------------------
@@ -3557,8 +3796,9 @@ fn edit_user_menu_file_uses_the_builtin_editor_when_none_is_configured() {
     let mut state = test_state(UiPhase::Panels);
     state.user_menu_path = PathBuf::from("/profile/usermenu.toml");
     let (state, effects) = update(state, Command::EditUserMenuFile);
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/profile/usermenu.toml") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/profile/usermenu.toml") }]);
     assert_eq!(state.user_menu_path, PathBuf::from("/profile/usermenu.toml"));
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening usermenu.toml…"), "the active panel announces the open");
 }
 
 #[test]
@@ -3921,10 +4161,12 @@ fn f3_on_a_file_dispatches_open_viewer_without_touching_the_filesystem() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("notes.txt", 42)];
     let (state, effects) = update(state, Command::RequestViewer);
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/notes.txt") }]);
     // Nothing changed yet — the phase flips only once `ViewerOpened` comes
     // back, since opening is I/O and `update` performs none itself.
     assert_eq!(state.phase, UiPhase::Panels);
+    assert_eq!(state.pending_open, Some(PendingOpen { request: 3, side: PanelSide::Left, kind: PendingOpenKind::Viewer }));
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening notes.txt…"), "the panel announces the outstanding open");
 }
 
 #[test]
@@ -3949,9 +4191,13 @@ fn f3_on_an_empty_panel_is_a_no_op() {
 
 #[test]
 fn viewer_opened_enters_the_viewer_phase_at_the_start_of_the_file() {
-    let state = test_state(UiPhase::Panels);
-    let (state, effects) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("big.log", 5_000_000_000)];
+    let (state, _) = update(state, Command::RequestViewer);
+    let (state, effects) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/big.log"), file_len: 5_000_000_000 });
     assert!(effects.is_empty());
+    assert_eq!(state.pending_open, None, "the applied reply clears the pending open");
+    assert_eq!(state.left.pending_note, None, "and takes the `Opening…` note down");
     match state.phase {
         UiPhase::Viewer(v) => {
             assert_eq!(v.path, PathBuf::from("/left/big.log"));
@@ -3966,21 +4212,22 @@ fn viewer_opened_enters_the_viewer_phase_at_the_start_of_the_file() {
 
 #[test]
 fn viewer_open_failed_surfaces_an_inline_error_on_the_active_panel_instead_of_opening() {
-    let state = test_state(UiPhase::Panels);
-    let (state, effects) = update(state, Command::ViewerOpenFailed { message: "access denied".to_string() });
+    let state = with_pending_open(test_state(UiPhase::Panels), 3);
+    let (state, effects) = update(state, Command::ViewerOpenFailed { request: 3, message: "access denied".to_string() });
     assert!(effects.is_empty());
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
+    assert_eq!(state.pending_open, None);
 }
 
 #[test]
 fn a_subsequently_successful_f3_open_clears_a_stale_last_error_from_an_earlier_failed_attempt() {
     let mut state = test_state(UiPhase::Panels);
-    let (state_after_failure, _) = update(state.clone(), Command::ViewerOpenFailed { message: "access denied".to_string() });
+    let (state_after_failure, _) = update(with_pending_open(state.clone(), 3), Command::ViewerOpenFailed { request: 3, message: "access denied".to_string() });
     assert_eq!(state_after_failure.left.last_error.as_deref(), Some("access denied"));
 
     state.left.last_error = Some("access denied".to_string());
-    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/notes.txt"), file_len: 10 });
+    let (state, _) = update(with_pending_open(state, 3), Command::ViewerOpened { request: 3, path: PathBuf::from("/left/notes.txt"), file_len: 10 });
     assert_eq!(
         state.left.last_error, None,
         "a successful F3 open must clear a stale error left by an earlier failed attempt"
@@ -3989,8 +4236,8 @@ fn a_subsequently_successful_f3_open_clears_a_stale_last_error_from_an_earlier_f
 }
 
 fn opened_viewer_state(file_len: u64) -> State {
-    let state = test_state(UiPhase::Panels);
-    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/f.txt"), file_len });
+    let state = with_pending_open(test_state(UiPhase::Panels), 3);
+    let (state, _) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/f.txt"), file_len });
     state
 }
 
@@ -4183,7 +4430,7 @@ fn a_stale_search_reply_for_a_closed_and_reopened_viewer_session_is_dropped() {
     let (state, stale_request) = viewer_with_pattern_confirmed(state, "needle");
 
     let (state, _) = update(state, Command::ViewerClose);
-    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/other.txt"), file_len: 200 });
+    let (state, _) = update(with_pending_open(state, 50), Command::ViewerOpened { request: 50, path: PathBuf::from("/left/other.txt"), file_len: 200 });
     let UiPhase::Viewer(v) = &state.phase else { panic!("expected viewer phase") };
     assert_eq!(v.search_request, None, "a freshly opened session has no outstanding search");
 
@@ -4664,8 +4911,10 @@ fn f4_with_no_editor_configured_opens_the_built_in_editor() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("report.txt", 10)];
     let (state, effects) = update(state, Command::RequestEditor);
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/report.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/report.txt") }]);
     assert_eq!(state.phase, UiPhase::Panels, "phase flips only once EditorOpened comes back — opening is I/O");
+    assert_eq!(state.pending_open, Some(PendingOpen { request: 3, side: PanelSide::Left, kind: PendingOpenKind::Editor }));
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening report.txt…"));
 }
 
 #[test]
@@ -4694,10 +4943,11 @@ fn f4_on_a_directory_or_empty_panel_does_not_open_the_editor() {
 
 #[test]
 fn editor_opened_enters_the_editor_phase_with_the_loaded_buffer() {
-    let state = test_state(UiPhase::Panels);
+    let state = with_pending_open(test_state(UiPhase::Panels), 3);
     let editor = editor_with(&["line one", "line two"]);
-    let (state, effects) = update(state, Command::EditorOpened(Box::new(editor)));
+    let (state, effects) = update(state, Command::EditorOpened { request: 3, editor: Box::new(editor) });
     assert!(effects.is_empty());
+    assert_eq!(state.pending_open, None);
     match state.phase {
         UiPhase::Editor(e) => assert_eq!(e.lines, vec!["line one".to_string(), "line two".to_string(), String::new()]),
         other => panic!("expected UiPhase::Editor, got {other:?}"),
@@ -4706,9 +4956,13 @@ fn editor_opened_enters_the_editor_phase_with_the_loaded_buffer() {
 
 #[test]
 fn editor_too_large_opens_the_viewer_instead_with_an_inline_notice() {
-    let state = test_state(UiPhase::Panels);
-    let (state, effects) = update(state, Command::EditorTooLarge { path: PathBuf::from("/left/huge.log"), size: 20_000_000 });
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/left/huge.log") }]);
+    let state = with_pending_open(test_state(UiPhase::Panels), 3);
+    let (state, effects) = update(state, Command::EditorTooLarge { request: 3, path: PathBuf::from("/left/huge.log"), size: 20_000_000 });
+    // The redirect is a fresh request for the same side (offload-blocking-io
+    // design D4): a late reply to the editor open can no longer match.
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 4, path: PathBuf::from("/left/huge.log") }]);
+    assert_eq!(state.pending_open, Some(PendingOpen { request: 4, side: PanelSide::Left, kind: PendingOpenKind::Viewer }));
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening huge.log…"));
     assert_eq!(state.phase, UiPhase::Panels);
     let message = state.left.last_error.expect("a notice explaining the redirect");
     assert!(message.contains("huge.log"), "{message}");
@@ -4728,10 +4982,10 @@ fn editor_not_editable_opens_the_viewer_instead_with_a_reason_specific_notice() 
         (NotEditableReason::NotUtf8, "setup.bat", "setup.bat is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
     ];
     for (reason, name, expected) in cases {
-        let state = test_state(UiPhase::Panels);
+        let state = with_pending_open(test_state(UiPhase::Panels), 3);
         let path = PathBuf::from(format!("/left/{name}"));
-        let (state, effects) = update(state, Command::EditorNotEditable { path: path.clone(), reason });
-        assert_eq!(effects, vec![Effect::OpenViewer { path }], "{reason:?} opens the viewer for the same path");
+        let (state, effects) = update(state, Command::EditorNotEditable { request: 3, path: path.clone(), reason });
+        assert_eq!(effects, vec![Effect::OpenViewer { request: 4, path }], "{reason:?} opens the viewer for the same path under a fresh id");
         assert_eq!(state.phase, UiPhase::Panels, "{reason:?} never enters the editor phase");
         assert_eq!(state.left.last_error.as_deref(), Some(expected), "{reason:?} notice");
         assert_eq!(state.right.last_error, None, "the notice lands on the active panel only");
@@ -4742,8 +4996,10 @@ fn editor_not_editable_opens_the_viewer_instead_with_a_reason_specific_notice() 
 fn editor_not_editable_notice_lands_on_the_right_panel_when_it_is_active() {
     let mut state = test_state(UiPhase::Panels);
     state.active = PanelSide::Right;
-    let (state, effects) = update(state, Command::EditorNotEditable { path: PathBuf::from("/right/export.reg"), reason: crate::editor::NotEditableReason::Utf16 });
-    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/right/export.reg") }]);
+    let state = with_pending_open(state, 3);
+    let (state, effects) =
+        update(state, Command::EditorNotEditable { request: 3, path: PathBuf::from("/right/export.reg"), reason: crate::editor::NotEditableReason::Utf16 });
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 4, path: PathBuf::from("/right/export.reg") }]);
     assert!(state.right.last_error.as_deref().unwrap().contains("UTF-16"));
     assert_eq!(state.left.last_error, None);
 }
@@ -4764,10 +5020,118 @@ fn f4_with_an_external_editor_configured_never_classifies_the_file() {
     assert_eq!(state.left.last_error, None, "no redirect notice");
 }
 
+// ---------------------------------------------------------------------
+// offload-blocking-io: open replies are gated on the pending request
+// (application-shell "Slow storage never blocks the event loop"; design D4)
+// ---------------------------------------------------------------------
+
+/// application-shell "A newer F3 supersedes an outstanding open": the late
+/// answer for the first file is discarded without touching the newer
+/// pending open, and the newer answer still applies.
+#[test]
+fn an_open_reply_with_a_stale_request_id_is_discarded() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("slow.log", 10), file_entry("fast.txt", 10)];
+    let (state, effects) = update(state, Command::RequestViewer);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/slow.log") }]);
+    let (state, _) = update(state, Command::MoveCursor(CursorMove::Down(1)));
+    let (state, effects) = update(state, Command::RequestViewer);
+    assert_eq!(effects, vec![Effect::OpenViewer { request: 4, path: PathBuf::from("/left/fast.txt") }]);
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening fast.txt…"), "the newer request owns the note");
+
+    let before = state.clone();
+    let (state, effects) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/slow.log"), file_len: 10 });
+    assert!(effects.is_empty());
+    assert_eq!(state, before, "the stale reply changes nothing, and the newer pending open is untouched");
+    let (state, effects) = update(state, Command::ViewerOpenFailed { request: 3, message: "late failure".to_string() });
+    assert!(effects.is_empty());
+    assert_eq!(state, before, "a stale failure lands nowhere either");
+
+    let (state, _) = update(state, Command::ViewerOpened { request: 4, path: PathBuf::from("/left/fast.txt"), file_len: 10 });
+    match &state.phase {
+        UiPhase::Viewer(v) => assert_eq!(v.path, PathBuf::from("/left/fast.txt"), "the viewer opens the newer file"),
+        other => panic!("expected the viewer, got {other:?}"),
+    }
+    assert_eq!(state.pending_open, None);
+}
+
+/// application-shell "A late open does not pull the user out of a menu":
+/// the reply arriving with the F9 menu open is discarded, the menu stays,
+/// and the pending state is cleared.
+#[test]
+fn an_open_reply_arriving_with_the_menu_open_is_discarded() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    let (state, _) = update(state, Command::RequestEditor);
+    let (state, _) = update(state, Command::MenuOpen);
+    assert!(state.menu.is_some());
+    let (state, effects) = update(state, Command::EditorOpened { request: 3, editor: Box::new(editor_with(&["abc"])) });
+    assert!(effects.is_empty());
+    assert!(state.menu.is_some(), "the menu stays open");
+    assert_eq!(state.phase, UiPhase::Panels, "the editor does not open");
+    assert_eq!(state.pending_open, None, "the late result is discarded and the pending open cleared");
+    assert_eq!(state.left.pending_note, None, "the `Opening…` note comes down");
+
+    // The same for the viewer, and for a reply while a dialog owns input.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    let (state, _) = update(state, Command::RequestViewer);
+    let (state, _) = update(state, Command::HelpOpen);
+    let (state, _) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/notes.txt"), file_len: 10 });
+    assert_eq!(state.phase, UiPhase::Panels, "the viewer does not open over the Help window");
+    assert!(state.help.is_some());
+
+    // A reply after the user left the panels (a file operation dialog).
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    let (state, _) = update(state, Command::RequestViewer);
+    let (state, _) = update(state, Command::RequestDelete);
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(_)), "precondition: the delete dialog owns the phase");
+    let (state, _) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/notes.txt"), file_len: 10 });
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(_)), "the dialog is untouched");
+    assert_eq!(state.pending_open, None);
+}
+
+/// application-shell "Launching a slow handler leaves the panels
+/// interactive", applied to the opens: a failure lands on the panel the
+/// open was requested from, not on the panel active when it arrives.
+#[test]
+fn an_open_failure_lands_on_the_recorded_side_after_a_tab() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    let (state, _) = update(state, Command::RequestEditor);
+    let (state, _) = update(state, Command::ToggleActivePanel);
+    assert_eq!(state.active, PanelSide::Right);
+    let (state, _) = update(state, Command::EditorOpenFailed { request: 3, message: "access denied".to_string() });
+    assert_eq!(state.left.last_error.as_deref(), Some("access denied"), "the failure lands on the requesting panel");
+    assert_eq!(state.right.last_error, None);
+    assert_eq!(state.left.pending_note, None);
+
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    let (state, _) = update(state, Command::RequestViewer);
+    let (state, _) = update(state, Command::ToggleActivePanel);
+    let (state, _) = update(state, Command::ViewerOpenFailed { request: 3, message: "access denied".to_string() });
+    assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
+    assert_eq!(state.right.last_error, None);
+}
+
+/// Requesting an open supersedes an earlier failure on the same panel: the
+/// `Opening…` note takes the stale error down (design D3).
+#[test]
+fn requesting_an_open_clears_the_panels_last_error() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![file_entry("notes.txt", 10)];
+    state.left.last_error = Some("an older failure".to_string());
+    let (state, _) = update(state, Command::RequestViewer);
+    assert_eq!(state.left.last_error, None);
+    assert_eq!(state.left.pending_note.as_deref(), Some("Opening notes.txt…"));
+}
+
 #[test]
 fn editor_open_failed_surfaces_an_inline_error() {
-    let state = test_state(UiPhase::Panels);
-    let (state, effects) = update(state, Command::EditorOpenFailed { message: "access denied".to_string() });
+    let state = with_pending_open(test_state(UiPhase::Panels), 3);
+    let (state, effects) = update(state, Command::EditorOpenFailed { request: 3, message: "access denied".to_string() });
     assert!(effects.is_empty());
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(state.left.last_error.as_deref(), Some("access denied"));
@@ -4892,12 +5256,16 @@ fn editor_save_dispatches_the_save_effect_and_the_reply_updates_the_saved_snapsh
     let state = editor_state(editor.clone());
     let (state, effects) = update(state, Command::EditorSave);
     match effects.as_slice() {
-        [Effect::SaveEditor { editor: e, then_quit: false }] => assert_eq!(e.lines, editor.lines),
+        [Effect::SaveEditor { editor: e, then_quit: false }] => {
+            assert_eq!(e.lines, editor.lines);
+            assert!(!e.save_pending, "the copy handed to the worker is not itself marked pending");
+        }
         other => panic!("expected a single SaveEditor effect, got {other:?}"),
     }
     // The buffer is unchanged until the reply arrives — save is I/O.
     let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
     assert!(e.is_modified());
+    assert!(e.save_pending, "the save is in flight (offload-blocking-io design D6)");
 
     // Mirrors what the TUI's effect executor actually does: clone the
     // editor into the effect, call the real (I/O-performing) `save()` on
@@ -4909,18 +5277,89 @@ fn editor_save_dispatches_the_save_effect_and_the_reply_updates_the_saved_snapsh
     assert!(effects.is_empty());
     let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
     assert!(!e.is_modified(), "the post-save snapshot from the reply clears the modified flag");
+    assert!(!e.save_pending, "the reply ends the in-flight save");
 }
 
 #[test]
 fn editor_save_failed_surfaces_an_inline_message_without_losing_the_buffer() {
     let mut editor = editor_with(&["abc"]);
     editor.type_char('X');
+    editor.save_pending = true;
     let state = editor_state(editor);
     let (state, effects) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
     assert!(effects.is_empty());
     let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
     assert_eq!(e.save_error.as_deref(), Some("disk full"));
     assert!(e.is_modified(), "a failed save must not silently discard the unsaved edit");
+    assert!(!e.save_pending, "the failure ends the in-flight save");
+}
+
+/// application-shell "Saving to a slow share shows progress and accepts no
+/// edits": while the save is in flight, edits, caret moves and further
+/// save/quit commands leave the editor unchanged and emit nothing; the reply
+/// then clears the flag (offload-blocking-io design D6).
+#[test]
+fn while_a_save_is_pending_the_editor_ignores_everything_but_the_save_reply() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, effects) = update(state, Command::EditorSave);
+    assert!(matches!(effects.as_slice(), [Effect::SaveEditor { then_quit: false, .. }]));
+    let UiPhase::Editor(pending) = &state.phase else { panic!("expected editor phase") };
+    assert!(pending.save_pending);
+    let pending = pending.clone();
+
+    for cmd in [
+        Command::EditorChar('Y'),
+        Command::EditorNewline,
+        Command::EditorBackspace,
+        Command::EditorMove(EditorMove::Right),
+        Command::EditorMove(EditorMove::Down),
+        Command::EditorSave,
+        Command::EditorRequestQuit,
+        Command::EditorConfirmQuitSave,
+        Command::EditorConfirmQuitDiscard,
+        Command::EditorUndo,
+    ] {
+        let (after, effects) = update(state.clone(), cmd.clone());
+        assert!(effects.is_empty(), "{cmd:?} emits nothing while a save is pending, got {effects:?}");
+        let UiPhase::Editor(e) = &after.phase else { panic!("{cmd:?}: the editor stays open while a save is pending") };
+        assert_eq!(*e, pending, "{cmd:?} leaves the editor unchanged while a save is pending");
+    }
+
+    // The reply — the worker's copy with its clean snapshot — clears the
+    // flag and the modified state, and typing works again.
+    let saved = editor_with(&["Xabc"]);
+    let (state, effects) = update(state, Command::EditorSaved { editor: Box::new(saved), then_quit: false });
+    assert!(effects.is_empty());
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.save_pending);
+    assert!(!e.is_modified(), "the saved buffer is clean");
+    let (state, _) = update(state, Command::EditorChar('Z'));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.is_modified(), "typing edits the buffer again once the save completed");
+}
+
+/// The save-on-exit confirm's "Y" is gated the same way, and a failure
+/// during it clears the flag so the user can act on the error.
+#[test]
+fn a_save_on_exit_in_flight_is_gated_until_its_reply() {
+    let mut editor = editor_with(&["abc"]);
+    editor.type_char('X');
+    let state = editor_state(editor);
+    let (state, _) = update(state, Command::EditorRequestQuit);
+    let (state, effects) = update(state, Command::EditorConfirmQuitSave);
+    assert!(matches!(effects.as_slice(), [Effect::SaveEditor { then_quit: true, .. }]));
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(e.save_pending);
+    let (after, effects) = update(state.clone(), Command::EditorCancelQuit);
+    assert!(effects.is_empty());
+    assert_eq!(after, state, "Esc during the in-flight save changes nothing");
+
+    let (state, _) = update(state, Command::EditorSaveFailed { message: "disk full".to_string() });
+    let UiPhase::Editor(e) = &state.phase else { panic!("expected editor phase") };
+    assert!(!e.save_pending);
+    assert_eq!(e.save_error.as_deref(), Some("disk full"));
 }
 
 #[test]
@@ -6875,7 +7314,7 @@ fn file_action_menu_item_click_activates_the_item_exactly_like_confirm() {
     let edit_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Edit).unwrap();
     let (state, effects) = update(state, Command::FileActionMenuItemClick(edit_index));
     assert!(state.file_action_menu.is_none(), "activating an entry closes the menu");
-    assert_eq!(effects, vec![Effect::OpenEditor { path: PathBuf::from("/left/notes.txt") }]);
+    assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
 #[test]
@@ -7990,15 +8429,16 @@ fn undersized_still_applies_editor_saved_viewer_opened_and_editor_opened() {
         other => panic!("expected the hidden editor, got {other:?}"),
     }
 
-    // ViewerOpened over hidden panels.
-    let state = shrunk(test_state(UiPhase::Panels));
-    let (state, _) = update(state, Command::ViewerOpened { path: PathBuf::from("/left/a.txt"), file_len: 10 });
+    // ViewerOpened over hidden panels: being undersized is not "leaving the
+    // panels", so the reply is still current (offload-blocking-io D4).
+    let state = with_pending_open(shrunk(test_state(UiPhase::Panels)), 3);
+    let (state, _) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/a.txt"), file_len: 10 });
     assert!(state.undersized);
     assert!(matches!(state.phase, UiPhase::Viewer(_)), "the viewer opens under the placeholder");
 
     // EditorOpened over hidden panels.
-    let state = shrunk(test_state(UiPhase::Panels));
-    let (state, _) = update(state, Command::EditorOpened(Box::new(twenty_line_editor())));
+    let state = with_pending_open(shrunk(test_state(UiPhase::Panels)), 3);
+    let (state, _) = update(state, Command::EditorOpened { request: 3, editor: Box::new(twenty_line_editor()) });
     assert!(state.undersized);
     assert!(matches!(state.phase, UiPhase::Editor(_)), "the editor opens under the placeholder");
 }

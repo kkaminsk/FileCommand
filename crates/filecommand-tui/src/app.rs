@@ -13,7 +13,7 @@ use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
-use filecommand_core::editor::{EditorMove, EditorState, LoadResult as EditorLoadResult};
+use filecommand_core::editor::EditorMove;
 use filecommand_core::external_editor::EditorInvocation;
 use filecommand_core::fs_ops::CancelFlag;
 use filecommand_core::line_edit::flatten_line_breaks;
@@ -27,6 +27,7 @@ use filecommand_core::{anim, config, drives, identity, update, Command, Effect, 
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
+use crate::config_writer::{ConfigWrite, ConfigWriter};
 use crate::console;
 use crate::diag;
 use crate::history_writer::HistoryWriter;
@@ -71,25 +72,33 @@ struct Runtime {
     /// path from `run` flushes it on drop (fuzzy-jump "Quitting flushes
     /// unwritten history"; history-persistence-hardening design D4).
     history_writer: HistoryWriter,
-    /// Where `Effect::PersistTheme` writes the `theme =` key back
-    /// (theme-selection "Applied theme persists to configuration").
-    config_path: PathBuf,
+    /// The background `config.toml` writer `Effect::PersistTheme` and
+    /// `Effect::PersistPanelSplit` hand their values to; it owns the config
+    /// path, writes one setting at a time with the newest value, and is the
+    /// disabled no-op when persistence is off for the session. Owned here so
+    /// every exit path from `run` flushes it on drop, bounded
+    /// (application-shell "Slow storage never blocks the event loop";
+    /// offload-blocking-io design D9).
+    config_writer: ConfigWriter,
     /// Where the F2 user menu lives; `Command::EditUserMenuFile` opens it via
     /// `State::user_menu_path`, and when the editor that had it open returns
     /// (built-in close or external exit) the file is reloaded and fed back as
     /// `Command::UserMenuReloaded` (user-menu "Edit the user menu file from
     /// the Commands menu"; design D4).
     usermenu_path: PathBuf,
-    /// `false` when the profile directory could not be created at startup:
-    /// the three persist effects are then skipped for the whole session
-    /// (config-profile-directory "Unwritable profile falls back without
-    /// losing the session"; design D2).
-    persist_enabled: bool,
     /// The F3 viewer's open byte window, kept here rather than in
     /// `core::State` because `ByteSource` is an I/O handle, not application
-    /// state (design D1). Set on `Effect::OpenViewer`, cleared on
-    /// `Command::ViewerClose` — the only path out of `UiPhase::Viewer`.
+    /// state (design D1). Adopted from `viewer_handoff` when a current
+    /// `Command::ViewerOpened` is applied, cleared on `Command::ViewerClose`
+    /// — the only path out of `UiPhase::Viewer`.
     viewer_source: Option<(PathBuf, ByteSource)>,
+    /// The channel a viewer-open worker hands its `ByteSource` back on,
+    /// immediately before its `ViewerOpened` reply (offload-blocking-io
+    /// design D4). Drained by `apply` after every `ViewerOpened`: the entry
+    /// whose request the reducer accepted becomes `viewer_source`, and every
+    /// other entry — a superseded or discarded open — is dropped, closing
+    /// its handle.
+    viewer_handoff: (Sender<worker::ViewerHandoff>, Receiver<worker::ViewerHandoff>),
     /// The OS clipboard behind `Effect::SetClipboard` — `Box<dyn Clipboard>`
     /// rather than a concrete type so tests can swap in
     /// `clipboard::RecordingClipboard` (clipboard-export; design D3).
@@ -154,21 +163,36 @@ impl CancelRegistry {
 }
 
 impl Runtime {
-    /// `Effect::OpenViewer`'s effect body. O(1): the open touches only the
-    /// handle and its length, never the content (viewer: Instant open —
-    /// "First frame reads only the visible window"), so this runs
-    /// synchronously rather than on a worker thread, exactly like
-    /// `EnumerateDrives`.
-    fn open_viewer_source(&mut self, path: PathBuf) {
-        match ByteSource::open(&path) {
-            Ok(source) => {
-                let file_len = source.len();
-                self.viewer_source = Some((path.clone(), source));
-                worker::deliver(&self.tx, "viewer opened", Command::ViewerOpened { path, file_len });
+    /// `apply`'s post-`update` step for a `Command::ViewerOpened { request }`
+    /// (offload-blocking-io design D4): drain the hand-off channel, keeping
+    /// the entry for `request` as `viewer_source` only if the reducer
+    /// accepted the reply — the phase *became* `Viewer` on this file — and
+    /// dropping every entry for an older request, which closes its handle.
+    /// The worker sends the source before the command, so the matching
+    /// entry is always already queued here; an older one belongs to an open
+    /// the user superseded, whose own `ViewerOpened` the reducer discarded
+    /// or will discard. An entry for a *newer* request (ids are monotonic)
+    /// whose command is still queued behind this one is put back, so two
+    /// opens completing back to back both find their source.
+    fn adopt_viewer_handoff(&mut self, request: u64, was_viewer: bool, after: &State) {
+        let opened_path = match &after.phase {
+            UiPhase::Viewer(viewer) if !was_viewer => Some(viewer.path.clone()),
+            _ => None,
+        };
+        let mut newer = Vec::new();
+        while let Ok((entry_request, path, source)) = self.viewer_handoff.1.try_recv() {
+            if entry_request == request {
+                if opened_path.as_deref() == Some(path.as_path()) {
+                    self.viewer_source = Some((path, source));
+                }
+                // A discarded reply's source is dropped here, releasing the file.
+            } else if entry_request > request {
+                newer.push((entry_request, path, source));
             }
-            Err(e) => {
-                worker::deliver(&self.tx, "viewer open failure", Command::ViewerOpenFailed { message: cannot_message("open", &path, &e) });
-            }
+            // An older entry is dropped here, releasing the file.
+        }
+        for entry in newer {
+            let _ = self.viewer_handoff.0.send(entry);
         }
     }
 
@@ -183,9 +207,8 @@ impl Runtime {
     /// D7): the source goes when the viewer phase has just ended by any
     /// route, or when a `ViewerOpened` was applied but the phase did not
     /// become `Viewer` (the reply was discarded). It is keyed to that
-    /// *transition*, never to "the phase is not `Viewer`" — `open_viewer_source`
-    /// installs the source while the phase is still `Panels`, and a command
-    /// applied before the queued `ViewerOpened` must not drop it.
+    /// *transition*, never to "the phase is not `Viewer`": a command applied
+    /// while the viewer is open must not drop its source.
     fn release_viewer_source_if_viewer_ended(&mut self, was_viewer: bool, viewer_opened: bool, after: &State) {
         if (was_viewer || viewer_opened) && !matches!(after.phase, UiPhase::Viewer(_)) {
             self.release_viewer_source();
@@ -531,20 +554,24 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
-    let history_writer = if persist_enabled {
-        HistoryWriter::spawn(history_path, crate::history_writer::DEBOUNCE, crate::history_writer::MAX_WAIT)
+    // Both background writers exist only when the profile directory is
+    // writable this session; otherwise every persist effect is a no-op
+    // (config-profile-directory "Unwritable profile falls back without
+    // losing the session"; design D2).
+    let (history_writer, config_writer) = if persist_enabled {
+        (HistoryWriter::spawn(history_path, crate::history_writer::DEBOUNCE, crate::history_writer::MAX_WAIT), ConfigWriter::spawn(config_path))
     } else {
-        HistoryWriter::disabled()
+        (HistoryWriter::disabled(), ConfigWriter::disabled())
     };
     let mut rt = Runtime {
         tx,
         active_job: None,
         cancels: CancelRegistry::default(),
         history_writer,
-        config_path,
+        config_writer,
         usermenu_path,
-        persist_enabled,
         viewer_source: None,
+        viewer_handoff: mpsc::channel(),
         clipboard: Box::new(PlatformClipboard::default()),
         mouse_tracker: MouseTracker::new(),
         git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
@@ -1369,7 +1396,10 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     // `Runtime::release_viewer_source_if_viewer_ended` (resize-preserves-
     // session-state design D7; viewer "Closing the viewer releases the file").
     let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
-    let viewer_opened = matches!(cmd, Command::ViewerOpened { .. });
+    let viewer_opened = match cmd {
+        Command::ViewerOpened { request, .. } => Some(request),
+        _ => None,
+    };
     // Commands → Menu file edit, built-in-editor leg: remember whether the
     // editor currently has the user-menu file open, so the transition out of
     // `UiPhase::Editor` (any of the quit paths, save-on-exit included)
@@ -1378,7 +1408,13 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     let editing_user_menu = matches!(&state.phase, UiPhase::Editor(editor) if editor.path == rt.usermenu_path);
     let (state, effects) = update(state, cmd);
     let quit = run_effects(effects, guard, rt)?;
-    rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened, &state);
+    // The viewer-open worker's source is waiting on the hand-off channel
+    // ahead of its `ViewerOpened`; it becomes the viewer's source only when
+    // the reducer accepted the reply (offload-blocking-io design D4).
+    if let Some(request) = viewer_opened {
+        rt.adopt_viewer_handoff(request, was_viewer, &state);
+    }
+    rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened.is_some(), &state);
     if editing_user_menu && !matches!(state.phase, UiPhase::Editor(_)) {
         reload_user_menu(rt);
     }
@@ -1456,14 +1492,21 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // to its directory the moment the TUI repaints.
                 worker::deliver(&rt.tx, "panel re-read", Command::RereadPanel(side));
             }
-            Effect::OpenWithAssociation { path, cwd } => {
+            Effect::OpenWithAssociation { side, path, cwd } => {
                 // Fire-and-forget (open-with-associated-app design D1/D3):
                 // no suspend, no wait, no mouse-tracker reset, no panel
-                // re-read. Only a launch failure reports back, as the
-                // command that lands the message on the panel's status line.
-                if let Err(message) = open_with_association(&path, &cwd) {
-                    worker::deliver(&rt.tx, "open-with failure", Command::OpenWithAssociationFailed { message });
-                }
+                // re-read. The launch runs on a worker thread with COM
+                // initialized (offload-blocking-io design D7), so a slow
+                // handler never freezes the panels; only a launch failure
+                // reports back, as the command that lands the message on
+                // the invoking panel's status line.
+                worker::spawn_open_with_association(side, path, cwd, rt.tx.clone(), rt.workers.token());
+            }
+            Effect::ProbePath { request, path } => {
+                // The command-line target check the reducer no longer makes
+                // itself (application-shell "The reducer performs no
+                // filesystem I/O"; offload-blocking-io design D1/D2).
+                worker::spawn_path_probe(request, path, rt.tx.clone(), rt.workers.token());
             }
             Effect::ShowScrollback => {
                 show_scrollback(guard)?;
@@ -1481,20 +1524,21 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 rt.history_writer.submit(file);
             }
             Effect::PersistTheme(name) => {
-                // Same tolerance as history: a failed config write must
-                // never take the session down (the theme is already active
-                // in memory either way); likewise skipped when persistence
-                // is off for the session (design D2).
-                if rt.persist_enabled {
-                    diag::log_err("persist", format_args!("config write {}", rt.config_path.display()), config::save_theme_atomic(&rt.config_path, &name));
-                }
+                // Handed to the background configuration writer, which
+                // applies writes one at a time with the newest value per
+                // setting and flushes, bounded, at exit (application-shell
+                // "Slow storage never blocks the event loop"; offload-
+                // blocking-io design D9). Same tolerance as history: a
+                // failed write is logged there and never takes the session
+                // down (the theme is already active in memory either way);
+                // the writer is the disabled no-op when persistence is off
+                // for the session (design D2).
+                rt.config_writer.submit(ConfigWrite::Theme(name));
             }
             Effect::PersistPanelSplit(percent) => {
-                // Same tolerance as the theme write above (panel-split
-                // "Split persistence to configuration"; design D2).
-                if rt.persist_enabled {
-                    diag::log_err("persist", format_args!("config write {}", rt.config_path.display()), config::save_panel_split_atomic(&rt.config_path, percent));
-                }
+                // Same path as the theme write above (panel-split "Split
+                // persistence to configuration"; design D2).
+                rt.config_writer.submit(ConfigWrite::PanelSplit(percent));
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
@@ -1512,7 +1556,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 slot.request(panel, path, request, rt.tx.clone(), rt.workers.token());
             }
             Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone(), rt.workers.token()),
-            Effect::OpenViewer { path } => rt.open_viewer_source(path),
+            Effect::OpenViewer { request, path } => {
+                // Off the event loop: a dropped SMB session blocks the open
+                // for the redirector timeout (offload-blocking-io design
+                // D4/D5). The source comes back on the hand-off channel
+                // ahead of the `ViewerOpened` reply.
+                worker::spawn_viewer_open(request, path, rt.viewer_handoff.0.clone(), rt.tx.clone(), rt.workers.token());
+            }
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
                 let cancel = rt.cancels.register(request);
                 worker::spawn_viewer_search(path, start_offset, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
@@ -1541,38 +1591,21 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     }
                 }
             }
-            Effect::OpenEditor { path } => match EditorState::open(&path) {
-                // Synchronous, like `Effect::OpenViewer`: the whole read is
-                // bounded by the 10 MB cap, so this is cheap enough for the
-                // input path rather than warranting a worker thread (design
-                // D1).
-                Ok(EditorLoadResult::Loaded(editor)) => {
-                    worker::deliver(&rt.tx, "editor opened", Command::EditorOpened(Box::new(editor)));
-                }
-                Ok(EditorLoadResult::TooLarge { size }) => {
-                    worker::deliver(&rt.tx, "editor too large", Command::EditorTooLarge { path, size });
-                }
-                Ok(EditorLoadResult::NotEditable { reason }) => {
-                    worker::deliver(&rt.tx, "editor not editable", Command::EditorNotEditable { path, reason });
-                }
-                Err(e) => {
-                    worker::deliver(&rt.tx, "editor open failure", Command::EditorOpenFailed { message: cannot_message("open", &path, &e) });
-                }
-            },
+            Effect::OpenEditor { request, path } => {
+                // Off the event loop: the whole-file read is bounded by the
+                // 10 MB cap but not in latency on a slow share (offload-
+                // blocking-io design D4).
+                worker::spawn_editor_open(request, path, rt.tx.clone(), rt.workers.token());
+            }
             Effect::FindInSubtree { root, pattern, request } => {
                 let cancel = rt.cancels.register(request);
                 worker::spawn_find_subtree(root, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
             }
             Effect::SaveEditor { editor, then_quit } => {
-                let mut editor = *editor;
-                match editor.save() {
-                    Ok(()) => {
-                        worker::deliver(&rt.tx, "editor saved", Command::EditorSaved { editor: Box::new(editor), then_quit });
-                    }
-                    Err(e) => {
-                        worker::deliver(&rt.tx, "editor save failure", Command::EditorSaveFailed { message: cannot_message("save", &editor.path, &e) });
-                    }
-                }
+                // Off the event loop; the reducer keeps the editor gated on
+                // `save_pending` until the reply (offload-blocking-io design
+                // D6).
+                worker::spawn_editor_save(editor, then_quit, rt.tx.clone(), rt.workers.token());
             }
             Effect::SetClipboard(payload) => {
                 // Path normalisation (clipboard-export "Windows file-object
@@ -1616,16 +1649,6 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
     Ok(quit)
 }
 
-/// The status-line error forms of filesystem-error-handling "Error messages
-/// name the affected path" (error-diagnostics design D4): `Cannot
-/// <verb> <name>: <reason>`, where the name is the file's own name — the
-/// panel title directly above already shows the directory, and a full path
-/// would push the reason off the truncated mini-status — or the whole path
-/// when there is no file name (a drive or share root).
-fn cannot_message(verb: &str, path: &Path, reason: impl std::fmt::Display) -> String {
-    format!("Cannot {verb} {}: {reason}", worker::name_or_path(path))
-}
-
 /// Suspend the TUI, run the command on the real terminal, and come back.
 ///
 /// Restore runs on every path — a spawn failure, a non-zero exit, or a
@@ -1663,9 +1686,11 @@ fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::
 /// (open-with-associated-app; design D1): `ShellExecuteW` with the `open`
 /// verb on Windows, a detached `xdg-open`/`open` elsewhere. Never suspends
 /// the TUI and never waits on the launched program; `Err(message)` is the
-/// user-facing failure text for the active panel's status line.
+/// user-facing failure text for the invoking panel's status line. Called
+/// from `worker::spawn_open_with_association`, on a worker thread with COM
+/// initialized (offload-blocking-io design D7).
 #[cfg(windows)]
-fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+pub(crate) fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
@@ -1722,7 +1747,7 @@ fn open_with_association_error(name: &str, code: u32) -> String {
 /// interleave with it. A spawn error maps to the same failure message shape
 /// the Windows path produces.
 #[cfg(not(windows))]
-fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+pub(crate) fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
     let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
     std::process::Command::new(program)
         .arg(path)
@@ -1892,51 +1917,8 @@ mod tests {
         assert!(registry.flags.is_empty());
     }
 
-    /// viewer: Instant open — "Closing the viewer releases the file": after
-    /// `Effect::OpenViewer` installs the source and `Command::ViewerClose`
-    /// clears it, the file and its directory can both be removed — an open
-    /// handle blocks directory removal on Windows, so this fails if the
-    /// source leaks. `apply`/`run_effects` need a `TerminalGuard`, which a
-    /// headless test cannot construct, so this drives the same `Runtime`
-    /// methods those two call.
-    #[test]
-    fn closing_the_viewer_releases_the_file_and_its_directory() {
-        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("file.bin");
-        std::fs::write(&path, b"hello world").unwrap();
-
-        let (tx, rx) = mpsc::channel();
-        let mut rt = Runtime {
-            tx,
-            active_job: None,
-            cancels: CancelRegistry::default(),
-            history_writer: HistoryWriter::disabled(),
-            config_path: dir.join(CONFIG_FILE),
-            usermenu_path: dir.join("usermenu.toml"),
-            persist_enabled: false,
-            viewer_source: None,
-            clipboard: Box::new(clipboard::RecordingClipboard::default()),
-            mouse_tracker: MouseTracker::new(),
-            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
-            workers: worker::WorkerGauge::new(),
-        };
-
-        rt.open_viewer_source(path.clone());
-        assert!(rt.viewer_source.is_some());
-        match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Command::ViewerOpened { path: opened, file_len: 11 }) => assert_eq!(opened, path),
-            other => panic!("expected ViewerOpened, got {other:?}"),
-        }
-
-        rt.release_viewer_source();
-        assert!(rt.viewer_source.is_none());
-        std::fs::remove_file(&path).unwrap();
-        std::fs::remove_dir(&dir).unwrap();
-    }
-
     /// A `Runtime` with no terminal and no worker threads, for the viewer-
-    /// source tests below (and the one above, which predates it).
+    /// source tests below.
     fn headless_runtime(dir: &std::path::Path) -> (Runtime, Receiver<Command>) {
         let (tx, rx) = mpsc::channel();
         let rt = Runtime {
@@ -1944,10 +1926,10 @@ mod tests {
             active_job: None,
             cancels: CancelRegistry::default(),
             history_writer: HistoryWriter::disabled(),
-            config_path: dir.join(CONFIG_FILE),
+            config_writer: ConfigWriter::disabled(),
             usermenu_path: dir.join("usermenu.toml"),
-            persist_enabled: false,
             viewer_source: None,
+            viewer_handoff: mpsc::channel(),
             clipboard: Box::new(clipboard::RecordingClipboard::default()),
             mouse_tracker: MouseTracker::new(),
             git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
@@ -1957,24 +1939,125 @@ mod tests {
     }
 
     /// Mirrors `apply` minus `run_effects` (which needs a `TerminalGuard`):
-    /// the pre-`update` `ViewerClose` release and the post-`update`
-    /// transition check, in the same order.
+    /// the pre-`update` `ViewerClose` release, the post-`update` hand-off
+    /// adoption and the transition check, in the same order.
     fn apply_headless(state: State, cmd: Command, rt: &mut Runtime) -> State {
         if matches!(cmd, Command::ViewerClose) {
             rt.release_viewer_source();
         }
         let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
-        let viewer_opened = matches!(cmd, Command::ViewerOpened { .. });
+        let viewer_opened = match cmd {
+            Command::ViewerOpened { request, .. } => Some(request),
+            _ => None,
+        };
         let (state, _effects) = update(state, cmd);
-        rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened, &state);
+        if let Some(request) = viewer_opened {
+            rt.adopt_viewer_handoff(request, was_viewer, &state);
+        }
+        rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened.is_some(), &state);
         state
     }
 
+    /// Run the viewer-open worker for `path` under `request` the way
+    /// `run_effects` does, and return its `ViewerOpened` reply once the
+    /// source is waiting on the hand-off channel.
+    fn open_on_worker(rt: &Runtime, rx: &Receiver<Command>, request: u64, path: &Path) -> Command {
+        worker::spawn_viewer_open(request, path.to_path_buf(), rt.viewer_handoff.0.clone(), rt.tx.clone(), rt.workers.token());
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(cmd @ Command::ViewerOpened { .. }) => cmd,
+            other => panic!("expected ViewerOpened, got {other:?}"),
+        }
+    }
+
+    /// A state whose pending open is `request` on the left panel, as
+    /// `handle_request_viewer` would have recorded it.
+    fn state_awaiting_open(request: u64) -> State {
+        let mut state = State::empty(Theme::classic());
+        state.term_size = (80, 24);
+        state.request_seq = request;
+        state.pending_open = Some(filecommand_core::update::PendingOpen { request, side: PanelSide::Left, kind: filecommand_core::update::PendingOpenKind::Viewer });
+        state
+    }
+
+    /// viewer: Instant open — "Closing the viewer releases the file": after
+    /// the worker's source is adopted on `ViewerOpened` and
+    /// `Command::ViewerClose` clears it, the file and its directory can both
+    /// be removed — an open handle blocks directory removal on Windows, so
+    /// this fails if the source leaks. `apply`/`run_effects` need a
+    /// `TerminalGuard`, which a headless test cannot construct, so this
+    /// drives the same `Runtime` methods those two call.
+    #[test]
+    fn closing_the_viewer_releases_the_file_and_its_directory() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        let opened = open_on_worker(&rt, &rx, 1, &path);
+        assert!(matches!(&opened, Command::ViewerOpened { request: 1, path: opened, file_len: 11 } if *opened == path), "{opened:?}");
+        let state = apply_headless(state_awaiting_open(1), opened, &mut rt);
+        assert!(matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the worker's source was adopted");
+
+        let state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// offload-blocking-io design D4 (task 5.7): `spawn_viewer_open` delivers
+    /// the source on the hand-off channel *before* its `ViewerOpened`, and
+    /// `apply` keeps only the entry whose request the reducer accepted,
+    /// dropping a non-matching one so its file is released.
+    #[test]
+    fn apply_keeps_the_matching_viewer_source_and_drops_a_superseded_one() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-handoff-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow.log");
+        let fast = dir.join("fast.txt");
+        std::fs::write(&slow, b"slow").unwrap();
+        std::fs::write(&fast, b"fast!").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        // The superseded open (request 1) and the current one (request 2)
+        // both complete; each source is on the channel before its command.
+        let opened_slow = open_on_worker(&rt, &rx, 1, &slow);
+        assert!(rt.viewer_handoff.1.try_recv().is_ok(), "the source arrives ahead of ViewerOpened");
+        let opened_fast = open_on_worker(&rt, &rx, 2, &fast);
+
+        // The reducer's pending open is request 2: the stale reply for 1 is
+        // discarded, and no source is adopted for it.
+        let state = apply_headless(state_awaiting_open(2), opened_slow, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels, "the stale reply did not open the viewer");
+        assert!(rt.viewer_source.is_none(), "no source is kept for a discarded reply");
+
+        let state = apply_headless(state, opened_fast, &mut rt);
+        match &state.phase {
+            UiPhase::Viewer(v) => assert_eq!(v.path, fast),
+            other => panic!("expected the viewer on fast.txt, got {other:?}"),
+        }
+        match &rt.viewer_source {
+            Some((path, source)) => {
+                assert_eq!(path, &fast, "the adopted source is the one for the accepted reply");
+                assert_eq!(source.len(), 5);
+            }
+            None => panic!("the matching source was adopted"),
+        }
+        // `slow.log`'s handle was dropped with its entry, so the file can go.
+        std::fs::remove_file(&slow).expect("the superseded open's handle was released");
+
+        let _state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&fast).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
     /// resize-preserves-session-state design D7 (task 3.4): the byte source
-    /// follows the viewer *phase*. It survives an unrelated command applied
-    /// between `Effect::OpenViewer` and the queued `ViewerOpened` (the phase
-    /// is still `Panels` then), survives a shrink below the floor and the
-    /// enlarge back, and is released exactly when the viewer closes.
+    /// follows the viewer *phase*. It survives a shrink below the floor and
+    /// the enlarge back, and is released exactly when the viewer closes.
     #[test]
     fn viewer_source_follows_the_viewer_phase_across_a_resize() {
         let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-resize-test-{}", std::process::id()));
@@ -1983,20 +2066,12 @@ mod tests {
         std::fs::write(&path, b"hello world").unwrap();
         let (mut rt, rx) = headless_runtime(&dir);
 
-        let mut state = State::empty(Theme::classic());
-        state.term_size = (80, 24);
-        rt.open_viewer_source(path.clone());
-        assert!(rt.viewer_source.is_some());
-        let opened = match rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(cmd @ Command::ViewerOpened { .. }) => cmd,
-            other => panic!("expected ViewerOpened, got {other:?}"),
-        };
-
+        let opened = open_on_worker(&rt, &rx, 1, &path);
         // A listing chunk already queued ahead of the reply is applied while
-        // the phase is still `Panels`: the fresh source must survive it.
+        // the phase is still `Panels`: the queued hand-off must survive it.
+        let state = state_awaiting_open(1);
         let request = state.left.listing_request.unwrap_or(0);
         let state = apply_headless(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![], request }, &mut rt);
-        assert!(rt.viewer_source.is_some(), "an unrelated command before ViewerOpened must not drop the source");
         let state = apply_headless(state, opened, &mut rt);
         assert!(matches!(state.phase, UiPhase::Viewer(_)));
         assert!(rt.viewer_source.is_some());
@@ -2020,7 +2095,7 @@ mod tests {
 
     /// Design D7's second clause: a `ViewerOpened` the reducer discards
     /// (here it arrives while the end-of-job summary owns the phase) must not
-    /// leave the source `Effect::OpenViewer` installed behind.
+    /// leave the worker's source behind — the hand-off entry is dropped.
     #[test]
     fn a_discarded_viewer_opened_releases_the_source() {
         let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-discard-test-{}", std::process::id()));
@@ -2029,14 +2104,14 @@ mod tests {
         std::fs::write(&path, b"hello world").unwrap();
         let (mut rt, rx) = headless_runtime(&dir);
 
-        rt.open_viewer_source(path.clone());
-        let opened = rx.recv_timeout(Duration::from_secs(5)).expect("ViewerOpened");
-        let mut state = State::empty(Theme::classic());
+        let opened = open_on_worker(&rt, &rx, 1, &path);
+        let mut state = state_awaiting_open(1);
         state.phase = UiPhase::FileOpSummary(vec![]);
         let state = apply_headless(state, opened, &mut rt);
         assert!(!matches!(state.phase, UiPhase::Viewer(_)), "the summary dialog swallowed the reply");
         assert!(rt.viewer_source.is_none());
-        std::fs::remove_file(&path).unwrap();
+        assert!(rt.viewer_handoff.1.try_recv().is_err(), "the hand-off channel was drained");
+        std::fs::remove_file(&path).expect("the discarded reply's handle was released");
         std::fs::remove_dir(&dir).unwrap();
     }
 
@@ -2753,10 +2828,10 @@ mod tests {
             active_job: None,
             cancels: CancelRegistry::default(),
             history_writer: HistoryWriter::disabled(),
-            config_path: dir.join(CONFIG_FILE),
+            config_writer: ConfigWriter::disabled(),
             usermenu_path: dir.join("usermenu.toml"),
-            persist_enabled: false,
             viewer_source: None,
+            viewer_handoff: mpsc::channel(),
             clipboard: Box::new(clipboard::RecordingClipboard::default()),
             mouse_tracker: MouseTracker::new(),
             git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
@@ -2893,7 +2968,7 @@ mod tests {
     fn cannot_message_formats_the_viewer_and_editor_open_failure() {
         let err = io::Error::new(io::ErrorKind::PermissionDenied, "Access is denied. (os error 5)");
         let path = Path::new("dir").join("locked.db");
-        assert_eq!(cannot_message("open", &path, &err), "Cannot open locked.db: Access is denied. (os error 5)");
+        assert_eq!(worker::cannot_message("open", &path, &err), "Cannot open locked.db: Access is denied. (os error 5)");
     }
 
     /// Scenario "Editor save failure names the file": `Cannot save <file>:
@@ -2903,10 +2978,10 @@ mod tests {
     fn cannot_message_formats_the_editor_save_failure() {
         let err = io::Error::new(io::ErrorKind::StorageFull, "There is not enough space on the disk. (os error 112)");
         let path = Path::new("dir").join("notes.txt");
-        assert_eq!(cannot_message("save", &path, &err), "Cannot save notes.txt: There is not enough space on the disk. (os error 112)");
+        assert_eq!(worker::cannot_message("save", &path, &err), "Cannot save notes.txt: There is not enough space on the disk. (os error 112)");
         // A non-`io::Error` reason (the editor's own refusal) formats the
         // same way around it.
-        assert_eq!(cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"), "Cannot save notes.txt: notes.txt is read-only — not saved");
+        assert_eq!(worker::cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"), "Cannot save notes.txt: notes.txt is read-only — not saved");
     }
 
     /// open-with-associated-app design D1 / file-action-menu "Open with the

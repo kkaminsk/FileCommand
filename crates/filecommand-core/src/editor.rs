@@ -244,6 +244,14 @@ pub struct EditorState {
     /// save attempted as part of the save-on-exit confirm), or `None`.
     /// Cleared by the next edit or successful save (design D6).
     pub save_error: Option<String>,
+    /// `true` from the moment F2 (or the save-on-exit confirm's "Y")
+    /// dispatches `Effect::SaveEditor` until `Command::EditorSaved`/
+    /// `EditorSaveFailed` replies. The save runs on a worker thread; while
+    /// it is outstanding the editor accepts no edits, caret moves, or
+    /// further save/quit commands and shows a `Saving…` notice on its last
+    /// body row (application-shell "Slow storage never blocks the event
+    /// loop"; offload-blocking-io design D6).
+    pub save_pending: bool,
     /// Whether the file began with a UTF-8 byte-order mark on load. The mark
     /// is kept out of the buffer — it is zero-width, so as a buffer
     /// character the caret could silently type in front of it or delete it
@@ -279,6 +287,7 @@ impl EditorState {
             replace_prompt: None,
             quit_confirm: false,
             save_error: None,
+            save_pending: false,
             has_bom,
         })
     }
@@ -692,6 +701,7 @@ mod tests {
             replace_prompt: None,
             quit_confirm: false,
             save_error: None,
+            save_pending: false,
             has_bom: false,
         }
     }

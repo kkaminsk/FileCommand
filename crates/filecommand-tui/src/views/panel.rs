@@ -905,18 +905,23 @@ fn render_bottom_border(
     // `bracketed` below), so the content itself has 2 fewer cells to work
     // with than the interior.
     let status_budget = inner_w.saturating_sub(2);
-    // An inline error (a failed listing, a failed F3/F4 dispatch — §7 "panel
-    // shows an inline error state") takes over the mini-status line until
-    // the next successful operation clears it (`begin_new_listing`). The
-    // multi-select summary takes precedence over the per-entry status while
-    // one or more entries are selected (selection "Selection count and size
-    // summary"); both drop fields/truncate with `…` in ladder order as the
-    // panel narrows (responsive-layout "Chrome degradation").
+    // A pending note — `Checking <path>…` while a command-line target probe
+    // runs, `Opening <name>…` while an F3/F4 open runs — ranks below the
+    // override and above the error, in the normal ministatus style
+    // (offload-blocking-io design D3). An inline error (a failed listing, a
+    // failed F3/F4 dispatch — §7 "panel shows an inline error state") takes
+    // over the mini-status line until the next successful operation clears
+    // it (`begin_new_listing`). The multi-select summary takes precedence
+    // over the per-entry status while one or more entries are selected
+    // (selection "Selection count and size summary"); both drop fields/
+    // truncate with `…` in ladder order as the panel narrows
+    // (responsive-layout "Chrome degradation").
     let status_text = match status_override {
         Some(text) => text,
-        None => match &panel.last_error {
-            Some(message) => message.clone(),
-            None => match panel.progress {
+        None => match (&panel.pending_note, &panel.last_error) {
+            (Some(note), _) => note.clone(),
+            (None, Some(message)) => message.clone(),
+            (None, None) => match panel.progress {
                 ListingProgress::Streaming { count } => reading_status(count),
                 ListingProgress::Complete { .. } => match panel.selection_status() {
                     Some(summary) => truncate_with_ellipsis(&summary, status_budget),

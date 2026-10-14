@@ -1014,6 +1014,24 @@ fn snapshot_editor_save_failed() {
     insta::assert_snapshot!("editor_save_failed", text);
 }
 
+/// application-shell "Saving to a slow share shows progress and accepts no
+/// edits" (offload-blocking-io design D6): while the save is in flight the
+/// last body row reads `Saving…`, with the header and the F-key bar exactly
+/// as builtin-editor "Full-screen editor chrome" specifies.
+#[test]
+fn snapshot_editor_saving() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
+    editor.type_char('!');
+    editor.save_pending = true;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[22].starts_with("Saving…"), "`{}`", rows[22]);
+    assert!(rows[0].contains("Edit: C:\\notes.txt *"), "header unchanged: `{}`", rows[0]);
+    assert!(rows[23].trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "F-key bar unchanged: `{}`", rows[23]);
+    insta::assert_snapshot!("editor_saving", text);
+}
+
 #[test]
 fn editor_replaces_the_panels_full_screen() {
     let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n").expect("valid UTF-8 fixture");
@@ -1469,6 +1487,72 @@ fn snapshot_clipboard_feedback_mini_status_error() {
     let row = mini_status_row(&text);
     assert!(row.contains("Clipboard busy"), "`{row}`");
     insta::assert_snapshot!("clipboard_feedback_mini_status_error", row);
+}
+
+// ---------------------------------------------------------------------
+// offload-blocking-io: the pending note on the mini-status line (design D3)
+// ---------------------------------------------------------------------
+
+/// command-line "cd to an unresponsive UNC path does not freeze the UI":
+/// `Checking <path>…` on the panel's mini-status while the probe runs.
+#[test]
+fn snapshot_pending_note_checking_mini_status() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note(r"Checking \\nas\share…".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains(r"Checking \\nas\share…"), "`{row}`");
+    insta::assert_snapshot!("pending_note_checking_mini_status", row);
+}
+
+/// application-shell "F4 on a slow share keeps the panels live":
+/// `Opening <name>…` on the panel's mini-status while the open runs.
+#[test]
+fn snapshot_pending_note_opening_mini_status() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note("Opening notes.txt…".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("Opening notes.txt…"), "`{row}`");
+    insta::assert_snapshot!("pending_note_opening_mini_status", row);
+}
+
+/// The note ranks below the status override (clipboard feedback here) and
+/// above `last_error`, and uses the normal ministatus style.
+#[test]
+fn pending_note_ranks_below_the_override_and_above_the_error() {
+    use filecommand_tui::style::role_style;
+    use filecommand_core::theme::Role;
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.pending_note = Some("Opening notes.txt…".to_string());
+    state.left.last_error = Some("Cannot open notes.txt: access denied".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("Opening notes.txt…"), "the note wins over the error: `{row}`");
+    assert!(!row.contains("Cannot open"), "`{row}`");
+
+    state.left.clipboard_feedback = Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("1 file copied to clipboard"), "the override wins over the note: `{row}`");
+    assert!(!row.contains("Opening"), "`{row}`");
+
+    // The note is drawn in the normal ministatus role, not the error role.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note("Opening notes.txt…".to_string());
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            views::render(frame.buffer_mut(), area, &state, ColorDepth::Ansi16, &pinned_identity_lines(), FIXED_CLOCK_TEXT, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let x = (0..80u16).find(|x| buf[(*x, 21)].symbol() == "O").expect("the note is on the mini-status row");
+    let theme = Theme::classic();
+    assert_eq!(buf[(x, 21)].fg, role_style(&theme, Role::PanelMinistatus, ColorDepth::Ansi16).fg.unwrap());
 }
 
 #[test]
