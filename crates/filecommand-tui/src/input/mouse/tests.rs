@@ -597,7 +597,7 @@ fn undersized_ignores_mouse_over_every_phase() {
         UiPhase::Panels,
         UiPhase::Splash { started_at_ms: 0 },
         UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 0)),
-        UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"")),
+        UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"").expect("valid UTF-8 fixture")),
         UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
             sources: vec![],
             source_dir: PathBuf::from("/left"),

@@ -405,7 +405,7 @@ fn snapshot_terminal_too_small_placeholder() {
 fn snapshot_placeholder_hides_the_editor_identically() {
     // The hidden screen never shows through: the placeholder over a modified
     // editor buffer is byte-identical to the one over the panels.
-    let mut editor = EditorState::from_bytes(PathBuf::from("notes.txt"), b"one\ntwo\nthree\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from("notes.txt"), b"one\ntwo\nthree\n").expect("valid UTF-8 fixture");
     editor.type_char('x');
     assert!(editor.is_modified());
     let over_editor = render_to_text(40, 10, &undersized_state(UiPhase::Editor(editor)), ColorDepth::Ansi16);

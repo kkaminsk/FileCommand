@@ -7420,7 +7420,7 @@ fn assert_survives_shrink_and_enlarge(state: State) -> State {
 
 fn twenty_line_editor() -> EditorState {
     let text: String = (1..=20).map(|n| format!("line {n}\n")).collect();
-    EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes())
+    EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes()).expect("valid UTF-8 fixture")
 }
 
 /// Task 4.2: the editor with a modified buffer, the caret on line 12 and
@@ -7719,7 +7719,7 @@ fn undersized_still_applies_editor_saved_viewer_opened_and_editor_opened() {
 #[test]
 fn enlarging_rescrolls_the_hidden_editor_to_its_caret() {
     let text: String = (1..=40).map(|n| format!("line {n}\n")).collect();
-    let mut editor = EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes());
+    let mut editor = EditorState::from_bytes(PathBuf::from("/left/notes.txt"), text.as_bytes()).expect("valid UTF-8 fixture");
     for _ in 0..30 {
         editor.move_down();
     }
