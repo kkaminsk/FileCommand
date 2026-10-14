@@ -3885,15 +3885,21 @@ fn handle_edit_user_menu_file(state: &mut State) -> Vec<Effect> {
 
 /// `Command::UserMenuReloaded`: the editor over `usermenu.toml` has closed
 /// and the TUI re-read it. A well-formed file replaces the F2 entries
-/// immediately; a malformed one raises the existing dismissable warning
-/// dialog and keeps the previous entries — the on-disk file (the user's own
-/// edit) is never overwritten (user-menu "Malformed edit warns without
-/// overwriting"; design D4).
+/// immediately — and if it carried non-fatal warnings (an unknown key, an
+/// entry missing a field), their one-line summary is shown in the same
+/// dismissable dialog (configuration-files "Warnings after editing the user
+/// menu"); a malformed one raises the existing warning and keeps the
+/// previous entries — the on-disk file (the user's own edit) is never
+/// overwritten (user-menu "Malformed edit warns without overwriting";
+/// design D4).
 fn apply_user_menu_reload(state: &mut State, result: config::UserMenuLoadResult) {
     if result.malformed {
         state.startup_warning = Some(format!("{} is malformed; keeping the previous user menu entries", config::USERMENU_FILE));
     } else {
         state.user_menu_entries = result.entries;
+        if let Some(summary) = config::summarize_warnings(&result.warnings) {
+            state.startup_warning = Some(summary);
+        }
     }
 }
 

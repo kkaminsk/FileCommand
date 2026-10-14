@@ -3514,6 +3514,7 @@ fn user_menu_reloaded_applies_a_wellformed_file() {
         warnings: Vec::new(),
         created_default: false,
         malformed: false,
+        problem: None,
     };
     let (state, effects) = update(state, Command::UserMenuReloaded(result));
     assert!(effects.is_empty());
@@ -3522,11 +3523,36 @@ fn user_menu_reloaded_applies_a_wellformed_file() {
     assert_eq!(state.startup_warning, None);
 }
 
+/// configuration-files "Warnings after editing the user menu": a
+/// well-formed reload with non-fatal warnings applies the entries *and*
+/// shows the warning summary naming the file and line.
+#[test]
+fn user_menu_reloaded_with_warnings_applies_entries_and_shows_the_summary() {
+    let mut state = test_state(UiPhase::Panels);
+    state.user_menu_entries = vec![config::UserMenuEntry { label: "Old".to_string(), command: "old".to_string() }];
+    let parsed = config::parse_usermenu("[[entry]]\nlabel = \"New\"\ncommand = \"new\"\nicon = \"disk\"\n");
+    assert!(!parsed.malformed && parsed.warnings.len() == 1, "fixture: one unknown-key warning");
+    let result = config::UserMenuLoadResult { entries: parsed.entries, warnings: parsed.warnings, created_default: false, malformed: false, problem: None };
+    let (state, effects) = update(state, Command::UserMenuReloaded(result));
+    assert!(effects.is_empty());
+    assert_eq!(state.user_menu_entries.len(), 1);
+    assert_eq!(state.user_menu_entries[0].label, "New", "the edited entries replace the F2 menu");
+    let warning = state.startup_warning.expect("the warnings raise the dialog");
+    assert!(warning.starts_with("usermenu.toml line 4:"), "names the file and line: {warning}");
+    assert!(warning.contains("icon"), "names the unknown key: {warning}");
+}
+
 #[test]
 fn user_menu_reloaded_malformed_warns_and_keeps_the_previous_entries() {
     let mut state = test_state(UiPhase::Panels);
     state.user_menu_entries = vec![config::UserMenuEntry { label: "Previous".to_string(), command: "prev".to_string() }];
-    let result = config::UserMenuLoadResult { entries: config::default_user_menu_entries(), warnings: Vec::new(), created_default: false, malformed: true };
+    let result = config::UserMenuLoadResult {
+        entries: config::default_user_menu_entries(),
+        warnings: Vec::new(),
+        created_default: false,
+        malformed: true,
+        problem: Some(config::UserMenuProblem::InvalidToml),
+    };
     let (state, effects) = update(state, Command::UserMenuReloaded(result));
     assert!(effects.is_empty());
     assert_eq!(state.user_menu_entries[0].label, "Previous", "the previous entries are kept, not the defaults");

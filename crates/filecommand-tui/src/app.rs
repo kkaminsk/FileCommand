@@ -401,7 +401,11 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     // capture configuration") — `config::load` is pure file I/O with no
     // terminal dependency, so this reorder ahead of `TerminalGuard::new` is
     // safe.
-    let config = config::load(&config_path);
+    let config::ParsedConfig { config, warnings: parsed_warnings } = config::load(&config_path);
+    // config.toml warnings first, usermenu.toml warnings appended below, in
+    // file-then-line order (configuration-files "Several warnings are
+    // summarized"; design D4).
+    let mut config_warnings: Vec<String> = parsed_warnings.iter().map(ToString::to_string).collect();
     let mouse_enabled = config.mouse_enabled && !launch.no_mouse;
     let mut guard = TerminalGuard::new(mouse_enabled)?;
 
@@ -447,6 +451,7 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     state.history = history_file.commands;
     state.dir_history = history_file.directories;
     let user_menu = config::load_user_menu(&usermenu_path);
+    config_warnings.extend(user_menu.warnings.iter().map(ToString::to_string));
     apply_user_menu(&mut state, user_menu);
     // Commands → Menu file edit reads the path back out of `State`
     // (pulldown-menu-completion design D4).
@@ -462,6 +467,9 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     if let Some(warning) = create_warning {
         set_startup_warning(&mut state, warning);
     }
+    // Lowest precedence of all: the configuration-content summary is shown
+    // only when no other startup warning fired (design D4).
+    apply_configuration_warnings(&mut state, &config_warnings);
     stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
@@ -1141,7 +1149,36 @@ fn stamp_startup_warning(state: &mut State) {
 fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
     state.user_menu_entries = user_menu.entries;
     if user_menu.malformed {
-        set_startup_warning(state, format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+        let file = config::USERMENU_FILE;
+        let warning = match user_menu.problem {
+            // A not-UTF-8 file gets its own message naming the way out,
+            // because the built-in editor will not open it
+            // (configuration-files "Non-UTF-8 usermenu.toml is kept, not
+            // overwritten"; design D3).
+            Some(config::UserMenuProblem::NotUtf8) => format!("{file} is not UTF-8 text; using the default menu — re-save it as UTF-8 or delete it to recreate the defaults"),
+            Some(config::UserMenuProblem::Unreadable(error)) => format!("{file} could not be read ({error}); using the default menu"),
+            Some(config::UserMenuProblem::InvalidToml) | None => format!("{file} is malformed; F2 uses the default user menu"),
+        };
+        set_startup_warning(state, warning);
+    }
+}
+
+/// Show the `config.toml`/`usermenu.toml` content warnings as one summary
+/// line in the startup-warning dialog, but only when no other startup
+/// warning is already up: the summary has the lowest precedence, so every
+/// warning an existing requirement mandates (profile directory, `--theme`,
+/// malformed user menu, legacy notice, unwritable profile) still shows
+/// (configuration-files "Profile warning keeps precedence", "Theme override
+/// warning keeps precedence"; design D4). Every individual warning goes to
+/// the diagnostic log regardless, since the dialog shows only the first.
+fn apply_configuration_warnings(state: &mut State, warnings: &[String]) {
+    for warning in warnings {
+        diag::log("config", warning);
+    }
+    if state.startup_warning.is_none() {
+        if let Some(summary) = config::summarize_warnings(warnings) {
+            set_startup_warning(state, summary);
+        }
     }
 }
 
@@ -1901,7 +1938,7 @@ mod tests {
     /// parsed correctly but never reached `State`.
     #[test]
     fn apply_config_wires_the_configured_editor_and_shell_into_state() {
-        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n");
+        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n").config;
         let mut state = State::empty(Theme::classic());
         assert_eq!(state.editor, None, "sanity: editor starts unset before wiring");
         apply_config(&mut state, &config);
@@ -1911,7 +1948,7 @@ mod tests {
 
     #[test]
     fn apply_config_wires_the_configured_panel_split_into_state() {
-        let config = config::parse("panel_split = 66\n");
+        let config = config::parse("panel_split = 66\n").config;
         let mut state = State::empty(Theme::classic());
         assert_eq!(state.split_percent, 50, "sanity: split starts at the default before wiring");
         apply_config(&mut state, &config);
@@ -1920,7 +1957,7 @@ mod tests {
 
     #[test]
     fn apply_config_leaves_editor_unset_when_config_omits_it() {
-        let config = config::parse("splash = false\n");
+        let config = config::parse("splash = false\n").config;
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
@@ -1933,9 +1970,9 @@ mod tests {
     fn apply_config_turns_animations_on_by_default_and_off_when_configured() {
         let mut state = State::empty(Theme::classic());
         assert!(!state.animations, "sanity: a state built without config does not animate");
-        apply_config(&mut state, &config::parse(""));
+        apply_config(&mut state, &config::parse("").config);
         assert!(state.animations, "default is animated");
-        apply_config(&mut state, &config::parse("animations = false\n"));
+        apply_config(&mut state, &config::parse("animations = false\n").config);
         assert!(!state.animations, "animations = false disables them");
     }
 
@@ -1943,7 +1980,7 @@ mod tests {
     /// `animations = true`, and without the flag the config value stands.
     #[test]
     fn noanimations_flag_overrides_the_config_value() {
-        let on = config::parse("animations = true\n");
+        let on = config::parse("animations = true\n").config;
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &on);
         apply_launch_options(&mut state, &parse_launch_args(["--noanimations".to_string()]));
@@ -1955,7 +1992,7 @@ mod tests {
         assert!(state.animations, "no flag leaves the config value alone");
 
         let mut state = State::empty(Theme::classic());
-        apply_config(&mut state, &config::parse("animations = false\n"));
+        apply_config(&mut state, &config::parse("animations = false\n").config);
         apply_launch_options(&mut state, &parse_launch_args(Vec::<String>::new()));
         assert!(!state.animations, "the flag never turns animations on");
     }
@@ -1992,7 +2029,7 @@ mod tests {
     /// something else.
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_for_an_unknown_name() {
-        let config = config::parse("theme = \"no-such-theme\"\n");
+        let config = config::parse("theme = \"no-such-theme\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
         assert_eq!(warning, None, "no --theme switch was passed, so no warning is raised");
@@ -2003,7 +2040,7 @@ mod tests {
     /// unset -> load -> resolve path end to end.
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_when_theme_is_unset() {
-        let config = config::parse("splash = false\n");
+        let config = config::parse("splash = false\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
         assert_eq!(warning, None);
@@ -2014,7 +2051,7 @@ mod tests {
     /// the fallback.
     #[test]
     fn resolve_startup_theme_loads_a_known_configured_theme() {
-        let config = config::parse("theme = \"terminal-green\"\n");
+        let config = config::parse("theme = \"terminal-green\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::terminal_green().name);
         assert_eq!(warning, None);
@@ -2354,7 +2391,7 @@ mod tests {
     /// `--theme` value beats a different `config.theme`, with no warning.
     #[test]
     fn resolve_startup_theme_override_wins_over_configuration() {
-        let config = config::parse("theme = \"nc-classic\"\n");
+        let config = config::parse("theme = \"nc-classic\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("yellow-storm"));
         assert_eq!(theme.name, Theme::yellow_storm().name);
         assert_eq!(warning, None, "a valid override produces no warning");
@@ -2365,7 +2402,7 @@ mod tests {
     /// warning naming the rejected value and listing the valid names.
     #[test]
     fn resolve_startup_theme_unknown_override_falls_back_with_a_warning() {
-        let config = config::parse("theme = \"nc-mono\"\n");
+        let config = config::parse("theme = \"nc-mono\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("no-such-theme"));
         assert_eq!(theme.name, Theme::mono().name);
         let warning = warning.expect("an unknown override raises a warning");
@@ -2380,7 +2417,7 @@ mod tests {
     /// value was missing (distinct wording from the unknown-name case).
     #[test]
     fn resolve_startup_theme_missing_value_falls_back_with_a_warning() {
-        let config = config::parse("theme = \"nc-mono\"\n");
+        let config = config::parse("theme = \"nc-mono\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some(""));
         assert_eq!(theme.name, Theme::mono().name);
         let warning = warning.expect("a missing value raises a warning");
@@ -2394,7 +2431,7 @@ mod tests {
     /// untouched (design D4).
     #[test]
     fn picker_apply_persists_normally_during_an_overridden_session() {
-        let config = config::parse("theme = \"nc-classic\"\n");
+        let config = config::parse("theme = \"nc-classic\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("terminal-green"));
         assert_eq!(theme.name, Theme::terminal_green().name);
         assert_eq!(warning, None);
@@ -2424,6 +2461,7 @@ mod tests {
             warnings: Vec::new(),
             created_default: false,
             malformed: true,
+            problem: Some(config::UserMenuProblem::InvalidToml),
         };
         apply_user_menu(&mut state, malformed);
         assert_eq!(state.user_menu_entries, default_entries, "falls back to default entries");
@@ -2440,10 +2478,100 @@ mod tests {
     fn apply_user_menu_does_not_warn_on_well_formed_content() {
         let mut state = State::empty(Theme::classic());
         let entries = config::default_user_menu_entries();
-        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false };
+        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false, problem: None };
         apply_user_menu(&mut state, ok);
         assert_eq!(state.user_menu_entries, entries);
         assert_eq!(state.startup_warning, None);
+    }
+
+    /// configuration-files "Non-UTF-8 usermenu.toml is kept, not
+    /// overwritten": the not-UTF-8 outcome gets its own message that says
+    /// how to recover, instead of the generic malformed one (design D3).
+    #[test]
+    fn apply_user_menu_names_the_not_utf8_recovery_for_a_non_utf8_file() {
+        let mut state = State::empty(Theme::classic());
+        let result = config::UserMenuLoadResult {
+            entries: config::default_user_menu_entries(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+            problem: Some(config::UserMenuProblem::NotUtf8),
+        };
+        apply_user_menu(&mut state, result);
+        let warning = state.startup_warning.expect("a not-UTF-8 user menu raises the dialog");
+        assert!(warning.starts_with("usermenu.toml is not UTF-8 text"), "{warning}");
+        assert!(warning.contains("re-save it as UTF-8"), "{warning}");
+    }
+
+    // -- configuration-files: the warning summary and its precedence ------
+
+    /// The config.toml warnings come first, then usermenu.toml's, and the
+    /// dialog shows the first plus a `(+N more)` count across both files
+    /// (configuration-files "Several warnings are summarized"; design D4).
+    #[test]
+    fn configuration_warnings_summarize_across_both_files() {
+        let mut state = State::empty(Theme::classic());
+        let parsed = config::parse("colour = \"red\"\nsplash false\n");
+        let menu = config::parse_usermenu("[[entry]]\nlabel = \"A\"\ncommand = \"a\"\nicon = \"x\"\n");
+        let mut warnings: Vec<String> = parsed.warnings.iter().map(ToString::to_string).collect();
+        warnings.extend(menu.warnings.iter().map(ToString::to_string));
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        apply_configuration_warnings(&mut state, &warnings);
+        let shown = state.startup_warning.expect("the summary is shown");
+        assert!(shown.starts_with("config.toml line 1: unknown setting \"colour\""), "{shown}");
+        assert!(shown.ends_with("(+2 more)"), "{shown}");
+    }
+
+    /// configuration-files "Profile warning keeps precedence": an existing
+    /// startup warning (here the unwritable-profile one) is never replaced
+    /// by the configuration summary.
+    #[test]
+    fn configuration_warnings_never_displace_an_existing_startup_warning() {
+        let mut state = State::empty(Theme::classic());
+        let profile_warning = "Could not create the profile directory C:\\nope: access denied; settings will not be saved".to_string();
+        set_startup_warning(&mut state, profile_warning.clone());
+        let warnings = vec!["config.toml line 2: unknown setting \"colour\"; ignored".to_string()];
+        apply_configuration_warnings(&mut state, &warnings);
+        assert_eq!(state.startup_warning.as_deref(), Some(profile_warning.as_str()));
+    }
+
+    /// configuration-files "Theme override warning keeps precedence": the
+    /// `--theme` warning wins over an unknown-setting summary; so does a
+    /// malformed `usermenu.toml`.
+    #[test]
+    fn theme_override_and_malformed_user_menu_warnings_outrank_the_summary() {
+        let config = config::parse("colour = \"red\"\n");
+        let summary: Vec<String> = config.warnings.iter().map(ToString::to_string).collect();
+
+        let mut state = State::empty(Theme::classic());
+        let (_, theme_warning) = resolve_startup_theme(&config.config, Some("no-such-theme"));
+        set_startup_warning(&mut state, theme_warning.expect("unknown --theme warns"));
+        apply_configuration_warnings(&mut state, &summary);
+        let shown = state.startup_warning.clone().unwrap();
+        assert!(shown.contains("--theme no-such-theme"), "{shown}");
+
+        let mut state = State::empty(Theme::classic());
+        let malformed = config::UserMenuLoadResult {
+            entries: config::default_user_menu_entries(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+            problem: Some(config::UserMenuProblem::InvalidToml),
+        };
+        apply_user_menu(&mut state, malformed);
+        apply_configuration_warnings(&mut state, &summary);
+        let shown = state.startup_warning.unwrap();
+        assert!(shown.contains("usermenu.toml is malformed"), "{shown}");
+    }
+
+    /// configuration-files "Clean configuration produces no warning".
+    #[test]
+    fn no_configuration_warnings_leave_the_startup_warning_alone() {
+        let mut state = State::empty(Theme::classic());
+        apply_configuration_warnings(&mut state, &[]);
+        assert_eq!(state.startup_warning, None);
+        let parsed = config::parse("splash = false # c\ntheme = \"nc-mono\" # c\n[mouse] # c\nenabled = true\n");
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 
     #[test]

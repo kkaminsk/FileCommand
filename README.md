@@ -151,9 +151,6 @@ shell = "cmd.exe /C"
 editor = "code -w"
 panel_split = 50
 
-[mouse]
-enabled = true
-
 key.paste_name = "ctrl+enter"
 key.paste_path = "ctrl+]"
 key.quick_filter = "ctrl+p"
@@ -164,7 +161,17 @@ key.split_reset = "ctrl+="
 key.clipboard_files = "ctrl+c"
 key.clipboard_paths = "ctrl+shift+insert"
 key.clear_line = "ctrl+y"
+
+[mouse]
+enabled = true
 ```
+
+Top-level settings must come before any `[table]`: a `key.*` line placed
+after `[mouse]` belongs to that table and is ignored (with a warning). A
+`#` outside quotes starts a comment, on its own line or after a value
+(`splash = false # straight to the panels`); quote any value that itself
+contains ` #`. A UTF-8 byte-order mark (Notepad's "UTF-8 with BOM") is
+accepted.
 
 | Key | Meaning | Default |
 |---|---|---|
@@ -178,8 +185,14 @@ key.clear_line = "ctrl+y"
 | `key.*` | Overridable key bindings (see table below). | see below |
 
 Only the bindings listed above are configurable; the rest of the key map
-(F-keys, Tab, arrows, Ctrl+T/W, etc.) is fixed. Unknown keys are ignored
-rather than rejected, and the schema tolerates missing/malformed lines.
+(F-keys, Tab, arrows, Ctrl+T/W, etc.) is fixed. A missing `config.toml`
+is silent, but anything FileCommand cannot use — an unknown key or table,
+a line that is not `key = value`, a setting under the wrong table, a
+boolean or key binding it cannot read, or a file that is not UTF-8 text —
+produces a one-line startup warning naming the file and line (with a
+`(+N more)` count when there are several); the rest of the file still
+applies. The warning dialog is dismissed with any key, and FileCommand
+starts regardless. With `--log`, every warning is written to the log.
 
 ### `usermenu.toml`
 
@@ -195,9 +208,16 @@ label = "Directory listing"
 command = "dir"
 ```
 
+Comments (`# …`, including after a value or after `[[entry]]`) and a UTF-8
+byte-order mark are accepted. An unknown key in an entry, a key outside an
+`[[entry]]` block, or an entry missing `label` or `command` produces a
+startup warning naming the line, and the rest of the menu still loads.
+
 Unlike `config.toml`, a malformed `usermenu.toml` is treated as an error: it
 falls back to a default menu and shows a warning rather than being silently
-overwritten.
+overwritten. A file that is not UTF-8 text (saved as ANSI or UTF-16) is
+reported the same way — re-save it as UTF-8, or delete it to recreate the
+defaults — and is never overwritten.
 
 ### `history.json`
 
