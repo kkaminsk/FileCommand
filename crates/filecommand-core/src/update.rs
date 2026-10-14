@@ -5,6 +5,7 @@
 //! events alike. It performs no I/O, spawns no threads, and reads no clock;
 //! callers supply the current time via [`Command::Tick`].
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
@@ -19,7 +20,7 @@ use crate::fs_ops::{ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, J
 use crate::git_info::{self, GitInfo};
 use crate::info::InfoValues;
 use crate::line_edit::{LineEdit, TextEditOp};
-use crate::listing::{Entry, EntryKind, FindMatch, SortMode};
+use crate::listing::{format_count, Entry, EntryKind, FindMatch, SortMode};
 use crate::menu::{MenuAction, MenuEntry, MenuId, MenuState};
 use crate::panel::{ClipboardFeedback, CursorMove, DisplayMode, PanelState, TreeState};
 use crate::panel_split;
@@ -770,7 +771,11 @@ pub enum Command {
     /// now (panel-navigation "Superseded directory listings are discarded
     /// and cancelled"; listing-request-guard design D1/D2).
     ListingChunk { panel: PanelSide, entries: Vec<Entry>, request: u64 },
-    ListingComplete { panel: PanelSide, total: usize, request: u64 },
+    /// `unreadable` is how many entries the reader skipped because their own
+    /// metadata could not be read; when non-zero the panel's mini-status
+    /// reports the count on completion (panel-navigation "One unreadable
+    /// entry does not fail a listing"; link-aware-listing design D6/D7).
+    ListingComplete { panel: PanelSide, total: usize, unreadable: usize, request: u64 },
     ListingFailed { panel: PanelSide, message: String, request: u64 },
     JobProgress(ProgressInfo),
     JobConflict(ConflictInfo),
@@ -2981,9 +2986,18 @@ fn enter_delete_confirm(state: &mut State) {
 /// filter"; filter-selection-safety design D2).
 fn enter_delete_confirm_for_sources(state: &mut State, sources: Vec<SourceItem>) {
     let side = state.active;
-    let source_dir = state.panel(side).cwd.clone();
-    let hidden_by_filter = state.panel(side).hidden_selected_count(&sources);
-    let needs_second_confirm = sources.iter().any(|s| s.is_dir);
+    let panel = state.panel(side);
+    let source_dir = panel.cwd.clone();
+    let hidden_by_filter = panel.hidden_selected_count(&sources);
+    // A directory *link* listed by this panel looks like a non-empty
+    // directory but Delete removes only the link (file-operations "Delete
+    // removes the link, not the target"), so it does not trigger the
+    // "contains a directory — delete its entire contents?" second prompt
+    // (panel-navigation "Deleting a directory link asks once"; link-aware-
+    // listing design D5). Usually an empty set.
+    let listed_links: HashSet<&OsString> = panel.entries.iter().filter(|e| e.link).map(|e| &e.name).collect();
+    let is_listed_link = |s: &SourceItem| s.path.parent() == Some(source_dir.as_path()) && listed_links.contains(&s.original_name);
+    let needs_second_confirm = sources.iter().any(|s| s.is_dir && !is_listed_link(s));
     state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false, hidden_by_filter });
 }
 
@@ -4217,6 +4231,17 @@ fn listing_reply_is_current(state: &State, cmd: &Command) -> bool {
     }
 }
 
+/// The mini-status line for a listing that skipped `n > 0` entries whose
+/// metadata could not be read: `1 entry could not be read`, or `N entries
+/// could not be read` with N comma-grouped (link-aware-listing design D7).
+fn unreadable_message(n: usize) -> String {
+    if n == 1 {
+        "1 entry could not be read".to_string()
+    } else {
+        format!("{} entries could not be read", format_count(n))
+    }
+}
+
 fn apply_listing_event(state: &mut State, cmd: Command) {
     // A reply from a superseded listing is dropped before any mutation —
     // entries, progress count, re-read anchor, find-file cursor target,
@@ -4255,10 +4280,20 @@ fn apply_listing_event(state: &mut State, cmd: Command) {
             // D3).
             reconcile_panel_viewport(state, panel);
         }
-        Command::ListingComplete { panel, total, .. } => {
+        Command::ListingComplete { panel, total, unreadable, .. } => {
             let term_size = state.term_size;
             let p = state.panel_mut(panel);
             p.progress = crate::panel::ListingProgress::Complete { count: total };
+            // Entries the reader skipped are reported through the existing
+            // inline-message surface, in place of the cursored entry's
+            // details the mini-status otherwise restores on completion;
+            // `begin_new_listing` clears it on the panel's next listing
+            // (panel-navigation "One unreadable entry does not fail a
+            // listing", "Streaming listing mini-status"; link-aware-listing
+            // design D7).
+            if unreadable > 0 {
+                p.last_error = Some(unreadable_message(unreadable));
+            }
             p.clamp_cursor();
             p.reconcile_selection();
             // A find-file navigation seeds this with the matched entry's

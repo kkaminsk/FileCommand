@@ -44,6 +44,7 @@ fn sample_entries() -> Vec<Entry> {
             size: 0,
             modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }),
             hidden: false,
+            link: false,
         },
         Entry {
             name: OsString::from("notes.txt"),
@@ -51,6 +52,7 @@ fn sample_entries() -> Vec<Entry> {
             size: 2048,
             modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }),
             hidden: false,
+            link: false,
         },
     ]
 }

@@ -25,7 +25,7 @@ const N: usize = 100_000;
 
 fn synthetic_entries(n: usize) -> Vec<Entry> {
     (0..n)
-        .map(|i| Entry { name: format!("file-{i:06}.txt").into(), kind: EntryKind::File, size: i as u64, modified: None, hidden: false })
+        .map(|i| Entry { name: format!("file-{i:06}.txt").into(), kind: EntryKind::File, size: i as u64, modified: None, hidden: false, link: false })
         .collect()
 }
 

@@ -1051,8 +1051,8 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None, hidden: false },
+            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None, hidden: false, link: false },
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         let mut right = PanelState::new(PathBuf::from(r"C:\right"));
@@ -1289,7 +1289,7 @@ mod tests {
         let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt), hidden: false },
+            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(dt), hidden: false, link: false },
         ]);
         // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
         let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
@@ -1312,8 +1312,8 @@ mod tests {
         // their last-digit cell column.
         let text = render_left_panel_rows(vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None, hidden: false },
-            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None, hidden: false },
+            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 87, modified: None, hidden: false, link: false },
+            Entry { name: OsString::from("b.txt"), kind: EntryKind::File, size: 35 * 1024, modified: None, hidden: false, link: false },
         ]);
         // Interior layout: 13-cell Name, `│`, then the 9-cell Size column —
         // cells 15..24 of the 40-cell row.
@@ -1343,11 +1343,11 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from(".git"), kind: EntryKind::Directory, size: 0, modified: None, hidden: true },
-            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
-            Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
-            Entry { name: OsString::from("secret.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
-            Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: false },
+            Entry { name: OsString::from(".git"), kind: EntryKind::Directory, size: 0, modified: None, hidden: true, link: false },
+            Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
+            Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
+            Entry { name: OsString::from("secret.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
+            Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false },
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         left.cursor = 1; // on the hidden `.git` directory

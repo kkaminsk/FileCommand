@@ -158,7 +158,7 @@ mod tests {
 
         fn panel_with(cwd: &str, n_entries: usize, scroll_offset: usize) -> PanelState {
             let mut panel = PanelState::new(PathBuf::from(cwd));
-            panel.entries = (0..n_entries).map(|i| Entry { name: OsString::from(format!("f{i}.txt")), kind: EntryKind::File, size: 0, modified: None, hidden: false }).collect();
+            panel.entries = (0..n_entries).map(|i| Entry { name: OsString::from(format!("f{i}.txt")), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }).collect();
             panel.scroll_offset = scroll_offset;
             panel
         }

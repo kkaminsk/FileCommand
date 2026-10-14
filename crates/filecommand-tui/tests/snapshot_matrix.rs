@@ -41,9 +41,9 @@ fn sample_panel(display_mode: DisplayMode) -> PanelState {
     let mut panel = PanelState::new(PathBuf::from(r"C:\Users\demo\projects\filecommand"));
     panel.entries = vec![
         Entry::parent_dir(),
-        Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false },
-        Entry { name: OsString::from("Cargo.toml"), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false },
-        Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false },
+        Entry { name: OsString::from("docs"), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry { name: OsString::from("Cargo.toml"), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry { name: OsString::from("readme.txt"), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false, link: false },
     ];
     panel.progress = ListingProgress::Complete { count: panel.entries.len() };
     panel.display_mode = display_mode;

@@ -45,7 +45,7 @@ fn buffer_to_text(buf: &Buffer, area: Rect) -> String {
 /// visible list is always `file{p-1:02}`.
 fn many_entries(n: usize) -> Vec<Entry> {
     std::iter::once(Entry::parent_dir())
-        .chain((0..n).map(|i| Entry { name: format!("file{i:02}").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false }))
+        .chain((0..n).map(|i| Entry { name: format!("file{i:02}").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }))
         .collect()
 }
 
@@ -184,7 +184,7 @@ fn snapshot_brief_mode_overflow_shifted_column_window() {
 fn overflow_tree_panel(n_children: usize, cursor: usize, rows: usize) -> PanelState {
     let mut panel = overflow_panel(r"C:\Users\demo\left", 3, 0);
     let mut tree = TreeState::new(PathBuf::from(r"C:\"), DisplayMode::Full);
-    let children: Vec<Entry> = (0..n_children).map(|i| Entry { name: format!("dir{i:02}").into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }).collect();
+    let children: Vec<Entry> = (0..n_children).map(|i| Entry { name: format!("dir{i:02}").into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }).collect();
     tree.insert_children(&PathBuf::from(r"C:\"), children);
     tree.cursor = cursor;
     tree.ensure_cursor_visible(rows);

@@ -1108,10 +1108,10 @@ mod tests {
     use std::ffi::OsString;
 
     fn file(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }
     }
     fn dir(name: &str) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
+        Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
     }
 
     #[test]
@@ -1273,8 +1273,8 @@ mod tests {
     fn selection_status_counts_files_and_zeros_directories() {
         let mut p = PanelState::new(PathBuf::from("/"));
         p.entries = vec![
-            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None, hidden: false },
-            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
+            Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: None, hidden: false, link: false },
+            Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
         ];
         assert_eq!(p.selection_status(), None);
         p.select_matching("*");
@@ -1433,7 +1433,7 @@ mod tests {
     }
 
     fn sized(name: &str, size: u64) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false, link: false }
     }
 
     fn timed(name: &str, day: u8) -> Entry {
@@ -1443,6 +1443,7 @@ mod tests {
             size: 0,
             modified: Some(DateTime { year: 2026, month: 1, day, hour: 0, minute: 0 }),
             hidden: false,
+            link: false,
         }
     }
 
@@ -1576,6 +1577,7 @@ mod tests {
                 size: 0,
                 modified: None,
                 hidden: false,
+                link: false,
             })
         }
 
@@ -1591,7 +1593,7 @@ mod tests {
             fn insert_sorted_preserves_sorted_order(names in prop::collection::vec(arb_name(), 0..15)) {
                 let mut entries: Vec<Entry> = Vec::new();
                 for name in names {
-                    let e = Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false };
+                    let e = Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false };
                     insert_sorted(&mut entries, e, SortMode::Name, SortDirection::Asc);
                 }
                 for w in entries.windows(2) {
@@ -1629,6 +1631,7 @@ mod tests {
                 size,
                 modified: day.map(|d| DateTime { year: 2026, month: 1, day: d, hour: 0, minute: 0 }),
                 hidden: false,
+                link: false,
             })
         }
 
@@ -1800,8 +1803,8 @@ mod tests {
             let mut p = PanelState::new(PathBuf::from("/"));
             p.entries = vec![
                 Entry::parent_dir(),
-                Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true },
-                Entry { name: OsString::from("readme.md"), kind: EntryKind::File, size: 0, modified: None, hidden: false },
+                Entry { name: OsString::from("desktop.ini"), kind: EntryKind::File, size: 0, modified: None, hidden: true, link: false },
+                Entry { name: OsString::from("readme.md"), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false },
             ];
             p.activate_quick_filter();
             for c in "desktop".chars() {
@@ -2065,7 +2068,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
         }
 
         #[test]
@@ -2640,7 +2643,7 @@ mod tests {
         use crate::listing::Entry as ListEntry;
 
         fn dir_child(name: &str) -> ListEntry {
-            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
+            ListEntry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
         }
 
         /// A flattened tree of `n` top-level directories under `C:\`.

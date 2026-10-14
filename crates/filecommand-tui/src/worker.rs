@@ -448,9 +448,12 @@ pub fn gather_info(reader: &dyn FsReader, path: &Path) -> InfoValues {
     let space = drive.and_then(drives::disk_space);
     let volume = drive.and_then(drives::volume_info);
     let (files, dirs) = match reader.read_dir(path) {
-        Ok(entries) => {
-            let dirs = entries.iter().filter(|e| e.is_dir).count();
-            (entries.len() - dirs, dirs)
+        // Directory links count as directories, like the panel lists them;
+        // entries skipped as unreadable are not counted (link-aware-listing
+        // design D6).
+        Ok(listing) => {
+            let dirs = listing.entries.iter().filter(|e| e.is_dir).count();
+            (listing.entries.len() - dirs, dirs)
         }
         // An unreadable directory still resolves — as zero counts rather
         // than a permanent `…` the user cannot clear.
@@ -642,7 +645,7 @@ fn read_listing(panel: PanelSide, path: &Path, request: u64, cancel: &CancelFlag
         return None;
     }
     Some(match result {
-        Ok(fs_count) => Command::ListingComplete { panel, total: total + fs_count, request },
+        Ok(totals) => Command::ListingComplete { panel, total: total + totals.entries, unreadable: totals.unreadable, request },
         // The message names the directory it could not read
         // (filesystem-error-handling "Error messages name the affected
         // path"), not just the bare OS error.
@@ -815,7 +818,7 @@ impl JobSink for ChannelSink {
 mod tests {
     use super::*;
     use filecommand_core::info::PENDING;
-    use filecommand_core::listing::RawDirEntry;
+    use filecommand_core::listing::{RawDirEntry, RawDirListing};
     use std::io;
     use std::io::Write;
 
@@ -891,27 +894,41 @@ mod tests {
         std::fs::remove_dir(&dir).unwrap();
     }
 
-    struct FakeReader(io::Result<Vec<RawDirEntry>>);
+    struct FakeReader(io::Result<RawDirListing>);
 
     impl FsReader for FakeReader {
-        fn read_dir(&self, _path: &Path) -> io::Result<Vec<RawDirEntry>> {
+        fn read_dir(&self, _path: &Path) -> io::Result<RawDirListing> {
             match &self.0 {
-                Ok(entries) => Ok(entries.clone()),
+                Ok(listing) => Ok(listing.clone()),
                 Err(e) => Err(io::Error::new(e.kind(), e.to_string())),
             }
         }
     }
 
     fn raw(name: &str, is_dir: bool) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: false }
+        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: false, link: false }
     }
 
     #[test]
     fn gather_info_counts_files_and_directories_separately() {
-        let reader = FakeReader(Ok(vec![raw("a.txt", false), raw("b.txt", false), raw("sub", true)]));
+        let reader = FakeReader(Ok(RawDirListing { entries: vec![raw("a.txt", false), raw("b.txt", false), raw("sub", true)], unreadable: 0 }));
         let values = gather_info(&reader, Path::new(r"C:\somewhere"));
         assert_eq!(values.file_count, Some(2));
         assert_eq!(values.dir_count, Some(1));
+    }
+
+    #[test]
+    fn gather_info_counts_directory_links_as_directories_and_ignores_skipped_entries() {
+        // link-aware-listing design D6 (task 4.11): a junction to a
+        // directory is a directory for the Info counts, as it is for the
+        // panel, and entries the reader skipped as unreadable count as
+        // neither.
+        let dir_link = RawDirEntry { name: "lnk".into(), is_dir: true, size: 0, modified: None, hidden: false, link: true };
+        let file_link = RawDirEntry { name: "f.lnk".into(), is_dir: false, size: 7, modified: None, hidden: false, link: true };
+        let reader = FakeReader(Ok(RawDirListing { entries: vec![raw("a.txt", false), raw("sub", true), dir_link, file_link], unreadable: 3 }));
+        let values = gather_info(&reader, Path::new(r"C:\somewhere"));
+        assert_eq!(values.file_count, Some(2));
+        assert_eq!(values.dir_count, Some(2));
     }
 
     #[test]
@@ -1280,9 +1297,10 @@ mod tests {
                     assert_eq!(request, 42);
                     chunks += 1;
                 }
-                Ok(Command::ListingComplete { panel: PanelSide::Left, total, request }) => {
+                Ok(Command::ListingComplete { panel: PanelSide::Left, total, unreadable, request }) => {
                     assert_eq!(request, 42);
                     assert_eq!(total, 4, "`..` plus three entries");
+                    assert_eq!(unreadable, 0);
                     break;
                 }
                 other => panic!("unexpected message: {other:?}"),

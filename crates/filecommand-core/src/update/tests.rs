@@ -35,7 +35,7 @@ fn listing_chunk(state: State, side: PanelSide, entries: Vec<Entry>) -> (State, 
 /// `ListingComplete` for `side`'s current listing; see [`listing_chunk`].
 fn listing_complete(state: State, side: PanelSide, total: usize) -> (State, Vec<Effect>) {
     let request = listing_request(&state, side);
-    update(state, Command::ListingComplete { panel: side, total, request })
+    update(state, Command::ListingComplete { panel: side, total, unreadable: 0, request })
 }
 
 /// `ListingFailed` for `side`'s current listing; see [`listing_chunk`].
@@ -52,11 +52,11 @@ fn start_listing(state: &State, side: PanelSide, path: impl Into<PathBuf>) -> Ef
 }
 
 fn file_entry(name: &str, size: u64) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false }
+    Entry { name: OsString::from(name), kind: EntryKind::File, size, modified: None, hidden: false, link: false }
 }
 
 fn dir_entry(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }
+    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }
 }
 
 /// Every navigation/re-read now also issues `Effect::QueryGitInfo`
@@ -4258,7 +4258,7 @@ fn f4_passes_the_original_os_string_file_name_through_without_lossy_conversion()
         let raw = std::ffi::OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]).to_os_string();
         let mut state = test_state(UiPhase::Panels);
         state.editor = Some("notepad".to_string());
-        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None, hidden: false }];
+        state.left.entries = vec![Entry { name: raw.clone(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }];
         let (_, effects) = update(state, Command::RequestExternalEditor);
         match effects.as_slice() {
             [Effect::RunExternalEditor(inv, _)] => assert_eq!(inv.file_arg, raw),
@@ -5270,7 +5270,7 @@ fn find_match(rel: &str, name: &str) -> FindMatch {
 }
 
 fn dir_entry_named(name: &str) -> Entry {
-    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false }
+    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }
 }
 
 #[test]
@@ -6550,7 +6550,7 @@ fn ctrl_click_toggles_selection_and_moves_the_cursor() {
 #[test]
 fn ctrl_click_on_parent_entry_never_selects_it() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }];
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }];
     let (state, _) = update(state, Command::ClickEntry { side: PanelSide::Left, name: OsString::from(".."), mods: ClickMods::Ctrl });
     assert!(state.left.selected.is_empty());
     assert_eq!(state.left.cursor, 0, "the cursor still moves to `..`");
@@ -6795,7 +6795,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
 #[test]
 fn open_action_menu_at_on_the_parent_entry_is_a_no_op() {
     let mut state = test_state(UiPhase::Panels);
-    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }];
+    state.left.entries = vec![Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("..") });
     assert!(state.file_action_menu.is_none(), "`..` is never a valid action-menu target");
 }
@@ -8111,7 +8111,7 @@ fn backspace_out_of_a_slow_directory_mid_listing_drops_every_reply_of_the_old_li
     assert_eq!(state.left.progress, crate::panel::ListingProgress::Streaming { count: 0 }, "the Reading… count covers only /left's entries");
 
     // Its completion must not complete the new listing either.
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, request: old });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, unreadable: 0, request: old });
     assert!(state.left.progress.is_streaming(), "the mini-status keeps showing Reading… for the new listing");
 
     // The new listing's own replies are applied as usual.
@@ -8161,10 +8161,10 @@ fn two_quick_rereads_list_each_entry_exactly_once() {
     let entries: Vec<Entry> = (0..500).map(|i| file_entry(&format!("e{i:03}"), 0)).collect();
     // Both readers deliver everything before the first one noticed its flag.
     let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: entries.clone(), request: first });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, request: first });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, unreadable: 0, request: first });
     assert!(state.left.entries.is_empty() && state.left.progress.is_streaming(), "the first generation's replies are dropped");
     let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: second });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, request: second });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 500, unreadable: 0, request: second });
 
     let names = entry_names(&state, PanelSide::Left);
     assert_eq!(names.len(), 500);
@@ -8305,7 +8305,7 @@ fn closing_a_tab_mid_listing_cancels_it_and_the_neighbor_receives_none_of_it() {
     assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "the complete neighbor is not re-read: {effects:?}");
 
     let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("in-big.txt", 1)], request: old });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1, request: old });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 1, unreadable: 0, request: old });
     assert_eq!(entry_names(&state, PanelSide::Left), vec!["big"], "the neighbor receives none of the closed tab's entries");
     assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 1 });
 
@@ -8331,7 +8331,7 @@ fn opening_a_tab_mid_listing_keeps_the_listing_flowing_into_the_new_tab() {
 
     // Later chunks fill the new tab until it completes.
     let (state, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![file_entry("b2.txt", 1)], request: old });
-    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, request: old });
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 2, unreadable: 0, request: old });
     assert_eq!(entry_names(&state, PanelSide::Left), vec!["b1.txt", "b2.txt"]);
     assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 2 });
 
@@ -8352,4 +8352,126 @@ fn swap_panels_is_still_refused_while_a_panel_streams_even_though_replies_carry_
     let (state, effects) = update(state, Command::SwapPanels);
     assert_eq!(state, before);
     assert!(effects.is_empty());
+}
+
+// ---------------------------------------------------------------------
+// link-aware-listing: directory links navigate like directories, skipped
+// entries are reported, and deleting a link asks once (panel-navigation
+// "Directory links list as directories", "One unreadable entry does not
+// fail a listing"; tasks 4.6–4.10)
+// ---------------------------------------------------------------------
+
+fn dir_link_entry(name: &str) -> Entry {
+    Entry { name: OsString::from(name), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: true }
+}
+
+fn dangling_link_entry(name: &str) -> Entry {
+    Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: true }
+}
+
+#[test]
+fn enter_descends_into_a_directory_link_and_parent_navigation_returns_to_the_links_directory() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from("/proj/node_modules");
+    state.left.entries = vec![dir_link_entry("lodash")];
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 1 };
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/proj/node_modules/lodash"), "the link's own path becomes the panel's directory");
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/proj/node_modules/lodash")), "{effects:?}");
+    assert!(state.file_action_menu.is_none(), "Enter navigates rather than opening the file-action menu");
+
+    // Ctrl+PgUp goes back to the directory containing the link, not to the
+    // target's parent.
+    let (state, effects) = update(state, Command::ParentDir);
+    assert_eq!(state.left.cwd, PathBuf::from("/proj/node_modules"));
+    assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/proj/node_modules")), "{effects:?}");
+}
+
+#[test]
+fn enter_on_a_dangling_link_does_not_start_a_listing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dangling_link_entry("old")];
+    state.left.progress = crate::panel::ListingProgress::Complete { count: 1 };
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel's directory is unchanged");
+    assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "no listing starts: {effects:?}");
+    assert!(state.file_action_menu.is_some(), "a dangling link is a file entry: Enter opens the file-action menu");
+}
+
+#[test]
+fn listing_complete_with_skipped_entries_reports_the_count_until_the_next_listing() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = (0..49).map(|i| file_entry(&format!("e{i:02}"), 0)).collect();
+    let request = listing_request(&state, PanelSide::Left);
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 49, unreadable: 1, request });
+    assert_eq!(state.left.last_error.as_deref(), Some("1 entry could not be read"));
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 49 }, "the other 49 entries are listed");
+    assert_eq!(state.left.entries.len(), 49);
+
+    // The count is comma-grouped and pluralized.
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    assert_eq!(state.left.last_error, None, "the message clears the moment the panel lists again");
+    let request = listing_request(&state, PanelSide::Left);
+    let (state, _) = update(state, Command::ListingComplete { panel: PanelSide::Left, total: 0, unreadable: 1234, request });
+    assert_eq!(state.left.last_error.as_deref(), Some("1,234 entries could not be read"));
+
+    // A re-read that reads everything leaves no message.
+    let (state, _) = update(state, Command::RereadPanel(PanelSide::Left));
+    let (state, _) = listing_complete(state, PanelSide::Left, 0);
+    assert_eq!(state.left.last_error, None);
+}
+
+#[test]
+fn listing_failed_still_sets_the_inline_read_error_state() {
+    let state = test_state(UiPhase::Panels);
+    let (state, _) = listing_failed(state, PanelSide::Left, "Cannot read left: access denied".into());
+    assert_eq!(state.left.last_error.as_deref(), Some("Cannot read left: access denied"));
+    assert_eq!(state.left.progress, crate::panel::ListingProgress::Complete { count: 0 });
+}
+
+#[test]
+fn deleting_a_directory_link_asks_once_while_a_real_directory_still_asks_twice() {
+    // F8 on the junction: one confirmation, because Delete removes only the
+    // link (design D5). The source still reports `is_dir`, as the job
+    // engine's reparse-point handling expects.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_link_entry("lodash"), dir_entry("real")];
+    state.left.cursor = 0;
+    let (state, _) = update(state, Command::RequestDelete);
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, needs_second_confirm, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].original_name, OsString::from("lodash"));
+            assert!(sources[0].is_dir);
+            assert!(!needs_second_confirm, "a directory link does not raise the non-empty-directory prompt");
+        }
+        other => panic!("expected the delete-confirm dialog, got {other:?}"),
+    }
+
+    // F8 on the real directory next to it still asks twice.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_link_entry("lodash"), dir_entry("real")];
+    state.left.cursor = 1;
+    let (state, _) = update(state, Command::RequestDelete);
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { needs_second_confirm, .. }) => {
+            assert!(needs_second_confirm, "a real directory requires the existing second confirmation");
+        }
+        other => panic!("expected the delete-confirm dialog, got {other:?}"),
+    }
+
+    // A selection mixing the link with a real directory asks twice for the
+    // real directory's sake.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries = vec![dir_link_entry("lodash"), dir_entry("real")];
+    state.left.selected.insert(OsString::from("lodash"));
+    state.left.selected.insert(OsString::from("real"));
+    let (state, _) = update(state, Command::RequestDelete);
+    match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, needs_second_confirm, .. }) => {
+            assert_eq!(sources.len(), 2);
+            assert!(needs_second_confirm);
+        }
+        other => panic!("expected the delete-confirm dialog, got {other:?}"),
+    }
 }

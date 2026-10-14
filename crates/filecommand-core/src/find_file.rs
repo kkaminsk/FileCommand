@@ -106,7 +106,7 @@ mod tests {
     fn a_match(name: &str) -> FindMatch {
         FindMatch {
             relative_path: PathBuf::from(name),
-            entry: Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false },
+            entry: Entry { name: OsString::from(name), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false },
         }
     }
 

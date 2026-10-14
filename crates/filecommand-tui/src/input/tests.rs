@@ -816,7 +816,7 @@ fn entries_are_irrelevant_to_key_mapping() {
     // The mapper reads modes, not contents: a populated panel maps the same
     // keys as an empty one.
     let mut state = panels();
-    state.left.entries = vec![Entry { name: "a.txt".into(), kind: EntryKind::File, size: 1, modified: None, hidden: false }];
+    state.left.entries = vec![Entry { name: "a.txt".into(), kind: EntryKind::File, size: 1, modified: None, hidden: false, link: false }];
     assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::TextEdit(TextEditOp::Insert('d'))));
 }
 

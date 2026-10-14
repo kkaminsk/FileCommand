@@ -3085,6 +3085,7 @@ mod tests {
             size: 1,
             modified: None,
             hidden: false,
+            link: false,
         }).collect();
         state.left.listing_request = Some(1);
         let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: 1 });

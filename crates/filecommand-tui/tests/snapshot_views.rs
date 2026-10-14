@@ -49,9 +49,9 @@ fn fixed_date() -> DateTime {
 fn fixed_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false },
-        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false },
+        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false, link: false },
     ]
 }
 
@@ -1125,7 +1125,7 @@ fn snapshot_brief_mode_three_name_columns() {
     let mut panel = complete_panel(r"C:\Users\demo\left", 0);
     panel.display_mode = DisplayMode::Brief;
     panel.entries = std::iter::once(Entry::parent_dir())
-        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false }))
+        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false }))
         .collect();
     state.left = panel;
     // A short panel (6 body rows, after the command line and F-key bar
@@ -1147,8 +1147,8 @@ fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
     tree.insert_children(
         &PathBuf::from(r"C:\"),
         vec![
-            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
-            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false },
+            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
+            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false },
         ],
     );
     tree.cursor = cursor;
@@ -1203,7 +1203,7 @@ fn quick_view_previews_the_opposite_cursor_file() {
     state.left = left;
 
     let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
-    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None, hidden: false }];
+    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None, hidden: false, link: false }];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -1225,7 +1225,7 @@ fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
     state.left = left;
 
     let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
-    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false }];
+    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false }];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -1284,11 +1284,11 @@ fn snapshot_git_info_absent_reserves_no_marker_column() {
 fn hidden_entries_fixture() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: ".git".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: true },
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false },
-        Entry { name: "desktop.ini".into(), kind: EntryKind::File, size: 87, modified: Some(fixed_date()), hidden: true },
-        Entry { name: "secret.txt".into(), kind: EntryKind::File, size: 35_840, modified: Some(fixed_date()), hidden: true },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false },
+        Entry { name: ".git".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: true, link: false },
+        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()), hidden: false, link: false },
+        Entry { name: "desktop.ini".into(), kind: EntryKind::File, size: 87, modified: Some(fixed_date()), hidden: true, link: false },
+        Entry { name: "secret.txt".into(), kind: EntryKind::File, size: 35_840, modified: Some(fixed_date()), hidden: true, link: false },
+        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()), hidden: false, link: false },
     ]
 }
 
@@ -1521,7 +1521,7 @@ fn snapshot_find_file_dialog_with_streamed_results() {
         1,
         filecommand_core::listing::FindMatch {
             relative_path: PathBuf::from(r"docs\readme.txt"),
-            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false },
+            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()), hidden: false, link: false },
         },
     );
     dialog.mark_done(1);

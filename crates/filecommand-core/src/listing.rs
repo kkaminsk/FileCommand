@@ -76,11 +76,20 @@ pub struct Entry {
     /// The renderer dims such entries via the `panel.hidden` role. The
     /// synthetic `..` entry is never hidden.
     pub hidden: bool,
+    /// The entry is a link — a junction or symbolic link on Windows, a
+    /// symbolic link elsewhere — classified by following it once: `kind`
+    /// and `size` describe the target, while `name`, `modified` and
+    /// `hidden` are the link's own (panel-navigation "Directory links list
+    /// as directories"; link-aware-listing design D1/D3). Internal only —
+    /// nothing renders it. Find-file never descends into a directory link,
+    /// and F8 on one asks a single confirmation because Delete removes only
+    /// the link (design D4/D5). The synthetic `..` entry is never a link.
+    pub link: bool,
 }
 
 impl Entry {
     pub fn parent_dir() -> Entry {
-        Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false }
+        Entry { name: OsString::from(".."), kind: EntryKind::ParentDir, size: 0, modified: None, hidden: false, link: false }
     }
 
     pub fn is_dir_like(&self) -> bool {
@@ -202,7 +211,7 @@ mod sort_tests {
     use super::*;
 
     fn f(name: &str, size: u64, modified: Option<DateTime>) -> Entry {
-        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified, hidden: false }
+        Entry { name: OsString::from(name), kind: EntryKind::File, size, modified, hidden: false, link: false }
     }
 
     fn dt(day: u8) -> DateTime {
@@ -433,13 +442,66 @@ pub struct RawDirEntry {
     /// (0x2) / `FILE_ATTRIBUTE_SYSTEM` (0x4) bits in the enumeration's own
     /// metadata, elsewhere from a leading `.` in the name.
     pub hidden: bool,
+    /// The entry is a link (see [`Entry::link`]). When set, `is_dir` and
+    /// `size` describe the link's target — or `false`/`0` for a link that
+    /// could not be followed — while `name`, `modified` and `hidden` are the
+    /// link's own (link-aware-listing design D1/D2).
+    pub link: bool,
+}
+
+/// One directory read: the entries that could be classified, plus how many
+/// were skipped because their own metadata could not be read (panel-
+/// navigation "One unreadable entry does not fail a listing"; link-aware-
+/// listing design D6). Skipping is per entry; a failure of the enumeration
+/// itself is still the `Err` of [`FsReader::read_dir`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RawDirListing {
+    pub entries: Vec<RawDirEntry>,
+    pub unreadable: usize,
 }
 
 /// A narrow seam over directory reads. Exists so later milestones can inject
 /// deterministic errors (permission denied, I/O failure, long-path edge
 /// cases) without touching the real filesystem.
 pub trait FsReader {
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>>;
+    fn read_dir(&self, path: &Path) -> io::Result<RawDirListing>;
+}
+
+/// What a reader learns about one enumerated entry from a single metadata
+/// record — the enumeration's own (`DirEntry::metadata`, which never follows
+/// a link) or the target's (`std::fs::metadata`, which does). The pure input
+/// of [`classify_entry`], so every classification branch is testable without
+/// a filesystem (link-aware-listing design D8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryFacts {
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub len: u64,
+    pub modified: Option<SystemTime>,
+    pub hidden: bool,
+}
+
+/// Classify one enumerated entry (link-aware-listing design D1/D2/D8):
+///
+/// - `own` is `Err` → `None`: the entry's own metadata could not be read, so
+///   it is skipped and the caller counts it as unreadable (design D6).
+/// - not a link → exactly the entry's own facts, no extra I/O.
+/// - a link → `follow()` is called once. On `Ok`, `is_dir` and (for a file
+///   target) `size` come from the target; on `Err` — dangling, or a target
+///   that cannot be reached — the entry lists as a non-enterable file of
+///   size 0. Either way `modified` and `hidden` stay the link's own, and
+///   `link` is set.
+pub fn classify_entry(name: OsString, own: io::Result<EntryFacts>, follow: impl FnOnce() -> io::Result<EntryFacts>) -> Option<RawDirEntry> {
+    let own = own.ok()?;
+    let (is_dir, size) = if !own.is_symlink {
+        (own.is_dir, if own.is_dir { 0 } else { own.len })
+    } else {
+        match follow() {
+            Ok(target) => (target.is_dir, if target.is_dir { 0 } else { target.len }),
+            Err(_) => (false, 0),
+        }
+    };
+    Some(RawDirEntry { name, is_dir, size, modified: own.modified, hidden: own.hidden, link: own.is_symlink })
 }
 
 /// The real filesystem, via `std::fs`, routed through [`to_long_path`].
@@ -464,22 +526,42 @@ fn is_hidden(name: &std::ffi::OsStr, _metadata: &std::fs::Metadata) -> bool {
     name.to_string_lossy().starts_with('.')
 }
 
+/// The [`EntryFacts`] of one `std::fs::Metadata` record for the entry named
+/// `name`. `is_symlink` is true for every name-surrogate reparse point on
+/// Windows (junctions and symbolic links alike) and for symbolic links
+/// elsewhere; `hidden` goes through the existing per-platform rule.
+fn facts_of(name: &std::ffi::OsStr, metadata: &std::fs::Metadata) -> EntryFacts {
+    EntryFacts {
+        is_dir: metadata.is_dir(),
+        is_symlink: metadata.file_type().is_symlink(),
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+        hidden: is_hidden(name, metadata),
+    }
+}
+
 impl FsReader for StdFsReader {
-    fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
+    /// Enumerate `path`. An error from the enumeration itself (`entry?`:
+    /// `FindNextFileW`/`readdir` failing) is still returned as `Err` — it
+    /// identifies no single entry, and continuing could repeat it forever.
+    /// An entry whose own metadata cannot be read is skipped and counted
+    /// instead of failing the whole listing (link-aware-listing design D6).
+    /// A link is followed with one `std::fs::metadata` call so that a
+    /// junction or symlink to a directory lists as a directory (design D1).
+    fn read_dir(&self, path: &Path) -> io::Result<RawDirListing> {
         let long = to_long_path(path);
-        let mut out = Vec::new();
+        let mut listing = RawDirListing::default();
         for entry in std::fs::read_dir(&long)? {
             let entry = entry?;
-            let metadata = entry.metadata()?;
-            out.push(RawDirEntry {
-                name: entry.file_name(),
-                is_dir: metadata.is_dir(),
-                size: if metadata.is_dir() { 0 } else { metadata.len() },
-                modified: metadata.modified().ok(),
-                hidden: is_hidden(&entry.file_name(), &metadata),
-            });
+            let name = entry.file_name();
+            let own = entry.metadata().map(|m| facts_of(&name, &m));
+            let follow = || std::fs::metadata(long.join(&name)).map(|m| facts_of(&name, &m));
+            match classify_entry(name.clone(), own, follow) {
+                Some(raw) => listing.entries.push(raw),
+                None => listing.unreadable += 1,
+            }
         }
-        Ok(out)
+        Ok(listing)
     }
 }
 
@@ -491,40 +573,51 @@ impl From<RawDirEntry> for Entry {
             size: raw.size,
             modified: raw.modified.map(DateTime::from_system_time),
             hidden: raw.hidden,
+            link: raw.link,
         }
     }
 }
 
+/// What [`list_dir_chunked`] delivered: the entries handed to `on_chunk`,
+/// and the entries the reader skipped as unreadable (link-aware-listing
+/// design D6). The caller reports the latter on the mini-status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListingTotals {
+    pub entries: usize,
+    pub unreadable: usize,
+}
+
 /// Read a directory and deliver entries in chunks via `on_chunk`, returning
-/// the number delivered. Designed to be called from a worker thread by
-/// `filecommand-tui`; core never spawns threads itself. `cancel` is the
-/// listing's stop signal (panel-navigation "Superseded reader stops";
-/// listing-request-guard design D5): it is checked before the read and
-/// before each chunk, and once set no further chunk is delivered — the
-/// returned count then covers only what was delivered. Until the streaming
-/// reader lands, the one `read_dir` call itself still runs to completion; a
-/// superseded listing costs that enumeration and nothing more.
+/// the number delivered and the number the reader skipped as unreadable.
+/// Designed to be called from a worker thread by `filecommand-tui`; core
+/// never spawns threads itself. `cancel` is the listing's stop signal
+/// (panel-navigation "Superseded reader stops"; listing-request-guard design
+/// D5): it is checked before the read and before each chunk, and once set no
+/// further chunk is delivered — the returned count then covers only what was
+/// delivered. Until the streaming reader lands, the one `read_dir` call
+/// itself still runs to completion; a superseded listing costs that
+/// enumeration and nothing more.
 pub fn list_dir_chunked<F: FnMut(Vec<Entry>)>(
     reader: &dyn FsReader,
     path: &Path,
     chunk_size: usize,
     cancel: &CancelFlag,
     mut on_chunk: F,
-) -> io::Result<usize> {
+) -> io::Result<ListingTotals> {
     if cancel.is_cancelled() {
-        return Ok(0);
+        return Ok(ListingTotals::default());
     }
     let raw = reader.read_dir(path)?;
-    let mut total = 0usize;
-    for chunk in raw.chunks(chunk_size.max(1)) {
+    let mut totals = ListingTotals { entries: 0, unreadable: raw.unreadable };
+    for chunk in raw.entries.chunks(chunk_size.max(1)) {
         if cancel.is_cancelled() {
             break;
         }
         let entries: Vec<Entry> = chunk.iter().cloned().map(Entry::from).collect();
-        total += entries.len();
+        totals.entries += entries.len();
         on_chunk(entries);
     }
-    Ok(total)
+    Ok(totals)
 }
 
 // ---------------------------------------------------------------------
@@ -539,7 +632,7 @@ pub fn list_dir_chunked<F: FnMut(Vec<Entry>)>(
 /// once per node expansion, never eagerly for the whole tree.
 pub fn list_child_dirs(reader: &dyn FsReader, path: &Path) -> io::Result<Vec<Entry>> {
     let raw = reader.read_dir(path)?;
-    let mut dirs: Vec<Entry> = raw.into_iter().filter(|e| e.is_dir).map(Entry::from).collect();
+    let mut dirs: Vec<Entry> = raw.entries.into_iter().filter(|e| e.is_dir).map(Entry::from).collect();
     dirs.sort_by(cmp_by_name);
     Ok(dirs)
 }
@@ -581,7 +674,10 @@ pub struct FindMatch {
 /// superseded searches stop"; listing-request-guard design D5): it is
 /// checked before each directory read and between the entries examined,
 /// and once set the walk returns without reading another directory or
-/// reporting another match.
+/// reporting another match. A directory *link* is matched by name like any
+/// entry but never descended into: links were leaves before they listed as
+/// directories, and Windows ships junction cycles such as
+/// `C:\ProgramData\Application Data` (link-aware-listing design D4).
 pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, pattern: &str, cancel: &CancelFlag, mut on_match: F) {
     let needle = pattern.to_lowercase();
     // Relative sub-paths pending a read, root itself represented as "".
@@ -591,8 +687,8 @@ pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, 
             return;
         }
         let abs_dir = if rel_dir.as_os_str().is_empty() { root.to_path_buf() } else { root.join(&rel_dir) };
-        let Ok(raw_entries) = reader.read_dir(&abs_dir) else { continue };
-        for raw in raw_entries {
+        let Ok(listing) = reader.read_dir(&abs_dir) else { continue };
+        for raw in listing.entries {
             if cancel.is_cancelled() {
                 return;
             }
@@ -600,7 +696,7 @@ pub fn find_in_subtree<F: FnMut(FindMatch)>(reader: &dyn FsReader, root: &Path, 
             if !needle.is_empty() && raw.name.to_string_lossy().to_lowercase().contains(&needle) {
                 on_match(FindMatch { relative_path: rel_path.clone(), entry: Entry::from(raw.clone()) });
             }
-            if raw.is_dir {
+            if raw.is_dir && !raw.link {
                 stack.push(rel_path);
             }
         }
@@ -653,7 +749,7 @@ mod tests {
             use std::ffi::OsStr;
             use std::os::unix::ffi::OsStrExt;
             let raw = OsStr::from_bytes(&[0x66, 0x6f, 0x80, 0x6f]); // "fo\x80o", invalid utf8
-            let entry = Entry { name: raw.to_os_string(), kind: EntryKind::File, size: 0, modified: None, hidden: false };
+            let entry = Entry { name: raw.to_os_string(), kind: EntryKind::File, size: 0, modified: None, hidden: false, link: false };
             let shown = display_name_lossy(&entry);
             assert!(shown.contains('\u{FFFD}'));
             assert_eq!(display_width(&shown), shown.chars().count());
@@ -673,7 +769,7 @@ mod tests {
 
     #[test]
     fn entry_status_line_marks_dirs_and_parent() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false };
+        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false };
         assert_eq!(entry_status_line(&dir), "sub  SUB-DIR");
         assert_eq!(entry_status_line(&Entry::parent_dir()), "..  UP--DIR");
     }
@@ -681,7 +777,7 @@ mod tests {
     #[test]
     fn entry_status_parts_splits_file_fields() {
         let dt = DateTime { year: 2026, month: 1, day: 2, hour: 3, minute: 4 };
-        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt), hidden: false };
+        let file = Entry { name: "a.txt".into(), kind: EntryKind::File, size: 100, modified: Some(dt), hidden: false, link: false };
         let (name, size, date, time) = entry_status_parts(&file);
         assert_eq!(name, "a.txt");
         assert_eq!(size.as_deref(), Some("100"));
@@ -691,7 +787,7 @@ mod tests {
 
     #[test]
     fn entry_status_parts_marks_dirs_and_parent_with_no_date_or_time() {
-        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false };
+        let dir = Entry { name: "sub".into(), kind: EntryKind::Directory, size: 0, modified: None, hidden: false, link: false };
         assert_eq!(entry_status_parts(&dir), ("sub".to_string(), Some("SUB-DIR".to_string()), None, None));
         assert_eq!(entry_status_parts(&Entry::parent_dir()), ("..".to_string(), Some("UP--DIR".to_string()), None, None));
     }
@@ -738,20 +834,20 @@ mod tests {
 
     struct FakeReader(Vec<RawDirEntry>);
     impl FsReader for FakeReader {
-        fn read_dir(&self, _path: &Path) -> io::Result<Vec<RawDirEntry>> {
-            Ok(self.0.clone())
+        fn read_dir(&self, _path: &Path) -> io::Result<RawDirListing> {
+            Ok(RawDirListing { entries: self.0.clone(), unreadable: 0 })
         }
     }
 
     #[test]
     fn list_dir_chunked_delivers_chunks_and_total() {
         let entries: Vec<RawDirEntry> = (0..10)
-            .map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None, hidden: false })
+            .map(|i| RawDirEntry { name: format!("f{i}").into(), is_dir: false, size: 0, modified: None, hidden: false, link: false })
             .collect();
         let reader = FakeReader(entries);
         let mut chunks = Vec::new();
         let total = list_dir_chunked(&reader, Path::new("."), 3, &CancelFlag::new(), |c| chunks.push(c.len())).unwrap();
-        assert_eq!(total, 10);
+        assert_eq!(total, ListingTotals { entries: 10, unreadable: 0 });
         assert_eq!(chunks, vec![3, 3, 3, 1]);
     }
 
@@ -760,7 +856,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     fn raw_hidden(name: &str, is_dir: bool) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: true }
+        RawDirEntry { name: name.into(), is_dir, size: 0, modified: None, hidden: true, link: false }
     }
 
     #[test]
@@ -787,7 +883,7 @@ mod tests {
         let reader = FakeReader(vec![raw_file("zeta.txt"), raw_hidden("desktop.ini", false), raw_hidden(".git", true), raw_dir("alpha")]);
         let mut entries = Vec::new();
         let total = list_dir_chunked(&reader, Path::new("."), 100, &CancelFlag::new(), |chunk| entries.extend(chunk)).unwrap();
-        assert_eq!(total, 4);
+        assert_eq!(total.entries, 4);
         let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
         assert_eq!(flags, vec![("zeta.txt", false), ("desktop.ini", true), (".git", true), ("alpha", false)], "enumeration order");
 
@@ -806,16 +902,20 @@ mod tests {
     struct TreeReader(std::collections::HashMap<PathBuf, Vec<RawDirEntry>>);
 
     impl FsReader for TreeReader {
-        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
-            self.0.get(path).cloned().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such fixture directory"))
+        fn read_dir(&self, path: &Path) -> io::Result<RawDirListing> {
+            self.0
+                .get(path)
+                .cloned()
+                .map(|entries| RawDirListing { entries, unreadable: 0 })
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such fixture directory"))
         }
     }
 
     fn raw_dir(name: &str) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None, hidden: false }
+        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None, hidden: false, link: false }
     }
     fn raw_file(name: &str) -> RawDirEntry {
-        RawDirEntry { name: name.into(), is_dir: false, size: 0, modified: None, hidden: false }
+        RawDirEntry { name: name.into(), is_dir: false, size: 0, modified: None, hidden: false, link: false }
     }
 
     #[test]
@@ -930,7 +1030,7 @@ mod tests {
     }
 
     impl FsReader for CountingReader {
-        fn read_dir(&self, path: &Path) -> io::Result<Vec<RawDirEntry>> {
+        fn read_dir(&self, path: &Path) -> io::Result<RawDirListing> {
             self.reads.set(self.reads.get() + 1);
             self.inner.read_dir(path)
         }
@@ -980,7 +1080,7 @@ mod tests {
         let mut chunks = 0usize;
         let total = list_dir_chunked(&reader, Path::new("."), 3, &cancel, |_| chunks += 1).unwrap();
         assert_eq!(chunks, 0, "a superseded reader delivers no chunk");
-        assert_eq!(total, 0);
+        assert_eq!(total.entries, 0);
     }
 
     #[test]
@@ -995,7 +1095,197 @@ mod tests {
         })
         .unwrap();
         assert_eq!(chunks, vec![3], "the chunk in flight when the flag was set is the last one");
-        assert_eq!(total, 3, "the count covers only what was delivered");
+        assert_eq!(total.entries, 3, "the count covers only what was delivered");
+    }
+
+    // -----------------------------------------------------------------
+    // link-aware-listing: link classification and skipped entries
+    // (panel-navigation "Directory links list as directories", "One
+    // unreadable entry does not fail a listing"; design D1/D2/D6/D8)
+    // -----------------------------------------------------------------
+
+    fn facts(is_dir: bool, is_symlink: bool, len: u64, secs: u64, hidden: bool) -> EntryFacts {
+        EntryFacts { is_dir, is_symlink, len, modified: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs)), hidden }
+    }
+
+    fn not_followed() -> io::Result<EntryFacts> {
+        panic!("a non-link entry must never be followed")
+    }
+
+    #[test]
+    fn classify_entry_skips_an_entry_whose_own_metadata_cannot_be_read() {
+        let own = Err(io::Error::new(io::ErrorKind::NotFound, "raced deletion"));
+        assert_eq!(classify_entry("gone".into(), own, not_followed), None);
+    }
+
+    #[test]
+    fn classify_entry_keeps_a_plain_file_and_a_plain_directory_as_they_are() {
+        let file = classify_entry("a.txt".into(), Ok(facts(false, false, 42, 10, false)), not_followed).unwrap();
+        assert_eq!(file, RawDirEntry { name: "a.txt".into(), is_dir: false, size: 42, modified: facts(false, false, 42, 10, false).modified, hidden: false, link: false });
+
+        let dir = classify_entry("sub".into(), Ok(facts(true, false, 4096, 20, true)), not_followed).unwrap();
+        assert!(dir.is_dir && !dir.link && dir.hidden);
+        assert_eq!(dir.size, 0, "a directory's own length is never shown as a size");
+    }
+
+    #[test]
+    fn classify_entry_lists_a_link_to_a_directory_as_a_directory_with_the_links_own_date_and_hidden_flag() {
+        let link_facts = facts(false, true, 0, 10, true);
+        let target = facts(true, false, 4096, 99, false);
+        let raw = classify_entry("lodash".into(), Ok(link_facts), || Ok(target)).unwrap();
+        assert!(raw.is_dir, "classified by the target");
+        assert!(raw.link);
+        assert_eq!(raw.size, 0);
+        assert_eq!(raw.modified, link_facts.modified, "the date is the link's own");
+        assert!(raw.hidden, "the hidden flag is the link's own");
+    }
+
+    #[test]
+    fn classify_entry_lists_a_link_to_a_file_with_the_targets_size_and_the_links_date() {
+        let link_facts = facts(false, true, 0, 10, false);
+        let target = facts(false, false, 4096, 99, false);
+        let raw = classify_entry("notes.lnk".into(), Ok(link_facts), || Ok(target)).unwrap();
+        assert!(!raw.is_dir && raw.link);
+        assert_eq!(raw.size, 4096, "the Size column shows the target's size");
+        assert_eq!(raw.modified, link_facts.modified);
+    }
+
+    #[test]
+    fn classify_entry_lists_a_dangling_link_as_a_non_enterable_file_without_failing() {
+        let link_facts = facts(false, true, 0, 10, false);
+        let raw = classify_entry("old".into(), Ok(link_facts), || Err(io::Error::new(io::ErrorKind::NotFound, "target gone"))).unwrap();
+        assert_eq!(raw, RawDirEntry { name: "old".into(), is_dir: false, size: 0, modified: link_facts.modified, hidden: false, link: true });
+        // A target that exists but cannot be reached is treated the same.
+        let raw = classify_entry("denied".into(), Ok(link_facts), || Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))).unwrap();
+        assert!(!raw.is_dir && raw.link && raw.size == 0);
+    }
+
+    /// A reader that also reports skipped entries, for the unreadable count.
+    struct SkippingReader(RawDirListing);
+    impl FsReader for SkippingReader {
+        fn read_dir(&self, _path: &Path) -> io::Result<RawDirListing> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn raw_dir_link(name: &str) -> RawDirEntry {
+        RawDirEntry { name: name.into(), is_dir: true, size: 0, modified: None, hidden: false, link: true }
+    }
+
+    #[test]
+    fn list_dir_chunked_reports_the_skipped_count_and_the_link_flag_survives_conversion_and_sorting() {
+        let reader = SkippingReader(RawDirListing { entries: vec![raw_file("zeta.txt"), raw_dir_link("lnk"), raw_dir("alpha")], unreadable: 2 });
+        let mut entries = Vec::new();
+        let totals = list_dir_chunked(&reader, Path::new("."), 100, &CancelFlag::new(), |chunk| entries.extend(chunk)).unwrap();
+        assert_eq!(totals, ListingTotals { entries: 3, unreadable: 2 });
+
+        let flags: Vec<(&str, EntryKind, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.kind, e.link)).collect();
+        assert_eq!(flags, vec![("zeta.txt", EntryKind::File, false), ("lnk", EntryKind::Directory, true), ("alpha", EntryKind::Directory, false)]);
+
+        entries.sort_by(|a, b| cmp_by_mode(a, b, SortMode::Name));
+        let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.link)).collect();
+        assert_eq!(flags, vec![("alpha", false), ("lnk", true), ("zeta.txt", false)], "a directory link sorts among the directories and keeps its flag");
+    }
+
+    #[test]
+    fn parent_dir_is_never_a_link() {
+        assert!(!Entry::parent_dir().link);
+    }
+
+    #[test]
+    fn find_in_subtree_matches_a_directory_link_by_name_but_never_reads_beneath_it() {
+        // design D4: links are leaves for the walk — `report_link` is
+        // reported, `/root/report_link/report_b.txt` is never seen, and the
+        // directory behind the link is never read.
+        let mut fixture = std::collections::HashMap::new();
+        fixture.insert(PathBuf::from("/root"), vec![raw_dir("real"), raw_dir_link("report_link")]);
+        fixture.insert(PathBuf::from("/root/real"), vec![raw_file("report_a.txt")]);
+        fixture.insert(PathBuf::from("/root/report_link"), vec![raw_file("report_b.txt")]);
+        let reader = CountingReader { inner: TreeReader(fixture), reads: std::cell::Cell::new(0) };
+
+        let mut paths = Vec::new();
+        find_in_subtree(&reader, Path::new("/root"), "report", &CancelFlag::new(), |m| paths.push(m.relative_path));
+        paths.sort();
+        assert_eq!(paths, vec![PathBuf::from("real").join("report_a.txt"), PathBuf::from("report_link")]);
+        assert_eq!(reader.reads.get(), 2, "only /root and /root/real are read");
+    }
+
+    /// Real junctions on the real filesystem (tasks.md 4.4): `mklink /J`
+    /// needs no privilege. The junction to a live directory lists as a
+    /// directory, the dangling one as a file, and neither fails the read
+    /// (panel-navigation "A junction to a directory lists as a directory",
+    /// "A dangling link does not fail the listing").
+    #[cfg(windows)]
+    #[test]
+    fn std_reader_classifies_junctions_by_their_target_and_survives_a_dangling_one() {
+        let dir = std::env::temp_dir().join(format!("filecommand-listing-junction-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target").join("inside.txt"), b"x").unwrap();
+        std::fs::write(dir.join("plain.txt"), b"12345").unwrap();
+        std::fs::create_dir(dir.join("gone")).unwrap();
+        let mklink = |link: &str, target: &str| {
+            let status = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J", link, target])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .status()
+                .expect("cmd.exe runs");
+            assert!(status.success(), "mklink /J {link} {target} failed");
+        };
+        mklink("lnk", "target");
+        mklink("old", "gone");
+        std::fs::remove_dir(dir.join("gone")).unwrap(); // `old` now dangles
+
+        let listing = StdFsReader.read_dir(&dir).expect("a dangling junction does not fail the listing");
+        assert_eq!(listing.unreadable, 0);
+        let by_name = |name: &str| listing.entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is listed: {:?}", listing.entries)).clone();
+        let lnk = by_name("lnk");
+        assert!(lnk.is_dir && lnk.link, "a junction to a directory lists as a directory: {lnk:?}");
+        let old = by_name("old");
+        assert!(!old.is_dir && old.link && old.size == 0, "a dangling junction lists as a non-enterable file: {old:?}");
+        let target = by_name("target");
+        assert!(target.is_dir && !target.link);
+        let plain = by_name("plain.txt");
+        assert!(!plain.is_dir && !plain.link && plain.size == 5);
+        assert_eq!(listing.entries.len(), 4);
+
+        // The junction's own path lists the target's contents, as Enter would.
+        let through = StdFsReader.read_dir(&dir.join("lnk")).unwrap();
+        assert_eq!(through.entries.iter().map(|e| e.name.clone()).collect::<Vec<_>>(), vec![OsString::from("inside.txt")]);
+
+        let _ = std::fs::remove_dir(dir.join("lnk"));
+        let _ = std::fs::remove_dir(dir.join("old"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Symbolic links on Unix (tasks.md 4.5): to a directory, to a
+    /// 4,096-byte file, and to a missing path (panel-navigation "A directory
+    /// symbolic link behaves like a junction", "A link to a file lists as a
+    /// file with the target's size", "A dangling link does not fail the
+    /// listing").
+    #[cfg(unix)]
+    #[test]
+    fn std_reader_classifies_symlinks_by_their_target_and_survives_a_dangling_one() {
+        let dir = std::env::temp_dir().join(format!("filecommand-listing-symlink-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("big.bin"), vec![0u8; 4096]).unwrap();
+        std::os::unix::fs::symlink(dir.join("target"), dir.join("dir_link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("big.bin"), dir.join("file_link")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), dir.join("dangling")).unwrap();
+
+        let listing = StdFsReader.read_dir(&dir).expect("a dangling symlink does not fail the listing");
+        assert_eq!(listing.unreadable, 0);
+        let by_name = |name: &str| listing.entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is listed")).clone();
+        let dir_link = by_name("dir_link");
+        assert!(dir_link.is_dir && dir_link.link);
+        let file_link = by_name("file_link");
+        assert!(!file_link.is_dir && file_link.link);
+        assert_eq!(file_link.size, 4096, "the target's size");
+        let dangling = by_name("dangling");
+        assert!(!dangling.is_dir && dangling.link && dangling.size == 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
@@ -1008,7 +1298,7 @@ mod tests {
         let mut raw_name = vec![0x66, 0x6f, 0x80];
         raw_name.extend_from_slice(b"report.txt");
         let name = std::ffi::OsStr::from_bytes(&raw_name).to_os_string();
-        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None, hidden: false }]);
+        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None, hidden: false, link: false }]);
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();
