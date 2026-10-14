@@ -124,6 +124,20 @@ fn walk_delete(fs: &dyn FileSystem, abs: &Path, out: &mut Vec<DeleteItem>, skipp
     }
 }
 
+/// Remove a reparse point (symlink/junction) itself, never anything reached
+/// through it: `remove_dir` for a directory-object link, `remove_file`
+/// otherwise. Read-only is deliberately *not* cleared first — `set_readonly`
+/// follows the link and would modify the target. Shared by Delete and the
+/// source-removal half of a cross-volume move so both halves apply one rule
+/// (move-reparse-point-safety design D3).
+fn remove_reparse_leaf(fs: &dyn FileSystem, path: &Path, is_dir: bool) -> io::Result<()> {
+    if is_dir {
+        fs.remove_dir(path)
+    } else {
+        fs.remove_file(path)
+    }
+}
+
 fn run_delete(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
     let mut items = Vec::new();
     let mut skipped = Vec::new();
@@ -151,14 +165,17 @@ fn run_delete(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
         };
         progress.current_file = path.file_name().unwrap_or_default().to_os_string();
 
-        let outcome = attempt_with_recovery(&path, &mut error_policy, sink, || {
-            if readonly {
-                let _ = fs.set_readonly(&path, false);
-            }
-            if is_dir {
-                fs.remove_dir(&path)
-            } else {
-                fs.remove_file(&path)
+        let outcome = attempt_with_recovery(&path, &mut error_policy, sink, || match &item {
+            DeleteItem::ReparseLeaf { .. } => remove_reparse_leaf(fs, &path, is_dir),
+            DeleteItem::File { .. } | DeleteItem::Dir { .. } => {
+                if readonly {
+                    let _ = fs.set_readonly(&path, false);
+                }
+                if is_dir {
+                    fs.remove_dir(&path)
+                } else {
+                    fs.remove_file(&path)
+                }
             }
         });
         match outcome {
@@ -184,14 +201,64 @@ fn run_delete(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
 // Copy / Move
 // ---------------------------------------------------------------------
 
+/// How the source-removal half of a cross-volume move disposes of a planned
+/// file once its copy succeeded (move-reparse-point-safety design D1). The
+/// copy half is the same for every variant: the destination receives the
+/// content read through the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceRemoval {
+    /// A regular file not beneath a traversed link: clear read-only, then
+    /// `remove_file`.
+    RemoveFile,
+    /// A file-type reparse point (file symlink) not beneath a link: its
+    /// content was copied by following it; only the link is removed, with
+    /// [`remove_reparse_leaf`].
+    RemoveLink { is_dir: bool },
+    /// Anything reached *through* a traversed directory link — the target's
+    /// own files, nested links, nested directories. Never touched: it was
+    /// never selected, only reached.
+    Keep,
+}
+
 struct PlannedFile {
     src_abs: PathBuf,
     rel_path: PathBuf,
     size: u64,
+    removal: SourceRemoval,
+    /// Index into `CopyPlan::dirs` of the nearest enclosing
+    /// `DirRemoval::RemoveLink` entry, if the file was planned through a
+    /// link. Any outcome other than `Done` marks that link incomplete so it
+    /// is kept (design D2).
+    enclosing_link: Option<usize>,
+}
+
+/// How the move's post-loop cleanup disposes of a planned directory
+/// (move-reparse-point-safety design D1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirRemoval {
+    /// A real directory not beneath a link: best-effort `remove_dir`, so a
+    /// directory left non-empty by a skipped file simply survives.
+    RemoveIfEmpty,
+    /// A directory-type reparse point: removed with [`remove_reparse_leaf`],
+    /// and only when every file copied through it succeeded (design D2).
+    RemoveLink { is_dir: bool },
+    /// A directory beneath a traversed link. Still created at the
+    /// destination (its `rel` is unchanged), never removed at the source.
+    Keep,
+}
+
+struct PlannedDir {
+    rel: PathBuf,
+    /// Recorded during the walk rather than rebuilt as
+    /// `source_dir.join(rel)`: the link's own path is needed for its
+    /// removal, and this drops the assumption that a source's
+    /// `original_name` sits directly in `source_dir`.
+    src_abs: PathBuf,
+    removal: DirRemoval,
 }
 
 struct CopyPlan {
-    dirs: Vec<PathBuf>,
+    dirs: Vec<PlannedDir>,
     files: Vec<PlannedFile>,
     skipped: Vec<SkippedItem>,
 }
@@ -201,12 +268,17 @@ fn plan_copy(fs: &dyn FileSystem, sources: &[super::job::SourceItem]) -> CopyPla
     let mut visited: HashSet<FileId> = HashSet::new();
     for src in sources {
         let rel_root = PathBuf::from(&src.original_name);
-        walk_copy(fs, &src.path, &rel_root, &mut visited, &mut plan);
+        walk_copy(fs, &src.path, &rel_root, None, &mut visited, &mut plan);
     }
     plan
 }
 
-fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<FileId>, plan: &mut CopyPlan) {
+/// `enclosing_link` is `Some(index into plan.dirs)` while the walk is beneath
+/// a traversed directory-type reparse point — the outermost one, since that
+/// is the only one the move may remove. Everything planned beneath it is
+/// `Keep`. Copy totals and the cycle guard are unchanged by this bookkeeping
+/// (move-reparse-point-safety design D1).
+fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, enclosing_link: Option<usize>, visited: &mut HashSet<FileId>, plan: &mut CopyPlan) {
     let md = match fs.metadata(abs) {
         Ok(m) => m,
         Err(e) => {
@@ -214,23 +286,30 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<
             return;
         }
     };
+    let under_link = enclosing_link.is_some();
+    let is_link = md.reparse.is_reparse_point();
 
     // Reparse points duplicate their target's content by default: resolve
     // whether the target is a directory or a file via the *following*
     // metadata query.
-    let is_dir_like = if md.reparse.is_reparse_point() {
+    let is_dir_like = if is_link {
         fs.metadata_follow(abs).map(|m| m.is_dir).unwrap_or(false)
     } else {
         md.is_dir
     };
 
     if !is_dir_like {
-        let size = if md.reparse.is_reparse_point() {
+        let size = if is_link {
             fs.metadata_follow(abs).map(|m| m.size).unwrap_or(md.size)
         } else {
             md.size
         };
-        plan.files.push(PlannedFile { src_abs: abs.to_path_buf(), rel_path: rel.to_path_buf(), size });
+        let removal = match (under_link, is_link) {
+            (true, _) => SourceRemoval::Keep,
+            (false, true) => SourceRemoval::RemoveLink { is_dir: md.is_dir },
+            (false, false) => SourceRemoval::RemoveFile,
+        };
+        plan.files.push(PlannedFile { src_abs: abs.to_path_buf(), rel_path: rel.to_path_buf(), size, removal, enclosing_link });
         return;
     }
 
@@ -244,11 +323,25 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, visited: &mut HashSet<
         }
     }
 
-    plan.dirs.push(rel.to_path_buf());
+    // `is_dir` here is the link's *own* directory-ness (a junction or
+    // `mklink /D` symlink on Windows; never for a Unix symlink), which is
+    // exactly what decides `remove_dir` versus `remove_file` for the leaf
+    // (design D4).
+    let removal = match (under_link, is_link) {
+        (true, _) => DirRemoval::Keep,
+        (false, true) => DirRemoval::RemoveLink { is_dir: md.is_dir },
+        (false, false) => DirRemoval::RemoveIfEmpty,
+    };
+    let index = plan.dirs.len();
+    plan.dirs.push(PlannedDir { rel: rel.to_path_buf(), src_abs: abs.to_path_buf(), removal });
+    let child_link = match removal {
+        DirRemoval::RemoveLink { .. } => Some(index),
+        _ => enclosing_link,
+    };
     match fs.read_dir(abs) {
         Ok(entries) => {
             for entry in entries {
-                walk_copy(fs, &abs.join(&entry.name), &rel.join(&entry.name), visited, plan);
+                walk_copy(fs, &abs.join(&entry.name), &rel.join(&entry.name), child_link, visited, plan);
             }
         }
         Err(e) => plan.skipped.push(SkippedItem::skipped(abs.to_path_buf(), e.to_string())),
@@ -421,13 +514,19 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
     // count is reported as a single job-level warning below.
     let streams_supported = fs.supports_named_streams(&job.dest_dir).unwrap_or(true);
     let mut streams_not_copied = 0usize;
+    // Per planned directory: whether any file copied through that link
+    // ended in anything other than `Done`. A marked link is kept, the same
+    // way a real directory survives a skipped file (move-reparse-point-
+    // safety design D2). Only `DirRemoval::RemoveLink` entries are ever
+    // read.
+    let mut link_incomplete = vec![false; plan.dirs.len()];
 
-    'dirs: for rel_dir in &plan.dirs {
+    'dirs: for planned_dir in &plan.dirs {
         if sink.is_cancelled() {
             cancelled = true;
             break;
         }
-        let target = job.dest_dir.join(rel_dir);
+        let target = job.dest_dir.join(&planned_dir.rel);
         let outcome = attempt_with_recovery(&target, &mut error_policy, sink, || match fs.create_dir(&target) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
@@ -461,6 +560,9 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
             // raised, and a move's source removal is never reached.
             if same_file(fs, &planned.src_abs, &target) {
                 skipped.push(SkippedItem::skipped(planned.src_abs.clone(), "source and destination are the same file".to_string()));
+                if let Some(link) = planned.enclosing_link {
+                    link_incomplete[link] = true;
+                }
                 continue 'files;
             }
 
@@ -491,6 +593,9 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                     ConflictChoice::Skip | ConflictChoice::SkipAll => {
                         skipped.push(SkippedItem::skipped(target, "target already exists".to_string()));
                         do_copy = false;
+                        if let Some(link) = planned.enclosing_link {
+                            link_incomplete[link] = true;
+                        }
                     }
                     ConflictChoice::Rename(new_name) => {
                         final_target = target.parent().unwrap_or(&job.dest_dir).join(new_name);
@@ -514,8 +619,23 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                         progress.bytes_done = baseline + bytes;
                         sink.progress(progress.clone());
                         if is_move {
-                            let _ = fs.set_readonly(&planned.src_abs, false);
-                            let _ = fs.remove_file(&planned.src_abs);
+                            match planned.removal {
+                                SourceRemoval::RemoveFile => {
+                                    let _ = fs.set_readonly(&planned.src_abs, false);
+                                    let _ = fs.remove_file(&planned.src_abs);
+                                }
+                                // A file symlink: the copy followed it; only
+                                // the link goes, and a failure is reported
+                                // rather than ignored (design D3).
+                                SourceRemoval::RemoveLink { is_dir } => {
+                                    if let Err(e) = remove_reparse_leaf(fs, &planned.src_abs, is_dir) {
+                                        skipped.push(SkippedItem::skipped(planned.src_abs.clone(), format!("copied, but the link could not be removed: {e}")));
+                                    }
+                                }
+                                // Reached through a link: never selected, never
+                                // removed (R-01).
+                                SourceRemoval::Keep => {}
+                            }
                         }
                     }
                     CopyOneResult::Cancelled | CopyOneResult::Aborted => {
@@ -525,6 +645,9 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                     CopyOneResult::Failed(reason) => {
                         progress.bytes_done = baseline;
                         skipped.push(SkippedItem::skipped(planned.src_abs.clone(), reason));
+                        if let Some(link) = planned.enclosing_link {
+                            link_incomplete[link] = true;
+                        }
                     }
                 }
             }
@@ -532,10 +655,30 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
     }
 
     if is_move && !cancelled {
-        // Clean up now-empty source directories, deepest first. Best-effort:
-        // a directory left non-empty by a skipped file simply survives.
-        for rel_dir in plan.dirs.iter().rev() {
-            let _ = fs.remove_dir(&job.source_dir.join(rel_dir));
+        // Clean up the source, deepest first, on each entry's recorded path
+        // (move-reparse-point-safety design D1-D3).
+        for (index, planned_dir) in plan.dirs.iter().enumerate().rev() {
+            match planned_dir.removal {
+                // Best-effort: a directory left non-empty by a skipped file
+                // simply survives, and that is an expected outcome.
+                DirRemoval::RemoveIfEmpty => {
+                    let _ = fs.remove_dir(&planned_dir.src_abs);
+                }
+                // Beneath a link: the target's own directories stay.
+                DirRemoval::Keep => {}
+                // The link itself goes only once everything copied through
+                // it succeeded, so the user is never left with the link
+                // gone and a partial copy at the destination. A failed
+                // removal is not an expected outcome, so it is reported.
+                DirRemoval::RemoveLink { is_dir } => {
+                    if link_incomplete[index] {
+                        continue;
+                    }
+                    if let Err(e) = remove_reparse_leaf(fs, &planned_dir.src_abs, is_dir) {
+                        skipped.push(SkippedItem::skipped(planned_dir.src_abs.clone(), format!("copied, but the link could not be removed: {e}")));
+                    }
+                }
+            }
         }
     }
 
@@ -976,6 +1119,178 @@ mod tests {
             other => panic!("expected a single skipped cycle entry, got {other:?}"),
         }
         assert!(fake.metadata(Path::new("/dst/src/a.txt")).is_ok());
+    }
+
+    // -------------------------------------------------------------
+    // move-reparse-point-safety (file-operations "Reparse-point
+    // (symlink/junction) semantics": the cross-volume move's
+    // source-removal half treats every link as a leaf)
+    // -------------------------------------------------------------
+
+    /// Volumes `/v1` and `/v2`; `/v1/work/proj/file.txt`; `/v1/shared/lib.dll`
+    /// and `/v1/shared/x86/a.dll`; junction `/v1/work/proj/shared` → `/v1/shared`;
+    /// empty `/v2/backup`.
+    fn junction_in_tree_fixture() -> FakeFs {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_dir(Path::new("/v1/work"));
+        fake.add_dir(Path::new("/v1/work/proj"));
+        fake.add_file(Path::new("/v1/work/proj/file.txt"), 3);
+        fake.add_dir(Path::new("/v1/shared"));
+        fake.add_file(Path::new("/v1/shared/lib.dll"), 10);
+        fake.add_dir(Path::new("/v1/shared/x86"));
+        fake.add_file(Path::new("/v1/shared/x86/a.dll"), 20);
+        fake.add_reparse_point(Path::new("/v1/work/proj/shared"), true, Path::new("/v1/shared"), super::super::fs::ReparseKind::Junction);
+        fake.add_dir(Path::new("/v2/backup"));
+        fake
+    }
+
+    fn move_proj_to_backup() -> Job {
+        Job {
+            kind: JobKind::Move,
+            sources: vec![source("proj", "/v1/work/proj")],
+            source_dir: PathBuf::from("/v1/work"),
+            dest_dir: PathBuf::from("/v2/backup"),
+            new_dir_name: None,
+        }
+    }
+
+    fn assert_shared_target_intact(fake: &FakeFs) {
+        assert_eq!(fake.metadata(Path::new("/v1/shared/lib.dll")).unwrap().size, 10, "R-01: the junction target's file must survive the move");
+        assert_eq!(fake.metadata(Path::new("/v1/shared/x86/a.dll")).unwrap().size, 20, "R-01: the target's subdirectory file must survive");
+        assert!(fake.metadata(Path::new("/v1/shared/x86")).unwrap().is_dir, "R-01: the target's subdirectory must survive");
+        assert!(fake.metadata(Path::new("/v1/shared")).unwrap().is_dir);
+    }
+
+    /// Audit finding R-01: "Cross-volume move of a tree containing a
+    /// junction to an outside directory leaves that directory's files
+    /// intact".
+    #[test]
+    fn move_cross_volume_through_junction_leaves_target_files_intact() {
+        let fake = junction_in_tree_fixture();
+        let mut sink = RecordingSink::new();
+        run_job(&move_proj_to_backup(), &fake, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_shared_target_intact(&fake);
+        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/file.txt")).unwrap().size, 3);
+        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).unwrap().size, 10, "the destination receives the link target's content");
+        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/x86/a.dll")).unwrap().size, 20);
+        assert!(fake.metadata(Path::new("/v1/work/proj/shared")).is_err(), "the junction itself is removed");
+        assert!(fake.metadata(Path::new("/v1/work/proj")).is_err(), "the source tree is gone");
+    }
+
+    /// "Cross-volume move of a selected junction removes only the link".
+    #[test]
+    fn move_cross_volume_of_selected_junction_removes_only_the_link() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_dir(Path::new("/v1/data"));
+        fake.add_file(Path::new("/v1/data/a.txt"), 5);
+        fake.add_dir(Path::new("/v1/data/sub"));
+        fake.add_file(Path::new("/v1/data/sub/b.txt"), 6);
+        fake.add_dir(Path::new("/v1/work"));
+        fake.add_reparse_point(Path::new("/v1/work/link"), true, Path::new("/v1/data"), super::super::fs::ReparseKind::Junction);
+        fake.add_dir(Path::new("/v2/backup"));
+
+        let job = Job {
+            kind: JobKind::Move,
+            sources: vec![source("link", "/v1/work/link")],
+            source_dir: PathBuf::from("/v1/work"),
+            dest_dir: PathBuf::from("/v2/backup"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_eq!(fake.metadata(Path::new("/v2/backup/link/a.txt")).unwrap().size, 5, "the destination receives the target's content");
+        assert_eq!(fake.metadata(Path::new("/v2/backup/link/sub/b.txt")).unwrap().size, 6);
+        assert!(fake.metadata(Path::new("/v1/work/link")).is_err(), "the junction is removed");
+        assert_eq!(fake.metadata(Path::new("/v1/data/a.txt")).unwrap().size, 5, "the target's files are untouched");
+        assert_eq!(fake.metadata(Path::new("/v1/data/sub/b.txt")).unwrap().size, 6);
+        assert!(fake.metadata(Path::new("/v1/data/sub")).unwrap().is_dir);
+    }
+
+    /// "A link whose content was not fully copied is kept".
+    #[test]
+    fn move_cross_volume_keeps_the_junction_when_a_file_beneath_it_was_skipped() {
+        let fake = junction_in_tree_fixture();
+        fake.inject(InjectableOp::CopyAfterChunks(0), Path::new("/v2/backup/proj/shared/lib.dll"), io::ErrorKind::StorageFull);
+        let mut sink = RecordingSink::new();
+        sink.error_answers.push(ErrorChoice::Skip);
+        run_job(&move_proj_to_backup(), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "exactly the skipped file is listed: {skipped:?}");
+                assert_eq!(skipped[0].path, PathBuf::from("/v1/work/proj/shared/lib.dll"));
+            }
+            other => panic!("expected Completed with one skipped item, got {other:?}"),
+        }
+        assert_shared_target_intact(&fake);
+        assert!(fake.metadata(Path::new("/v1/work/proj/shared")).unwrap().reparse.is_reparse_point(), "the junction survives an incomplete copy");
+        assert!(fake.metadata(Path::new("/v1/work/proj")).is_ok(), "the directory holding the kept link survives");
+        assert!(fake.metadata(Path::new("/v1/work/proj/file.txt")).is_err(), "the regular file was moved");
+        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/x86/a.dll")).unwrap().size, 20, "the rest of the link's content was copied");
+        assert!(fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).is_err());
+    }
+
+    /// Design D3: a file symlink is copied by following it, and only the link
+    /// is removed — the target file and its read-only attribute are never
+    /// touched (`set_readonly` would follow the link).
+    #[test]
+    fn move_cross_volume_of_a_file_symlink_removes_only_the_link() {
+        let fake = FakeFs::new();
+        fake.set_volume(Path::new("/v1"), 1);
+        fake.set_volume(Path::new("/v2"), 2);
+        fake.add_dir(Path::new("/v1/data"));
+        fake.add_file(Path::new("/v1/data/real.txt"), 42);
+        fake.set_readonly(Path::new("/v1/data/real.txt"), true).unwrap();
+        fake.add_dir(Path::new("/v1/work"));
+        fake.add_reparse_point(Path::new("/v1/work/link.txt"), false, Path::new("/v1/data/real.txt"), super::super::fs::ReparseKind::Symlink);
+        fake.add_dir(Path::new("/v2/backup"));
+
+        let job = Job {
+            kind: JobKind::Move,
+            sources: vec![source("link.txt", "/v1/work/link.txt")],
+            source_dir: PathBuf::from("/v1/work"),
+            dest_dir: PathBuf::from("/v2/backup"),
+            new_dir_name: None,
+        };
+        let mut sink = RecordingSink::new();
+        run_job(&job, &fake, &mut sink);
+
+        assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
+        assert_eq!(fake.metadata(Path::new("/v2/backup/link.txt")).unwrap().size, 42, "the destination receives the target's content");
+        assert!(fake.metadata(Path::new("/v1/work/link.txt")).is_err(), "the link is removed");
+        let target = fake.metadata(Path::new("/v1/data/real.txt")).unwrap();
+        assert_eq!(target.size, 42, "the target file survives");
+        assert!(target.readonly, "the target's read-only attribute is untouched");
+    }
+
+    /// Design D3: a link that cannot be removed is reported in the summary,
+    /// not silently ignored like a non-empty directory.
+    #[test]
+    fn move_cross_volume_reports_a_junction_that_could_not_be_removed() {
+        let fake = junction_in_tree_fixture();
+        fake.inject(InjectableOp::RemoveDir, Path::new("/v1/work/proj/shared"), io::ErrorKind::PermissionDenied);
+        let mut sink = RecordingSink::new();
+        run_job(&move_proj_to_backup(), &fake, &mut sink);
+
+        match &sink.outcome {
+            Some(JobOutcome::Completed { skipped }) => {
+                assert_eq!(skipped.len(), 1, "{skipped:?}");
+                assert_eq!(skipped[0].path, PathBuf::from("/v1/work/proj/shared"));
+                assert!(skipped[0].reason.starts_with("copied, but the link could not be removed: "), "{}", skipped[0].reason);
+            }
+            other => panic!("expected Completed with one skipped item, got {other:?}"),
+        }
+        assert_shared_target_intact(&fake);
+        assert!(fake.metadata(Path::new("/v1/work/proj/shared")).is_ok(), "the link is still there");
+        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).unwrap().size, 10, "its content was copied");
     }
 
     #[test]

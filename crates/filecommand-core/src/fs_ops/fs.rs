@@ -43,6 +43,14 @@ impl ReparseKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FsMetadata {
+    /// Whether the entry is a directory object. For the non-followed
+    /// metadata of a reparse point this means "the link itself is a
+    /// directory object" — a Windows junction or `mklink /D` symlink, which
+    /// is removed with `remove_dir` — not whether its target is a directory
+    /// (move-reparse-point-safety design D4). A Unix symlink is never a
+    /// directory object and is removed with `remove_file`. Callers that
+    /// recurse check `reparse` first, so a link is never traversed as a
+    /// directory by mistake.
     pub is_dir: bool,
     pub reparse: ReparseKind,
     pub size: u64,
@@ -152,6 +160,7 @@ mod windows_impl {
 
     const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
     const FILE_ATTRIBUTE_READONLY: u32 = 0x1;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 
     fn reparse_kind_from_metadata(md: &std::fs::Metadata, is_reparse: bool) -> ReparseKind {
         if !is_reparse {
@@ -171,7 +180,14 @@ mod windows_impl {
         let attrs = md.file_attributes();
         let is_reparse = attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0;
         FsMetadata {
-            is_dir: md.is_dir(),
+            // The attribute bit, not `md.is_dir()`: the latter is false for
+            // every name-surrogate reparse point, so a junction's no-follow
+            // metadata would claim it is a file and the reparse-leaf removal
+            // would call `DeleteFileW` on a directory object, which Windows
+            // refuses with "Access is denied" (move-reparse-point-safety
+            // design D4). For non-reparse entries, and for followed
+            // metadata, the two agree.
+            is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
             reparse: reparse_kind_from_metadata(&md, is_reparse),
             size: md.file_size(),
             modified: md.modified().ok(),
@@ -304,6 +320,11 @@ mod portable_impl {
     fn to_fs_metadata(md: std::fs::Metadata) -> FsMetadata {
         let is_symlink = md.file_type().is_symlink();
         FsMetadata {
+            // Deliberately `md.is_dir()`, unlike the Windows implementation:
+            // a Unix symlink is never a directory object, even when it
+            // points at a directory, and it is removed with `unlink`
+            // (`remove_file`); `rmdir` on it fails with `ENOTDIR`
+            // (move-reparse-point-safety design D4).
             is_dir: md.is_dir(),
             reparse: if is_symlink { ReparseKind::Symlink } else { ReparseKind::None },
             size: if md.is_dir() { 0 } else { md.len() },
@@ -625,8 +646,10 @@ mod stream_enum {
             }
             loop {
                 let name = decode_name(&data.stream_name);
-                if name != ":$DATA" {
-                    if let Some(stripped) = name.strip_suffix(":$DATA").and_then(|s| s.strip_prefix(':')) {
+                // The unnamed default stream is reported as `::$DATA`; a
+                // named one as `:<name>:$DATA`. Only the latter are ADS.
+                if let Some(stripped) = name.strip_suffix(":$DATA").and_then(|s| s.strip_prefix(':')) {
+                    if !stripped.is_empty() {
                         out.push(OsString::from(stripped));
                     }
                 }
@@ -811,6 +834,13 @@ impl FakeFs {
     /// every *ancestor* component is transparently redirected if it's a
     /// reparse point, but the final component itself is left as-is (so
     /// callers can still see that the final component is a reparse point).
+    ///
+    /// Every path-taking operation — not only `metadata` — resolves through
+    /// here, so a mutation addressed *through* a link lands on the target
+    /// side exactly as `DeleteFileW`/`RemoveDirectoryW` would, while a
+    /// mutation addressed *at* a link acts on the link node itself
+    /// (move-reparse-point-safety design D5). Without that, a test could
+    /// not reproduce a move deleting through a junction.
     fn resolve_ancestors(&self, path: &Path) -> PathBuf {
         let p = Self::norm(path);
         match (p.parent(), p.file_name()) {
@@ -897,7 +927,7 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::CreateDir, path) {
             return Err(io::Error::from(kind));
         }
-        let p = Self::norm(path);
+        let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         if nodes.contains_key(&p) {
             return Err(io::Error::from(io::ErrorKind::AlreadyExists));
@@ -913,10 +943,14 @@ impl FileSystem for FakeFs {
         chunk_bytes: usize,
         on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
     ) -> io::Result<u64> {
-        let size = match self.metadata(from)? {
+        // Opening a file for reading follows a file symlink, so the source
+        // is resolved fully; the destination resolves its ancestors like
+        // every other mutation (move-reparse-point-safety design D5).
+        let size = match self.metadata_follow(from)? {
             FsMetadata { size, is_dir: false, .. } => size,
             _ => return Err(io::Error::from(io::ErrorKind::InvalidInput)),
         };
+        let dest = self.resolve_ancestors(to);
         let chunk = chunk_bytes.max(1) as u64;
         let mut done = 0u64;
         let mut chunk_index = 0u64;
@@ -944,7 +978,7 @@ impl FileSystem for FakeFs {
         self.nodes
             .lock()
             .unwrap()
-            .insert(Self::norm(to), FakeNode::File { size, modified: None, readonly: false, streams: BTreeMap::new() });
+            .insert(dest, FakeNode::File { size, modified: None, readonly: false, streams: BTreeMap::new() });
         Ok(size)
     }
 
@@ -952,8 +986,8 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::Rename, from) {
             return Err(io::Error::from(kind));
         }
-        let pf = Self::norm(from);
-        let pt = Self::norm(to);
+        let pf = self.resolve_ancestors(from);
+        let pt = self.resolve_ancestors(to);
         let mut nodes = self.nodes.lock().unwrap();
         let node = nodes.remove(&pf).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
         nodes.insert(pt.clone(), node);
@@ -971,10 +1005,16 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::RemoveFile, path) {
             return Err(io::Error::from(kind));
         }
-        let p = Self::norm(path);
+        let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get(&p) {
             Some(FakeNode::File { readonly: true, .. }) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+            // `DeleteFileW` refuses a directory object — a real directory
+            // or a directory junction/symlink — with "Access is denied"
+            // (move-reparse-point-safety design D5).
+            Some(FakeNode::Dir { .. }) | Some(FakeNode::Reparse { is_dir: true, .. }) => {
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            }
             Some(_) => {
                 nodes.remove(&p);
                 Ok(())
@@ -987,7 +1027,11 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::RemoveDir, path) {
             return Err(io::Error::from(kind));
         }
-        let p = Self::norm(path);
+        // Ancestors resolve, the final component does not: `remove_dir` on
+        // a junction path removes the link node itself, and the emptiness
+        // check below looks at the link's own (always empty) children, never
+        // at the target's.
+        let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         if nodes.keys().any(|k| k.parent() == Some(p.as_path())) {
             return Err(io::Error::new(io::ErrorKind::Other, "directory not empty"));
@@ -1000,7 +1044,7 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::SetReadonly, path) {
             return Err(io::Error::from(kind));
         }
-        let p = Self::norm(path);
+        let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get_mut(&p) {
             Some(FakeNode::File { readonly: r, .. }) => *r = readonly,
@@ -1014,7 +1058,7 @@ impl FileSystem for FakeFs {
         if let Some(kind) = self.take_injection(InjectableOp::SetModified, path) {
             return Err(io::Error::from(kind));
         }
-        let p = Self::norm(path);
+        let p = self.resolve_ancestors(path);
         let mut nodes = self.nodes.lock().unwrap();
         match nodes.get_mut(&p) {
             Some(FakeNode::File { modified: m, .. }) => {
@@ -1157,6 +1201,57 @@ mod tests {
         let followed = fake.metadata_follow(Path::new("/link")).unwrap();
         assert!(!followed.reparse.is_reparse_point());
         assert!(followed.is_dir);
+    }
+
+    // move-reparse-point-safety design D5: mutations resolve ancestor links
+    // like NTFS, and `remove_file` refuses directory objects.
+
+    fn junction_fixture() -> FakeFs {
+        let fake = FakeFs::new();
+        fake.add_dir(Path::new("/shared"));
+        fake.add_file(Path::new("/shared/f.txt"), 9);
+        fake.add_dir(Path::new("/work"));
+        fake.add_reparse_point(Path::new("/work/link"), true, Path::new("/shared"), ReparseKind::Junction);
+        fake
+    }
+
+    #[test]
+    fn fake_fs_remove_file_through_ancestor_junction_removes_the_target_side_node() {
+        let fake = junction_fixture();
+        fake.remove_file(Path::new("/work/link/f.txt")).unwrap();
+        assert!(fake.metadata(Path::new("/shared/f.txt")).is_err(), "the real file behind the link is gone, as on NTFS");
+        assert!(fake.metadata(Path::new("/work/link")).is_ok(), "the link itself is untouched");
+    }
+
+    #[test]
+    fn fake_fs_remove_dir_on_a_junction_path_removes_only_the_link_node() {
+        let fake = junction_fixture();
+        fake.remove_dir(Path::new("/work/link")).unwrap();
+        assert!(fake.metadata(Path::new("/work/link")).is_err(), "the link node is gone");
+        assert_eq!(fake.metadata(Path::new("/shared/f.txt")).unwrap().size, 9, "the target and its content survive");
+    }
+
+    #[test]
+    fn fake_fs_remove_file_on_a_directory_junction_is_refused() {
+        let fake = junction_fixture();
+        let err = fake.remove_file(Path::new("/work/link")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "DeleteFileW on a directory object is denied");
+        assert!(fake.metadata(Path::new("/work/link")).is_ok());
+        fake.add_dir(Path::new("/plain"));
+        assert_eq!(fake.remove_file(Path::new("/plain")).unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn fake_fs_mutations_through_a_junction_land_on_the_target_side() {
+        let fake = junction_fixture();
+        fake.set_readonly(Path::new("/work/link/f.txt"), true).unwrap();
+        assert!(fake.metadata(Path::new("/shared/f.txt")).unwrap().readonly, "set_readonly followed the ancestor link");
+        fake.create_dir(Path::new("/work/link/sub")).unwrap();
+        assert!(fake.metadata(Path::new("/shared/sub")).unwrap().is_dir, "create_dir followed the ancestor link");
+        fake.rename(Path::new("/work/link/sub"), Path::new("/work/link/sub2")).unwrap();
+        assert!(fake.metadata(Path::new("/shared/sub2")).is_ok(), "rename resolved both ends");
+        fake.remove_dir(Path::new("/work/link/sub2")).unwrap();
+        assert!(fake.metadata(Path::new("/shared/sub2")).is_err(), "remove_dir through the link removed the target-side dir");
     }
 
     #[test]
