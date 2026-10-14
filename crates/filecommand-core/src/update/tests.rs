@@ -4467,7 +4467,7 @@ fn editor_with(lines: &[&str]) -> EditorState {
     if !lines.is_empty() {
         bytes.push(b'\n');
     }
-    EditorState::from_bytes(PathBuf::from("/left/edit.txt"), &bytes)
+    EditorState::from_bytes(PathBuf::from("/left/edit.txt"), &bytes).expect("test fixture is valid UTF-8")
 }
 
 /// A real on-disk file to back tests that exercise an actual
@@ -4487,6 +4487,7 @@ fn editor_with_temp_file(name: &str, lines: &[&str]) -> EditorState {
     match EditorState::open(&path).unwrap() {
         crate::editor::LoadResult::Loaded(e) => e,
         crate::editor::LoadResult::TooLarge { .. } => panic!("test fixture unexpectedly exceeds the editor size cap"),
+        crate::editor::LoadResult::NotEditable { reason } => panic!("test fixture unexpectedly not editable: {reason:?}"),
     }
 }
 
@@ -4548,6 +4549,55 @@ fn editor_too_large_opens_the_viewer_instead_with_an_inline_notice() {
     let message = state.left.last_error.expect("a notice explaining the redirect");
     assert!(message.contains("huge.log"), "{message}");
     assert!(message.contains("10 MB"), "{message}");
+}
+
+/// builtin-editor "UTF-16 file redirects to the viewer", "File containing a
+/// NUL byte redirects to the viewer", "Non-UTF-8 file redirects to the
+/// viewer": each reason lands its own notice on the active panel and opens
+/// the viewer, never the editor (editor-encoding-safety design D2).
+#[test]
+fn editor_not_editable_opens_the_viewer_instead_with_a_reason_specific_notice() {
+    use crate::editor::NotEditableReason;
+    let cases = [
+        (NotEditableReason::Utf16, "export.reg", "export.reg is UTF-16 text — the editor only edits UTF-8; opened in the viewer"),
+        (NotEditableReason::Binary, "tool.exe", "tool.exe looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer"),
+        (NotEditableReason::NotUtf8, "setup.bat", "setup.bat is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
+    ];
+    for (reason, name, expected) in cases {
+        let state = test_state(UiPhase::Panels);
+        let path = PathBuf::from(format!("/left/{name}"));
+        let (state, effects) = update(state, Command::EditorNotEditable { path: path.clone(), reason });
+        assert_eq!(effects, vec![Effect::OpenViewer { path }], "{reason:?} opens the viewer for the same path");
+        assert_eq!(state.phase, UiPhase::Panels, "{reason:?} never enters the editor phase");
+        assert_eq!(state.left.last_error.as_deref(), Some(expected), "{reason:?} notice");
+        assert_eq!(state.right.last_error, None, "the notice lands on the active panel only");
+    }
+}
+
+#[test]
+fn editor_not_editable_notice_lands_on_the_right_panel_when_it_is_active() {
+    let mut state = test_state(UiPhase::Panels);
+    state.active = PanelSide::Right;
+    let (state, effects) = update(state, Command::EditorNotEditable { path: PathBuf::from("/right/export.reg"), reason: crate::editor::NotEditableReason::Utf16 });
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/right/export.reg") }]);
+    assert!(state.right.last_error.as_deref().unwrap().contains("UTF-16"));
+    assert_eq!(state.left.last_error, None);
+}
+
+/// builtin-editor "External editor receives non-UTF-8 files unchanged": the
+/// reducer never inspects content, so with `editor =` configured F4 on a
+/// UTF-16 `.reg` export dispatches the external editor and no
+/// `Effect::OpenEditor` (and therefore no classification) ever runs.
+#[test]
+fn f4_with_an_external_editor_configured_never_classifies_the_file() {
+    let mut state = test_state(UiPhase::Panels);
+    state.editor = Some("notepad".to_string());
+    state.left.entries = vec![file_entry("export.reg", 4096)];
+    let (state, effects) = update(state, Command::RequestEditor);
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(effects[0], Effect::RunExternalEditor(_, PanelSide::Left)), "got {effects:?}");
+    assert!(!effects.iter().any(|e| matches!(e, Effect::OpenEditor { .. })), "no OpenEditor effect: {effects:?}");
+    assert_eq!(state.left.last_error, None, "no redirect notice");
 }
 
 #[test]

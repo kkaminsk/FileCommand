@@ -571,9 +571,17 @@ bin — deletes are permanent, and the confirmation dialog says so.
   F7 searches, F10/Esc closes.
 - **Editor** — F4 opens your configured external editor if `editor =` is set
   in `config.toml`; otherwise the built-in editor (files under 10 MB; larger
-  files open in the viewer instead). F2 saves, F3 marks a line-selection
-  anchor, F4 opens search-and-replace, F7 searches, Ctrl+X/C/V cut/copy/paste,
-  Ctrl+Z undoes, F10 quits (prompting to save if modified).
+  files open in the viewer instead). The built-in editor edits UTF-8 text
+  only: a file that is not valid UTF-8, is UTF-16, or contains NUL bytes
+  opens in the viewer with a notice instead (a UTF-8 byte-order mark is fine
+  and is kept on save). F2 saves, F3 marks a line-selection anchor, F4 opens
+  search-and-replace, F7 searches, Ctrl+X/C/V cut/copy/paste, Ctrl+Z undoes,
+  F10 quits (prompting to save if modified). Saves are atomic — the new
+  content is written to a temporary file and flushed before it replaces the
+  original, so a crash or a full disk never leaves a truncated file — and
+  keep the file's attributes, creation time and (on Windows) alternate data
+  streams. Read-only files are not saved; the editor says so and leaves them
+  untouched.
 
 ### Themes
 

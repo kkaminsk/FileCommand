@@ -63,6 +63,21 @@ pub fn render_editor(buf: &mut Buffer, area: Rect, editor: &EditorState, theme: 
         buf.set_string(area.x, y, pad_to_width(&clipped, w), style);
     }
 
+    // A failed save is shown as a one-row overlay on the last body row,
+    // directly above the F-key bar, until the next edit or successful save
+    // (builtin-editor "A failed save leaves the original intact";
+    // editor-encoding-safety design D6). The header and the F-key bar are
+    // untouched, the same way the save-on-exit confirm overlays the body.
+    let save_error_row = match (&editor.save_error, body_h) {
+        (Some(message), h) if h > 0 => {
+            let y = body_y + h - 1;
+            let text = clip_from(&format!("Save failed: {message}"), 0, w);
+            buf.set_string(area.x, y, pad_to_width(&text, w), role_style(theme, Role::DialogError, depth));
+            Some(y)
+        }
+        _ => None,
+    };
+
     let keybar_area = Rect { x: area.x, y: area.y + area.height - 1, width: area.width, height: 1 };
     render_editor_keybar(buf, keybar_area, theme, depth);
 
@@ -73,6 +88,10 @@ pub fn render_editor(buf: &mut Buffer, area: Rect, editor: &EditorState, theme: 
 
     let cursor_row = editor.caret.line.checked_sub(editor.top_line)?;
     if cursor_row as u16 >= body_h {
+        return None;
+    }
+    if save_error_row == Some(body_y + cursor_row as u16) {
+        // The caret's row is hidden behind the save-failure overlay.
         return None;
     }
     let cursor_col = editor.caret.col.checked_sub(editor.left_col)?;
@@ -147,7 +166,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn editor_from(path: &str, text: &str) -> EditorState {
-        EditorState::from_bytes(PathBuf::from(path), text.as_bytes())
+        EditorState::from_bytes(PathBuf::from(path), text.as_bytes()).expect("test fixture is valid UTF-8")
     }
 
     fn render(editor: &EditorState, area: Rect) -> (String, Option<(u16, u16)>) {
@@ -264,6 +283,39 @@ mod tests {
         let (text, cursor) = render(&e, area);
         assert_eq!(cursor, None);
         assert!(text.contains("Save changes to notes.txt?"), "{text}");
+    }
+
+    #[test]
+    fn a_save_failure_overlays_the_last_body_row_and_leaves_the_chrome_alone() {
+        let mut e = editor_from("C:\\notes.txt", "abc\n");
+        e.type_char('!');
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let (clean, _) = render(&e, area);
+        e.save_error = Some("Cannot save notes.txt: notes.txt is read-only — not saved".to_string());
+        let (text, cursor) = render(&e, area);
+        let clean_rows: Vec<&str> = clean.lines().collect();
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[0], clean_rows[0], "the header is unchanged");
+        assert_eq!(rows[23], clean_rows[23], "the F-key bar is unchanged");
+        assert!(rows[22].starts_with("Save failed: Cannot save notes.txt: notes.txt is read-only — not saved"), "`{}`", rows[22]);
+        assert_eq!(rows[1], clean_rows[1], "the text body above the overlay is unchanged");
+        assert_eq!(cursor, Some((1, 1)), "the caret is still shown when it is not on the overlay row");
+
+        let mut buf = Buffer::empty(area);
+        render_editor(&mut buf, area, &e, &Theme::classic(), ColorDepth::Ansi16);
+        let error_style = role_style(&Theme::classic(), Role::DialogError, ColorDepth::Ansi16);
+        assert_eq!(Some(buf[(0, 22)].bg), error_style.bg, "the overlay uses the dialog.error role");
+    }
+
+    #[test]
+    fn a_long_save_failure_message_is_truncated_to_the_width() {
+        let mut e = editor_from("f.txt", "abc\n");
+        e.save_error = Some("x".repeat(200));
+        let area = Rect { x: 0, y: 0, width: 40, height: 6 };
+        let (text, _) = render(&e, area);
+        let overlay = text.lines().nth(4).unwrap();
+        assert_eq!(display_width(overlay), 40);
+        assert!(overlay.starts_with("Save failed: xxx"), "`{overlay}`");
     }
 
     #[test]

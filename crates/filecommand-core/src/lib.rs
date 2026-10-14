@@ -10,6 +10,7 @@ pub mod clock;
 pub mod config;
 pub mod dialogs;
 pub mod drives;
+pub mod durable;
 pub mod editor;
 pub mod external_editor;
 pub mod find_file;

@@ -11,7 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use crate::config::{self, UserMenuEntry};
 use crate::dialogs::{FileActionMenuEntry, FileActionMenuState, HelpState, HistoryDialogState, ThemePickerState, UserMenuState};
 use crate::drives::{self, DriveSelect};
-use crate::editor::{EditorMove, EditorState, ReplacePrompt};
+use crate::editor::{EditorMove, EditorState, NotEditableReason, ReplacePrompt};
 use crate::external_editor::{self, EditorInvocation};
 use crate::find_file::FindFileState;
 use crate::fs_ops::dialog::{DropButtons, FileOpSetup, RunningDialog};
@@ -662,6 +662,13 @@ pub enum Command {
     /// the cap — redirected to the F3 viewer with a notice (builtin-editor
     /// "Large file redirects to the viewer").
     EditorTooLarge { path: PathBuf, size: u64 },
+    /// Reply to `Effect::OpenEditor`: the file is under the cap but is not
+    /// UTF-8 text the editor can write back byte-exactly (UTF-16, NUL
+    /// bytes, or invalid UTF-8) — redirected to the F3 viewer with a
+    /// reason-specific notice, exactly like `EditorTooLarge` (builtin-editor
+    /// "Non-UTF-8 file redirects to the viewer"; editor-encoding-safety
+    /// design D2).
+    EditorNotEditable { path: PathBuf, reason: NotEditableReason },
     /// Reply to `Effect::OpenEditor` when the file could not be opened.
     EditorOpenFailed { message: String },
 
@@ -1679,6 +1686,18 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
                 state.panel_mut(state.active).last_error =
                     Some(format!("{name} is too large for the editor (10 MB limit) — opened in the viewer"));
+                effects.push(Effect::OpenViewer { path });
+            }
+            Command::EditorNotEditable { path, reason } => {
+                // Same mechanism and notice surface as the size redirect
+                // (design D2); the wording names the reason so a UTF-16
+                // file is not just "not UTF-8".
+                let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+                state.panel_mut(state.active).last_error = Some(match reason {
+                    NotEditableReason::Utf16 => format!("{name} is UTF-16 text — the editor only edits UTF-8; opened in the viewer"),
+                    NotEditableReason::Binary => format!("{name} looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer"),
+                    NotEditableReason::NotUtf8 => format!("{name} is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
+                });
                 effects.push(Effect::OpenViewer { path });
             }
             Command::EditorOpenFailed { message } => state.panel_mut(state.active).last_error = Some(message),

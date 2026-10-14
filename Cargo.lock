@@ -297,6 +297,7 @@ dependencies = [
  "git2",
  "proptest",
  "unicode-width 0.1.14",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

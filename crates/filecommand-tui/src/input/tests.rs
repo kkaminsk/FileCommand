@@ -533,7 +533,7 @@ fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns
     let viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
     assert_eq!(map(ctrl_y, &viewer), None, "the viewer owns its keys");
 
-    let editor = state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc")));
+    let editor = state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc").expect("valid UTF-8 fixture")));
     assert_eq!(map(ctrl_y, &editor), None, "the editor owns its keys");
 }
 
@@ -861,7 +861,7 @@ fn viewer_search_prompt_owns_the_keyboard_while_open() {
 // ---------------------------------------------------------------------
 
 fn open_editor(text: &str) -> filecommand_core::editor::EditorState {
-    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes())
+    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes()).expect("valid UTF-8 fixture")
 }
 
 #[test]
@@ -1087,7 +1087,7 @@ fn ctrl_c_in_the_built_in_editor_still_copies() {
     // The sole exclusion: the editor's own Ctrl+C=Copy binding must survive
     // untouched (application-shell "Quit request keys and confirmation":
     // "in the built-in editor Ctrl+C SHALL remain Copy").
-    let e = EditorState::from_bytes(PathBuf::from("f.txt"), b"");
+    let e = EditorState::from_bytes(PathBuf::from("f.txt"), b"").expect("valid UTF-8 fixture");
     assert_eq!(map_editor_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCopy));
 }
 

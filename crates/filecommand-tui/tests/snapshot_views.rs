@@ -835,7 +835,7 @@ fn editor_state(editor: EditorState) -> State {
 
 #[test]
 fn snapshot_editor_chrome_unmodified() {
-    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n");
+    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("editor_chrome_unmodified", text);
@@ -848,7 +848,7 @@ fn snapshot_editor_header_position_and_modified_indicator() {
     // other file in this codebase), caret on line 12 column 8 (both
     // 1-based, matching the spec's header example), buffer modified.
     let content: String = (1..=440).map(|i| format!("line {i}\n")).collect();
-    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes());
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes()).expect("valid UTF-8 fixture");
     editor.caret.line = 11;
     editor.caret.col = 7;
     editor.type_char('!');
@@ -864,7 +864,7 @@ fn snapshot_editor_header_position_and_modified_indicator() {
 
 #[test]
 fn snapshot_editor_overwrite_indicator() {
-    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n").expect("valid UTF-8 fixture");
     editor.toggle_mode();
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -875,7 +875,7 @@ fn snapshot_editor_overwrite_indicator() {
 
 #[test]
 fn snapshot_editor_keybar() {
-    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let last = text.lines().last().unwrap();
@@ -885,7 +885,7 @@ fn snapshot_editor_keybar() {
 
 #[test]
 fn snapshot_editor_marked_selection() {
-    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n").expect("valid UTF-8 fixture");
     editor.start_mark();
     editor.move_down();
     let state = editor_state(editor);
@@ -895,7 +895,7 @@ fn snapshot_editor_marked_selection() {
 
 #[test]
 fn snapshot_editor_save_on_exit_confirm() {
-    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
     editor.type_char('!');
     editor.quit_confirm = true;
     let state = editor_state(editor);
@@ -904,9 +904,27 @@ fn snapshot_editor_save_on_exit_confirm() {
     insta::assert_snapshot!("editor_save_on_exit_confirm", text);
 }
 
+/// builtin-editor "A failed save leaves the original intact" / "Read-only
+/// file is not saved": the failure message is a one-row overlay on the last
+/// body row, with the header and the F-key bar unchanged
+/// (editor-encoding-safety design D6).
+#[test]
+fn snapshot_editor_save_failed() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
+    editor.type_char('!');
+    editor.save_error = Some("Cannot save notes.txt: notes.txt is read-only — not saved".to_string());
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[22].starts_with("Save failed: Cannot save notes.txt: notes.txt is read-only — not saved"), "`{}`", rows[22]);
+    assert!(rows[0].contains("Edit: C:\\notes.txt *"), "header unchanged: `{}`", rows[0]);
+    assert!(rows[23].trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "F-key bar unchanged: `{}`", rows[23]);
+    insta::assert_snapshot!("editor_save_failed", text);
+}
+
 #[test]
 fn editor_replaces_the_panels_full_screen() {
-    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n");
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!text.contains('\u{2554}'), "no panel border while the editor is open:\n{text}");

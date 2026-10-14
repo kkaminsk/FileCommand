@@ -11,5 +11,11 @@ description = "Platform-agnostic application logic for FileCommand (no terminal 
 unicode-width = { workspace = true }
 git2 = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# Atomic save: `ReplaceFileW` carries the original's creation time, DACL and
+# alternate data streams over to the replacement (editor-encoding-safety;
+# design D4). Same version as the TUI so the two share one dependency entry.
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+
 [dev-dependencies]
 proptest = { workspace = true }

@@ -49,6 +49,7 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
                 let reply = match EditorState::open(&path) {
                     Ok(filecommand_core::editor::LoadResult::Loaded(editor)) => Command::EditorOpened(Box::new(editor)),
                     Ok(filecommand_core::editor::LoadResult::TooLarge { size }) => Command::EditorTooLarge { path, size },
+                    Ok(filecommand_core::editor::LoadResult::NotEditable { reason }) => Command::EditorNotEditable { path, reason },
                     Err(e) => Command::EditorOpenFailed { message: e.to_string() },
                 };
                 let _ = tx.send(reply);

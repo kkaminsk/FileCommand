@@ -1341,6 +1341,9 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 Ok(EditorLoadResult::TooLarge { size }) => {
                     worker::deliver(&rt.tx, "editor too large", Command::EditorTooLarge { path, size });
                 }
+                Ok(EditorLoadResult::NotEditable { reason }) => {
+                    worker::deliver(&rt.tx, "editor not editable", Command::EditorNotEditable { path, reason });
+                }
                 Err(e) => {
                     worker::deliver(&rt.tx, "editor open failure", Command::EditorOpenFailed { message: cannot_message("open", &path, &e) });
                 }

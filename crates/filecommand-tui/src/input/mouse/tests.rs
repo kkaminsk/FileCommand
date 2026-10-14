@@ -610,7 +610,7 @@ fn viewer_phase_ignores_map_mouse_if_ever_called_directly() {
 #[test]
 fn editor_phase_ignores_map_mouse_if_ever_called_directly() {
     let mut state = test_state();
-    state.phase = UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b""));
+    state.phase = UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"").expect("valid UTF-8 fixture"));
     assert_ignores_mouse_over_a_hit_row(state);
 }
 
