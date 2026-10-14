@@ -1853,7 +1853,7 @@ mod tests {
         let rt = Runtime {
             tx,
             active_job: None,
-            history_path: dir.join("history.json"),
+            history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
             persist_enabled: false,
@@ -2660,7 +2660,7 @@ mod tests {
         let rt = Runtime {
             tx,
             active_job: None,
-            history_path: dir.join("history.json"),
+            history_writer: HistoryWriter::disabled(),
             config_path: dir.join(CONFIG_FILE),
             usermenu_path: dir.join("usermenu.toml"),
             persist_enabled: false,
