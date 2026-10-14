@@ -355,8 +355,23 @@ impl PanelState {
         }
     }
 
+    /// The entry under the cursor, or `None` when the panel has no current
+    /// entry: an empty listing, or — while a quick filter is active — a
+    /// cursor entry the pattern hides. The latter happens only when no
+    /// entry is visible at all (a pattern matching nothing where there is
+    /// no `..`, such as a drive root), since `snap_cursor_to_visible`
+    /// otherwise keeps the cursor on a visible entry. Every cursor-targeted
+    /// command treats `None` as "do nothing", so none of them ever acts on
+    /// an entry the filter hides (quick-filter "Cursor and mini-status
+    /// behavior under an active filter"; filter-selection-safety design D1).
+    /// The visibility check matches the single cursor entry rather than
+    /// allocating `visible_indices()`.
     pub fn selected(&self) -> Option<&Entry> {
-        self.entries.get(self.cursor)
+        let entry = self.entries.get(self.cursor)?;
+        match &self.quick_filter {
+            Some(pattern) if !Self::matches_quick_filter(entry, pattern) => None,
+            _ => Some(entry),
+        }
     }
 
     pub fn clamp_cursor(&mut self) {
@@ -620,13 +635,18 @@ impl PanelState {
     /// Toggle selection on the entry under the cursor, then advance the
     /// cursor by one row (never wrapping past the last entry). The parent
     /// `..` pseudo-entry is never selectable and toggling it is a no-op.
+    /// The entry comes from [`Self::selected`], so with no current entry (a
+    /// quick filter hiding everything) nothing is toggled (quick-filter
+    /// "Ins does nothing while no entry is visible"; filter-selection-safety
+    /// design D1).
     pub fn toggle_selection_and_advance(&mut self) {
-        if let Some(entry) = self.entries.get(self.cursor) {
-            if entry.kind != EntryKind::ParentDir {
-                let name = entry.name.clone();
-                if !self.selected.remove(&name) {
-                    self.selected.insert(name);
-                }
+        let name = match self.selected() {
+            Some(entry) if entry.kind != EntryKind::ParentDir => Some(entry.name.clone()),
+            _ => None,
+        };
+        if let Some(name) = name {
+            if !self.selected.remove(&name) {
+                self.selected.insert(name);
             }
         }
         self.move_cursor(CursorMove::Down(1));
@@ -677,6 +697,22 @@ impl PanelState {
             return None;
         }
         Some(format!("{} files selected, {} bytes", format_count(self.selected.len()), format_count(self.selected_bytes() as usize)))
+    }
+
+    /// How many of `sources` are selected entries of this panel that the
+    /// active quick filter currently hides — the count the copy/move/delete
+    /// setup dialogs disclose (selection "Operations disclose selected
+    /// entries hidden by the quick filter"; filter-selection-safety design
+    /// D2). A source counts when it lies in this panel's `cwd`, its name is
+    /// in the panel's selection set, and its listing entry fails the filter.
+    /// Always 0 with no active filter.
+    pub fn hidden_selected_count(&self, sources: &[crate::fs_ops::SourceItem]) -> usize {
+        let Some(pattern) = &self.quick_filter else { return 0 };
+        sources
+            .iter()
+            .filter(|s| s.path.parent() == Some(self.cwd.as_path()) && self.selected.contains(&s.original_name))
+            .filter(|s| self.entries.iter().any(|e| e.name == s.original_name && !Self::matches_quick_filter(e, pattern)))
+            .count()
     }
 
     // -------------------------------------------------------------------
@@ -960,20 +996,48 @@ pub struct TabData {
 }
 
 /// DOS-style wildcard match (`*` = any run of characters, `?` = any single
-/// character), case-insensitive.
+/// character), case-insensitive. `+` (select a group) and `-` (deselect a
+/// group) share this matcher (selection "Wildcard pattern matching for group
+/// select and deselect"; filter-selection-safety design D4).
+///
+/// Iterative two-pointer glob with single-star backtracking over `Vec<char>`:
+/// `?` consumes exactly one Unicode scalar value, never one byte, and only
+/// the most recent `*` is ever backtracked to, so the worst case is
+/// O(|pattern| × |name|) with no recursion and no exponential blow-up.
+/// Case-insensitivity is per character (equal, or equal after
+/// `to_lowercase`) rather than a whole-string lowercase pass, which can
+/// change the character count (`İ` lowercases to two scalars) and would
+/// break "`?` is one character".
 pub fn wildcard_match(pattern: &str, name: &str) -> bool {
-    fn match_bytes(pat: &[u8], s: &[u8]) -> bool {
-        match (pat.first(), s.first()) {
-            (None, None) => true,
-            (Some(b'*'), _) => match_bytes(&pat[1..], s) || (!s.is_empty() && match_bytes(pat, &s[1..])),
-            (Some(b'?'), Some(_)) => match_bytes(&pat[1..], &s[1..]),
-            (Some(pc), Some(sc)) if pc == sc => match_bytes(&pat[1..], &s[1..]),
-            _ => false,
+    fn char_eq(a: char, b: char) -> bool {
+        a == b || a.to_lowercase().eq(b.to_lowercase())
+    }
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    let (mut p, mut s) = (0, 0);
+    // The most recent `*`'s pattern index, plus the name index it has
+    // consumed up to: on a mismatch, retry with the star absorbing one more
+    // character.
+    let mut star: Option<usize> = None;
+    let mut mark = 0;
+    while s < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || char_eq(pattern[p], name[s])) {
+            p += 1;
+            s += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            mark = s;
+            p += 1;
+        } else if let Some(st) = star {
+            p = st + 1;
+            mark += 1;
+            s = mark;
+        } else {
+            return false;
         }
     }
-    let pattern = pattern.to_lowercase();
-    let name = name.to_lowercase();
-    match_bytes(pattern.as_bytes(), name.as_bytes())
+    // Whatever of the pattern the name didn't consume must be trailing stars.
+    pattern[p..].iter().all(|&c| c == '*')
 }
 
 /// Compare two entries for sort order. `..` always sorts first regardless of
@@ -1218,6 +1282,97 @@ mod tests {
         assert!(!wildcard_match("a?c", "abbc"));
         assert!(wildcard_match("*", "anything"));
         assert!(!wildcard_match("*.txt", "readme.md"));
+    }
+
+    // -----------------------------------------------------------------
+    // filter-selection-safety (R-19): character-correct, bounded matching
+    // (tasks.md 3.1, 4.7/4.8/4.9/4.10; design D4)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn wildcard_question_mark_matches_exactly_one_character_not_one_byte() {
+        // selection "Question mark matches one multi-byte character".
+        assert!(wildcard_match("?.txt", "é.txt"), "é is one character (two UTF-8 bytes)");
+        assert!(wildcard_match("?.txt", "日.txt"), "日 is one character (three UTF-8 bytes)");
+        assert!(!wildcard_match("?.txt", "ab.txt"), "two characters need ??");
+        assert!(wildcard_match("??.txt", "ab.txt"));
+    }
+
+    #[test]
+    fn wildcard_match_edge_cases() {
+        assert!(wildcard_match("*.TXT", "readme.txt"), "matching ignores case");
+        assert!(wildcard_match("a*", "a"), "* matches the empty run");
+        assert!(wildcard_match("*", ""), "* matches the empty string");
+        assert!(!wildcard_match("?", ""), "? needs exactly one character");
+        assert!(!wildcard_match("?.txt", ".txt"));
+        assert!(wildcard_match("*.*", "readme.txt"));
+        assert!(!wildcard_match("*.txt", "readme.txt.bak"));
+    }
+
+    #[test]
+    fn wildcard_deselect_uses_the_same_character_based_matcher() {
+        // selection "Deselect uses the same matching" (tasks.md 4.10).
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = vec![file("é.txt"), file("ab.txt")];
+        p.select_matching("*.txt");
+        assert_eq!(p.selected.len(), 2);
+        p.deselect_matching("?.txt");
+        assert_eq!(p.selected, HashSet::from([OsString::from("ab.txt")]), "?.txt deselects é.txt (one char) but not ab.txt (two)");
+    }
+
+    #[test]
+    fn wildcard_pathological_pattern_completes_promptly() {
+        // selection "Pathological pattern completes promptly": 1,000 entries
+        // of 200 `a`s each against a ten-star pattern — the old recursive
+        // matcher was exponential here; the two-pointer one is
+        // O(|pattern| × |name|) per entry.
+        let mut p = PanelState::new(PathBuf::from("/"));
+        p.entries = (0..1000).map(|i| file(&format!("{}{i:04}", "a".repeat(200)))).collect();
+        let start = std::time::Instant::now();
+        p.select_matching("*a*a*a*a*a*a*a*a*a*a*b");
+        let elapsed = start.elapsed();
+        assert!(p.selected.is_empty(), "nothing matches");
+        assert!(elapsed < std::time::Duration::from_secs(5), "select_matching stalled for {elapsed:?}");
+    }
+
+    mod wildcard_proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// The naive recursive definition of the same semantics — correct
+        /// but exponential, so the strategies keep the inputs tiny. The
+        /// property pins the iterative two-pointer matcher against it
+        /// (tasks.md 4.9).
+        fn reference_match(pattern: &[char], name: &[char]) -> bool {
+            fn char_eq(a: char, b: char) -> bool {
+                a == b || a.to_lowercase().eq(b.to_lowercase())
+            }
+            match (pattern.first(), name.first()) {
+                (None, None) => true,
+                (Some('*'), _) => reference_match(&pattern[1..], name) || (!name.is_empty() && reference_match(pattern, &name[1..])),
+                (Some('?'), Some(_)) => reference_match(&pattern[1..], &name[1..]),
+                (Some(&pc), Some(&nc)) if char_eq(pc, nc) => reference_match(&pattern[1..], &name[1..]),
+                _ => false,
+            }
+        }
+
+        /// ASCII plus multi-byte characters, with the two wildcards mixed
+        /// into the pattern.
+        fn arb_pattern() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(vec!['a', 'B', '.', 't', 'é', '日', '*', '?']), 0..8).prop_map(|cs| cs.into_iter().collect())
+        }
+
+        fn arb_name() -> impl Strategy<Value = String> {
+            prop::collection::vec(prop::sample::select(vec!['a', 'b', 'B', '.', 't', 'x', 'é', '日']), 0..8).prop_map(|cs| cs.into_iter().collect())
+        }
+
+        proptest! {
+            #[test]
+            fn matches_the_naive_reference_matcher(pattern in arb_pattern(), name in arb_name()) {
+                let want = reference_match(&pattern.chars().collect::<Vec<_>>(), &name.chars().collect::<Vec<_>>());
+                prop_assert_eq!(wildcard_match(&pattern, &name), want, "pattern {:?} against name {:?}", pattern, name);
+            }
+        }
     }
 
     mod selection_proptests {
@@ -1671,6 +1826,79 @@ mod tests {
             p.activate_quick_filter();
             p.quick_filter_backspace();
             assert_eq!(p.quick_filter.as_deref(), Some(""));
+        }
+
+        // -------------------------------------------------------------
+        // filter-selection-safety: no current entry when the filter hides
+        // everything (tasks.md 1.1/1.2/1.3, 4.1/4.2; design D1)
+        // -------------------------------------------------------------
+
+        /// A drive-root-style listing: no `..`, so a pattern matching
+        /// nothing leaves *no* visible entry at all.
+        fn drive_root_with(names: &[&str]) -> PanelState {
+            let mut p = PanelState::new(PathBuf::from(r"C:\"));
+            p.entries = names.iter().map(|n| file(n)).collect();
+            p
+        }
+
+        fn filter_by(p: &mut PanelState, pattern: &str) {
+            p.activate_quick_filter();
+            for c in pattern.chars() {
+                p.quick_filter_push(c);
+            }
+        }
+
+        #[test]
+        fn a_filter_matching_nothing_at_a_drive_root_means_no_current_entry() {
+            // quick-filter "No visible entry at a drive root means no
+            // current entry".
+            let mut p = drive_root_with(&["pagefile.sys", "notes.txt"]);
+            filter_by(&mut p, "zzzz");
+            assert!(p.visible_indices().is_empty(), "setup precondition: nothing visible");
+            assert!(p.selected().is_none(), "the panel has no current entry while the filter hides everything");
+        }
+
+        #[test]
+        fn selected_returns_the_cursor_entry_when_it_matches_the_filter() {
+            let mut p = panel_with(&["report.txt", "readme.md"]);
+            p.cursor = 1; // "report.txt"
+            filter_by(&mut p, "rep");
+            assert_eq!(p.selected().map(|e| e.name.to_string_lossy().into_owned()), Some("report.txt".to_string()));
+        }
+
+        #[test]
+        fn selected_without_a_filter_returns_the_cursor_entry_exactly_as_before() {
+            let mut p = panel_with(&["a.txt", "b.txt"]);
+            p.cursor = 2;
+            assert_eq!(p.selected().map(|e| e.name.to_string_lossy().into_owned()), Some("b.txt".to_string()));
+            p.cursor = 0;
+            assert_eq!(p.selected().map(|e| e.kind), Some(EntryKind::ParentDir));
+        }
+
+        #[test]
+        fn ins_with_no_current_entry_leaves_the_selection_unchanged() {
+            // R-17 regression: Ins used to read `entries[cursor]` directly,
+            // toggling the hidden cursor entry.
+            let mut p = drive_root_with(&["pagefile.sys", "notes.txt"]);
+            p.cursor = 0;
+            filter_by(&mut p, "zzzz");
+            p.toggle_selection_and_advance();
+            assert!(p.selected.is_empty(), "Ins must not toggle an entry the filter hides");
+            assert_eq!(p.cursor, 0, "no visible entry: the cursor cannot advance");
+        }
+
+        #[test]
+        fn widening_the_pattern_restores_a_current_entry() {
+            // quick-filter "Widening the pattern restores a current entry":
+            // the cursor stays put while nothing is visible and snaps to the
+            // nearest visible entry once the pattern matches again.
+            let mut p = drive_root_with(&["pagefile.sys", "notes.txt"]);
+            p.cursor = 1; // "notes.txt"
+            filter_by(&mut p, "notesx");
+            assert!(p.selected().is_none());
+            assert_eq!(p.cursor, 1, "the cursor itself is left where it was");
+            p.quick_filter_backspace(); // "notes"
+            assert_eq!(p.selected().map(|e| e.name.to_string_lossy().into_owned()), Some("notes.txt".to_string()));
         }
     }
 

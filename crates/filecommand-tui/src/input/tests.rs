@@ -144,6 +144,7 @@ fn destination_input_state() -> State {
         source_dir: PathBuf::from("/left"),
         input: filecommand_core::line_edit::LineEdit::default(),
         buttons: None,
+        hidden_by_filter: 0,
     }))
 }
 
@@ -299,6 +300,7 @@ fn delete_confirm_routes_y_n() {
         source_dir: PathBuf::from("/left"),
         needs_second_confirm: false,
         confirmed_once: false,
+        hidden_by_filter: 0,
     }));
     assert_eq!(map(plain(KeyCode::Char('y')), &state), Some(Command::FileOpConfirm));
     assert_eq!(map(plain(KeyCode::Char('n')), &state), Some(Command::FileOpCancel));
@@ -505,6 +507,7 @@ fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns
         source_dir: PathBuf::from("/left"),
         needs_second_confirm: false,
         confirmed_once: false,
+        hidden_by_filter: 0,
     }));
     assert_eq!(map(ctrl_y, &delete_confirm), Some(Command::FileOpConfirm), "the delete-confirm's unguarded y arm is unchanged");
 

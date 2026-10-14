@@ -2725,7 +2725,7 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
         let side = state.active;
         let source_dir = state.panel(side).cwd.clone();
         state.phase =
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: LineEdit::default(), buttons: None });
+            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: LineEdit::default(), buttons: None, hidden_by_filter: 0 });
         return;
     }
     let sources = active_selection_sources(state);
@@ -2750,6 +2750,10 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
 /// the pre-`mouse-panel-drag` dialog) and `Some` only from `DragDrop`, which
 /// also passes the exact drop path as `prefill` rather than the opposite
 /// panel's cwd (operation-dialogs "Drop-initiated destination dialog").
+/// `hidden_by_filter` is computed from the *source* panel — for a drag begun
+/// on the inactive panel, that panel's own filter and selection decide the
+/// count (selection "Operations disclose selected entries hidden by the
+/// quick filter"; filter-selection-safety design D2).
 fn enter_file_op_setup_for_sources(
     state: &mut State,
     kind: JobKind,
@@ -2759,10 +2763,11 @@ fn enter_file_op_setup_for_sources(
     buttons: Option<DropButtons>,
 ) {
     let source_dir = state.panel(source_side).cwd.clone();
+    let hidden_by_filter = state.panel(source_side).hidden_selected_count(&sources);
     // A pre-filled destination opens with the caret at the end of the text,
     // so Enter-to-accept is unchanged and editing starts from the tail
     // (text-field-editing "Pre-filled field accepts unchanged with Enter").
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: LineEdit::from(prefill), buttons });
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: LineEdit::from(prefill), buttons, hidden_by_filter });
 }
 
 /// F8: enter the delete-confirmation dialog. A no-op when there is nothing
@@ -2776,12 +2781,16 @@ fn enter_delete_confirm(state: &mut State) {
 }
 
 /// Shared by `enter_delete_confirm` (F8) and the file-action menu's Delete
-/// (cursor-entry-only, D3).
+/// (cursor-entry-only, D3). `hidden_by_filter` counts the sources that are
+/// selected entries of the source (active) panel hidden by its quick filter
+/// (selection "Operations disclose selected entries hidden by the quick
+/// filter"; filter-selection-safety design D2).
 fn enter_delete_confirm_for_sources(state: &mut State, sources: Vec<SourceItem>) {
     let side = state.active;
     let source_dir = state.panel(side).cwd.clone();
+    let hidden_by_filter = state.panel(side).hidden_selected_count(&sources);
     let needs_second_confirm = sources.iter().any(|s| s.is_dir);
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false });
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false, hidden_by_filter });
 }
 
 /// The file-action menu's Rename: enter the in-place rename input dialog,
@@ -3120,19 +3129,20 @@ fn handle_file_op(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// dialog's `[ Copy ]`/`[ Move ]` buttons — confirms with an explicit `kind`
 /// override instead): an empty/whitespace destination re-shows the same
 /// dialog unchanged, exactly as before this was split out; otherwise builds
-/// and dispatches the job. `buttons` only ever rides along unchanged — it
-/// has no bearing on which job runs.
+/// and dispatches the job. `buttons` and `hidden_by_filter` only ever ride
+/// along unchanged — neither has any bearing on which job runs.
 fn confirm_destination_input(
     kind: JobKind,
     sources: Vec<SourceItem>,
     source_dir: PathBuf,
     input: LineEdit,
     buttons: Option<DropButtons>,
+    hidden_by_filter: usize,
     effects: &mut Vec<Effect>,
 ) -> UiPhase {
     let trimmed = input.text().trim();
     if trimmed.is_empty() {
-        return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons });
+        return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter });
     }
     let job = match kind {
         JobKind::Mkdir => {
@@ -3151,31 +3161,31 @@ fn confirm_destination_input(
 
 fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effect>) -> UiPhase {
     match setup {
-        FileOpSetup::DestinationInput { kind, sources, source_dir, mut input, buttons } => match cmd {
+        FileOpSetup::DestinationInput { kind, sources, source_dir, mut input, buttons, hidden_by_filter } => match cmd {
             Command::TextEdit(op) => {
                 input.apply(&op);
-                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
+                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter })
             }
             Command::RequestPaste => {
                 effects.push(Effect::ReadClipboardText);
-                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons })
+                UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter })
             }
             Command::FileOpCancel => UiPhase::Panels,
             // Enter: confirm with whatever `kind` the dialog opened with —
             // the drop dialog's initially proposed verb, or the plain
             // keyboard dialog's fixed Copy/Move/Mkdir.
-            Command::FileOpConfirm => confirm_destination_input(kind, sources, source_dir, input, buttons, effects),
+            Command::FileOpConfirm => confirm_destination_input(kind, sources, source_dir, input, buttons, hidden_by_filter, effects),
             // The drop dialog's `[ Copy ]`/`[ Move ]` buttons: confirm with
             // an explicit verb instead, overriding `kind` (operation-dialogs
             // "Switching the verb in the dialog").
-            Command::FileOpConfirmAs(explicit_kind) => confirm_destination_input(explicit_kind, sources, source_dir, input, buttons, effects),
-            _ => UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons }),
+            Command::FileOpConfirmAs(explicit_kind) => confirm_destination_input(explicit_kind, sources, source_dir, input, buttons, hidden_by_filter, effects),
+            _ => UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter }),
         },
-        FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once } => match cmd {
+        FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once, hidden_by_filter } => match cmd {
             Command::FileOpCancel => UiPhase::Panels,
             Command::FileOpConfirm => {
                 if needs_second_confirm && !confirmed_once {
-                    UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: true })
+                    UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: true, hidden_by_filter })
                 } else {
                     let job =
                         Job { kind: JobKind::Delete, sources, source_dir: source_dir.clone(), dest_dir: source_dir.clone(), new_dir_name: None };
@@ -3188,7 +3198,7 @@ fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effe
                     running
                 }
             }
-            _ => UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once }),
+            _ => UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once, hidden_by_filter }),
         },
         FileOpSetup::RenameInput { source_dir, original_name, is_dir, mut input } => match cmd {
             Command::TextEdit(op) => {

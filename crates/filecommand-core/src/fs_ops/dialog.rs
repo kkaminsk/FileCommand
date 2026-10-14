@@ -22,8 +22,11 @@ pub enum FileOpSetup {
     /// initiated F5/F6/Mkdir dialog (no button row, Enter/Esc only, unchanged
     /// from before `mouse-panel-drag`) and `Some` for a drop-initiated dialog,
     /// which adds a `[ Copy ] [ Move ] [ Cancel ]` row (operation-dialogs
-    /// "Drop-initiated destination dialog").
-    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: LineEdit, buttons: Option<DropButtons> },
+    /// "Drop-initiated destination dialog"). `hidden_by_filter` is the same
+    /// disclosure count as `DeleteConfirm`'s, rendered on the blank row
+    /// below the field (selection "Operations disclose selected entries
+    /// hidden by the quick filter"); 0 for Mkdir.
+    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: LineEdit, buttons: Option<DropButtons>, hidden_by_filter: usize },
     DeleteConfirm {
         sources: Vec<SourceItem>,
         source_dir: PathBuf,
@@ -33,6 +36,13 @@ pub enum FileOpSetup {
         /// The first confirmation has already been given; a second Enter/Y
         /// now runs the job.
         confirmed_once: bool,
+        /// How many of `sources` are selected entries of the source panel
+        /// that its active quick filter hides (0 when there is no filter or
+        /// nothing hidden) — computed once when the dialog opens and shown
+        /// as its own row between the question and the buttons (selection
+        /// "Operations disclose selected entries hidden by the quick
+        /// filter"; filter-selection-safety design D2/D3).
+        hidden_by_filter: usize,
     },
     /// The file-action menu's in-place Rename: a text-input dialog
     /// pre-filled with `original_name`, renaming within `source_dir`
@@ -53,6 +63,22 @@ pub enum FileOpSetup {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DropButtons {
     pub focused: JobKind,
+}
+
+/// The hidden-selection disclosure line the delete confirmation and the
+/// copy/move destination dialog both show when some of the operation's
+/// sources are selected entries the source panel's quick filter hides
+/// (selection "Operations disclose selected entries hidden by the quick
+/// filter"; filter-selection-safety design D3). `None` when there is
+/// nothing to disclose — the dialogs are then unchanged.
+pub fn hidden_by_filter_disclosure(hidden_by_filter: usize, source_count: usize) -> Option<String> {
+    if hidden_by_filter == 0 {
+        None
+    } else if source_count == 1 {
+        Some("Selected item is hidden by filter".to_string())
+    } else {
+        Some(format!("{hidden_by_filter} of {source_count} selected hidden by filter"))
+    }
 }
 
 /// Dialogs shown while a `Job` is in flight on the worker thread.

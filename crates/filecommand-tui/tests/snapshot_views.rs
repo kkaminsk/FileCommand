@@ -187,6 +187,7 @@ fn drop_dialog_state(focused: JobKind) -> State {
         source_dir: PathBuf::from(r"C:\Users\demo\left"),
         input: filecommand_core::line_edit::LineEdit::from(r"C:\Users\demo\right"),
         buttons: Some(DropButtons { focused }),
+        hidden_by_filter: 0,
     });
     state
 }
@@ -205,6 +206,87 @@ fn snapshot_drop_dialog_with_move_focused() {
     assert!(text.contains("Move 1 file"));
     assert!(text.contains("[ Copy ]") && text.contains("[ Move ]") && text.contains("[ Cancel ]"));
     insta::assert_snapshot!("drop_dialog_move_focused", text);
+}
+
+// -----------------------------------------------------------------
+// filter-selection-safety: the hidden-selection disclosure on the delete
+// confirmation and destination dialogs (selection "Operations disclose
+// selected entries hidden by the quick filter"; tasks.md 2.4/2.5/4.6)
+// -----------------------------------------------------------------
+
+fn hidden_disclosure_sources(n: usize) -> Vec<SourceItem> {
+    (0..n).map(|i| SourceItem { original_name: format!("f{i}.txt").into(), path: PathBuf::from(format!(r"C:\Users\demo\left\f{i}.txt")), is_dir: false }).collect()
+}
+
+fn delete_confirm_state(sources: usize, hidden_by_filter: usize) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: hidden_disclosure_sources(sources),
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter,
+    });
+    state
+}
+
+#[test]
+fn snapshot_delete_confirm_discloses_hidden_selection() {
+    let text = render_to_text(80, 24, &delete_confirm_state(5, 2), ColorDepth::Ansi16);
+    assert!(text.contains("Delete 5 files? This cannot be undone."), "the question is untouched:\n{text}");
+    assert!(text.contains("2 of 5 selected hidden by filter"), "the disclosure row is shown:\n{text}");
+    insta::assert_snapshot!("delete_confirm_hidden_by_filter", text);
+}
+
+#[test]
+fn snapshot_delete_confirm_discloses_a_single_hidden_selection() {
+    let text = render_to_text(80, 24, &delete_confirm_state(1, 1), ColorDepth::Ansi16);
+    assert!(text.contains("Delete f0.txt? This cannot be undone."), "the single item is still named:\n{text}");
+    assert!(text.contains("Selected item is hidden by filter"), "singular wording:\n{text}");
+    insta::assert_snapshot!("delete_confirm_hidden_single", text);
+}
+
+#[test]
+fn snapshot_delete_confirm_without_hidden_selection_is_unchanged() {
+    let text = render_to_text(80, 24, &delete_confirm_state(5, 0), ColorDepth::Ansi16);
+    assert!(text.contains("Delete 5 files? This cannot be undone."));
+    assert!(!text.contains("hidden by filter"), "no disclosure without hidden selections:\n{text}");
+    insta::assert_snapshot!("delete_confirm_no_hidden", text);
+}
+
+fn destination_input_state(sources: usize, hidden_by_filter: usize) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+        kind: JobKind::Copy,
+        sources: hidden_disclosure_sources(sources),
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        input: filecommand_core::line_edit::LineEdit::from(r"C:\Users\demo\right"),
+        buttons: None,
+        hidden_by_filter,
+    });
+    state
+}
+
+#[test]
+fn snapshot_destination_input_discloses_hidden_selection() {
+    let text = render_to_text(80, 24, &destination_input_state(5, 2), ColorDepth::Ansi16);
+    assert!(text.contains("2 of 5 selected hidden by filter"), "the disclosure is shown:\n{text}");
+    assert!(!text.contains("[ Copy ]"), "no button row appears — the box is unchanged:\n{text}");
+    insta::assert_snapshot!("destination_input_hidden_by_filter", text);
+}
+
+#[test]
+fn snapshot_destination_input_discloses_a_single_hidden_selection() {
+    let text = render_to_text(80, 24, &destination_input_state(1, 1), ColorDepth::Ansi16);
+    assert!(text.contains("Selected item is hidden by filter"), "singular wording:\n{text}");
+    insta::assert_snapshot!("destination_input_hidden_single", text);
+}
+
+#[test]
+fn snapshot_destination_input_without_hidden_selection_is_unchanged() {
+    let text = render_to_text(80, 24, &destination_input_state(5, 0), ColorDepth::Ansi16);
+    assert!(!text.contains("hidden by filter"), "no disclosure without hidden selections:\n{text}");
+    insta::assert_snapshot!("destination_input_no_hidden", text);
 }
 
 // -----------------------------------------------------------------
@@ -448,6 +530,7 @@ fn snapshot_destination_field_scrolled_so_the_caret_is_visible() {
         source_dir: PathBuf::from(r"C:\Users\demo\left"),
         input: filecommand_core::line_edit::LineEdit::from(long_path),
         buttons: None,
+        hidden_by_filter: 0,
     });
     let (text, cursor) = render_with_cursor(80, 24, &state);
     assert!(text.contains(r"[ts\archive\final\q3\old\verylong\name\xy]"), "the window scrolled to the last 40 chars:\n{text}");

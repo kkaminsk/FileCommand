@@ -1029,6 +1029,229 @@ fn jump_to_prefix_only_lands_within_the_active_quick_filter() {
 }
 
 // ---------------------------------------------------------------------
+// filter-selection-safety: no current entry under an empty filter (R-17;
+// quick-filter "Cursor and mini-status behavior under an active filter")
+// ---------------------------------------------------------------------
+
+/// A drive-root-style listing (no `..`) whose quick filter matches nothing,
+/// with nothing selected: the panel has no current entry.
+fn filtered_out_root_state() -> State {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from("/");
+    state.left.entries = vec![file_entry("pagefile.sys", 1), file_entry("notes.txt", 1)];
+    state.left.quick_filter = Some("zzzz".to_string());
+    state
+}
+
+/// quick-filter "Cursor-targeted operations do nothing while no entry is
+/// visible" (tasks.md 4.3).
+#[test]
+fn cursor_targeted_commands_do_nothing_while_no_entry_is_visible() {
+    for cmd in [
+        Command::RequestDelete,
+        Command::RequestCopy,
+        Command::RequestMove,
+        Command::RequestViewer,
+        Command::RequestEditor,
+        Command::Enter,
+        Command::PasteCursorName,
+    ] {
+        let state = filtered_out_root_state();
+        let command_line_before = state.command_line.clone();
+        let (state, effects) = update(state, cmd.clone());
+        assert!(effects.is_empty(), "{cmd:?} must emit no effects");
+        assert_eq!(state.phase, UiPhase::Panels, "{cmd:?} must not change the phase");
+        assert!(state.file_action_menu.is_none(), "{cmd:?} must not open the file-action menu");
+        assert_eq!(state.command_line, command_line_before, "{cmd:?} must not touch the command line");
+    }
+}
+
+/// quick-filter "Ins does nothing while no entry is visible" (tasks.md 4.3).
+#[test]
+fn ins_does_nothing_while_no_entry_is_visible() {
+    let state = filtered_out_root_state();
+    let (state, effects) = update(state, Command::ToggleSelectAtCursor);
+    assert!(effects.is_empty());
+    assert!(state.left.selected.is_empty(), "Ins must not toggle the hidden cursor entry");
+}
+
+/// quick-filter "Widening the pattern restores a current entry"
+/// (tasks.md 4.4).
+#[test]
+fn widening_the_pattern_restores_cursor_targeted_commands() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from("/");
+    state.left.entries = vec![file_entry("aaa.txt", 1), file_entry("notes.txt", 1)];
+    let (state, _) = update(state, Command::QuickFilterStart(PanelSide::Left));
+    let state = "notesz".chars().fold(state, |s, c| update(s, Command::QuickFilterChar(c)).0);
+    assert!(state.left.selected().is_none(), "setup precondition: nothing visible");
+
+    let (state, _) = update(state, Command::QuickFilterBackspace); // "notes"
+    let (state, effects) = update(state, Command::RequestViewer);
+    assert_eq!(effects, vec![Effect::OpenViewer { path: PathBuf::from("/notes.txt") }]);
+    assert_eq!(state.phase, UiPhase::Panels, "the viewer opens only once ViewerOpened comes back");
+}
+
+// ---------------------------------------------------------------------
+// filter-selection-safety: hidden-selection disclosure (R-17; selection
+// "Operations disclose selected entries hidden by the quick filter")
+// ---------------------------------------------------------------------
+
+/// Five selected entries, two of them (`x.log`, `y.log`) hidden by the
+/// `.txt` quick filter.
+fn five_selected_two_hidden_state() -> State {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.entries =
+        vec![file_entry("a.txt", 1), file_entry("b.txt", 1), file_entry("c.txt", 1), file_entry("x.log", 1), file_entry("y.log", 1)];
+    for name in ["a.txt", "b.txt", "c.txt", "x.log", "y.log"] {
+        state.left.selected.insert(OsString::from(name));
+    }
+    state.left.quick_filter = Some(".txt".to_string());
+    state
+}
+
+/// selection "Delete confirmation states the hidden count" (tasks.md 4.5).
+#[test]
+fn delete_confirm_discloses_selected_entries_hidden_by_the_filter() {
+    let state = five_selected_two_hidden_state();
+    let (state, effects) = update(state, Command::RequestDelete);
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(sources.len(), 5);
+            assert_eq!(hidden_by_filter, 2, "x.log and y.log are selected but hidden by the filter");
+        }
+        other => panic!("expected FileOpSetup::DeleteConfirm, got {other:?}"),
+    }
+    // Confirming still deletes all five (user decision: the operation
+    // reaches the whole selection; the dialog only discloses).
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.sources.len(), 5),
+        other => panic!("expected one RunJob over all five sources, got {other:?}"),
+    }
+    assert!(matches!(state.phase, UiPhase::FileOpRunning { .. }));
+}
+
+/// selection "Destination dialog states the hidden count" (tasks.md 4.5).
+#[test]
+fn destination_dialog_discloses_selected_entries_hidden_by_the_filter() {
+    let state = five_selected_two_hidden_state();
+    let (state, _) = update(state, Command::RequestCopy);
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(kind, JobKind::Copy);
+            assert_eq!(sources.len(), 5);
+            assert_eq!(hidden_by_filter, 2);
+        }
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+    // Accepting the destination copies all five.
+    let (_, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.sources.len(), 5),
+        other => panic!("expected one RunJob over all five sources, got {other:?}"),
+    }
+}
+
+/// selection "No hidden selection leaves the dialogs unchanged"
+/// (tasks.md 4.5).
+#[test]
+fn no_filter_means_no_hidden_selection_disclosure() {
+    let mut state = five_selected_two_hidden_state();
+    state.left.quick_filter = None;
+    let (state, _) = update(state, Command::RequestDelete);
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { hidden_by_filter, .. }) => assert_eq!(hidden_by_filter, 0),
+        other => panic!("expected FileOpSetup::DeleteConfirm, got {other:?}"),
+    }
+    let mut state = five_selected_two_hidden_state();
+    state.left.quick_filter = None;
+    let (state, _) = update(state, Command::RequestCopy);
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { hidden_by_filter, .. }) => assert_eq!(hidden_by_filter, 0),
+        other => panic!("expected FileOpSetup::DestinationInput, got {other:?}"),
+    }
+}
+
+/// A drop begun on the *inactive* panel computes the count against that
+/// (source) panel's own filter and selection (design D2; tasks.md 4.5).
+#[test]
+fn a_drop_computes_the_hidden_count_against_the_source_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 1), file_entry("x.log", 1)];
+    for name in ["a.txt", "b.txt", "x.log"] {
+        state.right.selected.insert(OsString::from(name));
+    }
+    state.right.quick_filter = Some(".txt".to_string()); // hides x.log
+    state.left.entries = vec![dir_entry("dest")];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Right, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::SubDir { side: PanelSide::Left, name: OsString::from("dest") }) });
+    let (state, _) = update(state, Command::DragDrop { op: JobKind::Copy });
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(sources.len(), 3);
+            assert_eq!(hidden_by_filter, 1, "the count comes from the source panel's filter and selection");
+        }
+        other => panic!("expected the drop dialog, got {other:?}"),
+    }
+}
+
+/// A right-clicked, selection-scoped file-action-menu Delete reports the
+/// same count F8 does; the Enter-opened (single-target) menu reports 0
+/// (design D2; tasks.md 4.5).
+#[test]
+fn a_selection_scoped_menu_delete_discloses_the_hidden_count() {
+    let state = five_selected_two_hidden_state();
+    let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("a.txt") });
+    assert!(state.file_action_menu.as_ref().unwrap().selection_scoped, "setup precondition: right-click on a selected entry");
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(sources.len(), 5);
+            assert_eq!(hidden_by_filter, 2);
+        }
+        other => panic!("expected FileOpSetup::DeleteConfirm, got {other:?}"),
+    }
+}
+
+#[test]
+fn an_enter_opened_menu_delete_is_single_target_with_no_disclosure() {
+    let mut state = five_selected_two_hidden_state();
+    state.left.cursor = 0; // a.txt, visible under the filter and itself selected
+    let (state, _) = update(state, Command::Enter);
+    assert!(state.file_action_menu.is_some());
+    let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(sources.len(), 1, "the Enter-opened menu stays single-target");
+            assert_eq!(hidden_by_filter, 0, "its one target is a visible entry");
+        }
+        other => panic!("expected FileOpSetup::DeleteConfirm, got {other:?}"),
+    }
+}
+
+/// A command-line `del` of an unselected entry the filter hides reports 0:
+/// the typed target is not a selected entry of the panel, so the "selected
+/// … hidden by filter" wording would not be true of it (design D2;
+/// tasks.md 4.5).
+#[test]
+fn a_command_line_del_of_an_unselected_hidden_entry_reports_zero() {
+    let mut state = five_selected_two_hidden_state();
+    state.left.entries.push(file_entry("zz.log", 1)); // hidden by the ".txt" filter, not selected
+    let state = type_line(state, "del zz.log");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty());
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(hidden_by_filter, 0);
+        }
+        other => panic!("expected FileOpSetup::DeleteConfirm, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------
 // Panel tabs (Ctrl+T / Ctrl+W / Alt+1..9), reducer-level (task 15.5)
 // ---------------------------------------------------------------------
 

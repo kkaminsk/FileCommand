@@ -4,7 +4,7 @@
 //! "Drop-initiated destination dialog"; mouse-panel-drag design D3).
 
 use filecommand_core::dialogs::overlay_rect;
-use filecommand_core::fs_ops::dialog::{DropButtons, FileOpSetup};
+use filecommand_core::fs_ops::dialog::{hidden_by_filter_disclosure, DropButtons, FileOpSetup};
 use filecommand_core::fs_ops::JobKind;
 use filecommand_core::line_edit::LineEdit;
 use filecommand_core::listing::{display_width, truncate_with_ellipsis};
@@ -88,19 +88,19 @@ fn prompt_for(kind: JobKind) -> &'static str {
 
 pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, setup: &FileOpSetup) -> Option<(u16, u16)> {
     match setup {
-        FileOpSetup::DestinationInput { kind, sources, input, buttons, .. } => {
+        FileOpSetup::DestinationInput { kind, sources, input, buttons, hidden_by_filter, .. } => {
             let title = match buttons {
                 Some(db) => drop_dialog_title(db.focused, sources.len()),
                 None => title_for(*kind).to_string(),
             };
-            render_input_box(buf, area, theme, depth, &title, prompt_for(*kind), input, *buttons)
+            render_input_box(buf, area, theme, depth, &title, prompt_for(*kind), input, *buttons, hidden_by_filter_disclosure(*hidden_by_filter, sources.len()))
         }
         // The file-action menu's in-place Rename: same bracket-and-dots
         // input box, pre-filled with the target's current name (design D2;
         // file-action-menu "In-place Rename": "an input dialog pre-filled
         // with the target entry's current name"). Never a drop-initiated
         // dialog, so it always gets the plain 6-row box.
-        FileOpSetup::RenameInput { input, .. } => render_input_box(buf, area, theme, depth, "Rename", "New name:", input, None),
+        FileOpSetup::RenameInput { input, .. } => render_input_box(buf, area, theme, depth, "Rename", "New name:", input, None, None),
         FileOpSetup::DeleteConfirm { .. } => None,
     }
 }
@@ -111,8 +111,13 @@ pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, dep
 /// Rename dialogs stay byte-for-byte unchanged (operation-dialogs "F5
 /// dialog unchanged"). Returns the terminal cursor's position: the field's
 /// caret (text-field-editing "Field rendering keeps the caret visible").
+/// `disclosure` (the hidden-selection line, `Some` only when the source
+/// panel's quick filter hides part of the selection) is drawn on the blank
+/// row below the field — the box size, field, caret, title, and button row
+/// are all unchanged (filter-selection-safety design D3; selection
+/// "Operations disclose selected entries hidden by the quick filter").
 #[allow(clippy::too_many_arguments)]
-fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, title: &str, prompt: &str, input: &LineEdit, buttons: Option<DropButtons>) -> Option<(u16, u16)> {
+fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, title: &str, prompt: &str, input: &LineEdit, buttons: Option<DropButtons>, disclosure: Option<String>) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
 
@@ -148,6 +153,12 @@ fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDep
     buf.set_string(x + 1 + inner_w as u16, y + 3, "\u{2551}", body);
 
     buf.set_string(x, y + 4, &blank, body);
+    // The hidden-selection disclosure reuses this otherwise-blank row
+    // (filter-selection-safety design D3), drawn with the same left margin
+    // as the prompt and truncated to the row's inner width.
+    if let Some(text) = disclosure {
+        buf.set_string(x + 2, y + 4, truncate_with_ellipsis(&text, inner_w.saturating_sub(2)), body);
+    }
     if let Some(db) = buttons {
         render_button_row(buf, x, y + 5, inner_w, theme, depth, db.focused, body);
     }
@@ -244,6 +255,7 @@ mod tests {
             source_dir: PathBuf::from(r"C:\left"),
             input: LineEdit::from(r"D:\BACKUP"),
             buttons: None,
+            hidden_by_filter: 0,
         };
         let mut buf = Buffer::empty(area());
         render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
@@ -264,6 +276,7 @@ mod tests {
             source_dir: PathBuf::from(r"C:\left"),
             input: LineEdit::from(r"D:\BACKUP\OLD"),
             buttons: Some(DropButtons { focused: JobKind::Copy }),
+            hidden_by_filter: 0,
         };
         let mut buf = Buffer::empty(area());
         render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
@@ -296,6 +309,7 @@ mod tests {
             source_dir: PathBuf::from(r"C:\left"),
             input: LineEdit::from(r"D:\BACKUP"),
             buttons: Some(DropButtons { focused: JobKind::Move }),
+            hidden_by_filter: 0,
         };
         let mut buf = Buffer::empty(area());
         render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
@@ -320,5 +334,70 @@ mod tests {
         let text = buffer_to_text(&buf, area());
         assert!(!text.contains("[ Copy ]"));
         assert!(hit_buttons(area(), &setup).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // filter-selection-safety: the hidden-selection disclosure on the
+    // blank row below the field (tasks.md 2.5/4.6; design D3)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_hidden_selection_disclosure_reuses_the_blank_row_below_the_field() {
+        // selection "Destination dialog states the hidden count"; design D3:
+        // the box geometry, field, caret, and title are all unchanged — the
+        // text lands on the previously blank row directly below the field.
+        let theme = Theme::classic();
+        let setup = FileOpSetup::DestinationInput {
+            kind: JobKind::Copy,
+            sources: source_items(5),
+            source_dir: PathBuf::from(r"C:\left"),
+            input: LineEdit::from(r"D:\BACKUP"),
+            buttons: None,
+            hidden_by_filter: 2,
+        };
+        let mut buf = Buffer::empty(area());
+        render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
+        let text = buffer_to_text(&buf, area());
+        assert!(text.contains("2 of 5 selected hidden by filter"), "the disclosure is shown:\n{text}");
+        assert!(text.contains(" Copy "), "the title is unchanged:\n{text}");
+        assert!(!text.contains("[ Copy ]"), "no button row appears — the box is unchanged:\n{text}");
+        assert!(hit_buttons(area(), &setup).is_empty(), "still no clickable buttons");
+        let prompt_row = text.lines().position(|l| l.contains("Copy/move to:")).expect("the prompt row");
+        let disclosure_row = text.lines().position(|l| l.contains("hidden by filter")).expect("the disclosure row");
+        assert_eq!(disclosure_row, prompt_row + 2, "the disclosure lands on the blank row directly below the field");
+    }
+
+    #[test]
+    fn a_single_hidden_source_gets_the_singular_wording() {
+        let theme = Theme::classic();
+        let setup = FileOpSetup::DestinationInput {
+            kind: JobKind::Copy,
+            sources: source_items(1),
+            source_dir: PathBuf::from(r"C:\left"),
+            input: LineEdit::from(r"D:\BACKUP"),
+            buttons: None,
+            hidden_by_filter: 1,
+        };
+        let mut buf = Buffer::empty(area());
+        render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
+        let text = buffer_to_text(&buf, area());
+        assert!(text.contains("Selected item is hidden by filter"), "singular wording:\n{text}");
+    }
+
+    #[test]
+    fn no_hidden_selection_leaves_the_dialog_unchanged() {
+        let theme = Theme::classic();
+        let setup = FileOpSetup::DestinationInput {
+            kind: JobKind::Copy,
+            sources: source_items(5),
+            source_dir: PathBuf::from(r"C:\left"),
+            input: LineEdit::from(r"D:\BACKUP"),
+            buttons: None,
+            hidden_by_filter: 0,
+        };
+        let mut buf = Buffer::empty(area());
+        render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
+        let text = buffer_to_text(&buf, area());
+        assert!(!text.contains("hidden by filter"), "no disclosure without hidden selections:\n{text}");
     }
 }
