@@ -130,6 +130,21 @@ impl RealFs {
     }
 }
 
+/// The one way [`RealFs`] methods obtain an OS path from a caller's path.
+/// `to_extended_path` leaves a relative path relative, and Windows then
+/// resolves it against the process's current directory — which FileCommand
+/// never changes from the launch directory — so a relative path reaching
+/// `RealFs` is always an upstream bug: fail loudly in debug builds and
+/// tests instead of silently acting on the wrong directory
+/// (relative-destination-resolution design D4). The assertion lives at this
+/// boundary rather than inside `to_extended_path` because
+/// `shell::spawn_safe_path` legitimately routes relative program names such
+/// as `cmd.exe` through the latter once they approach `MAX_PATH`.
+fn ext(path: &Path) -> PathBuf {
+    debug_assert!(path.is_absolute(), "fs_ops received a relative path: {path:?}");
+    to_extended_path(path)
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
@@ -167,21 +182,21 @@ mod windows_impl {
 
     impl super::FileSystem for super::RealFs {
         fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let mut out = to_fs_metadata(std::fs::symlink_metadata(&p)?);
             out.file_id = super::identity::file_id_via_handle(&p, false);
             Ok(out)
         }
 
         fn metadata_follow(&self, path: &Path) -> io::Result<FsMetadata> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let mut out = to_fs_metadata(std::fs::metadata(&p)?);
             out.file_id = super::identity::file_id_via_handle(&p, true);
             Ok(out)
         }
 
         fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let mut out = Vec::new();
             for entry in std::fs::read_dir(&p)? {
                 let entry = entry?;
@@ -192,7 +207,7 @@ mod windows_impl {
         }
 
         fn create_dir(&self, path: &Path) -> io::Result<()> {
-            std::fs::create_dir(to_extended_path(path))
+            std::fs::create_dir(ext(path))
         }
 
         fn copy_file_chunked(
@@ -202,46 +217,46 @@ mod windows_impl {
             chunk_bytes: usize,
             on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
         ) -> io::Result<u64> {
-            copy_chunked_impl(&to_extended_path(from), &to_extended_path(to), chunk_bytes, on_chunk)
+            copy_chunked_impl(&ext(from), &ext(to), chunk_bytes, on_chunk)
         }
 
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            std::fs::rename(to_extended_path(from), to_extended_path(to))
+            std::fs::rename(ext(from), ext(to))
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
-            std::fs::remove_file(to_extended_path(path))
+            std::fs::remove_file(ext(path))
         }
 
         fn remove_dir(&self, path: &Path) -> io::Result<()> {
-            std::fs::remove_dir(to_extended_path(path))
+            std::fs::remove_dir(ext(path))
         }
 
         fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let mut perms = std::fs::metadata(&p)?.permissions();
             perms.set_readonly(readonly);
             std::fs::set_permissions(&p, perms)
         }
 
         fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let file = std::fs::OpenOptions::new().write(true).open(&p)?;
             file.set_modified(modified)
         }
 
         fn list_streams(&self, path: &Path) -> io::Result<Vec<OsString>> {
-            super::stream_enum::list_streams(&to_extended_path(path))
+            super::stream_enum::list_streams(&ext(path))
         }
 
         fn copy_stream_chunked(&self, from: &Path, stream: &OsStr, to: &Path, chunk_bytes: usize) -> io::Result<u64> {
-            let from_stream = super::stream_enum::stream_path(&to_extended_path(from), stream);
-            let to_stream = super::stream_enum::stream_path(&to_extended_path(to), stream);
+            let from_stream = super::stream_enum::stream_path(&ext(from), stream);
+            let to_stream = super::stream_enum::stream_path(&ext(to), stream);
             copy_chunked_impl(&from_stream, &to_stream, chunk_bytes, &mut |_| ChunkControl::Continue)
         }
 
         fn supports_named_streams(&self, path: &Path) -> io::Result<bool> {
-            super::volume_caps::supports_named_streams(&to_extended_path(path))
+            super::volume_caps::supports_named_streams(&ext(path))
         }
 
         fn same_volume(&self, a: &Path, b: &Path) -> io::Result<bool> {
@@ -311,16 +326,16 @@ mod portable_impl {
 
     impl super::FileSystem for super::RealFs {
         fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
-            Ok(to_fs_metadata(std::fs::symlink_metadata(to_extended_path(path))?))
+            Ok(to_fs_metadata(std::fs::symlink_metadata(ext(path))?))
         }
 
         fn metadata_follow(&self, path: &Path) -> io::Result<FsMetadata> {
-            Ok(to_fs_metadata(std::fs::metadata(to_extended_path(path))?))
+            Ok(to_fs_metadata(std::fs::metadata(ext(path))?))
         }
 
         fn read_dir(&self, path: &Path) -> io::Result<Vec<RawEntry>> {
             let mut out = Vec::new();
-            for entry in std::fs::read_dir(to_extended_path(path))? {
+            for entry in std::fs::read_dir(ext(path))? {
                 let entry = entry?;
                 out.push(RawEntry { name: entry.file_name(), metadata: to_fs_metadata(entry.metadata()?) });
             }
@@ -328,7 +343,7 @@ mod portable_impl {
         }
 
         fn create_dir(&self, path: &Path) -> io::Result<()> {
-            std::fs::create_dir(to_extended_path(path))
+            std::fs::create_dir(ext(path))
         }
 
         fn copy_file_chunked(
@@ -339,8 +354,8 @@ mod portable_impl {
             on_chunk: &mut dyn FnMut(u64) -> ChunkControl,
         ) -> io::Result<u64> {
             use std::io::{Read, Write};
-            let mut src = std::fs::File::open(to_extended_path(from))?;
-            let mut dst = std::fs::File::create(to_extended_path(to))?;
+            let mut src = std::fs::File::open(ext(from))?;
+            let mut dst = std::fs::File::create(ext(to))?;
             let mut buf = vec![0u8; chunk_bytes.max(4096)];
             let mut total = 0u64;
             loop {
@@ -352,7 +367,7 @@ mod portable_impl {
                 total += n as u64;
                 if on_chunk(total) == ChunkControl::Cancel {
                     drop(dst);
-                    let _ = std::fs::remove_file(to_extended_path(to));
+                    let _ = std::fs::remove_file(ext(to));
                     return Err(super::cancelled_error());
                 }
             }
@@ -360,26 +375,26 @@ mod portable_impl {
         }
 
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
-            std::fs::rename(to_extended_path(from), to_extended_path(to))
+            std::fs::rename(ext(from), ext(to))
         }
 
         fn remove_file(&self, path: &Path) -> io::Result<()> {
-            std::fs::remove_file(to_extended_path(path))
+            std::fs::remove_file(ext(path))
         }
 
         fn remove_dir(&self, path: &Path) -> io::Result<()> {
-            std::fs::remove_dir(to_extended_path(path))
+            std::fs::remove_dir(ext(path))
         }
 
         fn set_readonly(&self, path: &Path, readonly: bool) -> io::Result<()> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let mut perms = std::fs::metadata(&p)?.permissions();
             perms.set_readonly(readonly);
             std::fs::set_permissions(&p, perms)
         }
 
         fn set_modified(&self, path: &Path, modified: SystemTime) -> io::Result<()> {
-            let p = to_extended_path(path);
+            let p = ext(path);
             let file = std::fs::OpenOptions::new().write(true).open(&p)?;
             file.set_modified(modified)
         }

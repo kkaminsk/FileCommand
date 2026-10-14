@@ -505,6 +505,248 @@ fn escape_cancels_destination_input_back_to_panels() {
     assert!(effects.is_empty());
 }
 
+// ---------------------------------------------------------------------
+// relative-destination-resolution: the F5/F6/F7 destination resolves
+// against the source panel's directory (operation-dialogs "Relative
+// destinations resolve against the source panel directory"). The drive
+// forms are Windows-only `Path` semantics, so these tests are too.
+// ---------------------------------------------------------------------
+
+/// Backspace the destination/name field's current text away and type
+/// `replacement` — the same edits a user retyping the field makes.
+#[cfg(windows)]
+fn replace_destination_text(state: State, replacement: &str) -> State {
+    let len = match &state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { input, .. }) => input.len_chars(),
+        other => panic!("expected the destination dialog, got {other:?}"),
+    };
+    let state = (0..len).fold(state, |s, _| update(s, Command::TextEdit(TextEditOp::Backspace)).0);
+    replacement.chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0)
+}
+
+/// Drive F6 from a left panel at `source_cwd` holding one file, retype the
+/// destination field as `text`, and confirm with Enter.
+#[cfg(windows)]
+fn confirm_move_with_destination(source_cwd: &str, text: &str) -> (State, Vec<Effect>) {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(source_cwd);
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestMove);
+    let state = replace_destination_text(state, text);
+    update(state, Command::FileOpConfirm)
+}
+
+/// Scenario "A relative name lands inside the source panel's directory".
+#[cfg(windows)]
+#[test]
+fn a_relative_destination_lands_inside_the_source_panels_directory() {
+    let (_, effects) = confirm_move_with_destination(r"C:\work", "backup");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => {
+            assert_eq!(job.kind, JobKind::Move);
+            assert_eq!(job.dest_dir, PathBuf::from(r"C:\work\backup"), "relative to the source panel, not the launch directory");
+        }
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Scenario "A parent-relative path is resolved and normalized": the job
+/// carries the normalized path, so the completion re-read finds the panel
+/// showing it (`panels_matching` compares by exact `PathBuf` equality).
+#[cfg(windows)]
+#[test]
+fn a_parent_relative_destination_is_resolved_and_normalized() {
+    let (state, effects) = confirm_move_with_destination(r"C:\work\proj", r"..\archive");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"C:\work\archive")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+    let mut state = state;
+    state.right.cwd = PathBuf::from(r"C:\work\archive");
+    let (_, effects) = update(
+        state,
+        Command::JobDone {
+            outcome: JobOutcome::Completed { skipped: vec![] },
+            source_dir: PathBuf::from(r"C:\work\proj"),
+            dest_dir: PathBuf::from(r"C:\work\archive"),
+        },
+    );
+    assert!(
+        effects.contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\work\archive") }),
+        "the panel showing the resolved destination re-reads on completion, got {effects:?}"
+    );
+}
+
+/// Scenarios "A bare drive letter means that drive's root" and "A
+/// drive-rooted path keeps the source panel's drive".
+#[cfg(windows)]
+#[test]
+fn bare_drive_letter_and_drive_rooted_destinations_resolve() {
+    let (_, effects) = confirm_move_with_destination(r"C:\work", "D:");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"D:\")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+    let (_, effects) = confirm_move_with_destination(r"C:\work", r"\archive");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"C:\archive")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Scenario "A drive-relative path resolves against the source panel or
+/// the drive root".
+#[cfg(windows)]
+#[test]
+fn a_drive_relative_destination_resolves_against_the_source_panel_or_the_drive_root() {
+    let (_, effects) = confirm_move_with_destination(r"D:\work", "D:old");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"D:\work\old")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+    let (_, effects) = confirm_move_with_destination(r"C:\work", "D:old");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"D:\old")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Scenario "UNC and absolute destinations are used unchanged".
+#[cfg(windows)]
+#[test]
+fn unc_and_absolute_destinations_are_used_unchanged() {
+    let (_, effects) = confirm_move_with_destination(r"C:\work", r"\\server\share\dest");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"\\server\share\dest")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+    let (_, effects) = confirm_move_with_destination(r"C:\work", r"E:\backup");
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(job.dest_dir, PathBuf::from(r"E:\backup")),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Scenario "An edited drop destination resolves against the drag's source
+/// panel": the drag begins on the *inactive* right panel, so `sub` is
+/// relative to `D:\src`, not to the panel it was dropped on.
+#[cfg(windows)]
+#[test]
+fn an_edited_drop_destination_resolves_against_the_drags_source_panel() {
+    let mut state = test_state(UiPhase::Panels);
+    state.right.cwd = PathBuf::from(r"D:\src");
+    state.right.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::DragBegin { side: PanelSide::Right, name: OsString::from("a.txt"), op: JobKind::Copy });
+    let (state, _) = update(state, Command::DragOver { op: JobKind::Copy, target: Some(DropTarget::PanelDir(PanelSide::Left)) });
+    let (state, _) = update(state, Command::DragDrop { op: JobKind::Copy });
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { buttons: Some(_), .. })), "setup precondition: the drop dialog opened");
+    let state = replace_destination_text(state, "sub");
+    let (_, effects) = update(state, Command::FileOpConfirmAs(JobKind::Copy));
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => {
+            assert_eq!(job.kind, JobKind::Copy);
+            assert_eq!(job.dest_dir, PathBuf::from(r"D:\src\sub"), "resolved against the panel the drag started from");
+        }
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Scenario "A make-directory name with a parent path creates it where it
+/// points": the job carries the resolved parent and the bare name, so a
+/// panel showing that parent re-reads on completion.
+#[cfg(windows)]
+#[test]
+fn a_make_directory_name_with_a_parent_path_creates_it_where_it_points() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\work\proj");
+    state.right.cwd = PathBuf::from(r"C:\work");
+    let (state, _) = update(state, Command::RequestMkdir);
+    let state = replace_destination_text(state, r"..\shared");
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => {
+            assert_eq!(job.kind, JobKind::Mkdir);
+            assert_eq!(job.dest_dir, PathBuf::from(r"C:\work"));
+            assert_eq!(job.new_dir_name, Some(OsString::from("shared")));
+        }
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+    let (_, effects) = update(
+        state,
+        Command::JobDone {
+            outcome: JobOutcome::Completed { skipped: vec![] },
+            source_dir: PathBuf::from(r"C:\work\proj"),
+            dest_dir: PathBuf::from(r"C:\work"),
+        },
+    );
+    assert!(
+        effects.contains(&Effect::StartListing { panel: PanelSide::Right, path: PathBuf::from(r"C:\work") }),
+        "a panel showing the new directory's parent re-reads on completion, got {effects:?}"
+    );
+}
+
+/// A plain F7 name builds exactly the job F7 has always built: the panel's
+/// own directory as `dest_dir`, the bare name as `new_dir_name` (design D3).
+#[cfg(windows)]
+#[test]
+fn a_plain_make_directory_name_builds_the_unchanged_job() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\work");
+    let (state, _) = update(state, Command::RequestMkdir);
+    let state = replace_destination_text(state, "sub");
+    let (_, effects) = update(state, Command::FileOpConfirm);
+    match effects.as_slice() {
+        [Effect::RunJob(job)] => assert_eq!(
+            job,
+            &Job {
+                kind: JobKind::Mkdir,
+                sources: vec![],
+                source_dir: PathBuf::from(r"C:\work"),
+                dest_dir: PathBuf::from(r"C:\work"),
+                new_dir_name: Some(OsString::from("sub")),
+            },
+            "a plain name yields exactly today's job"
+        ),
+        other => panic!("expected exactly one RunJob, got {other:?}"),
+    }
+}
+
+/// Design D3: a make-directory name that resolves to something with no
+/// final component (a drive root) names nothing to create — the dialog
+/// stays open, exactly as for an empty field.
+#[cfg(windows)]
+#[test]
+fn a_make_directory_name_resolving_to_a_drive_root_keeps_the_dialog_open() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\work");
+    let (state, _) = update(state, Command::RequestMkdir);
+    let state = replace_destination_text(state, "D:");
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    assert!(effects.is_empty(), "no operation starts, got {effects:?}");
+    assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind: JobKind::Mkdir, .. })));
+}
+
+/// Scenario "An unresolvable destination keeps the dialog open": `..` at a
+/// drive root resolves to nothing, so the dialog stays open with the text
+/// intact and no operation starts.
+#[cfg(windows)]
+#[test]
+fn an_unresolvable_destination_keeps_the_dialog_open() {
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\");
+    state.left.entries = vec![file_entry("a.txt", 1)];
+    let (state, _) = update(state, Command::RequestMove);
+    let state = replace_destination_text(state, "..");
+    let (state, effects) = update(state, Command::FileOpConfirm);
+    assert!(effects.is_empty(), "no operation starts, got {effects:?}");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { ref input, .. }) => {
+            assert_eq!(input.text(), "..", "the field keeps the entered text");
+        }
+        other => panic!("expected the dialog to stay open, got {other:?}"),
+    }
+}
+
 #[test]
 fn delete_confirm_requires_second_confirmation_for_a_directory() {
     let mut state = test_state(UiPhase::Panels);
@@ -2316,6 +2558,143 @@ fn cd_dotdot_and_bare_drive_letters_resolve() {
     assert_eq!(parse_cd("dir"), None);
     assert_eq!(parse_cd("cd  \"C:\\Program Files\" "), Some(r"C:\Program Files".to_string()));
     assert_eq!(parse_cd("CD sub"), Some("sub".to_string()), "builtin verbs are case-insensitive");
+}
+
+// ---------------------------------------------------------------------
+// relative-destination-resolution: the shared resolver's new contract
+// (command-line "cd, del and rmdir targets resolve to a normalized
+// absolute path") — the same rules the destination input dialog resolves
+// with (operation-dialogs "Relative destinations resolve against the
+// source panel directory")
+// ---------------------------------------------------------------------
+
+/// The resolver's form table (design D2): every result is absolute and
+/// free of `.`/`..` components whenever `cwd` is, and a drive-relative
+/// form never depends on the process's per-drive current directory.
+#[cfg(windows)]
+#[test]
+fn resolve_cd_target_normalizes_and_resolves_drive_relative_forms() {
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work\proj"), r"..\archive"), Some(PathBuf::from(r"C:\work\archive")));
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), "backup"), Some(PathBuf::from(r"C:\work\backup")));
+    // A drive-rooted path keeps the panel's drive.
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), r"\archive"), Some(PathBuf::from(r"C:\archive")));
+    // A drive-relative form resolves against the panel's directory when it
+    // is on that drive (compared case-insensitively), and against the
+    // drive's root otherwise.
+    assert_eq!(resolve_cd_target(Path::new(r"D:\work"), "D:old"), Some(PathBuf::from(r"D:\work\old")));
+    assert_eq!(resolve_cd_target(Path::new(r"d:\work"), "D:old"), Some(PathBuf::from(r"d:\work\old")));
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), "D:old"), Some(PathBuf::from(r"D:\old")));
+    // UNC and absolute paths pass through unchanged; an absolute path
+    // carrying `..` is normalized rather than kept as typed.
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), r"\\server\share\dest"), Some(PathBuf::from(r"\\server\share\dest")));
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), r"E:\backup"), Some(PathBuf::from(r"E:\backup")));
+    assert_eq!(resolve_cd_target(Path::new(r"C:\work"), r"C:\a\..\b"), Some(PathBuf::from(r"C:\b")));
+    // `..` at a drive root still resolves to nothing.
+    assert_eq!(resolve_cd_target(Path::new(r"C:\"), ".."), None);
+}
+
+/// The normalization half of the new contract is platform-independent (the
+/// Windows-only drive forms are covered by the test above).
+#[test]
+fn resolve_cd_target_removes_dot_and_dotdot_components() {
+    assert_eq!(resolve_cd_target(Path::new("/a/b"), "../c"), Some(PathBuf::from("/a/c")));
+    assert_eq!(resolve_cd_target(Path::new("/a/b"), "./c"), Some(PathBuf::from("/a/b/c")));
+    assert_eq!(resolve_cd_target(Path::new("/a/b"), "c/../../d"), Some(PathBuf::from("/a/d")));
+}
+
+/// A per-test directory under the system temp dir, pre-cleaned (callers
+/// remove it again at the end; a panicking test just leaves it behind,
+/// like `editor_with_temp_file`).
+#[cfg(windows)]
+fn temp_dir_for(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("filecommand-update-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// command-line "cd with a parent-relative path lands on the normalized
+/// directory": `cd ..\x` navigates to the *normalized* path, so the
+/// `StartListing` it begins carries no `..` component (a verbatim-prefixed
+/// path with one fails with OS error 123). The existence probe for a `..`
+/// target always consults the real filesystem — the resolved parent is
+/// never the panel's own directory — so this test needs real directories.
+#[cfg(windows)]
+#[test]
+fn cd_with_a_parent_relative_path_lists_the_normalized_directory() {
+    let root = temp_dir_for("cd-dotdot");
+    std::fs::create_dir_all(root.join("work").join("proj")).unwrap();
+    std::fs::create_dir_all(root.join("work").join("x")).unwrap();
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = root.join("work").join("proj");
+    let state = type_line(state, r"cd ..\x");
+    let (state, effects) = update(state, Command::Enter);
+    let expected = root.join("work").join("x");
+    assert_eq!(state.left.cwd, expected, "the panel lands on the normalized directory");
+    assert!(
+        without_git_info_effects(effects).contains(&Effect::StartListing { panel: PanelSide::Left, path: expected }),
+        "the listing targets the resolved path"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// command-line "cd with a drive-relative path resolves against the panel
+/// or the drive root".
+#[cfg(windows)]
+#[test]
+fn cd_with_a_drive_relative_path_resolves_against_the_panel_or_the_drive_root() {
+    // On the target's own drive the panel directory stands in for the
+    // drive's current directory: `D:old` names the listed entry `old`.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"D:\work");
+    state.left.entries = vec![dir_entry("old")];
+    let state = type_line(state, "cd D:old");
+    let (state, effects) = update(state, Command::Enter);
+    assert_eq!(state.left.cwd, PathBuf::from(r"D:\work\old"));
+    let effects = without_git_info_effects(effects);
+    assert!(
+        effects.contains(&Effect::StartListing { panel: PanelSide::Left, path: PathBuf::from(r"D:\work\old") }),
+        "the listing targets the panel-relative resolution, got {effects:?}"
+    );
+
+    // On any other drive there is no per-drive current directory to lean
+    // on, so the target resolves against the drive's root. `D:\old` does
+    // not exist on the test host (same assumption `cd \NOSUCHDIR` makes of
+    // `C:`), so the rejection names exactly the resolved path.
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = PathBuf::from(r"C:\work");
+    let state = type_line(state, "cd D:old");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty(), "a nonexistent target starts no listing, got {effects:?}");
+    let expected = format!("{} not found", PathBuf::from(r"D:\old").display());
+    assert_eq!(state.left.last_error.as_deref(), Some(expected.as_str()));
+}
+
+/// command-line "del with a parent-relative path names the resolved file":
+/// the `..` resolves against the panel's directory, so the
+/// delete-confirmation dialog opens for the file the path actually points
+/// at. Same real-filesystem probe caveat as `cd ..\x` above.
+#[cfg(windows)]
+#[test]
+fn del_with_a_parent_relative_path_names_the_resolved_file() {
+    let root = temp_dir_for("del-dotdot");
+    std::fs::create_dir_all(root.join("work").join("proj")).unwrap();
+    std::fs::write(root.join("work").join("old.txt"), b"x").unwrap();
+    let mut state = test_state(UiPhase::Panels);
+    state.left.cwd = root.join("work").join("proj");
+    let state = type_line(state, r"del ..\old.txt");
+    let (state, effects) = update(state, Command::Enter);
+    assert!(effects.is_empty(), "nothing is deleted until the dialog is accepted, got {effects:?}");
+    match state.phase {
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, .. }) => {
+            assert_eq!(sources.len(), 1);
+            assert_eq!(sources[0].path, root.join("work").join("old.txt"), "the dialog names the resolved, normalized path");
+            assert_eq!(sources[0].original_name, OsString::from("old.txt"));
+            assert!(!sources[0].is_dir);
+        }
+        other => panic!("expected the delete-confirmation dialog, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 // ---------------------------------------------------------------------

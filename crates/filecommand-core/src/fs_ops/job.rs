@@ -39,19 +39,22 @@ pub struct SourceItem {
 }
 
 /// A single Copy/Move/Delete/Mkdir/Rename request. `dest_dir` is the
-/// destination directory for Copy/Move and the parent directory for Mkdir;
-/// `Delete` leaves it equal to `source_dir` (unused, but keeps the type
-/// uniform for panel-re-read matching in `core::update`). `Rename` likewise
-/// sets `dest_dir` equal to `source_dir` — the renamed entry stays put — and
-/// carries its single source's new name in `new_dir_name`.
+/// destination directory for Copy/Move; `Delete` leaves it equal to
+/// `source_dir` (unused, but keeps the type uniform for panel-re-read
+/// matching in `core::update`). Mkdir and `Rename` carry the resolved parent
+/// of the new name in `dest_dir` — `source_dir` itself for a plain name —
+/// and the bare new name in `new_dir_name` (relative-destination-resolution
+/// design D3). `dest_dir` is absolute and normalized for every kind, so the
+/// completion re-read in `core::update` matches panels against it exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     pub kind: JobKind,
     pub sources: Vec<SourceItem>,
     pub source_dir: PathBuf,
     pub dest_dir: PathBuf,
-    /// The new directory's name for Mkdir, or the target entry's new name
-    /// for Rename; unused by Copy/Move/Delete.
+    /// The bare final component of the resolved target: the new directory's
+    /// name for Mkdir, or the target entry's new name for Rename; unused by
+    /// Copy/Move/Delete.
     pub new_dir_name: Option<OsString>,
 }
 

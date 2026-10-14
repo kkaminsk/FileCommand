@@ -617,17 +617,19 @@ fn run_move_same_volume(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) 
 // Rename (file-action-menu "In-place Rename")
 // ---------------------------------------------------------------------
 
-/// In-place rename of the job's single source within `source_dir` (equal to
-/// `dest_dir`, per the `Job` doc). Mirrors [`run_move_same_volume`]'s
-/// identity-aware conflict check — a case-only rename onto the same
-/// underlying file is never treated as "target already exists" — but always
-/// targets `new_dir_name` rather than the source's own original name, and
-/// never falls back to a copy-then-delete cross-volume path since a rename
-/// never leaves its own directory. Collisions and errors surface through the
-/// same `sink.conflict`/`sink.error` calls every other job uses, so the
-/// existing `operation-dialogs` conflict/error dialogs render unchanged
-/// (file-action-menu "Rename collisions/failures must surface through the
-/// existing overwrite-conflict and error-recovery dialogs").
+/// In-place rename of the job's single source to `dest_dir` joined with
+/// `new_dir_name` — `dest_dir` is the resolved parent of the new name, equal
+/// to `source_dir` for a plain name, per the `Job` doc. Mirrors
+/// [`run_move_same_volume`]'s identity-aware conflict check — a case-only
+/// rename onto the same underlying file is never treated as "target already
+/// exists" — but always targets `new_dir_name` rather than the source's own
+/// original name, and never falls back to a copy-then-delete cross-volume
+/// path since a rename never leaves its own directory. Collisions and errors
+/// surface through the same `sink.conflict`/`sink.error` calls every other
+/// job uses, so the existing `operation-dialogs` conflict/error dialogs
+/// render unchanged (file-action-menu "Rename collisions/failures must
+/// surface through the existing overwrite-conflict and error-recovery
+/// dialogs").
 fn run_rename(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
     let mut progress = ProgressInfo::starting(1, 0);
     sink.progress(progress.clone());

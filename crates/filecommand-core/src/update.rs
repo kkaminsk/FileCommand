@@ -2010,9 +2010,26 @@ fn parse_builtin_arg(text: &str, verb: &str) -> Option<String> {
     }
 }
 
-/// Resolve a `cd` target against `cwd`. Absolute paths, UNC paths, and bare
-/// drive letters (`D:`) are taken as-is; anything else is relative.
+/// Resolve a `cd` target against `cwd`; this one resolver also backs the
+/// F5/F6 destination field and the F7/Rename name (operation-dialogs
+/// "Relative destinations resolve against the source panel directory"), so
+/// every free-form path the app accepts follows the same rules. The result
+/// is absolute and lexically normalized — no `.`/`..` components — whenever
+/// `cwd` is (command-line "cd, del and rmdir targets resolve to a
+/// normalized absolute path"). `.` and `..`, bare drive letters (`D:`),
+/// UNC paths, absolute paths, and paths relative to `cwd` keep their
+/// meaning; a drive-relative `D:x` (Windows only) is taken relative to
+/// `cwd` when `cwd` is on drive `D:` and relative to `D:\` otherwise, so no
+/// result ever depends on the process's launch or per-drive current
+/// directory. `..` at a drive or UNC root has nowhere to go: `None`.
 pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
+    let resolved = resolve_cd_target_unnormalized(cwd, target)?;
+    Some(crate::fs_ops::path::lexically_normalize(&resolved))
+}
+
+/// The raw resolution behind [`resolve_cd_target`], before the lexical
+/// normalization every `Some` result then goes through.
+fn resolve_cd_target_unnormalized(cwd: &Path, target: &str) -> Option<PathBuf> {
     if target == ".." {
         return crate::panel::parent_path(cwd);
     }
@@ -2030,7 +2047,47 @@ pub fn resolve_cd_target(cwd: &Path, target: &str) -> Option<PathBuf> {
             return Some(drives::drive_root(letter));
         }
     }
+    // `D:x` (a drive letter, a colon, then a non-separator) is a
+    // drive-relative path on Windows. FileCommand has no per-drive current
+    // directory, so `cwd` stands in for drive `D:`'s when it is on that
+    // drive; otherwise the drive's root. On other platforms `D:x` is an
+    // ordinary file name, relative to `cwd` like anything else.
+    if let Some((letter, rest)) = parse_drive_relative(target) {
+        let base = match drives::drive_letter_of(cwd) {
+            Some(cwd_letter) if cwd_letter.eq_ignore_ascii_case(&letter) => cwd.to_path_buf(),
+            _ => drives::drive_root(letter),
+        };
+        return Some(base.join(rest));
+    }
     Some(cwd.join(target))
+}
+
+/// The drive letter and remainder of a drive-relative `X:rest` target
+/// (Windows path semantics): an ASCII letter, a colon, then at least one
+/// character that is not a path separator. `X:` alone (a bare drive letter)
+/// and `X:\…`/`X:/…` (absolute) are both handled before this is consulted.
+/// Non-Windows hosts have no drive-relative paths: always `None`, so `D:x`
+/// stays an ordinary file name there.
+#[cfg(windows)]
+fn parse_drive_relative(target: &str) -> Option<(char, &str)> {
+    let mut chars = target.chars();
+    let (Some(letter), Some(':')) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let rest = chars.as_str();
+    if rest.is_empty() || rest.starts_with(['\\', '/']) {
+        return None;
+    }
+    Some((letter, rest))
+}
+
+/// Non-Windows hosts have no drive-relative paths (see above).
+#[cfg(not(windows))]
+fn parse_drive_relative(_target: &str) -> Option<(char, &str)> {
+    None
 }
 
 /// Move the cursor to the first entry matching the type-ahead `pattern`
@@ -3131,6 +3188,14 @@ fn handle_file_op(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// dialog unchanged, exactly as before this was split out; otherwise builds
 /// and dispatches the job. `buttons` and `hidden_by_filter` only ever ride
 /// along unchanged — neither has any bearing on which job runs.
+///
+/// The entered text resolves against the source panel's directory through
+/// the same rules `cd` uses (`resolve_cd_target`), never against the
+/// process's launch or per-drive current directory (operation-dialogs
+/// "Relative destinations resolve against the source panel directory";
+/// design D1/D3). A destination that resolves to nothing (`..` at a drive
+/// or UNC root) re-shows the dialog with its text intact, exactly like an
+/// empty field.
 fn confirm_destination_input(
     kind: JobKind,
     sources: Vec<SourceItem>,
@@ -3144,11 +3209,24 @@ fn confirm_destination_input(
     if trimmed.is_empty() {
         return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter });
     }
+    let Some(target) = resolve_cd_target(&source_dir, trimmed) else {
+        return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter });
+    };
     let job = match kind {
+        // F7 takes a *name*, but the field is free-form, so it resolves the
+        // same way: the job then carries the resolved parent directory and
+        // the bare new name — a plain name resolves to `source_dir` + that
+        // name, exactly the job this arm has always built — and a panel
+        // showing that parent re-reads on completion. A result with no
+        // parent or file name (a drive or UNC root) names nothing to
+        // create, so the dialog stays open, like an empty field.
         JobKind::Mkdir => {
-            Job { kind, sources: vec![], source_dir: source_dir.clone(), dest_dir: source_dir.clone(), new_dir_name: Some(OsString::from(trimmed)) }
+            let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+                return UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter });
+            };
+            Job { kind, sources: vec![], source_dir: source_dir.clone(), dest_dir: parent.to_path_buf(), new_dir_name: Some(name.to_os_string()) }
         }
-        _ => Job { kind, sources, source_dir: source_dir.clone(), dest_dir: PathBuf::from(trimmed), new_dir_name: None },
+        _ => Job { kind, sources, source_dir: source_dir.clone(), dest_dir: target, new_dir_name: None },
     };
     let running = UiPhase::FileOpRunning {
         source_dir: job.source_dir.clone(),
@@ -3215,13 +3293,27 @@ fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effe
                 if trimmed.is_empty() {
                     return UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
                 }
+                // The name goes through the same resolver as every other
+                // destination (design D3): a plain name resolves to
+                // `source_dir` + that name, yielding exactly the job this
+                // arm has always built, while a drive-relative or
+                // `..`-carrying name no longer escapes onto the process's
+                // per-drive/launch directory. A name that resolves to
+                // nothing, or to something with no final component (a drive
+                // or UNC root), keeps the dialog open, like an empty field.
+                let Some(target) = resolve_cd_target(&source_dir, trimmed) else {
+                    return UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
+                };
+                let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+                    return UiPhase::FileOpSetup(FileOpSetup::RenameInput { source_dir, original_name, is_dir, input });
+                };
                 let source = SourceItem { original_name: original_name.clone(), path: source_dir.join(&original_name), is_dir };
                 let job = Job {
                     kind: JobKind::Rename,
                     sources: vec![source],
                     source_dir: source_dir.clone(),
-                    dest_dir: source_dir.clone(),
-                    new_dir_name: Some(OsString::from(trimmed)),
+                    dest_dir: parent.to_path_buf(),
+                    new_dir_name: Some(name.to_os_string()),
                 };
                 let running = UiPhase::FileOpRunning {
                     source_dir: job.source_dir.clone(),
