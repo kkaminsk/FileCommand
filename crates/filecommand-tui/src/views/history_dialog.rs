@@ -26,11 +26,27 @@ const EMPTY_PLACEHOLDER: &str = "(no history)";
 /// `None` for the final frame: the box unfolds top-down on open and a newly
 /// highlighted row flashes in the hotkey accent before settling
 /// (ui-animations "Pop-up menus unfold and highlights settle").
-pub fn render_history_dialog(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &HistoryDialogState, history: &[String], now: Option<u64>) {
+pub fn render_history_dialog(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &HistoryDialogState,
+    history: &[String],
+    now: Option<u64>,
+) {
     super::unfold(buf, now, dialog.opened_at_ms, |b| draw_history_dialog(b, area, theme, depth, dialog, history, now));
 }
 
-fn draw_history_dialog(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &HistoryDialogState, history: &[String], now: Option<u64>) {
+fn draw_history_dialog(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &HistoryDialogState,
+    history: &[String],
+    now: Option<u64>,
+) {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let settling = matches!((now, dialog.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
     let highlight = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);

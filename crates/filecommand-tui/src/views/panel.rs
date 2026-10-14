@@ -288,7 +288,9 @@ fn drag_feedback_for(panel: &PanelState, side: PanelSide, drag: &DragState) -> O
             };
             DragFeedback::Valid { row: Some(RowHighlight::Row(name.clone())), dir }
         }
-        Some(DropTarget::TreeNode { side: s, path }) if *s == side => DragFeedback::Valid { row: Some(RowHighlight::TreeNode(path.clone())), dir: path.clone() },
+        Some(DropTarget::TreeNode { side: s, path }) if *s == side => {
+            DragFeedback::Valid { row: Some(RowHighlight::TreeNode(path.clone())), dir: path.clone() }
+        }
         Some(DropTarget::Tab { side: s, index }) if *s == side => {
             let dir = panel.tab_dirs().get(*index).cloned()?;
             DragFeedback::Valid { row: Some(RowHighlight::Tab(*index)), dir }
@@ -530,7 +532,14 @@ pub fn render_panel(
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -539,7 +548,14 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, &row_highlight, button_focused_style);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -547,7 +563,8 @@ pub fn render_panel(
     // driving the opposite panel as the cursor moves (additional-panel-
     // modes "Tree display mode structure and rendering").
     if panel.display_mode == DisplayMode::Tree {
-        let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style, &row_highlight, button_focused_style);
+        let mini_status =
+            render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style, &row_highlight, button_focused_style);
         render_bottom_border(
             buf,
             area,
@@ -835,7 +852,13 @@ fn render_tree_body(
             Some(node) if node.depth == 0 => {
                 let is_target = is_target_tree_node(row_highlight, &node.path);
                 let text = node.path.display().to_string();
-                let style = if is_target { button_focused_style } else if is_cursor { cursor_style } else { dir_style };
+                let style = if is_target {
+                    button_focused_style
+                } else if is_cursor {
+                    cursor_style
+                } else {
+                    dir_style
+                };
                 buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), style);
             }
             Some(node) => {
@@ -866,7 +889,16 @@ fn render_tree_body(
 /// directory indicator"; design D7). Returns the mini-status override — the
 /// previewed file's name and size.
 #[allow(clippy::too_many_arguments)]
-fn render_quick_view_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: u16, opposite: &PanelState, theme: &Theme, depth: ColorDepth) -> Option<String> {
+fn render_quick_view_body(
+    buf: &mut Buffer,
+    x0: u16,
+    body_y0: u16,
+    w: usize,
+    body_h: u16,
+    opposite: &PanelState,
+    theme: &Theme,
+    depth: ColorDepth,
+) -> Option<String> {
     let text_style = role_style(theme, Role::ViewerText, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let inner_w = w.saturating_sub(2);
@@ -942,12 +974,7 @@ fn render_bottom_border(
     let fill_total = inner_w.saturating_sub(display_width(&bracketed));
     let left_fill = fill_total / 2;
     let right_fill = fill_total - left_fill;
-    let bottom = format!(
-        "\u{255A}{}{}{}\u{255D}",
-        "\u{2550}".repeat(left_fill),
-        bracketed,
-        "\u{2550}".repeat(right_fill),
-    );
+    let bottom = format!("\u{255A}{}{}{}\u{255D}", "\u{2550}".repeat(left_fill), bracketed, "\u{2550}".repeat(right_fill),);
     buf.set_string(area.x, bottom_y, &bottom, frame_style);
     if !bracketed.is_empty() {
         buf.set_string(area.x + 1 + left_fill as u16, bottom_y, &bracketed, ministatus_style);
@@ -1113,7 +1140,11 @@ mod tests {
         render_panel(&mut with_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, Some(&drag));
         let mut without_drag = Buffer::empty(area);
         render_panel(&mut without_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
-        assert_eq!(buffer_to_text(&with_drag, area), buffer_to_text(&without_drag, area), "source rows/frame must render unchanged while a drag targets the other panel");
+        assert_eq!(
+            buffer_to_text(&with_drag, area),
+            buffer_to_text(&without_drag, area),
+            "source rows/frame must render unchanged while a drag targets the other panel"
+        );
     }
 
     #[test]
@@ -1237,7 +1268,9 @@ mod tests {
         // Narrow just enough that Name+Size+Date+Time would leave Name
         // under 12, but Name+Size+Date still fits at >= 12.
         let full_name_w = |w: usize| w.saturating_sub(ColumnSet::FULL.reserved_w());
-        let w = (0usize..40).find(|&w| full_name_w(w) < MIN_NAME_W && w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) >= MIN_NAME_W).unwrap();
+        let w = (0usize..40)
+            .find(|&w| full_name_w(w) < MIN_NAME_W && w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) >= MIN_NAME_W)
+            .unwrap();
         let cols = choose_columns(w, 0);
         assert_eq!(cols, ColumnSet { size: true, date: true, time: false });
     }
@@ -1246,7 +1279,10 @@ mod tests {
     fn choose_columns_drops_date_next() {
         let two_col = ColumnSet { size: true, date: false, time: false };
         let w = (0usize..40)
-            .find(|&w| w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) < MIN_NAME_W && w.saturating_sub(two_col.reserved_w()) >= MIN_NAME_W)
+            .find(|&w| {
+                w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) < MIN_NAME_W
+                    && w.saturating_sub(two_col.reserved_w()) >= MIN_NAME_W
+            })
             .unwrap();
         let cols = choose_columns(w, 0);
         assert_eq!(cols, two_col);
@@ -1298,10 +1334,8 @@ mod tests {
         // `06-27-26`, and `23:30` complete, with no blank cells between the
         // Time value and the right border.
         let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
-        let text = render_left_panel_rows(vec![
-            Entry::parent_dir(),
-            Entry::new(OsString::from("docs"), EntryKind::Directory, 0, Some(dt), false, false),
-        ]);
+        let text =
+            render_left_panel_rows(vec![Entry::parent_dir(), Entry::new(OsString::from("docs"), EntryKind::Directory, 0, Some(dt), false, false)]);
         // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
         let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
         assert!(header_interior.contains("\u{2502}Size"), "header labels stay left-aligned after the separator: `{header_interior}`");

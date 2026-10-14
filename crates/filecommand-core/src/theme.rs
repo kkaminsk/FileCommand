@@ -345,10 +345,7 @@ impl Theme {
             let input = roles.remove(role).ok_or(ThemeError::MissingRole(*role))?;
             let fg = input.fg.ok_or(ThemeError::MissingAnsi16Fg(*role))?;
             let bg = input.bg.ok_or(ThemeError::MissingAnsi16Bg(*role))?;
-            resolved.insert(
-                *role,
-                ColorSpec { fg, bg, fg_truecolor: input.fg_truecolor, bg_truecolor: input.bg_truecolor },
-            );
+            resolved.insert(*role, ColorSpec { fg, bg, fg_truecolor: input.fg_truecolor, bg_truecolor: input.bg_truecolor });
         }
         Ok(Theme { name: name.into(), roles: resolved })
     }
@@ -587,19 +584,17 @@ impl Theme {
         set(Role::ViewerMatch, A(Black), A(Green));
         set(Role::TabActive, A(Black), A(Green));
         set(Role::TabInactive, A(Green), A(Black));
-        Theme::build("terminal-green", m)
-            .expect("terminal-green role table is complete")
-            .with_truecolor_overrides(&[
-                (Role::PanelFrame, None, Some(Rgb(0, 40, 0))),
-                (Role::PanelScrollbar, None, Some(Rgb(0, 40, 0))),
-                (Role::PanelFile, Some(Rgb(51, 204, 51)), Some(Rgb(0, 40, 0))),
-                (Role::PanelDirectory, Some(Rgb(102, 255, 102)), Some(Rgb(0, 40, 0))),
-                // A darker phosphor green on the file background — the
-                // truecolor rendering of "dimmed" (design D2).
-                (Role::PanelHidden, Some(Rgb(30, 122, 30)), Some(Rgb(0, 40, 0))),
-                (Role::PanelCursor, None, Some(Rgb(51, 204, 51))),
-                (Role::ScreenBackdrop, None, Some(Rgb(0, 40, 0))),
-            ])
+        Theme::build("terminal-green", m).expect("terminal-green role table is complete").with_truecolor_overrides(&[
+            (Role::PanelFrame, None, Some(Rgb(0, 40, 0))),
+            (Role::PanelScrollbar, None, Some(Rgb(0, 40, 0))),
+            (Role::PanelFile, Some(Rgb(51, 204, 51)), Some(Rgb(0, 40, 0))),
+            (Role::PanelDirectory, Some(Rgb(102, 255, 102)), Some(Rgb(0, 40, 0))),
+            // A darker phosphor green on the file background — the
+            // truecolor rendering of "dimmed" (design D2).
+            (Role::PanelHidden, Some(Rgb(30, 122, 30)), Some(Rgb(0, 40, 0))),
+            (Role::PanelCursor, None, Some(Rgb(51, 204, 51))),
+            (Role::ScreenBackdrop, None, Some(Rgb(0, 40, 0))),
+        ])
     }
 
     /// `nc-classic`'s structure with magenta standing in for blue and
@@ -661,16 +656,14 @@ impl Theme {
         set(Role::ViewerMatch, A(Black), A(BrightMagenta));
         set(Role::TabActive, A(Black), A(BrightMagenta));
         set(Role::TabInactive, A(BrightMagenta), A(Magenta));
-        Theme::build("purple-lights", m)
-            .expect("purple-lights role table is complete")
-            .with_truecolor_overrides(&[
-                (Role::ScreenBackdrop, None, Some(Rgb(48, 0, 64))),
-                (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
-                (Role::PanelScrollbar, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
-                (Role::PanelFile, Some(Rgb(169, 169, 169)), Some(Rgb(48, 0, 64))),
-                (Role::PanelHidden, Some(Rgb(110, 90, 128)), Some(Rgb(48, 0, 64))),
-                (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
-            ])
+        Theme::build("purple-lights", m).expect("purple-lights role table is complete").with_truecolor_overrides(&[
+            (Role::ScreenBackdrop, None, Some(Rgb(48, 0, 64))),
+            (Role::PanelFrame, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+            (Role::PanelScrollbar, Some(Rgb(186, 85, 211)), Some(Rgb(48, 0, 64))),
+            (Role::PanelFile, Some(Rgb(169, 169, 169)), Some(Rgb(48, 0, 64))),
+            (Role::PanelHidden, Some(Rgb(110, 90, 128)), Some(Rgb(48, 0, 64))),
+            (Role::PanelCursor, None, Some(Rgb(186, 85, 211))),
+        ])
     }
 
     /// Amber terminal: yellow on black base, bright-yellow directories,
@@ -737,18 +730,16 @@ impl Theme {
         set(Role::ViewerMatch, A(Black), A(Yellow));
         set(Role::TabActive, A(Black), A(Yellow));
         set(Role::TabInactive, A(Yellow), A(Black));
-        Theme::build("yellow-storm", m)
-            .expect("yellow-storm role table is complete")
-            .with_truecolor_overrides(&[
-                (Role::PanelFrame, Some(Rgb(255, 191, 0)), None),
-                (Role::PanelScrollbar, Some(Rgb(255, 191, 0)), None),
-                (Role::PanelFile, Some(Rgb(255, 191, 0)), None),
-                (Role::PanelDirectory, Some(Rgb(255, 214, 51)), None),
-                // A darker amber on the unchanged black background (design
-                // D2).
-                (Role::PanelHidden, Some(Rgb(128, 96, 0)), None),
-                (Role::PanelCursor, None, Some(Rgb(255, 191, 0))),
-            ])
+        Theme::build("yellow-storm", m).expect("yellow-storm role table is complete").with_truecolor_overrides(&[
+            (Role::PanelFrame, Some(Rgb(255, 191, 0)), None),
+            (Role::PanelScrollbar, Some(Rgb(255, 191, 0)), None),
+            (Role::PanelFile, Some(Rgb(255, 191, 0)), None),
+            (Role::PanelDirectory, Some(Rgb(255, 214, 51)), None),
+            // A darker amber on the unchanged black background (design
+            // D2).
+            (Role::PanelHidden, Some(Rgb(128, 96, 0)), None),
+            (Role::PanelCursor, None, Some(Rgb(255, 191, 0))),
+        ])
     }
 
     /// High-contrast black-on-bright-white accessibility theme, the light
@@ -837,8 +828,7 @@ impl Theme {
 }
 
 /// All built-in theme names, in menu/picker display order.
-pub const BUILTIN_THEME_NAMES: &[&str] =
-    &["nc-classic", "nc-mono", "terminal-green", "purple-lights", "yellow-storm", "inverted"];
+pub const BUILTIN_THEME_NAMES: &[&str] = &["nc-classic", "nc-mono", "terminal-green", "purple-lights", "yellow-storm", "inverted"];
 
 pub const DEFAULT_THEME_NAME: &str = "nc-classic";
 
@@ -862,10 +852,7 @@ mod tests {
         for role in ALL_ROLES {
             m.insert(*role, ColorSpecInput::new(ColorValue::Ansi16(Ansi16::White), ColorValue::Ansi16(Ansi16::Black)));
         }
-        m.insert(
-            Role::PanelFrame,
-            ColorSpecInput { fg: None, bg: Some(ColorValue::Ansi16(Ansi16::Black)), fg_truecolor: None, bg_truecolor: None },
-        );
+        m.insert(Role::PanelFrame, ColorSpecInput { fg: None, bg: Some(ColorValue::Ansi16(Ansi16::Black)), fg_truecolor: None, bg_truecolor: None });
         let err = Theme::build("bad", m).unwrap_err();
         assert_eq!(err, ThemeError::MissingAnsi16Fg(Role::PanelFrame));
     }
@@ -1008,8 +995,7 @@ mod tests {
 
     #[test]
     fn resolve_uses_truecolor_only_when_reported_and_present() {
-        let with_true = ColorSpec::new(ColorValue::Ansi16(Ansi16::Cyan), ColorValue::Ansi16(Ansi16::Blue))
-            .with_truecolor(Some(Rgb(1, 2, 3)), None);
+        let with_true = ColorSpec::new(ColorValue::Ansi16(Ansi16::Cyan), ColorValue::Ansi16(Ansi16::Blue)).with_truecolor(Some(Rgb(1, 2, 3)), None);
         assert_eq!(with_true.resolve_fg(ColorDepth::TrueColor), ResolvedColor::Rgb(Rgb(1, 2, 3)));
         // bg has no truecolor override even though depth is truecolor -> falls back to ANSI-16.
         assert_eq!(with_true.resolve_bg(ColorDepth::TrueColor), ResolvedColor::Ansi16(Ansi16::Blue));

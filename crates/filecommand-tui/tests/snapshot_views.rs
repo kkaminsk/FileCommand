@@ -72,12 +72,7 @@ fn streaming_panel(cwd: &str, count: usize) -> PanelState {
 }
 
 fn base_state(phase: UiPhase, theme: Theme) -> State {
-    State {
-        left: complete_panel(r"C:\Users\demo\left", 1),
-        right: complete_panel(r"C:\Users\demo\right", 0),
-        phase,
-        ..State::empty(theme)
-    }
+    State { left: complete_panel(r"C:\Users\demo\left", 1), right: complete_panel(r"C:\Users\demo\right", 0), phase, ..State::empty(theme) }
 }
 
 /// Render `state` at `width`x`height` through a real ratatui `TestBackend`
@@ -215,7 +210,13 @@ fn snapshot_drop_dialog_with_move_focused() {
 // -----------------------------------------------------------------
 
 fn hidden_disclosure_sources(n: usize) -> Vec<SourceItem> {
-    (0..n).map(|i| SourceItem { original_name: format!("f{i}.txt").into(), path: PathBuf::from(format!(r"C:\Users\demo\left\f{i}.txt")), is_dir: false }).collect()
+    (0..n)
+        .map(|i| SourceItem {
+            original_name: format!("f{i}.txt").into(),
+            path: PathBuf::from(format!(r"C:\Users\demo\left\f{i}.txt")),
+            is_dir: false,
+        })
+        .collect()
 }
 
 fn delete_confirm_state(sources: usize, hidden_by_filter: usize) -> State {
@@ -927,7 +928,8 @@ fn editor_state(editor: EditorState) -> State {
 
 #[test]
 fn snapshot_editor_chrome_unmodified() {
-    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n").expect("valid UTF-8 fixture");
+    let editor =
+        EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("editor_chrome_unmodified", text);
@@ -1142,9 +1144,8 @@ fn snapshot_brief_mode_three_name_columns() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut panel = complete_panel(r"C:\Users\demo\left", 0);
     panel.display_mode = DisplayMode::Brief;
-    panel.entries = std::iter::once(Entry::parent_dir())
-        .chain((0..8).map(|i| Entry::new(format!("f{i}.txt"), EntryKind::File, 0, None, false, false)))
-        .collect();
+    panel.entries =
+        std::iter::once(Entry::parent_dir()).chain((0..8).map(|i| Entry::new(format!("f{i}.txt"), EntryKind::File, 0, None, false, false))).collect();
     state.left = panel;
     // A short panel (6 body rows, after the command line and F-key bar
     // reserve their own rows) so the 9 entries visibly wrap into a second
@@ -1164,10 +1165,7 @@ fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
     let mut tree = TreeState::new(PathBuf::from(r"C:\"), prior_mode);
     tree.insert_children(
         &PathBuf::from(r"C:\"),
-        vec![
-            Entry::new("Alpha", EntryKind::Directory, 0, None, false, false),
-            Entry::new("Beta", EntryKind::Directory, 0, None, false, false),
-        ],
+        vec![Entry::new("Alpha", EntryKind::Directory, 0, None, false, false), Entry::new("Beta", EntryKind::Directory, 0, None, false, false)],
     );
     tree.cursor = cursor;
     panel.display_mode = DisplayMode::Tree;
@@ -1232,7 +1230,10 @@ fn quick_view_previews_the_opposite_cursor_file() {
     assert!(text.contains("Hello from quick view"), "the previewed file's head is rendered like the viewer's text mode:\n{text}");
     assert!(text.contains("second line"), "{text}");
     let bottom_row = text.lines().nth(21).unwrap();
-    assert!(bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'), "mini-status shows the previewed file's name and size: `{bottom_row}`");
+    assert!(
+        bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'),
+        "mini-status shows the previewed file's name and size: `{bottom_row}`"
+    );
 }
 
 #[test]
@@ -1521,8 +1522,8 @@ fn snapshot_pending_note_opening_mini_status() {
 /// above `last_error`, and uses the normal ministatus style.
 #[test]
 fn pending_note_ranks_below_the_override_and_above_the_error() {
-    use filecommand_tui::style::role_style;
     use filecommand_core::theme::Role;
+    use filecommand_tui::style::role_style;
 
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left.pending_note = Some("Opening notes.txt…".to_string());
@@ -1532,7 +1533,8 @@ fn pending_note_ranks_below_the_override_and_above_the_error() {
     assert!(row.contains("Opening notes.txt…"), "the note wins over the error: `{row}`");
     assert!(!row.contains("Cannot open"), "`{row}`");
 
-    state.left.clipboard_feedback = Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
+    state.left.clipboard_feedback =
+        Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let row = mini_status_row(&text);
     assert!(row.contains("1 file copied to clipboard"), "the override wins over the note: `{row}`");
@@ -1759,7 +1761,7 @@ fn snapshot_theme_picker_dialog_previews_a_non_active_highlighted_theme() {
     // render through `purple-lights`'s role table, while the marker stays
     // on the applied theme's (`nc-classic`) row (theme-selection scenario
     // "Moving the highlight previews the theme").
-    use filecommand_core::theme::{BUILTIN_THEME_NAMES, Role};
+    use filecommand_core::theme::{Role, BUILTIN_THEME_NAMES};
     use filecommand_tui::style::role_style;
 
     let mut state = base_state(UiPhase::Panels, Theme::classic());
@@ -1928,8 +1930,7 @@ fn snapshot_file_action_menu_dialog_directory() {
     // Delete — Open first and highlighted, no View/Edit/Run — and Open
     // shows the directory in the platform file browser.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu =
-        Some(filecommand_core::dialogs::FileActionMenuState::open(std::ffi::OsString::from("docs"), true, false, false));
+    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::open(std::ffi::OsString::from("docs"), true, false, false));
     let menu = state.file_action_menu.as_ref().unwrap();
     assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
     assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");

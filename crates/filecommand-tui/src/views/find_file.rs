@@ -104,10 +104,7 @@ mod tests {
     }
 
     fn a_match(rel: &str) -> FindMatch {
-        FindMatch {
-            relative_path: PathBuf::from(rel),
-            entry: Entry::new(OsString::from(rel), EntryKind::File, 0, None, false, false),
-        }
+        FindMatch { relative_path: PathBuf::from(rel), entry: Entry::new(OsString::from(rel), EntryKind::File, 0, None, false, false) }
     }
 
     #[test]

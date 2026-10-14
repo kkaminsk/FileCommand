@@ -120,11 +120,23 @@ mod tests {
     use super::*;
 
     fn source_items(n: usize) -> Vec<SourceItem> {
-        (0..n).map(|i| SourceItem { original_name: OsString::from(format!("f{i}.txt")), path: PathBuf::from(format!(r"C:\left\f{i}.txt")), is_dir: false }).collect()
+        (0..n)
+            .map(|i| SourceItem {
+                original_name: OsString::from(format!("f{i}.txt")),
+                path: PathBuf::from(format!(r"C:\left\f{i}.txt")),
+                is_dir: false,
+            })
+            .collect()
     }
 
     fn delete_setup(sources: Vec<SourceItem>, hidden_by_filter: usize) -> FileOpSetup {
-        FileOpSetup::DeleteConfirm { sources, source_dir: PathBuf::from(r"C:\left"), needs_second_confirm: false, confirmed_once: false, hidden_by_filter }
+        FileOpSetup::DeleteConfirm {
+            sources,
+            source_dir: PathBuf::from(r"C:\left"),
+            needs_second_confirm: false,
+            confirmed_once: false,
+            hidden_by_filter,
+        }
     }
 
     fn area() -> Rect {

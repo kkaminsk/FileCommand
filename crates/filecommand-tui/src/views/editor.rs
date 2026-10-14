@@ -183,7 +183,10 @@ mod tests {
     fn render(editor: &EditorState, area: Rect) -> (String, Option<(u16, u16)>) {
         let mut buf = Buffer::empty(area);
         let cursor = render_editor(&mut buf, area, editor, &Theme::classic(), ColorDepth::Ansi16);
-        let text = (0..area.height).map(|y| (0..area.width).map(|x| buf[(area.x + x, area.y + y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        let text = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(area.x + x, area.y + y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
         (text, cursor)
     }
 

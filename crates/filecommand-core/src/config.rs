@@ -540,7 +540,9 @@ fn apply_top_level_key(config: &mut Config, key: &str, value: &Value, line: usiz
     if let Some(target) = binding_target {
         match parse_string(value).as_deref().and_then(parse_binding) {
             Some(binding) => *target = binding,
-            None => warnings.push(ConfigWarning::at(CONFIG_FILE, line, format!("{key} \"{}\" is not a key binding; using the default", value.text()))),
+            None => {
+                warnings.push(ConfigWarning::at(CONFIG_FILE, line, format!("{key} \"{}\" is not a key binding; using the default", value.text())))
+            }
         }
         return;
     }
@@ -624,10 +626,16 @@ pub fn load(path: &Path) -> ParsedConfig {
     match std::fs::read(path) {
         Ok(bytes) => match decode_utf8_text(bytes) {
             Some(contents) => parse(&contents),
-            None => ParsedConfig { config: Config::default(), warnings: vec![ConfigWarning::whole_file(CONFIG_FILE, "is not UTF-8 text; using default settings")] },
+            None => ParsedConfig {
+                config: Config::default(),
+                warnings: vec![ConfigWarning::whole_file(CONFIG_FILE, "is not UTF-8 text; using default settings")],
+            },
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => ParsedConfig::default(),
-        Err(e) => ParsedConfig { config: Config::default(), warnings: vec![ConfigWarning::whole_file(CONFIG_FILE, format!("could not be read ({e}); using default settings"))] },
+        Err(e) => ParsedConfig {
+            config: Config::default(),
+            warnings: vec![ConfigWarning::whole_file(CONFIG_FILE, format!("could not be read ({e}); using default settings"))],
+        },
     }
 }
 
@@ -708,7 +716,8 @@ pub fn set_theme_line(input: &str, theme_name: &str) -> String {
 /// could not keep its other settings.
 fn read_config_for_rewrite(path: &Path) -> io::Result<String> {
     match std::fs::read(path) {
-        Ok(bytes) => decode_utf8_text(bytes).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{CONFIG_FILE} is not UTF-8 text; not rewritten"))),
+        Ok(bytes) => decode_utf8_text(bytes)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("{CONFIG_FILE} is not UTF-8 text; not rewritten"))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(String::new()),
         Err(e) => Err(e),
     }
@@ -1499,7 +1508,13 @@ pub struct UserMenuLoadResult {
 
 impl UserMenuLoadResult {
     fn fallback(problem: UserMenuProblem) -> UserMenuLoadResult {
-        UserMenuLoadResult { entries: default_user_menu_entries(), warnings: Vec::new(), created_default: false, malformed: true, problem: Some(problem) }
+        UserMenuLoadResult {
+            entries: default_user_menu_entries(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+            problem: Some(problem),
+        }
     }
 }
 
@@ -1848,8 +1863,16 @@ mod tests {
         assert_eq!(one("k = \"a # b\"", QuoteMode::Verbatim), kv("k", Value::Basic("a # b".to_string()), None));
         assert_eq!(one("k = \"x\" # c \"d\"", QuoteMode::Verbatim), kv("k", Value::Basic("x".to_string()), Some("# c \"d\"")));
         assert_eq!(one("k = 'x' # c", QuoteMode::Verbatim), kv("k", Value::Literal("x".to_string()), Some("# c")));
-        assert_eq!(one("k = \"C:\\dir\\\"", QuoteMode::Verbatim), kv("k", Value::Basic("C:\\dir\\".to_string()), None), "a trailing backslash still terminates in Verbatim mode");
-        assert_eq!(one("k = \"say \\\"hi\\\"\"", QuoteMode::Verbatim), kv("k", Value::Basic("say \\\"hi\\\"".to_string()), None), "verbatim inner text");
+        assert_eq!(
+            one("k = \"C:\\dir\\\"", QuoteMode::Verbatim),
+            kv("k", Value::Basic("C:\\dir\\".to_string()), None),
+            "a trailing backslash still terminates in Verbatim mode"
+        );
+        assert_eq!(
+            one("k = \"say \\\"hi\\\"\"", QuoteMode::Verbatim),
+            kv("k", Value::Basic("say \\\"hi\\\"".to_string()), None),
+            "verbatim inner text"
+        );
         assert_eq!(one("k = \"a\" b\"", QuoteMode::Verbatim), kv("k", Value::Basic("a\" b".to_string()), None), "the last quote qualifies");
         assert_eq!(one("k = \"\"", QuoteMode::Verbatim), kv("k", Value::Basic(String::new()), None));
     }
@@ -1857,7 +1880,10 @@ mod tests {
     #[test]
     fn tokenizer_toml_escapes_mode_does_not_close_on_an_escaped_quote() {
         assert_eq!(one("k = \"a \\\" # b\" # c", QuoteMode::TomlEscapes), kv("k", Value::Basic("a \\\" # b".to_string()), Some("# c")));
-        assert!(matches!(one("k = \"C:\\dir\\\"", QuoteMode::TomlEscapes), LineKind::Malformed { .. }), "in TOML the backslash escapes the quote, so it is unterminated");
+        assert!(
+            matches!(one("k = \"C:\\dir\\\"", QuoteMode::TomlEscapes), LineKind::Malformed { .. }),
+            "in TOML the backslash escapes the quote, so it is unterminated"
+        );
     }
 
     #[test]
@@ -1998,7 +2024,10 @@ mod tests {
             assert!(w.message.contains("not a [mouse] setting"), "{w}");
             assert!(w.message.contains("before the first [table]"), "{w}");
         }
-        assert_eq!(parsed.warnings[3].to_string(), "config.toml line 14: \"key.fuzzy_jump\" is not a [mouse] setting and was ignored — put top-level settings before the first [table]");
+        assert_eq!(
+            parsed.warnings[3].to_string(),
+            "config.toml line 14: \"key.fuzzy_jump\" is not a [mouse] setting and was ignored — put top-level settings before the first [table]"
+        );
         assert_eq!(summarize_warnings(&parsed.warnings).unwrap(), format!("{} (+9 more)", parsed.warnings[0]));
     }
 
@@ -2006,7 +2035,9 @@ mod tests {
     fn corrected_readme_example_parses_with_zero_warnings_and_all_bindings() {
         // `[mouse]` moved to the end, and `key.fuzzy_jump` changed so the
         // bindings demonstrably apply.
-        let corrected = OLD_README_EXAMPLE.replace("[mouse]\nenabled = true\n\n", "").replace("key.fuzzy_jump = \"ctrl+j\"", "key.fuzzy_jump = \"ctrl+g\"") + "\n[mouse]\nenabled = false\n";
+        let corrected =
+            OLD_README_EXAMPLE.replace("[mouse]\nenabled = true\n\n", "").replace("key.fuzzy_jump = \"ctrl+j\"", "key.fuzzy_jump = \"ctrl+g\"")
+                + "\n[mouse]\nenabled = false\n";
         let parsed = super::parse(&corrected);
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
         assert_eq!(parsed.config.keys.fuzzy_jump, KeyBinding::new(true, false, false, "g"));
@@ -2020,17 +2051,28 @@ mod tests {
         assert_eq!(warnings_of("colour = \"red\"\nsplash = false\n"), vec!["config.toml line 1: unknown setting \"colour\"; ignored"]);
         assert_eq!(warnings_of("# c\nsplash false\n"), vec!["config.toml line 2: expected key = value; line ignored"]);
         assert!(super::parse("# c\nsplash false\n").config.splash, "the line is ignored and the default stands");
-        assert_eq!(warnings_of("[colors]\nfg = \"red\"\nbg = \"blue\"\n"), vec!["config.toml line 1: unknown table [colors]; its settings are ignored"], "one warning for the header covers its keys");
+        assert_eq!(
+            warnings_of("[colors]\nfg = \"red\"\nbg = \"blue\"\n"),
+            vec!["config.toml line 1: unknown table [colors]; its settings are ignored"],
+            "one warning for the header covers its keys"
+        );
         assert_eq!(warnings_of("[[entry]]\n"), vec!["config.toml line 1: unknown table [[entry]]; its settings are ignored"]);
         let p = super::parse("animations = yes\n");
         assert!(p.config.animations, "the default stands");
         assert_eq!(p.warnings[0].to_string(), "config.toml line 1: animations must be true or false; using the default");
-        assert_eq!(warnings_of("splash = \"true\"\n"), vec!["config.toml line 1: splash must be true or false; using the default"], "booleans are bare in TOML");
+        assert_eq!(
+            warnings_of("splash = \"true\"\n"),
+            vec!["config.toml line 1: splash must be true or false; using the default"],
+            "booleans are bare in TOML"
+        );
         assert_eq!(warnings_of("[mouse]\nenabled = maybe\n"), vec!["config.toml line 2: enabled must be true or false; using the default"]);
         let p = super::parse("key.fuzzy_jump = \"\"\n");
         assert_eq!(p.config.keys.fuzzy_jump, Keys::default().fuzzy_jump);
         assert_eq!(p.warnings[0].to_string(), "config.toml line 1: key.fuzzy_jump \"\" is not a key binding; using the default");
-        assert_eq!(warnings_of("key.paste_name = \"ctrl\"\n"), vec!["config.toml line 1: key.paste_name \"ctrl\" is not a key binding; using the default"]);
+        assert_eq!(
+            warnings_of("key.paste_name = \"ctrl\"\n"),
+            vec!["config.toml line 1: key.paste_name \"ctrl\" is not a key binding; using the default"]
+        );
         assert_eq!(warnings_of("key.paste_name = \"ctrl+\"\n"), Vec::<String>::new(), "a trailing + is the + key, as parse_binding always read it");
     }
 
@@ -2040,7 +2082,10 @@ mod tests {
         assert_eq!(warnings_of("panel_split = \"wide\"\npanel_split = 150\n"), Vec::<String>::new());
         let p = super::parse("# c\n# c\ntheme = \"purple-lights\n");
         assert_eq!(p.config.theme, DEFAULT_THEME_NAME, "the unterminated line is ignored");
-        assert_eq!(p.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(), vec!["config.toml line 3: unterminated quoted value; line ignored"]);
+        assert_eq!(
+            p.warnings.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            vec!["config.toml line 3: unterminated quoted value; line ignored"]
+        );
     }
 
     #[test]
@@ -2274,7 +2319,10 @@ mod tests {
     fn set_top_level_key_does_not_replace_a_key_inside_a_table() {
         let input = "splash = true\n[mouse]\ntheme = \"nc-mono\"\n";
         let out = set_theme_line(input, "inverted");
-        assert_eq!(out, "splash = true\ntheme = \"inverted\"\n[mouse]\ntheme = \"nc-mono\"\n", "the in-table line is left as it was; the new line goes above the table");
+        assert_eq!(
+            out, "splash = true\ntheme = \"inverted\"\n[mouse]\ntheme = \"nc-mono\"\n",
+            "the in-table line is left as it was; the new line goes above the table"
+        );
         assert_eq!(super::parse(&out).config.theme, "inverted");
     }
 
@@ -2332,9 +2380,17 @@ mod tests {
     #[test]
     fn history_lone_or_bad_unicode_escapes_become_replacement_chars_without_dropping_entries() {
         assert_eq!(parse_history(r#"["cd a","cd b\uD83D","cd c"]"#), vec!["cd a".to_string(), "cd b\u{fffd}".to_string(), "cd c".to_string()]);
-        assert_eq!(parse_history(r#"["x\uZZZZy","z"]"#), vec!["x\u{fffd}ZZZZy".to_string(), "z".to_string()], "a \\u without hex digits is U+FFFD and parsing continues");
+        assert_eq!(
+            parse_history(r#"["x\uZZZZy","z"]"#),
+            vec!["x\u{fffd}ZZZZy".to_string(), "z".to_string()],
+            "a \\u without hex digits is U+FFFD and parsing continues"
+        );
         assert_eq!(parse_history(r#"["a\uDE00b"]"#), vec!["a\u{fffd}b".to_string()], "a stray low surrogate");
-        assert_eq!(parse_history(r#"["a\uD83Db","c"]"#), vec!["a\u{fffd}b".to_string(), "c".to_string()], "a high surrogate not followed by a low one");
+        assert_eq!(
+            parse_history(r#"["a\uD83Db","c"]"#),
+            vec!["a\u{fffd}b".to_string(), "c".to_string()],
+            "a high surrogate not followed by a low one"
+        );
         assert_eq!(parse_history(r#"["a\u00e9\u0041\n\t\b\f\/\\\""]"#), vec!["aéA\n\t\u{8}\u{c}/\\\"".to_string()]);
         assert_eq!(parse_history(r#"["short\u12"]"#), vec!["short\u{fffd}12".to_string()], "a short escape never swallows the closing quote");
     }
@@ -2439,7 +2495,10 @@ mod tests {
     fn history_file_paths_with_backslashes_round_trip() {
         // Windows paths are the norm here; the escaped backslashes must
         // survive the JSON round trip intact.
-        let file = HistoryFile { commands: vec![], directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\A\B\C"), visit_count: 5, last_visited_ms: 42 }] };
+        let file = HistoryFile {
+            commands: vec![],
+            directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\A\B\C"), visit_count: 5, last_visited_ms: 42 }],
+        };
         let rendered = render_history_file(&file);
         assert_eq!(parse_history_file(&rendered), file);
     }
@@ -2524,7 +2583,10 @@ mod tests {
     #[test]
     fn migrate_keeps_v2_timestamps_except_future_ones_which_clamp_to_now() {
         let now = 1_787_000_000_000;
-        let mut file = HistoryFile { commands: vec![], directories: vec![dir(r"C:\past", 2, now - 5_000), dir(r"C:\future", 2, now + 60_000), dir(r"C:\now", 1, now)] };
+        let mut file = HistoryFile {
+            commands: vec![],
+            directories: vec![dir(r"C:\past", 2, now - 5_000), dir(r"C:\future", 2, now + 60_000), dir(r"C:\now", 1, now)],
+        };
         migrate_loaded_history(&mut file, false, now);
         assert_eq!(file.directories, vec![dir(r"C:\past", 2, now - 5_000), dir(r"C:\future", 2, now), dir(r"C:\now", 1, now)]);
     }
@@ -2788,7 +2850,8 @@ mod tests {
     /// byte-for-byte on disk.
     #[test]
     fn load_user_menu_never_overwrites_a_non_utf8_file() {
-        let utf16: Vec<u8> = [0xFFu8, 0xFE].into_iter().chain("[[entry]]\nlabel = \"A\"\ncommand = \"a\"\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
+        let utf16: Vec<u8> =
+            [0xFFu8, 0xFE].into_iter().chain("[[entry]]\nlabel = \"A\"\ncommand = \"a\"\n".encode_utf16().flat_map(u16::to_le_bytes)).collect();
         let ansi = b"[[entry]]\nlabel = \"Caf\xe9\"\ncommand = \"a\"\n".to_vec();
         for (name, bytes) in [("utf16", utf16), ("ansi", ansi)] {
             let dir = temp_dir(&format!("usermenu-{name}"));

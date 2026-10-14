@@ -154,13 +154,19 @@ pub enum ButtonId {
 /// they overlay the panels without replacing whatever phase is underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiPhase {
-    Splash { started_at_ms: u64 },
+    Splash {
+        started_at_ms: u64,
+    },
     Panels,
     /// Gathering input before a Copy/Move/Mkdir/Delete job is dispatched.
     FileOpSetup(FileOpSetup),
     /// A job is running on the worker thread; `dialog` shows progress, or a
     /// conflict/error the worker is blocked waiting on.
-    FileOpRunning { source_dir: PathBuf, dest_dir: PathBuf, dialog: RunningDialog },
+    FileOpRunning {
+        source_dir: PathBuf,
+        dest_dir: PathBuf,
+        dialog: RunningDialog,
+    },
     /// End-of-job summary, shown when the job skipped 1+ items or recorded
     /// 1+ metadata-restore warnings — the two kinds share this vector and
     /// are told apart by `SkippedItem::kind` (operation-dialogs "End-of-job
@@ -534,11 +540,7 @@ impl State {
         // simply reveals the panels (startup-splash "Below the floor at
         // startup"; design D2).
         let undersized = Self::too_small(term_size);
-        let phase = if show_splash && !undersized {
-            UiPhase::Splash { started_at_ms: now_ms }
-        } else {
-            UiPhase::Panels
-        };
+        let phase = if show_splash && !undersized { UiPhase::Splash { started_at_ms: now_ms } } else { UiPhase::Panels };
         let mut state = State {
             left: PanelState::new(left_cwd.clone()),
             right: PanelState::new(right_cwd.clone()),
@@ -585,7 +587,10 @@ pub enum Command {
     /// from the monotonic `Clock` (animations, every in-session timing) and
     /// `epoch_ms` from the `WallClock` (Unix-epoch milliseconds; frecency
     /// stamps only — history-persistence-hardening design D1).
-    Tick { now_ms: u64, epoch_ms: u64 },
+    Tick {
+        now_ms: u64,
+        epoch_ms: u64,
+    },
 
     // Adjustable panel split (Ctrl+Left/Ctrl+Right/Ctrl+=; panel-split
     // "Adjust and reset the panel split").
@@ -665,7 +670,10 @@ pub enum Command {
     QuickSearchEnd,
 
     // Sort modes (Ctrl+F3..Ctrl+F7).
-    SetSortMode { side: PanelSide, mode: SortMode },
+    SetSortMode {
+        side: PanelSide,
+        mode: SortMode,
+    },
 
     // Ctrl+P inline quick filter (§4.7). `QuickFilterStart` carries the
     // panel side so the Left/Right pull-down's Filter item can start the
@@ -700,7 +708,11 @@ pub enum Command {
     /// reply for a node the tree no longer has (a since-superseded Tree
     /// session) is silently dropped (additional-panel-modes "Children read
     /// on expand").
-    TreeNodeExpanded { panel: PanelSide, path: PathBuf, children: Vec<Entry> },
+    TreeNodeExpanded {
+        panel: PanelSide,
+        path: PathBuf,
+        children: Vec<Entry>,
+    },
 
     // F9 menu overlay.
     MenuOpen,
@@ -717,7 +729,10 @@ pub enum Command {
 
     // Drive select (Alt+F1/F2).
     OpenDriveSelect(PanelSide),
-    DriveListReady { target: PanelSide, drives: Vec<char> },
+    DriveListReady {
+        target: PanelSide,
+        drives: Vec<char>,
+    },
     DriveSelectMove(isize),
     DriveSelectConfirm,
     DriveSelectCancel,
@@ -769,20 +784,34 @@ pub enum Command {
     /// superseded — a newer F3/F4, a menu or dialog opened meanwhile — is
     /// discarded instead of pulling them out of what they are doing
     /// (offload-blocking-io design D4).
-    EditorOpened { request: u64, editor: Box<EditorState> },
+    EditorOpened {
+        request: u64,
+        editor: Box<EditorState>,
+    },
     /// Reply to `Effect::OpenEditor`: the file is `size` bytes, at or above
     /// the cap — redirected to the F3 viewer with a notice (builtin-editor
     /// "Large file redirects to the viewer").
-    EditorTooLarge { request: u64, path: PathBuf, size: u64 },
+    EditorTooLarge {
+        request: u64,
+        path: PathBuf,
+        size: u64,
+    },
     /// Reply to `Effect::OpenEditor`: the file is under the cap but is not
     /// UTF-8 text the editor can write back byte-exactly (UTF-16, NUL
     /// bytes, or invalid UTF-8) — redirected to the F3 viewer with a
     /// reason-specific notice, exactly like `EditorTooLarge` (builtin-editor
     /// "Non-UTF-8 file redirects to the viewer"; editor-encoding-safety
     /// design D2).
-    EditorNotEditable { request: u64, path: PathBuf, reason: NotEditableReason },
+    EditorNotEditable {
+        request: u64,
+        path: PathBuf,
+        reason: NotEditableReason,
+    },
     /// Reply to `Effect::OpenEditor` when the file could not be opened.
-    EditorOpenFailed { request: u64, message: String },
+    EditorOpenFailed {
+        request: u64,
+        message: String,
+    },
 
     // Editor keymap, while `UiPhase::Editor` owns focus.
     EditorChar(char),
@@ -819,12 +848,17 @@ pub enum Command {
     /// Reply to `Effect::SaveEditor`: the write succeeded. `then_quit`
     /// echoes back whether this save was requested by the save-on-exit
     /// confirm's "Y", in which case the editor closes once applied.
-    EditorSaved { editor: Box<EditorState>, then_quit: bool },
+    EditorSaved {
+        editor: Box<EditorState>,
+        then_quit: bool,
+    },
     /// Reply to `Effect::SaveEditor`: the write failed — aborts a save-on-
     /// exit quit attempt and surfaces the message inline rather than losing
     /// the buffer (builtin-editor "Modified indicator and save-on-exit
     /// prompt").
-    EditorSaveFailed { message: String },
+    EditorSaveFailed {
+        message: String,
+    },
     /// F10: quit if unmodified, else raise the save-on-exit confirm
     /// (builtin-editor "Quitting with unsaved changes prompts").
     EditorRequestQuit,
@@ -844,19 +878,46 @@ pub enum Command {
     /// slow directory's entries never pour into whatever the panel shows
     /// now (panel-navigation "Superseded directory listings are discarded
     /// and cancelled"; listing-request-guard design D1/D2).
-    ListingChunk { panel: PanelSide, entries: Vec<Entry>, request: u64 },
+    ListingChunk {
+        panel: PanelSide,
+        entries: Vec<Entry>,
+        request: u64,
+    },
     /// `unreadable` is how many entries the reader skipped because their own
     /// metadata could not be read; when non-zero the panel's mini-status
     /// reports the count on completion (panel-navigation "One unreadable
     /// entry does not fail a listing"; link-aware-listing design D6/D7).
-    ListingComplete { panel: PanelSide, total: usize, unreadable: usize, request: u64 },
-    ListingFailed { panel: PanelSide, message: String, request: u64 },
+    ListingComplete {
+        panel: PanelSide,
+        total: usize,
+        unreadable: usize,
+        request: u64,
+    },
+    ListingFailed {
+        panel: PanelSide,
+        message: String,
+        request: u64,
+    },
     JobProgress(ProgressInfo),
     JobConflict(ConflictInfo),
     JobError(ErrorInfo),
-    JobDone { outcome: JobOutcome, source_dir: PathBuf, dest_dir: PathBuf },
-    DriveLabelResolved { target: PanelSide, letter: char, label: Option<String>, generation: u64 },
-    InfoResolved { panel: PanelSide, path: PathBuf, request: u64, values: InfoValues },
+    JobDone {
+        outcome: JobOutcome,
+        source_dir: PathBuf,
+        dest_dir: PathBuf,
+    },
+    DriveLabelResolved {
+        target: PanelSide,
+        letter: char,
+        label: Option<String>,
+        generation: u64,
+    },
+    InfoResolved {
+        panel: PanelSide,
+        path: PathBuf,
+        request: u64,
+        values: InfoValues,
+    },
     /// Reply to `Effect::QueryGitInfo`: either a resolved repository's
     /// branch and per-entry statuses, or `GitInfo::none()` for "outside any
     /// repository" and for a timed-out query (git-info "Background
@@ -872,32 +933,54 @@ pub enum Command {
     /// a timeout is evidence about the repository, not about the panel's
     /// current directory (git-info "Timeout recorded after the panel moved
     /// on"; git-info-timeout-memory design D1).
-    GitInfoResolved { panel: PanelSide, path: PathBuf, request: u64, info: GitInfo, timed_out_root: Option<PathBuf> },
+    GitInfoResolved {
+        panel: PanelSide,
+        path: PathBuf,
+        request: u64,
+        info: GitInfo,
+        timed_out_root: Option<PathBuf>,
+    },
     /// Reply to `Effect::OpenViewer`: the file opened at `file_len` bytes
     /// (viewer: Instant open). `request` echoes the effect's id and is
     /// matched against `State::pending_open` exactly as the editor replies
     /// are (offload-blocking-io design D4).
-    ViewerOpened { request: u64, path: PathBuf, file_len: u64 },
+    ViewerOpened {
+        request: u64,
+        path: PathBuf,
+        file_len: u64,
+    },
     /// Reply to `Effect::OpenViewer`: the file could not be opened or
     /// mapped (§7 error policy — surfaced as an inline error, never a
     /// panic).
-    ViewerOpenFailed { request: u64, message: String },
+    ViewerOpenFailed {
+        request: u64,
+        message: String,
+    },
     /// Reply to `Effect::ProbePath`: what the worker found at the probed
     /// command-line target. Matched against `State::command_probe` by
     /// `request`; a stale or superseded reply changes nothing
     /// (application-shell "The reducer performs no filesystem I/O";
     /// offload-blocking-io design D1).
-    PathProbed { request: u64, kind: ProbeKind },
+    PathProbed {
+        request: u64,
+        kind: ProbeKind,
+    },
     /// Reply to `Effect::RunViewerSearch` (viewer: F7 streaming search).
     /// `request` echoes the id `Effect::RunViewerSearch` was issued with, so
     /// a reply from a search superseded by a since-closed/reopened viewer
     /// session (`ViewerState::search_request`) is recognized as stale and
     /// dropped rather than applied to whatever viewer session happens to be
     /// open when it arrives.
-    ViewerSearchResult { offset: Option<u64>, match_range: Option<(u64, u64)>, request: u64 },
+    ViewerSearchResult {
+        offset: Option<u64>,
+        match_range: Option<(u64, u64)>,
+        request: u64,
+    },
     /// Reply to `Effect::RunExternalEditor` when the editor could not be
     /// spawned (external-editor: Editor spawn errors do not crash the app).
-    ExternalEditorSpawnFailed { message: String },
+    ExternalEditorSpawnFailed {
+        message: String,
+    },
 
     // Ctrl+J fuzzy jump (M5).
     /// Open the dialog (default binding, overridable via `config.toml`).
@@ -919,9 +1002,14 @@ pub enum Command {
     /// walk finds it. `request` is matched against `FindFileState::request`
     /// so a reply from an abandoned/superseded search is dropped (find-file
     /// "Non-blocking search with static progress").
-    FindFileMatch { request: u64, m: FindMatch },
+    FindFileMatch {
+        request: u64,
+        m: FindMatch,
+    },
     /// Reply to `Effect::FindInSubtree`: the walk has finished.
-    FindFileSearchDone { request: u64 },
+    FindFileSearchDone {
+        request: u64,
+    },
     FindFileMove(isize),
     /// Enter on a result: navigate the active panel's current tab in place
     /// and close the dialog (find-file "Navigate to a chosen result").
@@ -1006,7 +1094,10 @@ pub enum Command {
     // (`ToggleInfoMode`, `EnterTreeMode`) since each carries extra
     // bookkeeping (an Info query, a Tree session) this generic command
     // deliberately does not.
-    SetDisplayMode { side: PanelSide, mode: DisplayMode },
+    SetDisplayMode {
+        side: PanelSide,
+        mode: DisplayMode,
+    },
 
     /// Dismiss the startup-warning modal (any key, per the one-shot dialogs'
     /// existing Esc/Enter-dismiss convention) (user-menu "Malformed file
@@ -1036,7 +1127,10 @@ pub enum Command {
     /// reports a failed editor open (file-action-menu "Open with the
     /// associated application": "No association is reported inline";
     /// offload-blocking-io design D7).
-    OpenWithAssociationFailed { side: PanelSide, message: String },
+    OpenWithAssociationFailed {
+        side: PanelSide,
+        message: String,
+    },
 
     // Clipboard export (clipboard-export). Reachable from Ctrl+C/Ctrl+Ins
     // and Ctrl+Shift+Ins over the panels, the Files pull-down's three-item
@@ -1058,7 +1152,11 @@ pub enum Command {
     /// message; `Err(message)` shows `message` verbatim in the error role
     /// (clipboard-export "Clipboard busy retry" — the TUI retries before
     /// giving up, so by the time this arrives the failure is final).
-    ClipboardResult { payload: ClipboardPayload, fell_back_to_paths: bool, result: Result<(), String> },
+    ClipboardResult {
+        payload: ClipboardPayload,
+        fell_back_to_paths: bool,
+        result: Result<(), String>,
+    },
 
     // Mouse (mouse-basics). `input::map_mouse` is the only source of these —
     // raw coordinates and `crossterm::event::KeyModifiers` never reach this
@@ -1070,7 +1168,11 @@ pub enum Command {
     /// toggles selection"). `input::map_mouse` also turns a same-row
     /// double-click into a plain `Command::Enter` instead of this (mouse-
     /// input "Double-click acts as Enter").
-    ClickEntry { side: PanelSide, name: OsString, mods: ClickMods },
+    ClickEntry {
+        side: PanelSide,
+        name: OsString,
+        mods: ClickMods,
+    },
     /// A left-click on a panel's title or blank body area: focuses `side`
     /// without moving its cursor (mouse-input "Click focuses and places the
     /// cursor").
@@ -1080,7 +1182,10 @@ pub enum Command {
     /// independent of which panel is active (mouse-input "Wheel moves the
     /// cursor of the panel under the pointer"). The viewer/editor have their
     /// own wheel handling that never reaches this command (design D6).
-    ScrollPanel { side: PanelSide, delta: isize },
+    ScrollPanel {
+        side: PanelSide,
+        delta: isize,
+    },
     /// A left-click on a function-key-bar slot (1..=10, `10` for F10):
     /// dispatches exactly what that F-key would (mouse-input "Key bar, menu
     /// bar, pull-down items, and dialog buttons are clickable").
@@ -1101,7 +1206,10 @@ pub enum Command {
     /// until the directory-target support of `file-action-menu` "Directory
     /// targets and selection-scoped invocation" lands (mouse-basics section
     /// 3).
-    OpenActionMenuAt { side: PanelSide, name: OsString },
+    OpenActionMenuAt {
+        side: PanelSide,
+        name: OsString,
+    },
 
     // Mouse drag-and-drop (mouse-panel-drag; design D2/D4). `op` on each of
     // these is the verb the drag's button/modifiers propose right now,
@@ -1117,17 +1225,26 @@ pub enum Command {
     /// else `name` alone, never `..` — and its initial proposed verb
     /// (mouse-drag "Drag lifecycle"). A no-op if `name` no longer names a
     /// selectable entry.
-    DragBegin { side: PanelSide, name: OsString, op: JobKind },
+    DragBegin {
+        side: PanelSide,
+        name: OsString,
+        op: JobKind,
+    },
     /// The drag's pointer resolved to a new de-duplicated position (the
     /// TUI's `MouseTracker` owns de-duplication, so core only sees actual
     /// changes — design D4). A no-op if no drag is in progress.
-    DragOver { op: JobKind, target: Option<DropTarget> },
+    DragOver {
+        op: JobKind,
+        target: Option<DropTarget>,
+    },
     /// The button released. Opens the drop-initiated destination dialog if
     /// the drag's target is (still) valid and the source panel still shows
     /// the captured directory; otherwise ends the drag with no effect
     /// (mouse-drag "Release on an invalid spot", "Robust against listing
     /// changes"). A no-op if no drag is in progress.
-    DragDrop { op: JobKind },
+    DragDrop {
+        op: JobKind,
+    },
     /// Esc mid-drag: ends the drag with no effect (mouse-drag "Esc
     /// cancels").
     DragCancel,
@@ -1169,7 +1286,11 @@ pub enum Effect {
     /// the panel's `PanelState::listing_request` (listing-request-guard
     /// design D1). The TUI registers a cancel flag under `request` so a
     /// later `CancelRequest(request)` can stop the read.
-    StartListing { panel: PanelSide, path: PathBuf, request: u64 },
+    StartListing {
+        panel: PanelSide,
+        path: PathBuf,
+        request: u64,
+    },
     /// Stop the background work issued under this request id, if it is
     /// still running: a directory listing (`StartListing`), a find-file
     /// subtree walk (`FindInSubtree`), or a viewer F7 search
@@ -1204,7 +1325,11 @@ pub enum Effect {
     /// so a slow handler never freezes the panels; a launch failure comes
     /// back as `Command::OpenWithAssociationFailed` for `side`, the panel
     /// the menu acted on (offload-blocking-io design D7).
-    OpenWithAssociation { side: PanelSide, path: PathBuf, cwd: PathBuf },
+    OpenWithAssociation {
+        side: PanelSide,
+        path: PathBuf,
+        cwd: PathBuf,
+    },
     /// Check what exists at `path` — the resolved target of a command-line
     /// `cd`/`del`/`rmdir` that is not already listed in the panel — on a
     /// worker thread, through the `\\?\` long-path abstraction, and reply
@@ -1212,7 +1337,10 @@ pub enum Effect {
     /// the filesystem itself, so an unreachable share blocks only the worker
     /// (application-shell "The reducer performs no filesystem I/O";
     /// offload-blocking-io design D1/D2).
-    ProbePath { request: u64, path: PathBuf },
+    ProbePath {
+        request: u64,
+        path: PathBuf,
+    },
     /// Leave the alternate screen to expose the host terminal's scrollback
     /// until any key is pressed.
     ShowScrollback,
@@ -1234,11 +1362,19 @@ pub enum Effect {
     /// Fetch one drive's volume label on a worker thread. `generation`
     /// travels with the result so a reply from a since-superseded dialog
     /// session can be told apart from the current one.
-    FetchDriveLabel { target: PanelSide, letter: char, generation: u64 },
+    FetchDriveLabel {
+        target: PanelSide,
+        letter: char,
+        generation: u64,
+    },
     /// Gather the Info panel's async values on a worker thread. `request`
     /// travels with the result so a reply from a since-superseded query can
     /// be told apart from the current one.
-    QueryInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    QueryInfo {
+        panel: PanelSide,
+        path: PathBuf,
+        request: u64,
+    },
     /// Run `git_info::query` for `path` on a dedicated worker thread —
     /// never the shared Info worker, since a slow status call on one panel
     /// must not head-of-line-block the other (design D3) — and report the
@@ -1246,13 +1382,20 @@ pub enum Effect {
     /// the result so a stale or timed-out reply can be told apart from the
     /// query that's still current (git-info "Background repository
     /// detection", "Pathspec-scoped status queries").
-    QueryGitInfo { panel: PanelSide, path: PathBuf, request: u64 },
+    QueryGitInfo {
+        panel: PanelSide,
+        path: PathBuf,
+        request: u64,
+    },
     /// Read `path`'s immediate child directories for Tree-mode expansion
     /// (`listing::list_child_dirs`) on a worker thread, reporting them back
     /// via `Command::TreeNodeExpanded` — one directory's worth of I/O per
     /// call, never a recursive scan (additional-panel-modes "Children read
     /// on expand"; design D7).
-    ExpandTreeNode { panel: PanelSide, path: PathBuf },
+    ExpandTreeNode {
+        panel: PanelSide,
+        path: PathBuf,
+    },
     /// Open `path` for the F3 viewer on a worker thread and report back its
     /// length via `Command::ViewerOpened`, or the failure via
     /// `Command::ViewerOpenFailed`, each echoing `request`. The open is O(1)
@@ -1261,13 +1404,21 @@ pub enum Effect {
     /// panel shows `Opening <name>…` meanwhile (viewer: Instant open;
     /// application-shell "Slow storage never blocks the event loop";
     /// offload-blocking-io design D4/D5).
-    OpenViewer { request: u64, path: PathBuf },
+    OpenViewer {
+        request: u64,
+        path: PathBuf,
+    },
     /// Run the F7 streaming search from `start_offset` for `pattern`
     /// against `path`, reporting the match back via
     /// `Command::ViewerSearchResult` (viewer: F7 streaming search).
     /// `request` must be echoed back unchanged in the `ViewerSearchResult`
     /// reply so a stale reply can be told apart from the current search.
-    RunViewerSearch { path: PathBuf, start_offset: u64, pattern: Vec<u8>, request: u64 },
+    RunViewerSearch {
+        path: PathBuf,
+        start_offset: u64,
+        pattern: Vec<u8>,
+        request: u64,
+    },
     /// Suspend the TUI, launch the external editor per `EditorInvocation`,
     /// wait for it to exit, then restore and re-read the panel side that
     /// owned the cursor entry — the same suspend/restore seam
@@ -1281,7 +1432,10 @@ pub enum Effect {
     /// `Opening <name>…` while the read is outstanding (application-shell
     /// "Slow storage never blocks the event loop"; offload-blocking-io
     /// design D4).
-    OpenEditor { request: u64, path: PathBuf },
+    OpenEditor {
+        request: u64,
+        path: PathBuf,
+    },
     /// Write `editor`'s buffer to disk via `EditorState::save` on a worker
     /// thread, reporting the post-save state back via `Command::EditorSaved`
     /// (or the failure via `Command::EditorSaveFailed`). `then_quit` travels
@@ -1290,7 +1444,10 @@ pub enum Effect {
     /// one save is ever in flight — `EditorState::save_pending` gates the
     /// editor until the reply — so no request id is needed (offload-
     /// blocking-io design D6).
-    SaveEditor { editor: Box<EditorState>, then_quit: bool },
+    SaveEditor {
+        editor: Box<EditorState>,
+        then_quit: bool,
+    },
     /// Walk `root`'s subtree for entries whose name contains `pattern` on a
     /// worker thread, streaming each match back via `Command::FindFileMatch`
     /// as it's found and finishing with `Command::FindFileSearchDone` —
@@ -1298,7 +1455,11 @@ pub enum Effect {
     /// with static progress"). `request` travels with every reply so a
     /// stale/abandoned search's results are dropped once the dialog has
     /// moved on.
-    FindInSubtree { root: PathBuf, pattern: String, request: u64 },
+    FindInSubtree {
+        root: PathBuf,
+        pattern: String,
+        request: u64,
+    },
     /// Write `payload` to the OS clipboard via the TUI's `Clipboard` trait
     /// and report the outcome back via `Command::ClipboardResult`. Executed
     /// synchronously, like `EnumerateDrives` — `OpenClipboard` binds to the
@@ -1568,7 +1729,9 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 effects.push(request_open(&mut state, side, PendingOpenKind::Viewer, path));
                 state.panel_mut(side).last_error = Some(match reason {
                     NotEditableReason::Utf16 => format!("{name} is UTF-16 text — the editor only edits UTF-8; opened in the viewer"),
-                    NotEditableReason::Binary => format!("{name} looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer"),
+                    NotEditableReason::Binary => {
+                        format!("{name} looks binary (contains NUL bytes) — the editor only edits UTF-8 text; opened in the viewer")
+                    }
                     NotEditableReason::NotUtf8 => format!("{name} is not valid UTF-8 — the editor only edits UTF-8 text; opened in the viewer"),
                 });
             }
@@ -1985,8 +2148,7 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
                 // Both borrows below are immutable — computed fully before
                 // the mutable one that follows — so there's no conflict with
                 // `state.drag.as_mut()` afterwards.
-                let valid_target =
-                    state.drag.as_ref().and_then(|drag| target.as_ref().filter(|t| valid_drop_target(&state, drag, t)).cloned());
+                let valid_target = state.drag.as_ref().and_then(|drag| target.as_ref().filter(|t| valid_drop_target(&state, drag, t)).cloned());
                 if let Some(drag) = state.drag.as_mut() {
                     drag.op = op;
                     drag.target = valid_target;
@@ -2077,11 +2239,7 @@ fn recall_history(state: &mut State, delta: isize) {
 fn paste_cursor_entry(state: &mut State, full_path: bool) {
     let panel = state.active_panel();
     let Some(entry) = panel.selected() else { return };
-    let text = if full_path {
-        panel.cwd.join(&entry.name).display().to_string()
-    } else {
-        entry.name.to_string_lossy().into_owned()
-    };
+    let text = if full_path { panel.cwd.join(&entry.name).display().to_string() } else { entry.name.to_string_lossy().into_owned() };
     state.command_line.end();
     if !state.command_line.is_empty() && !state.command_line.text().ends_with(' ') {
         state.command_line.insert(' ');
@@ -2298,7 +2456,8 @@ fn complete_delete_builtin(state: &mut State, side: PanelSide, path: PathBuf, wa
     match kind {
         ProbeKind::Dir | ProbeKind::File if (kind == ProbeKind::Dir) == want_dir => {
             let is_dir = kind == ProbeKind::Dir;
-            let original_name = listed_name(state, side, &path).unwrap_or_else(|| path.file_name().map(OsString::from).unwrap_or_else(|| OsString::from(path.display().to_string())));
+            let original_name = listed_name(state, side, &path)
+                .unwrap_or_else(|| path.file_name().map(OsString::from).unwrap_or_else(|| OsString::from(path.display().to_string())));
             enter_delete_confirm_for_sources(state, vec![SourceItem { original_name, path, is_dir }]);
             vec![]
         }
@@ -3235,8 +3394,14 @@ fn enter_file_op_setup(state: &mut State, kind: JobKind) {
     if kind == JobKind::Mkdir {
         let side = state.active;
         let source_dir = state.panel(side).cwd.clone();
-        state.phase =
-            UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources: vec![], source_dir, input: LineEdit::default(), buttons: None, hidden_by_filter: 0 });
+        state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+            kind,
+            sources: vec![],
+            source_dir,
+            input: LineEdit::default(),
+            buttons: None,
+            hidden_by_filter: 0,
+        });
         return;
     }
     let sources = active_selection_sources(state);
@@ -3278,7 +3443,8 @@ fn enter_file_op_setup_for_sources(
     // A pre-filled destination opens with the caret at the end of the text,
     // so Enter-to-accept is unchanged and editing starts from the tail
     // (text-field-editing "Pre-filled field accepts unchanged with Enter").
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: LineEdit::from(prefill), buttons, hidden_by_filter });
+    state.phase =
+        UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input: LineEdit::from(prefill), buttons, hidden_by_filter });
 }
 
 /// F8: enter the delete-confirmation dialog. A no-op when there is nothing
@@ -3310,7 +3476,8 @@ fn enter_delete_confirm_for_sources(state: &mut State, sources: Vec<SourceItem>)
     let listed_links: HashSet<&OsString> = panel.entries.iter().filter(|e| e.link).map(|e| &e.name).collect();
     let is_listed_link = |s: &SourceItem| s.path.parent() == Some(source_dir.as_path()) && listed_links.contains(&s.original_name);
     let needs_second_confirm = sources.iter().any(|s| s.is_dir && !is_listed_link(s));
-    state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false, hidden_by_filter });
+    state.phase =
+        UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: false, hidden_by_filter });
 }
 
 /// The file-action menu's Rename: enter the in-place rename input dialog,
@@ -3721,14 +3888,22 @@ fn handle_file_op_setup(setup: FileOpSetup, cmd: Command, effects: &mut Vec<Effe
             // The drop dialog's `[ Copy ]`/`[ Move ]` buttons: confirm with
             // an explicit verb instead, overriding `kind` (operation-dialogs
             // "Switching the verb in the dialog").
-            Command::FileOpConfirmAs(explicit_kind) => confirm_destination_input(explicit_kind, sources, source_dir, input, buttons, hidden_by_filter, effects),
+            Command::FileOpConfirmAs(explicit_kind) => {
+                confirm_destination_input(explicit_kind, sources, source_dir, input, buttons, hidden_by_filter, effects)
+            }
             _ => UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind, sources, source_dir, input, buttons, hidden_by_filter }),
         },
         FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once, hidden_by_filter } => match cmd {
             Command::FileOpCancel => UiPhase::Panels,
             Command::FileOpConfirm => {
                 if needs_second_confirm && !confirmed_once {
-                    UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, source_dir, needs_second_confirm, confirmed_once: true, hidden_by_filter })
+                    UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+                        sources,
+                        source_dir,
+                        needs_second_confirm,
+                        confirmed_once: true,
+                        hidden_by_filter,
+                    })
                 } else {
                     let job =
                         Job { kind: JobKind::Delete, sources, source_dir: source_dir.clone(), dest_dir: source_dir.clone(), new_dir_name: None };
@@ -3844,11 +4019,9 @@ fn handle_file_op_running(
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
         },
         Command::FileOpCancel => match dialog {
-            RunningDialog::Conflict { kind, info, progress, rename_input: Some(_) } => UiPhase::FileOpRunning {
-                source_dir,
-                dest_dir,
-                dialog: RunningDialog::Conflict { kind, info, progress, rename_input: None },
-            },
+            RunningDialog::Conflict { kind, info, progress, rename_input: Some(_) } => {
+                UiPhase::FileOpRunning { source_dir, dest_dir, dialog: RunningDialog::Conflict { kind, info, progress, rename_input: None } }
+            }
             other => UiPhase::FileOpRunning { source_dir, dest_dir, dialog: other },
         },
         Command::FileOpErrorChoice(choice) => match dialog {
@@ -4017,10 +4190,7 @@ fn handle_tree_enter(state: &mut State, side: PanelSide) -> Vec<Effect> {
 // ---------------------------------------------------------------------
 
 fn is_fuzzy_jump_command(cmd: &Command) -> bool {
-    matches!(
-        cmd,
-        Command::TextEdit(_) | Command::RequestPaste | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel
-    )
+    matches!(cmd, Command::TextEdit(_) | Command::RequestPaste | Command::FuzzyJumpMove(_) | Command::FuzzyJumpConfirm | Command::FuzzyJumpCancel)
 }
 
 /// Drive the fuzzy-jump dialog (gated in [`update`] by `state.fuzzy_jump`).
@@ -4245,10 +4415,7 @@ fn handle_history_dialog(state: &mut State, cmd: Command) -> Vec<Effect> {
 /// Ctrl+U during a mouse drag is ignored (a menu can never be open
 /// mid-drag, so the guard lives here rather than in the menu path).
 fn handle_swap_panels(state: &mut State) -> Vec<Effect> {
-    if state.drag.is_some()
-        || state.left.progress.is_streaming()
-        || state.right.progress.is_streaming()
-    {
+    if state.drag.is_some() || state.left.progress.is_streaming() || state.right.progress.is_streaming() {
         return vec![];
     }
     std::mem::swap(&mut state.left, &mut state.right);

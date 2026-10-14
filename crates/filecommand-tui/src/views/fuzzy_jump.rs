@@ -19,7 +19,15 @@ const MAX_LIST_ROWS: usize = 10;
 /// + separator + bottom frame.
 const CHROME_ROWS: u16 = 4;
 
-pub fn render_fuzzy_jump(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FuzzyJumpState, history: &[FrecencyEntry], now_ms: u64) -> Option<(u16, u16)> {
+pub fn render_fuzzy_jump(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &FuzzyJumpState,
+    history: &[FrecencyEntry],
+    now_ms: u64,
+) -> Option<(u16, u16)> {
     let body_style = role_style(theme, Role::DialogPrimary, depth);
     let input_style = role_style(theme, Role::DialogInput, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);

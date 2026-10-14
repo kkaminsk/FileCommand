@@ -104,11 +104,20 @@ fn run_mkdir(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink) {
 // ---------------------------------------------------------------------
 
 enum DeleteItem {
-    File { path: PathBuf, size: u64, readonly: bool },
+    File {
+        path: PathBuf,
+        size: u64,
+        readonly: bool,
+    },
     /// A reparse point (symlink/junction): removing it deletes the link,
     /// never the target's contents.
-    ReparseLeaf { path: PathBuf, is_dir: bool },
-    Dir { path: PathBuf },
+    ReparseLeaf {
+        path: PathBuf,
+        is_dir: bool,
+    },
+    Dir {
+        path: PathBuf,
+    },
 }
 
 fn walk_delete(fs: &dyn FileSystem, abs: &Path, out: &mut Vec<DeleteItem>, skipped: &mut Vec<SkippedItem>) {
@@ -306,18 +315,10 @@ fn walk_copy(fs: &dyn FileSystem, abs: &Path, rel: &Path, enclosing_link: Option
     // Reparse points duplicate their target's content by default: resolve
     // whether the target is a directory or a file via the *following*
     // metadata query.
-    let is_dir_like = if is_link {
-        fs.metadata_follow(abs).map(|m| m.is_dir).unwrap_or(false)
-    } else {
-        md.is_dir
-    };
+    let is_dir_like = if is_link { fs.metadata_follow(abs).map(|m| m.is_dir).unwrap_or(false) } else { md.is_dir };
 
     if !is_dir_like {
-        let size = if is_link {
-            fs.metadata_follow(abs).map(|m| m.size).unwrap_or(md.size)
-        } else {
-            md.size
-        };
+        let size = if is_link { fs.metadata_follow(abs).map(|m| m.size).unwrap_or(md.size) } else { md.size };
         let removal = match (under_link, is_link) {
             (true, _) => SourceRemoval::Keep,
             (false, true) => SourceRemoval::RemoveLink { is_dir: md.is_dir },
@@ -481,7 +482,13 @@ fn remove_partial(fs: &dyn FileSystem, temp: &Path) {
 /// missing streams are not reported one by one: the file is counted in
 /// `streams_not_copied` instead, so the job reports one aggregated warning
 /// rather than one per file.
-fn record_unrestored(dst: &Path, unrestored: Vec<Unrestored>, streams_supported: bool, streams_not_copied: &mut usize, warnings: &mut Vec<SkippedItem>) {
+fn record_unrestored(
+    dst: &Path,
+    unrestored: Vec<Unrestored>,
+    streams_supported: bool,
+    streams_not_copied: &mut usize,
+    warnings: &mut Vec<SkippedItem>,
+) {
     let mut streams_missing = false;
     for item in unrestored {
         match item.what {
@@ -668,7 +675,19 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
 
             if do_copy {
                 let baseline = progress.bytes_done;
-                match copy_one_file(fs, &planned.src_abs, &final_target, &copy_opts, &mut error_policy, sink, &mut progress, baseline, streams_supported, &mut streams_not_copied, &mut skipped) {
+                match copy_one_file(
+                    fs,
+                    &planned.src_abs,
+                    &final_target,
+                    &copy_opts,
+                    &mut error_policy,
+                    sink,
+                    &mut progress,
+                    baseline,
+                    streams_supported,
+                    &mut streams_not_copied,
+                    &mut skipped,
+                ) {
                     CopyOneResult::Done(bytes) => {
                         progress.files_done += 1;
                         progress.bytes_done = baseline + bytes;
@@ -691,7 +710,10 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                                     match outcome {
                                         RetryOutcome::Done => {}
                                         RetryOutcome::Skip(reason) => {
-                                            skipped.push(SkippedItem::skipped(src.clone(), format!("copied, but the source could not be removed: {reason}")));
+                                            skipped.push(SkippedItem::skipped(
+                                                src.clone(),
+                                                format!("copied, but the source could not be removed: {reason}"),
+                                            ));
                                         }
                                         RetryOutcome::Abort => {
                                             cancelled = true;
@@ -704,7 +726,10 @@ fn run_copy_or_move(job: &Job, fs: &dyn FileSystem, sink: &mut dyn JobSink, is_m
                                 // rather than ignored (design D3).
                                 SourceRemoval::RemoveLink { is_dir } => {
                                     if let Err(e) = remove_reparse_leaf(fs, &planned.src_abs, is_dir) {
-                                        skipped.push(SkippedItem::skipped(planned.src_abs.clone(), format!("copied, but the link could not be removed: {e}")));
+                                        skipped.push(SkippedItem::skipped(
+                                            planned.src_abs.clone(),
+                                            format!("copied, but the link could not be removed: {e}"),
+                                        ));
                                     }
                                 }
                                 // Reached through a link: never selected, never
@@ -1268,7 +1293,11 @@ mod tests {
         assert!(matches!(&sink.outcome, Some(JobOutcome::Completed { skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
         assert_shared_target_intact(&fake);
         assert_eq!(fake.metadata(Path::new("/v2/backup/proj/file.txt")).unwrap().size, 3);
-        assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).unwrap().size, 10, "the destination receives the link target's content");
+        assert_eq!(
+            fake.metadata(Path::new("/v2/backup/proj/shared/lib.dll")).unwrap().size,
+            10,
+            "the destination receives the link target's content"
+        );
         assert_eq!(fake.metadata(Path::new("/v2/backup/proj/shared/x86/a.dll")).unwrap().size, 20);
         assert!(fake.metadata(Path::new("/v1/work/proj/shared")).is_err(), "the junction itself is removed");
         assert!(fake.metadata(Path::new("/v1/work/proj")).is_err(), "the source tree is gone");
@@ -1466,13 +1495,8 @@ mod tests {
     }
 
     fn assert_no_partials(fake: &FakeFs, dir: &str) {
-        let leftovers: Vec<OsString> = fake
-            .read_dir(Path::new(dir))
-            .unwrap()
-            .into_iter()
-            .map(|e| e.name)
-            .filter(|n| n.to_string_lossy().contains(PARTIAL_SUFFIX))
-            .collect();
+        let leftovers: Vec<OsString> =
+            fake.read_dir(Path::new(dir)).unwrap().into_iter().map(|e| e.name).filter(|n| n.to_string_lossy().contains(PARTIAL_SUFFIX)).collect();
         assert!(leftovers.is_empty(), "no temporary partial file may remain in {dir}: {leftovers:?}");
     }
 
@@ -1892,7 +1916,11 @@ mod tests {
         run_job(&job, &fake, &mut sink);
 
         assert_eq!(sink.conflicts_seen, 1, "the second file's conflict was asked once");
-        assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "cancelled with no skipped item for the conflicting target: {:?}", sink.outcome);
+        assert!(
+            matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()),
+            "cancelled with no skipped item for the conflicting target: {:?}",
+            sink.outcome
+        );
         assert_eq!(fake.metadata(Path::new("/dst/a.txt")).unwrap().size, 1, "the first file was copied before the conflict");
         assert_eq!(fake.metadata(Path::new("/dst/b.txt")).unwrap().size, 99, "the conflicting target is untouched");
         assert!(fake.metadata(Path::new("/dst/c.txt")).is_err(), "nothing after the conflict is processed");
@@ -1911,7 +1939,10 @@ mod tests {
         assert!(matches!(sink.outcome, Some(JobOutcome::Cancelled { ref skipped }) if skipped.is_empty()), "{:?}", sink.outcome);
         assert!(fake.metadata(Path::new("/src/a.txt")).is_err(), "the first file was moved before the conflict");
         assert_eq!(fake.metadata(Path::new("/dst/b.txt")).unwrap().size, 99, "the conflicting target is untouched");
-        assert!(fake.metadata(Path::new("/src/b.txt")).is_ok() && fake.metadata(Path::new("/src/c.txt")).is_ok(), "the conflicting source and the third file stay put");
+        assert!(
+            fake.metadata(Path::new("/src/b.txt")).is_ok() && fake.metadata(Path::new("/src/c.txt")).is_ok(),
+            "the conflicting source and the third file stay put"
+        );
         assert!(fake.metadata(Path::new("/dst/c.txt")).is_err());
     }
 
@@ -2076,39 +2107,20 @@ mod tests {
     fn assert_untouched(fake: &FakeFs, path: &Path, modified: SystemTime) {
         let md = fake.metadata(path).unwrap();
         assert_eq!(md.size, 2048, "content size must survive");
-        assert_eq!(
-            md.modified,
-            Some(modified),
-            "last-write time must survive (a self-copy would have replaced the node)"
-        );
-        assert_eq!(
-            fake.list_streams(path).unwrap(),
-            vec![OsString::from("Zone.Identifier")],
-            "the alternate stream must survive"
-        );
+        assert_eq!(md.modified, Some(modified), "last-write time must survive (a self-copy would have replaced the node)");
+        assert_eq!(fake.list_streams(path).unwrap(), vec![OsString::from("Zone.Identifier")], "the alternate stream must survive");
     }
 
     fn assert_skipped_same_file(sink: &RecordingSink, src: &str) {
         match &sink.outcome {
             Some(JobOutcome::Completed { skipped }) => {
-                assert_eq!(
-                    skipped.len(),
-                    1,
-                    "the same-file item is reported as skipped: {skipped:?}"
-                );
+                assert_eq!(skipped.len(), 1, "the same-file item is reported as skipped: {skipped:?}");
                 assert_eq!(skipped[0].path, PathBuf::from(src));
-                assert!(
-                    skipped[0].reason.contains("same file"),
-                    "the reason should name the self-copy: {}",
-                    skipped[0].reason
-                );
+                assert!(skipped[0].reason.contains("same file"), "the reason should name the self-copy: {}", skipped[0].reason);
             }
             other => panic!("expected Completed with one skipped item, got {other:?}"),
         }
-        assert_eq!(
-            sink.conflicts_seen, 0,
-            "a same-file copy must not raise the overwrite-conflict dialog"
-        );
+        assert_eq!(sink.conflicts_seen, 0, "a same-file copy must not raise the overwrite-conflict dialog");
     }
 
     #[test]
@@ -2136,12 +2148,7 @@ mod tests {
         let fake = FakeFs::new();
         fake.add_dir(Path::new("/work"));
         let modified = self_copy_fixture(&fake, Path::new("/work/report.txt"));
-        fake.add_reparse_point(
-            Path::new("/alias"),
-            true,
-            Path::new("/work"),
-            super::super::fs::ReparseKind::Junction,
-        );
+        fake.add_reparse_point(Path::new("/alias"), true, Path::new("/work"), super::super::fs::ReparseKind::Junction);
 
         let job = Job {
             kind: JobKind::Copy,
@@ -2166,12 +2173,7 @@ mod tests {
         fake.set_volume(Path::new("/v2"), 2);
         fake.add_dir(Path::new("/v1/work"));
         let modified = self_copy_fixture(&fake, Path::new("/v1/work/report.txt"));
-        fake.add_reparse_point(
-            Path::new("/v2/alias"),
-            true,
-            Path::new("/v1/work"),
-            super::super::fs::ReparseKind::Junction,
-        );
+        fake.add_reparse_point(Path::new("/v2/alias"), true, Path::new("/v1/work"), super::super::fs::ReparseKind::Junction);
 
         // Different volume tags make `same_volume` answer false, so the move
         // takes the copy-then-delete path rather than the rename path.
@@ -2211,13 +2213,7 @@ mod tests {
         fn create_dir(&self, path: &Path) -> io::Result<()> {
             self.0.create_dir(path)
         }
-        fn copy_file(
-            &self,
-            from: &Path,
-            to: &Path,
-            opts: &CopyOptions,
-            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<CopyReport> {
+        fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
             self.0.copy_file(from, to, opts, on_progress)
         }
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {

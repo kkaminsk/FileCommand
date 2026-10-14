@@ -78,11 +78,7 @@ pub fn paths_text(items: &[PathBuf]) -> String {
 /// The Names payload's text: one file name per line, no trailing separator
 /// after the last (clipboard-export "Clipboard payloads and scope").
 pub fn names_text(items: &[PathBuf]) -> String {
-    items
-        .iter()
-        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
+    items.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(windows)]

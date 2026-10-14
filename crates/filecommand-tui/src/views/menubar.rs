@@ -336,11 +336,7 @@ mod tests {
     fn separator_rows_are_drawn_with_the_horizontal_rule_glyph() {
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 24);
         // FILES_MENU puts a separator after "Delete" (and two more below).
-        assert!(
-            rows.iter().any(|r| r.contains('\u{251C}') && r.contains('\u{2524}')),
-            "expected a `├──┤` separator row in:\n{}",
-            rows.join("\n")
-        );
+        assert!(rows.iter().any(|r| r.contains('\u{251C}') && r.contains('\u{2524}')), "expected a `├──┤` separator row in:\n{}", rows.join("\n"));
     }
 
     #[test]

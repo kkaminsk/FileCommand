@@ -280,8 +280,7 @@ pub fn literal_pathspec(rel: &Path) -> String {
 /// shows, or `None` for a clean/ignored/current entry (git-info "Clean
 /// entry has blank marker").
 fn classify(status: Status) -> Option<FileStatus> {
-    let working_tree_dirty =
-        status.intersects(Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED | Status::WT_TYPECHANGE);
+    let working_tree_dirty = status.intersects(Status::WT_MODIFIED | Status::WT_DELETED | Status::WT_RENAMED | Status::WT_TYPECHANGE);
     let staged =
         status.intersects(Status::INDEX_NEW | Status::INDEX_MODIFIED | Status::INDEX_DELETED | Status::INDEX_RENAMED | Status::INDEX_TYPECHANGE);
     let untracked = status.contains(Status::WT_NEW);

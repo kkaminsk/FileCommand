@@ -22,8 +22,11 @@ const BOX_INNER_W: usize = FIELD_WIDTH + 4;
 /// each represents — `None` for `[ Cancel ]`, which is never the focused
 /// button (only `[ Copy ]`/`[ Move ]` alternate focus, per the verb the drag
 /// proposed — mouse-drag design D1/D2).
-const DROP_BUTTONS: [(&str, Option<JobKind>, ButtonId); 3] =
-    [("[ Copy ]", Some(JobKind::Copy), ButtonId::DropDialogCopy), ("[ Move ]", Some(JobKind::Move), ButtonId::DropDialogMove), ("[ Cancel ]", None, ButtonId::DropDialogCancel)];
+const DROP_BUTTONS: [(&str, Option<JobKind>, ButtonId); 3] = [
+    ("[ Copy ]", Some(JobKind::Copy), ButtonId::DropDialogCopy),
+    ("[ Move ]", Some(JobKind::Move), ButtonId::DropDialogMove),
+    ("[ Cancel ]", None, ButtonId::DropDialogCancel),
+];
 
 /// The gap, in display columns, between adjacent button labels.
 const BUTTON_GAP: usize = 2;
@@ -93,7 +96,17 @@ pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, dep
                 Some(db) => drop_dialog_title(db.focused, sources.len()),
                 None => title_for(*kind).to_string(),
             };
-            render_input_box(buf, area, theme, depth, &title, prompt_for(*kind), input, *buttons, hidden_by_filter_disclosure(*hidden_by_filter, sources.len()))
+            render_input_box(
+                buf,
+                area,
+                theme,
+                depth,
+                &title,
+                prompt_for(*kind),
+                input,
+                *buttons,
+                hidden_by_filter_disclosure(*hidden_by_filter, sources.len()),
+            )
         }
         // The file-action menu's in-place Rename: same bracket-and-dots
         // input box, pre-filled with the target's current name (design D2;
@@ -117,7 +130,17 @@ pub fn render_destination_input(buf: &mut Buffer, area: Rect, theme: &Theme, dep
 /// are all unchanged (filter-selection-safety design D3; selection
 /// "Operations disclose selected entries hidden by the quick filter").
 #[allow(clippy::too_many_arguments)]
-fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, title: &str, prompt: &str, input: &LineEdit, buttons: Option<DropButtons>, disclosure: Option<String>) -> Option<(u16, u16)> {
+fn render_input_box(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    title: &str,
+    prompt: &str,
+    input: &LineEdit,
+    buttons: Option<DropButtons>,
+    disclosure: Option<String>,
+) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
 
@@ -172,7 +195,16 @@ fn render_input_box(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDep
 /// `Cancel` always render in `Role::ButtonNormal` (operation-dialogs
 /// "Drop-initiated destination dialog"; mouse-drag design D1/D2).
 #[allow(clippy::too_many_arguments)]
-fn render_button_row(buf: &mut Buffer, x: u16, y: u16, inner_w: usize, theme: &Theme, depth: ColorDepth, focused: JobKind, body: ratatui::style::Style) {
+fn render_button_row(
+    buf: &mut Buffer,
+    x: u16,
+    y: u16,
+    inner_w: usize,
+    theme: &Theme,
+    depth: ColorDepth,
+    focused: JobKind,
+    body: ratatui::style::Style,
+) {
     let normal = role_style(theme, Role::ButtonNormal, depth);
     let focused_style = role_style(theme, Role::ButtonFocused, depth);
     buf.set_string(x, y, "\u{2551}", body);
@@ -231,7 +263,13 @@ mod tests {
     }
 
     fn source_items(n: usize) -> Vec<SourceItem> {
-        (0..n).map(|i| SourceItem { original_name: OsString::from(format!("f{i}.txt")), path: PathBuf::from(format!(r"C:\left\f{i}.txt")), is_dir: false }).collect()
+        (0..n)
+            .map(|i| SourceItem {
+                original_name: OsString::from(format!("f{i}.txt")),
+                path: PathBuf::from(format!(r"C:\left\f{i}.txt")),
+                is_dir: false,
+            })
+            .collect()
     }
 
     fn area() -> Rect {
@@ -328,7 +366,12 @@ mod tests {
     #[test]
     fn rename_input_never_gets_a_button_row() {
         let theme = Theme::classic();
-        let setup = FileOpSetup::RenameInput { source_dir: PathBuf::from(r"C:\left"), original_name: OsString::from("a.txt"), is_dir: false, input: LineEdit::from("a.txt") };
+        let setup = FileOpSetup::RenameInput {
+            source_dir: PathBuf::from(r"C:\left"),
+            original_name: OsString::from("a.txt"),
+            is_dir: false,
+            input: LineEdit::from("a.txt"),
+        };
         let mut buf = Buffer::empty(area());
         render_destination_input(&mut buf, area(), &theme, ColorDepth::Ansi16, &setup);
         let text = buffer_to_text(&buf, area());

@@ -49,7 +49,8 @@ fn sample_hitmap() -> HitMap {
     };
     hm.keybar = vec![(Rect { x: 10, y: 20, width: 5, height: 1 }, 5)];
     hm.menu_titles = vec![(Rect { x: 5, y: 0, width: 5, height: 1 }, MenuId::Files)];
-    hm.dialog_buttons = vec![(Rect { x: 1, y: 1, width: 4, height: 1 }, ButtonId::QuitYes), (Rect { x: 6, y: 1, width: 3, height: 1 }, ButtonId::QuitNo)];
+    hm.dialog_buttons =
+        vec![(Rect { x: 1, y: 1, width: 4, height: 1 }, ButtonId::QuitYes), (Rect { x: 6, y: 1, width: 3, height: 1 }, ButtonId::QuitNo)];
     hm
 }
 

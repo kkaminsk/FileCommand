@@ -38,8 +38,22 @@ fn fixed_identity() -> [String; 4] {
 fn sample_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry::new(OsString::from("Documents"), EntryKind::Directory, 0, Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }), false, false),
-        Entry::new(OsString::from("notes.txt"), EntryKind::File, 2048, Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }), false, false),
+        Entry::new(
+            OsString::from("Documents"),
+            EntryKind::Directory,
+            0,
+            Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }),
+            false,
+            false,
+        ),
+        Entry::new(
+            OsString::from("notes.txt"),
+            EntryKind::File,
+            2048,
+            Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }),
+            false,
+            false,
+        ),
     ]
 }
 

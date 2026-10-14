@@ -31,16 +31,33 @@ const THEMES_LABEL: &str = "Themes";
 /// `None` for the final frame: the box unfolds top-down on open and a newly
 /// highlighted row flashes in the hotkey accent before settling
 /// (ui-animations "Pop-up menus unfold and highlights settle").
-pub fn render_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry], now: Option<u64>) {
+pub fn render_user_menu(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &UserMenuState,
+    entries: &[UserMenuEntry],
+    now: Option<u64>,
+) {
     super::unfold(buf, now, dialog.opened_at_ms, |b| draw_user_menu(b, area, theme, depth, dialog, entries, now));
 }
 
-fn draw_user_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &UserMenuState, entries: &[UserMenuEntry], now: Option<u64>) {
+fn draw_user_menu(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &UserMenuState,
+    entries: &[UserMenuEntry],
+    now: Option<u64>,
+) {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let settling = matches!((now, dialog.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
     let highlight = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
 
-    let widest_label = entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER)).max(display_width(THEMES_LABEL));
+    let widest_label =
+        entries.iter().map(|e| display_width(&e.label)).max().unwrap_or(display_width(EMPTY_PLACEHOLDER)).max(display_width(THEMES_LABEL));
     let preferred_inner_w = (widest_label + 2).clamp(MIN_INNER_W, MAX_INNER_W).max(display_width(TITLE));
     // User rows (or the one-row empty placeholder), plus a separator row and
     // the built-in Themes row. The minimum height (5 = 2 borders + 1

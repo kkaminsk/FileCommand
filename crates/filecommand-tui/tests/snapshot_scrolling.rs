@@ -44,9 +44,7 @@ fn buffer_to_text(buf: &Buffer, area: Rect) -> String {
 /// `filei` for `i` in `0..n`, so position `p` (`p >= 1`) in the unfiltered
 /// visible list is always `file{p-1:02}`.
 fn many_entries(n: usize) -> Vec<Entry> {
-    std::iter::once(Entry::parent_dir())
-        .chain((0..n).map(|i| Entry::new(format!("file{i:02}"), EntryKind::File, 0, None, false, false)))
-        .collect()
+    std::iter::once(Entry::parent_dir()).chain((0..n).map(|i| Entry::new(format!("file{i:02}"), EntryKind::File, 0, None, false, false))).collect()
 }
 
 fn overflow_panel(cwd: &str, n_files: usize, cursor: usize) -> PanelState {
@@ -121,10 +119,10 @@ fn snapshot_full_mode_overflow_thumb_at_middle_shows_scrolled_window_contents() 
     let n_files = rows + 12;
     let total = n_files + 1;
     let max_offset = total - rows; // == 13, independent of `rows`, since n_files == rows + 12
-    // A cursor position just past the initial window's bottom edge lands the
-    // reconciled offset partway through `0..max_offset` — strictly between
-    // the two ends, unlike a `total / 2` cursor which (at these dimensions)
-    // is still inside the unscrolled top window and wouldn't move it at all.
+                                   // A cursor position just past the initial window's bottom edge lands the
+                                   // reconciled offset partway through `0..max_offset` — strictly between
+                                   // the two ends, unlike a `total / 2` cursor which (at these dimensions)
+                                   // is still inside the unscrolled top window and wouldn't move it at all.
     let mid_cursor = rows + 5;
     let mut panel = overflow_panel(r"C:\Users\demo\left", n_files, mid_cursor);
     panel.ensure_cursor_visible(rows);

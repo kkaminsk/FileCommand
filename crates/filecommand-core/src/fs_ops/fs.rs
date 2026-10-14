@@ -176,13 +176,7 @@ pub trait FileSystem: Send + Sync {
     /// partial destination is removed as far as the platform allows, and an
     /// `io::Error` of kind `Interrupted` is returned (the caller
     /// distinguishes cancellation from a genuine I/O failure by that kind).
-    fn copy_file(
-        &self,
-        from: &Path,
-        to: &Path,
-        opts: &CopyOptions,
-        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<CopyReport>;
+    fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport>;
     fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
     fn remove_file(&self, path: &Path) -> io::Result<()>;
     fn remove_dir(&self, path: &Path) -> io::Result<()>;
@@ -314,13 +308,7 @@ mod windows_impl {
             std::fs::create_dir(ext(path))
         }
 
-        fn copy_file(
-            &self,
-            from: &Path,
-            to: &Path,
-            opts: &CopyOptions,
-            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<CopyReport> {
+        fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
             super::copy_ex::copy_file(&ext(from), &ext(to), opts, on_progress)
         }
 
@@ -457,12 +445,7 @@ mod copy_ex {
         io::Error::other(format!("destination length {actual} does not match the {expected} bytes copied"))
     }
 
-    pub fn copy_file(
-        from: &Path,
-        to: &Path,
-        opts: &CopyOptions,
-        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<CopyReport> {
+    pub fn copy_file(from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
         // Followed, like `CopyFileExW` itself (no COPY_FILE_COPY_SYMLINK): a
         // file symlink is copied as its target's content.
         let src_md = std::fs::metadata(from)?;
@@ -644,13 +627,7 @@ mod portable_impl {
         /// time on the open handle, optional `sync_all`, a length check, and
         /// read-only applied after close. Creation time, extended attributes
         /// and ADS are not exposed portably and are not attempted.
-        fn copy_file(
-            &self,
-            from: &Path,
-            to: &Path,
-            opts: &CopyOptions,
-            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<CopyReport> {
+        fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
             use std::io::{Read, Write};
             let from = ext(from);
             let to = ext(to);
@@ -774,7 +751,16 @@ mod volume_caps {
         // SAFETY: `wide` is null-terminated and outlives the call; the only
         // non-null out pointer is `flags`, a live local.
         let ok = unsafe {
-            GetVolumeInformationW(wide.as_ptr(), std::ptr::null_mut(), 0, std::ptr::null_mut(), std::ptr::null_mut(), &mut flags, std::ptr::null_mut(), 0)
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut flags,
+                std::ptr::null_mut(),
+                0,
+            )
         };
         if ok == 0 {
             return Err(io::Error::last_os_error());
@@ -1070,19 +1056,13 @@ impl FakeFs {
     }
 
     pub fn add_file(&self, path: &Path, size: u64) {
-        self.nodes
-            .lock()
-            .unwrap()
-            .insert(Self::norm(path), FakeNode::File { size, modified: None, readonly: false, streams: BTreeMap::new() });
+        self.nodes.lock().unwrap().insert(Self::norm(path), FakeNode::File { size, modified: None, readonly: false, streams: BTreeMap::new() });
     }
 
     pub fn add_file_with_stream(&self, path: &Path, size: u64, stream_name: &str, stream_size: u64) {
         let mut streams = BTreeMap::new();
         streams.insert(OsString::from(stream_name), stream_size);
-        self.nodes
-            .lock()
-            .unwrap()
-            .insert(Self::norm(path), FakeNode::File { size, modified: None, readonly: false, streams });
+        self.nodes.lock().unwrap().insert(Self::norm(path), FakeNode::File { size, modified: None, readonly: false, streams });
     }
 
     pub fn add_reparse_point(&self, path: &Path, is_dir: bool, target: &Path, kind: ReparseKind) {
@@ -1303,13 +1283,7 @@ impl FileSystem for FakeFs {
     /// exclusive; and the source's streams, read-only state and last-write
     /// time are carried over on success, each one divertible into
     /// `unrestored` by the matching injection.
-    fn copy_file(
-        &self,
-        from: &Path,
-        to: &Path,
-        opts: &CopyOptions,
-        on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-    ) -> io::Result<CopyReport> {
+    fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
         // Opening a file for reading follows a file symlink, so the source
         // is resolved fully; the destination resolves its ancestors like
         // every other mutation (move-reparse-point-safety design D5).
@@ -1334,9 +1308,8 @@ impl FileSystem for FakeFs {
         loop {
             let fail_after = {
                 let mut injections = self.injections.lock().unwrap();
-                let idx = injections
-                    .iter()
-                    .position(|i| matches!(i.op, InjectableOp::CopyAfterChunks(n) if n == chunk_index) && keys.contains(&i.path));
+                let idx =
+                    injections.iter().position(|i| matches!(i.op, InjectableOp::CopyAfterChunks(n) if n == chunk_index) && keys.contains(&i.path));
                 idx.map(|idx| injections.remove(idx).kind)
             };
             if let Some(kind) = fail_after {
@@ -1422,9 +1395,7 @@ impl FileSystem for FakeFs {
             // `DeleteFileW` refuses a directory object — a real directory
             // or a directory junction/symlink — with "Access is denied"
             // (move-reparse-point-safety design D5).
-            Some(FakeNode::Dir { .. }) | Some(FakeNode::Reparse { is_dir: true, .. }) => {
-                Err(io::Error::from(io::ErrorKind::PermissionDenied))
-            }
+            Some(FakeNode::Dir { .. }) | Some(FakeNode::Reparse { is_dir: true, .. }) => Err(io::Error::from(io::ErrorKind::PermissionDenied)),
             Some(_) => {
                 nodes.remove(&p);
                 Ok(())

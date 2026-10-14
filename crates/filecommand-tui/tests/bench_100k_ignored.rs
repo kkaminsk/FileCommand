@@ -177,12 +177,20 @@ fn bench_streaming_listing_performance_100k() {
     let n_batches = sorted_batches.len();
     let (panel_sorted, merge_sorted, worst_sorted) = streamed_merge(sorted_batches);
     assert_eq!(panel_sorted.entries, sorted);
-    eprintln!("merge_streamed, {n_batches:>2} policy batches, sorted arrival   {:>9.3} ms   (worst single merge {:.3} ms)", ms(merge_sorted), ms(worst_sorted));
+    eprintln!(
+        "merge_streamed, {n_batches:>2} policy batches, sorted arrival   {:>9.3} ms   (worst single merge {:.3} ms)",
+        ms(merge_sorted),
+        ms(worst_sorted)
+    );
 
     let shuffled_batches = policy_batches(shuffled(synthetic_entries(N)));
     let (panel_shuffled, merge_shuffled, worst_shuffled) = streamed_merge(shuffled_batches);
     assert_eq!(panel_shuffled.entries, sorted, "the merge equals one bulk sort");
-    eprintln!("merge_streamed, {n_batches:>2} policy batches, shuffled arrival {:>9.3} ms   (worst single merge {:.3} ms)", ms(merge_shuffled), ms(worst_shuffled));
+    eprintln!(
+        "merge_streamed, {n_batches:>2} policy batches, shuffled arrival {:>9.3} ms   (worst single merge {:.3} ms)",
+        ms(merge_shuffled),
+        ms(worst_shuffled)
+    );
 
     // --- the whole reducer path: ListingChunk → merge → anchor → viewport ----
     let mut state = State::empty(Theme::classic());
@@ -201,7 +209,11 @@ fn bench_streaming_listing_performance_100k() {
     apply_total += d;
     assert_eq!(state.left.entries.len(), N);
     assert_eq!(state.left.entries, sorted);
-    eprintln!("update(): {n_batches} ListingChunks + ListingComplete, shuffled {:>9.3} ms   (worst single chunk {:.3} ms)", ms(apply_total), ms(apply_worst));
+    eprintln!(
+        "update(): {n_batches} ListingChunks + ListingComplete, shuffled {:>9.3} ms   (worst single chunk {:.3} ms)",
+        ms(apply_total),
+        ms(apply_worst)
+    );
 
     // --- re-sort by each mode (Ctrl+F3..F6) ------------------------------
     let mut panel = panel_of(N, None);
@@ -232,7 +244,10 @@ fn bench_streaming_listing_performance_100k() {
     eprintln!();
     assert!(merge_ratio <= 3.0, "panel-navigation \"Streaming 100,000 entries costs about one sort\": {merge_ratio:.2}x");
     assert!(render_ratio <= 2.0, "panel-navigation \"Frame cost does not grow with directory size\": {render_ratio:.2}x");
-    assert!(render_ratio_filtered <= 2.0, "panel-navigation \"Frame cost does not grow with directory size\" (filtered): {render_ratio_filtered:.2}x");
+    assert!(
+        render_ratio_filtered <= 2.0,
+        "panel-navigation \"Frame cost does not grow with directory size\" (filtered): {render_ratio_filtered:.2}x"
+    );
 }
 
 /// The design's open question (streaming-listing-performance): does a

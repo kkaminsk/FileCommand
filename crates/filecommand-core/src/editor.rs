@@ -179,11 +179,15 @@ pub enum LoadResult {
     Loaded(EditorState),
     /// The file is `size` bytes, at or above [`EDITOR_MAX_BYTES`]; the
     /// caller should redirect to the F3 viewer instead.
-    TooLarge { size: u64 },
+    TooLarge {
+        size: u64,
+    },
     /// The file is under the cap but is not UTF-8 text the editor can write
     /// back byte-exactly; the caller should redirect to the F3 viewer with a
     /// reason-specific notice (design D1/D2).
-    NotEditable { reason: NotEditableReason },
+    NotEditable {
+        reason: NotEditableReason,
+    },
 }
 
 /// The F4-in-editor search-and-replace prompt's two stages: the literal

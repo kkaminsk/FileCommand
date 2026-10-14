@@ -219,9 +219,7 @@ const COMMANDS_MENU: &[MenuEntry] = &[
     item("Menu file edit", 0, "", MenuAction::EditMenuFile),
 ];
 
-const OPTIONS_MENU: &[MenuEntry] = &[
-    item("Themes", 0, "", MenuAction::OpenThemes),
-];
+const OPTIONS_MENU: &[MenuEntry] = &[item("Themes", 0, "", MenuAction::OpenThemes)];
 
 /// The pull-down contents for a menu.
 pub fn entries(id: MenuId) -> &'static [MenuEntry] {
@@ -382,10 +380,7 @@ mod tests {
         let mut menu = MenuState::for_menu(MenuId::Files);
         // A separator sits between "Copy name(s)" and "Select group", so
         // stepping down from the former must land on the latter.
-        let copy_names = entries(MenuId::Files)
-            .iter()
-            .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy name(s)"))
-            .unwrap();
+        let copy_names = entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy name(s)")).unwrap();
         menu.selected = copy_names;
         menu.move_selection(1);
         assert_eq!(menu.selected_item().map(|i| i.label), Some("Select group"));

@@ -327,7 +327,9 @@ mod tests {
 
     fn full_history(now: u64) -> Vec<FrecencyEntry> {
         // Entry i has i+1 visits, all stamped now, so entry 0 scores lowest.
-        (0..MAX_DIR_HISTORY).map(|i| FrecencyEntry { path: PathBuf::from(format!(r"C:\d{i}")), visit_count: i as u32 + 1, last_visited_ms: now }).collect()
+        (0..MAX_DIR_HISTORY)
+            .map(|i| FrecencyEntry { path: PathBuf::from(format!(r"C:\d{i}")), visit_count: i as u32 + 1, last_visited_ms: now })
+            .collect()
     }
 
     #[test]
@@ -339,7 +341,11 @@ mod tests {
             FrecencyEntry { path: PathBuf::from(r"C:\tie-last"), visit_count: 1, last_visited_ms: now },
         ];
         prune_to_cap(&mut history, 2, now);
-        assert_eq!(history.iter().map(|e| e.path.to_string_lossy().into_owned()).collect::<Vec<_>>(), vec![r"C:\high", r"C:\tie-first"], "the last of the equal-score entries goes first");
+        assert_eq!(
+            history.iter().map(|e| e.path.to_string_lossy().into_owned()).collect::<Vec<_>>(),
+            vec![r"C:\high", r"C:\tie-first"],
+            "the last of the equal-score entries goes first"
+        );
         prune_to_cap(&mut history, 1, now);
         assert_eq!(history[0].path, PathBuf::from(r"C:\high"), "then the lowest score");
         prune_to_cap(&mut history, 5, now);

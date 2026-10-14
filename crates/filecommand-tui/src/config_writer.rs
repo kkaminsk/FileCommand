@@ -185,11 +185,7 @@ fn perform(path: &Path, save: &(dyn Fn(&Path, &ConfigWrite) -> io::Result<()> + 
 fn writer_loop(path: &Path, rx: &Receiver<Msg>, save: &(dyn Fn(&Path, &ConfigWrite) -> io::Result<()> + Send)) {
     let mut pending: Vec<ConfigWrite> = Vec::new();
     loop {
-        let msg = if pending.is_empty() {
-            rx.recv().map_err(|_| TryRecvError::Disconnected)
-        } else {
-            rx.try_recv()
-        };
+        let msg = if pending.is_empty() { rx.recv().map_err(|_| TryRecvError::Disconnected) } else { rx.try_recv() };
         match msg {
             Ok(Msg::Write(write)) => enqueue(&mut pending, write),
             Err(TryRecvError::Empty) => {

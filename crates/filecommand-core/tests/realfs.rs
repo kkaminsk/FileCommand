@@ -7,8 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use filecommand_core::fs_ops::{
-    run_job, CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind,
-    JobOutcome, JobSink, ProgressInfo, RealFs, SourceItem,
+    run_job, CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, Job, JobKind, JobOutcome, JobSink, ProgressInfo, RealFs, SourceItem,
 };
 
 /// A per-test directory under `std::env::temp_dir()`, named with the process
@@ -17,10 +16,7 @@ struct TempDir(PathBuf);
 
 impl TempDir {
     fn new(test_name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!(
-            "filecommand-realfs-{}-{test_name}",
-            std::process::id()
-        ));
+        let path = std::env::temp_dir().join(format!("filecommand-realfs-{}-{test_name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         TempDir(path)
@@ -123,11 +119,23 @@ fn file_source(path: &Path) -> SourceItem {
 }
 
 fn copy_job(src: &Path, dest_dir: &Path) -> Job {
-    Job { kind: JobKind::Copy, sources: vec![file_source(src)], source_dir: src.parent().unwrap().to_path_buf(), dest_dir: dest_dir.to_path_buf(), new_dir_name: None }
+    Job {
+        kind: JobKind::Copy,
+        sources: vec![file_source(src)],
+        source_dir: src.parent().unwrap().to_path_buf(),
+        dest_dir: dest_dir.to_path_buf(),
+        new_dir_name: None,
+    }
 }
 
 fn move_job(src: &Path, dest_dir: &Path) -> Job {
-    Job { kind: JobKind::Move, sources: vec![file_source(src)], source_dir: src.parent().unwrap().to_path_buf(), dest_dir: dest_dir.to_path_buf(), new_dir_name: None }
+    Job {
+        kind: JobKind::Move,
+        sources: vec![file_source(src)],
+        source_dir: src.parent().unwrap().to_path_buf(),
+        dest_dir: dest_dir.to_path_buf(),
+        new_dir_name: None,
+    }
 }
 
 fn assert_completed_clean(sink: &RecordingSink) {
@@ -239,7 +247,11 @@ fn an_existing_file_with_the_temporary_name_is_left_alone() {
     assert_completed_clean(&sink);
     assert_eq!(fs::read(dst.join("report.txt")).unwrap(), b"the copy");
     assert_eq!(fs::read(&leftover).unwrap(), b"someone else's file", "not modified or removed");
-    assert_eq!(partial_files_in(&dst), vec![OsString::from("report.txt.~fc-partial")], "only the pre-existing file remains; the -2 temporary was renamed away");
+    assert_eq!(
+        partial_files_in(&dst),
+        vec![OsString::from("report.txt.~fc-partial")],
+        "only the pre-existing file remains; the -2 temporary was renamed away"
+    );
 }
 
 /// file-operations "A copy never overwrites its own source": F5 into the
@@ -254,11 +266,7 @@ fn copy_into_own_directory_leaves_file_unchanged() {
 
     let job = Job {
         kind: JobKind::Copy,
-        sources: vec![SourceItem {
-            original_name: OsString::from("report.txt"),
-            path: file.clone(),
-            is_dir: false,
-        }],
+        sources: vec![SourceItem { original_name: OsString::from("report.txt"), path: file.clone(), is_dir: false }],
         source_dir: temp.path().to_path_buf(),
         dest_dir: temp.path().to_path_buf(),
         new_dir_name: None,
@@ -266,28 +274,13 @@ fn copy_into_own_directory_leaves_file_unchanged() {
     let mut sink = RecordingSink::default();
     run_job(&job, &RealFs::new(), &mut sink);
 
-    assert_eq!(
-        fs::read(&file).unwrap(),
-        content,
-        "the file keeps its original 2,048 bytes"
-    );
-    assert_eq!(
-        sink.conflicts_seen, 0,
-        "a same-file copy must not raise the overwrite-conflict dialog"
-    );
+    assert_eq!(fs::read(&file).unwrap(), content, "the file keeps its original 2,048 bytes");
+    assert_eq!(sink.conflicts_seen, 0, "a same-file copy must not raise the overwrite-conflict dialog");
     match &sink.outcome {
         Some(JobOutcome::Completed { skipped }) => {
-            assert_eq!(
-                skipped.len(),
-                1,
-                "the same-file item is reported as skipped: {skipped:?}"
-            );
+            assert_eq!(skipped.len(), 1, "the same-file item is reported as skipped: {skipped:?}");
             assert_eq!(skipped[0].path, file);
-            assert!(
-                skipped[0].reason.contains("same file"),
-                "the reason should name the self-copy: {}",
-                skipped[0].reason
-            );
+            assert!(skipped[0].reason.contains("same file"), "the reason should name the self-copy: {}", skipped[0].reason);
         }
         other => panic!("expected Completed with one skipped item, got {other:?}"),
     }
@@ -359,13 +352,7 @@ mod windows_only {
         fn create_dir(&self, path: &Path) -> io::Result<()> {
             self.inner.create_dir(path)
         }
-        fn copy_file(
-            &self,
-            from: &Path,
-            to: &Path,
-            opts: &CopyOptions,
-            on_progress: &mut dyn FnMut(u64) -> ChunkControl,
-        ) -> io::Result<CopyReport> {
+        fn copy_file(&self, from: &Path, to: &Path, opts: &CopyOptions, on_progress: &mut dyn FnMut(u64) -> ChunkControl) -> io::Result<CopyReport> {
             self.inner.copy_file(from, to, opts, on_progress)
         }
         fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
@@ -452,9 +439,16 @@ mod windows_only {
         assert_eq!(fs::read(fx.outside.join("keep.txt")).unwrap(), b"keep me", "R-01: the junction target's file survives the move");
         assert_eq!(fs::read(fx.outside.join("x86").join("a.dll")).unwrap(), b"a.dll", "R-01: the target's subdirectory survives");
         assert_eq!(fs::read(fx.dst.join("proj").join("file.txt")).unwrap(), b"proj");
-        assert_eq!(fs::read(fx.dst.join("proj").join("shared").join("keep.txt")).unwrap(), b"keep me", "the destination holds a copy of the target's content");
+        assert_eq!(
+            fs::read(fx.dst.join("proj").join("shared").join("keep.txt")).unwrap(),
+            b"keep me",
+            "the destination holds a copy of the target's content"
+        );
         assert_eq!(fs::read(fx.dst.join("proj").join("shared").join("x86").join("a.dll")).unwrap(), b"a.dll");
-        assert!(!fx.dst.join("proj").join("shared").symlink_metadata().unwrap().file_type().is_symlink(), "the destination `shared` is a plain directory, not a link");
+        assert!(
+            !fx.dst.join("proj").join("shared").symlink_metadata().unwrap().file_type().is_symlink(),
+            "the destination `shared` is a plain directory, not a link"
+        );
         assert!(fx.src.join("proj").symlink_metadata().is_err(), "the source tree, including the junction, is removed");
     }
 
@@ -536,7 +530,13 @@ mod windows_only {
 
     fn assert_decorated(path: &Path, d: &Decorated) {
         let md = fs::symlink_metadata(path).unwrap();
-        assert_eq!(md.file_attributes() & ALL_FOUR, ALL_FOUR, "read-only, hidden, system and archive on {}: {:#x}", path.display(), md.file_attributes());
+        assert_eq!(
+            md.file_attributes() & ALL_FOUR,
+            ALL_FOUR,
+            "read-only, hidden, system and archive on {}: {:#x}",
+            path.display(),
+            md.file_attributes()
+        );
         assert_eq!(md.created().unwrap(), d.created, "creation time on {}", path.display());
         assert_eq!(md.modified().unwrap(), d.modified, "last-write time on {}", path.display());
         assert_eq!(fs::read(path).unwrap(), d.content);
@@ -600,7 +600,8 @@ mod windows_only {
         fs::write(dst.join("report.txt"), b"old, complete content").unwrap();
         let _hold = fs::OpenOptions::new().read(true).share_mode(0).open(src.join("report.txt")).unwrap();
 
-        let mut sink = RecordingSink { conflict_answers: vec![ConflictChoice::Overwrite], error_answers: vec![ErrorChoice::Skip], ..Default::default() };
+        let mut sink =
+            RecordingSink { conflict_answers: vec![ConflictChoice::Overwrite], error_answers: vec![ErrorChoice::Skip], ..Default::default() };
         run_job(&copy_job(&src.join("report.txt"), &dst), &RealFs::new(), &mut sink);
 
         assert_eq!(sink.conflicts_seen, 1);
@@ -643,7 +644,13 @@ mod windows_only {
         assert_eq!(fs::read(verbatim(&dst.join("moved.txt"))).unwrap(), b"moving far away");
         assert!(fs::symlink_metadata(verbatim(&src.join("moved.txt"))).is_err());
 
-        let job = Job { kind: JobKind::Delete, sources: vec![file_source(&dst.join("long.txt"))], source_dir: dst.clone(), dest_dir: dst.clone(), new_dir_name: None };
+        let job = Job {
+            kind: JobKind::Delete,
+            sources: vec![file_source(&dst.join("long.txt"))],
+            source_dir: dst.clone(),
+            dest_dir: dst.clone(),
+            new_dir_name: None,
+        };
         let mut sink = RecordingSink::default();
         run_job(&job, &RealFs::new(), &mut sink);
         assert_completed_clean(&sink);
@@ -659,7 +666,13 @@ mod windows_only {
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("foo.txt"), b"foo").unwrap();
 
-        let job = Job { kind: JobKind::Rename, sources: vec![file_source(&dir.join("foo.txt"))], source_dir: dir.clone(), dest_dir: dir.clone(), new_dir_name: Some(OsString::from("Foo.txt")) };
+        let job = Job {
+            kind: JobKind::Rename,
+            sources: vec![file_source(&dir.join("foo.txt"))],
+            source_dir: dir.clone(),
+            dest_dir: dir.clone(),
+            new_dir_name: Some(OsString::from("Foo.txt")),
+        };
         let mut sink = RecordingSink::default();
         run_job(&job, &RealFs::new(), &mut sink);
 
@@ -692,7 +705,8 @@ mod windows_only {
         assert!(fs::symlink_metadata(src.join("big.bin")).is_err(), "the source is gone");
         assert!(partial_files_in(&dst).is_empty(), "{:?}", partial_files_in(&dst));
         let ops = fs_.ops();
-        let landed = ops.iter().position(|o| matches!(o, Op::Rename(_, to) if to == &dst.join("big.bin"))).expect("the copy was renamed over the target");
+        let landed =
+            ops.iter().position(|o| matches!(o, Op::Rename(_, to) if to == &dst.join("big.bin"))).expect("the copy was renamed over the target");
         let removed = ops.iter().position(|o| *o == Op::RemoveFile(src.join("big.bin"))).expect("the source was removed");
         assert!(landed < removed, "copy landed before the source was touched: {ops:?}");
     }

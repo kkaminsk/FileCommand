@@ -182,7 +182,9 @@ mod tests {
     fn snapshot(n: usize) -> HistoryFile {
         HistoryFile {
             commands: (0..=n).map(|i| format!("cmd{i}")).collect(),
-            directories: (0..=n).map(|i| FrecencyEntry { path: PathBuf::from(format!(r"C:\d{i}")), visit_count: 1, last_visited_ms: 1_000 + i as u64 }).collect(),
+            directories: (0..=n)
+                .map(|i| FrecencyEntry { path: PathBuf::from(format!(r"C:\d{i}")), visit_count: 1, last_visited_ms: 1_000 + i as u64 })
+                .collect(),
         }
     }
 
@@ -232,7 +234,10 @@ mod tests {
         let dir = temp_dir("flush");
         let path = dir.join("history.json");
         let writer = HistoryWriter::spawn(path.clone(), Duration::from_secs(60), Duration::from_secs(600));
-        writer.submit(HistoryFile { commands: vec!["cd C:\\work".to_string()], directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\work"), visit_count: 1, last_visited_ms: 5 }] });
+        writer.submit(HistoryFile {
+            commands: vec!["cd C:\\work".to_string()],
+            directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\work"), visit_count: 1, last_visited_ms: 5 }],
+        });
         drop(writer);
         let on_disk = config::load_history_file(&path);
         assert_eq!(on_disk.commands, vec!["cd C:\\work".to_string()]);
@@ -264,8 +269,14 @@ mod tests {
 
         let a = HistoryWriter::spawn(path.clone(), Duration::from_secs(60), Duration::from_secs(600));
         let b = HistoryWriter::spawn(path.clone(), Duration::from_secs(60), Duration::from_secs(600));
-        a.submit(HistoryFile { commands: vec!["cd C:\\a".to_string()], directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\a"), visit_count: 2, last_visited_ms: 10 }] });
-        b.submit(HistoryFile { commands: vec!["cd C:\\b".to_string()], directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\b"), visit_count: 1, last_visited_ms: 20 }] });
+        a.submit(HistoryFile {
+            commands: vec!["cd C:\\a".to_string()],
+            directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\a"), visit_count: 2, last_visited_ms: 10 }],
+        });
+        b.submit(HistoryFile {
+            commands: vec!["cd C:\\b".to_string()],
+            directories: vec![FrecencyEntry { path: PathBuf::from(r"C:\b"), visit_count: 1, last_visited_ms: 20 }],
+        });
         drop(a);
         drop(b);
 
@@ -273,7 +284,11 @@ mod tests {
         let mut paths = dir_paths(&on_disk);
         paths.sort();
         assert_eq!(paths, vec![r"C:\a", r"C:\b"]);
-        assert_eq!(on_disk.commands, vec!["cd D:\\build".to_string(), "cd C:\\a".to_string(), "cd C:\\b".to_string()], "the foreign command is kept, ordered before both instances' own");
+        assert_eq!(
+            on_disk.commands,
+            vec!["cd D:\\build".to_string(), "cd C:\\a".to_string(), "cd C:\\b".to_string()],
+            "the foreign command is kept, ordered before both instances' own"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -285,7 +300,11 @@ mod tests {
         let dir = temp_dir("legacy-merge");
         let path = dir.join("history.json");
         // A legacy file: no "version", session-relative times.
-        std::fs::write(&path, "{\n  \"commands\": [],\n  \"directories\": [\n    {\"path\": \"C:\\\\old\", \"visit_count\": 7, \"last_visited_ms\": 42}\n  ]\n}\n").unwrap();
+        std::fs::write(
+            &path,
+            "{\n  \"commands\": [],\n  \"directories\": [\n    {\"path\": \"C:\\\\old\", \"visit_count\": 7, \"last_visited_ms\": 42}\n  ]\n}\n",
+        )
+        .unwrap();
         let before = crate::clock::now_unix_ms();
         write_merged(&path, &HistoryFile::default());
         let text = std::fs::read_to_string(&path).unwrap();

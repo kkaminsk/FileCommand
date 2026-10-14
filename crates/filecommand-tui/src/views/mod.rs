@@ -405,10 +405,7 @@ fn render_phase(
             None
         }
         UiPhase::Editor(e) => editor::render_editor(buf, area, e, theme, depth),
-        UiPhase::Panels
-        | UiPhase::FileOpSetup(_)
-        | UiPhase::FileOpRunning { .. }
-        | UiPhase::FileOpSummary(_) => {
+        UiPhase::Panels | UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => {
             let l = layout::compute((area.width, area.height), state.split_percent);
             let left_type_ahead = (state.active == PanelSide::Left).then_some(state.quick_search.as_deref()).flatten();
             let right_type_ahead = (state.active == PanelSide::Right).then_some(state.quick_search.as_deref()).flatten();
@@ -486,7 +483,9 @@ fn render_phase(
                 // Ranked with the epoch clock, as the reducer's Enter and
                 // cursor handlers rank, so the drawn order is the acted-on
                 // order (history-persistence-hardening design D1).
-                iris(buf, now, opened, |b| fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.epoch_ms));
+                iris(buf, now, opened, |b| {
+                    fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.epoch_ms)
+                });
             }
             let mut find_caret = None;
             if let Some(dialog) = &state.find_file {

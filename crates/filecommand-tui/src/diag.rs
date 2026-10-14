@@ -65,16 +65,7 @@ fn timestamp() -> String {
     let now = SystemTime::now();
     let dt = DateTime::from_system_time(now);
     let dur = now.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default();
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        dt.year,
-        dt.month,
-        dt.day,
-        dt.hour,
-        dt.minute,
-        dur.as_secs() % 60,
-        dur.subsec_millis()
-    )
+    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z", dt.year, dt.month, dt.day, dt.hour, dt.minute, dur.as_secs() % 60, dur.subsec_millis())
 }
 
 /// Open the diagnostic log at `path`, enabling [`log`] for the rest of the

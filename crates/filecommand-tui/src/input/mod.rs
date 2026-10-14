@@ -393,11 +393,7 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         // filter": "the activation key toggles the filter"). The keymap
         // passes the active side; the Left/Right menus pass their own
         // (pulldown-menu-completion design D1).
-        return Some(if state.active_panel().quick_filter.is_some() {
-            Command::QuickFilterEnd
-        } else {
-            Command::QuickFilterStart(active)
-        });
+        return Some(if state.active_panel().quick_filter.is_some() { Command::QuickFilterEnd } else { Command::QuickFilterStart(active) });
     }
     if matches_binding(&key, &keys.fuzzy_jump) {
         return Some(Command::FuzzyJumpOpen);

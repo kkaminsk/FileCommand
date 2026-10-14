@@ -46,9 +46,7 @@ impl DriveSelect {
     /// that drive is present.
     pub fn new(target: PanelSide, letters: Vec<char>, current: Option<char>) -> DriveSelect {
         let drives: Vec<DriveEntry> = letters.into_iter().map(|letter| DriveEntry { letter, label: None }).collect();
-        let selected = current
-            .and_then(|c| drives.iter().position(|d| d.letter.eq_ignore_ascii_case(&c)))
-            .unwrap_or(0);
+        let selected = current.and_then(|c| drives.iter().position(|d| d.letter.eq_ignore_ascii_case(&c))).unwrap_or(0);
         DriveSelect { target, drives, selected, generation: 0 }
     }
 
@@ -86,10 +84,7 @@ pub struct DiskSpace {
 /// Turn the `GetLogicalDrives` bitmask into drive letters. Bit 0 is `A:`.
 /// Pure, so the bit-twiddling is testable without a Windows host.
 pub fn drives_from_bitmask(mask: u32) -> Vec<char> {
-    (0..26u32)
-        .filter(|i| mask & (1 << i) != 0)
-        .filter_map(|i| char::from_u32(u32::from(b'A') + i))
-        .collect()
+    (0..26u32).filter(|i| mask & (1 << i) != 0).filter_map(|i| char::from_u32(u32::from(b'A') + i)).collect()
 }
 
 /// The root directory of a drive letter, e.g. `C:\`.

@@ -8,10 +8,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BIN: &str = env!("CARGO_BIN_EXE_filecommand");
 
 fn run(arg: &str) -> std::process::Output {
-    std::process::Command::new(BIN)
-        .arg(arg)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {BIN}: {e}"))
+    std::process::Command::new(BIN).arg(arg).output().unwrap_or_else(|e| panic!("failed to spawn {BIN}: {e}"))
 }
 
 #[test]

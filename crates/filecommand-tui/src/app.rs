@@ -1024,7 +1024,13 @@ fn next_timeout(now: u64, core_wake: Option<u64>, minute_wake: Duration, workers
 /// double-click"). A no-op while the clock is already fresh; applies no
 /// transition early (a key during the splash hold still dismisses the
 /// splash, exactly as before).
-fn tick_before_input(state: State, clock: &RealClock, wall_clock: &RealWallClock, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
+fn tick_before_input(
+    state: State,
+    clock: &RealClock,
+    wall_clock: &RealWallClock,
+    guard: &mut TerminalGuard,
+    rt: &mut Runtime,
+) -> io::Result<(State, bool)> {
     let now = clock.now_ms();
     if now.saturating_sub(state.clock_ms) > POLL_INTERVAL.as_millis() as u64 {
         // Both clocks travel in the tick, so a visit recorded right after an
@@ -1263,7 +1269,9 @@ fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
             // because the built-in editor will not open it
             // (configuration-files "Non-UTF-8 usermenu.toml is kept, not
             // overwritten"; design D3).
-            Some(config::UserMenuProblem::NotUtf8) => format!("{file} is not UTF-8 text; using the default menu — re-save it as UTF-8 or delete it to recreate the defaults"),
+            Some(config::UserMenuProblem::NotUtf8) => {
+                format!("{file} is not UTF-8 text; using the default menu — re-save it as UTF-8 or delete it to recreate the defaults")
+            }
             Some(config::UserMenuProblem::Unreadable(error)) => format!("{file} could not be read ({error}); using the default menu"),
             Some(config::UserMenuProblem::InvalidToml) | None => format!("{file} is malformed; F2 uses the default user menu"),
         };
@@ -1612,7 +1620,9 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // first painted frame already lists every letter.
                 worker::deliver(&rt.tx, "drive list", Command::DriveListReady { target, drives: drives::enumerate_drives() });
             }
-            Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone(), rt.workers.token()),
+            Effect::FetchDriveLabel { target, letter, generation } => {
+                worker::spawn_drive_label(target, letter, generation, rt.tx.clone(), rt.workers.token())
+            }
             Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone(), rt.workers.token()),
             Effect::QueryGitInfo { panel, path, request } => {
                 let slot = match panel {
@@ -2042,7 +2052,8 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         state.term_size = (80, 24);
         state.request_seq = request;
-        state.pending_open = Some(filecommand_core::update::PendingOpen { request, side: PanelSide::Left, kind: filecommand_core::update::PendingOpenKind::Viewer });
+        state.pending_open =
+            Some(filecommand_core::update::PendingOpen { request, side: PanelSide::Left, kind: filecommand_core::update::PendingOpenKind::Viewer });
         state
     }
 
@@ -2381,7 +2392,8 @@ mod tests {
     /// regardless of order, just like any two independent switches.
     #[test]
     fn parse_launch_args_reads_nomouse_alongside_other_switches_regardless_of_order() {
-        let nomouse_first = parse_launch_args(["--nomouse".to_string(), "--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
+        let nomouse_first =
+            parse_launch_args(["--nomouse".to_string(), "--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
         assert!(nomouse_first.no_mouse);
         assert!(nomouse_first.no_splash);
         assert_eq!(nomouse_first.theme.as_deref(), Some("terminal-green"));
@@ -2730,7 +2742,8 @@ mod tests {
     fn apply_user_menu_does_not_warn_on_well_formed_content() {
         let mut state = State::empty(Theme::classic());
         let entries = config::default_user_menu_entries();
-        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false, problem: None };
+        let ok =
+            config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false, problem: None };
         apply_user_menu(&mut state, ok);
         assert_eq!(state.user_menu_entries, entries);
         assert_eq!(state.startup_warning, None);
@@ -2777,7 +2790,15 @@ mod tests {
 
         let area = Rect { x: 0, y: 0, width: 80, height: 24 };
         let mut buf = Buffer::empty(area);
-        views::fuzzy_jump::render_fuzzy_jump(&mut buf, area, &state.theme, ColorDepth::Ansi16, state.fuzzy_jump.as_ref().unwrap(), &state.dir_history, state.epoch_ms);
+        views::fuzzy_jump::render_fuzzy_jump(
+            &mut buf,
+            area,
+            &state.theme,
+            ColorDepth::Ansi16,
+            state.fuzzy_jump.as_ref().unwrap(),
+            &state.dir_history,
+            state.epoch_ms,
+        );
         let first_row = (0..area.height)
             .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
             .find(|row| row.contains("C:\\"))
@@ -3049,7 +3070,10 @@ mod tests {
         assert_eq!(worker::cannot_message("save", &path, &err), "Cannot save notes.txt: There is not enough space on the disk. (os error 112)");
         // A non-`io::Error` reason (the editor's own refusal) formats the
         // same way around it.
-        assert_eq!(worker::cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"), "Cannot save notes.txt: notes.txt is read-only — not saved");
+        assert_eq!(
+            worker::cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"),
+            "Cannot save notes.txt: notes.txt is read-only — not saved"
+        );
     }
 
     /// open-with-associated-app design D1 / file-action-menu "Open with the
@@ -3405,10 +3429,14 @@ mod tests {
             ],
             "each key mapped against the state the previous one produced"
         );
-        let (reference_state, _) = apply_one_at_a_time(state, &[KeyCode::F(7), KeyCode::Char('n'), KeyCode::Char('e'), KeyCode::Char('w'), KeyCode::Enter]);
+        let (reference_state, _) =
+            apply_one_at_a_time(state, &[KeyCode::F(7), KeyCode::Char('n'), KeyCode::Char('e'), KeyCode::Char('w'), KeyCode::Enter]);
         assert_eq!(burst_state, reference_state);
         assert!(
-            matches!(burst_state.phase, UiPhase::FileOpSetup(filecommand_core::fs_ops::dialog::FileOpSetup::DestinationInput { .. }) | UiPhase::FileOpRunning { .. }),
+            matches!(
+                burst_state.phase,
+                UiPhase::FileOpSetup(filecommand_core::fs_ops::dialog::FileOpSetup::DestinationInput { .. }) | UiPhase::FileOpRunning { .. }
+            ),
             "the dialog opened and was confirmed: {:?}",
             burst_state.phase
         );

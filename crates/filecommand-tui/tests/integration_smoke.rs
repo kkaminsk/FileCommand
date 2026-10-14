@@ -35,7 +35,9 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
         match effect {
             // The smoke test never supersedes a listing or a walk, so each
             // gets a flag nothing will ever set (listing-request-guard).
-            Effect::StartListing { panel, path, request } => worker::spawn_listing(panel, path, request, CancelFlag::new(), tx.clone(), workers.token()),
+            Effect::StartListing { panel, path, request } => {
+                worker::spawn_listing(panel, path, request, CancelFlag::new(), tx.clone(), workers.token())
+            }
             Effect::QueryGitInfo { panel, path, request } => {
                 let slot = match panel {
                     PanelSide::Left => &git_slots[0],
@@ -43,7 +45,9 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
                 };
                 slot.request(panel, path, request, tx.clone(), workers.token());
             }
-            Effect::FindInSubtree { root, pattern, request } => worker::spawn_find_subtree(root, pattern, request, CancelFlag::new(), tx.clone(), workers.token()),
+            Effect::FindInSubtree { root, pattern, request } => {
+                worker::spawn_find_subtree(root, pattern, request, CancelFlag::new(), tx.clone(), workers.token())
+            }
             // `Effect::OpenEditor`/`SaveEditor` run on the same worker
             // threads the real app uses (offload-blocking-io design D4/D6).
             Effect::OpenEditor { request, path } => worker::spawn_editor_open(request, path, tx.clone(), workers.token()),
@@ -57,7 +61,14 @@ fn execute(effects: Vec<Effect>, tx: &Sender<Command>, git_slots: &[worker::GitQ
 /// (and *their* resulting effects, transitively) until the system goes
 /// quiet — so callers always see a settled `State` rather than one with
 /// listings still streaming in.
-fn step(mut state: State, cmd: Command, tx: &Sender<Command>, rx: &Receiver<Command>, git_slots: &[worker::GitQuerySlot; 2], workers: &worker::WorkerGauge) -> State {
+fn step(
+    mut state: State,
+    cmd: Command,
+    tx: &Sender<Command>,
+    rx: &Receiver<Command>,
+    git_slots: &[worker::GitQuerySlot; 2],
+    workers: &worker::WorkerGauge,
+) -> State {
     let (s, effects) = update(state, cmd);
     state = s;
     execute(effects, tx, git_slots, workers);
@@ -111,8 +122,7 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     let git_slots = [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()];
     let workers = worker::WorkerGauge::new();
 
-    let (state, effects) =
-        State::initial(filecommand_core::theme::Theme::classic(), (80, 24), 1_000, 1_000, fx.left(), fx.root.join("right"), false);
+    let (state, effects) = State::initial(filecommand_core::theme::Theme::classic(), (80, 24), 1_000, 1_000, fx.left(), fx.root.join("right"), false);
     execute(effects, &tx, &git_slots, &workers);
     let mut state = step(state, Command::Tick { now_ms: 1_000, epoch_ms: 1_000 }, &tx, &rx, &git_slots, &workers);
 

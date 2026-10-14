@@ -1156,9 +1156,14 @@ mod tests {
         // before enumeration finishes").
         let reader = FakeReader(raw_files(5));
         let mut batches = Vec::new();
-        let total = list_dir_streaming(&reader, Path::new("."), &CancelFlag::new(), BatchPolicy::default(), &stepping_clock(Duration::from_millis(60)), |b| {
-            batches.push(b.len())
-        })
+        let total = list_dir_streaming(
+            &reader,
+            Path::new("."),
+            &CancelFlag::new(),
+            BatchPolicy::default(),
+            &stepping_clock(Duration::from_millis(60)),
+            |b| batches.push(b.len()),
+        )
         .unwrap();
         assert_eq!(total.entries, 5);
         assert_eq!(batches, vec![1, 1, 1, 1, 1]);
@@ -1259,7 +1264,11 @@ mod tests {
 
         entries.sort_by(|a, b| cmp_by_mode(a, b, SortMode::Name));
         let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.hidden)).collect();
-        assert_eq!(flags, vec![(".git", true), ("alpha", false), ("desktop.ini", true), ("zeta.txt", false)], "the flag follows its entry through the sort");
+        assert_eq!(
+            flags,
+            vec![(".git", true), ("alpha", false), ("desktop.ini", true), ("zeta.txt", false)],
+            "the flag follows its entry through the sort"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -1489,7 +1498,17 @@ mod tests {
     #[test]
     fn classify_entry_keeps_a_plain_file_and_a_plain_directory_as_they_are() {
         let file = classify_entry("a.txt".into(), Ok(facts(false, false, 42, 10, false)), not_followed).unwrap();
-        assert_eq!(file, RawDirEntry { name: "a.txt".into(), is_dir: false, size: 42, modified: facts(false, false, 42, 10, false).modified, hidden: false, link: false });
+        assert_eq!(
+            file,
+            RawDirEntry {
+                name: "a.txt".into(),
+                is_dir: false,
+                size: 42,
+                modified: facts(false, false, 42, 10, false).modified,
+                hidden: false,
+                link: false
+            }
+        );
 
         let dir = classify_entry("sub".into(), Ok(facts(true, false, 4096, 20, true)), not_followed).unwrap();
         assert!(dir.is_dir && !dir.link && dir.hidden);
@@ -1552,7 +1571,11 @@ mod tests {
 
         entries.sort_by(|a, b| cmp_by_mode(a, b, SortMode::Name));
         let flags: Vec<(&str, bool)> = entries.iter().map(|e| (e.name.to_str().unwrap(), e.link)).collect();
-        assert_eq!(flags, vec![("alpha", false), ("lnk", true), ("zeta.txt", false)], "a directory link sorts among the directories and keeps its flag");
+        assert_eq!(
+            flags,
+            vec![("alpha", false), ("lnk", true), ("zeta.txt", false)],
+            "a directory link sorts among the directories and keeps its flag"
+        );
     }
 
     #[test]
@@ -1607,7 +1630,8 @@ mod tests {
 
         let listing = StdFsReader.read_dir(&dir).expect("a dangling junction does not fail the listing");
         assert_eq!(listing.unreadable, 0);
-        let by_name = |name: &str| listing.entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is listed: {:?}", listing.entries)).clone();
+        let by_name =
+            |name: &str| listing.entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} is listed: {:?}", listing.entries)).clone();
         let lnk = by_name("lnk");
         assert!(lnk.is_dir && lnk.link, "a junction to a directory lists as a directory: {lnk:?}");
         let old = by_name("old");
@@ -1666,7 +1690,10 @@ mod tests {
         let mut raw_name = vec![0x66, 0x6f, 0x80];
         raw_name.extend_from_slice(b"report.txt");
         let name = std::ffi::OsStr::from_bytes(&raw_name).to_os_string();
-        fixture.insert(PathBuf::from("/root"), vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None, hidden: false, link: false }]);
+        fixture.insert(
+            PathBuf::from("/root"),
+            vec![RawDirEntry { name: name.clone(), is_dir: false, size: 0, modified: None, hidden: false, link: false }],
+        );
         let reader = TreeReader(fixture);
 
         let mut matches = Vec::new();

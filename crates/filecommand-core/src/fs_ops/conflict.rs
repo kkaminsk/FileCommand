@@ -152,12 +152,7 @@ mod tests {
         }
 
         fn arb_choice() -> impl Strategy<Value = Choice> {
-            prop_oneof![
-                Just(Choice::Overwrite),
-                Just(Choice::OverwriteAll),
-                Just(Choice::Skip),
-                Just(Choice::SkipAll),
-            ]
+            prop_oneof![Just(Choice::Overwrite), Just(Choice::OverwriteAll), Just(Choice::Skip), Just(Choice::SkipAll),]
         }
 
         proptest! {

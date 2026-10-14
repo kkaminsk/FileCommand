@@ -71,7 +71,15 @@ pub fn render_splash(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDe
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_row(buf: &mut Buffer, box_x: u16, y: u16, inner_w: usize, text: &str, text_style: ratatui::style::Style, frame_style: ratatui::style::Style) {
+fn write_row(
+    buf: &mut Buffer,
+    box_x: u16,
+    y: u16,
+    inner_w: usize,
+    text: &str,
+    text_style: ratatui::style::Style,
+    frame_style: ratatui::style::Style,
+) {
     buf.set_string(box_x, y, "\u{2551}", frame_style);
     let pad = inner_w.saturating_sub(display_width(text));
     let left = pad / 2;

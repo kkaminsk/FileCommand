@@ -203,12 +203,7 @@ pub fn iris_rect(finish: OverlayRect, progress: u16) -> OverlayRect {
     };
     let width = grow(2, finish.width);
     let height = grow(1, finish.height);
-    OverlayRect {
-        x: finish.x + (finish.width - width) / 2,
-        y: finish.y + (finish.height - height) / 2,
-        width,
-        height,
-    }
+    OverlayRect { x: finish.x + (finish.width - width) / 2, y: finish.y + (finish.height - height) / 2, width, height }
 }
 
 #[cfg(test)]

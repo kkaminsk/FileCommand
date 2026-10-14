@@ -74,11 +74,7 @@ pub fn render_viewer(buf: &mut Buffer, area: Rect, viewer: &ViewerState, theme: 
 /// the file name visible last, left-truncated with `…` if even that alone
 /// does not fit (responsive-layout "Full-screen surface degradation").
 fn render_header(buf: &mut Buffer, x: u16, y: u16, w: usize, viewer: &ViewerState, style: Style) {
-    let filename = viewer
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| viewer.path.display().to_string());
+    let filename = viewer.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| viewer.path.display().to_string());
     let pct = percent_through(viewer.top_offset, viewer.file_len);
     let pos = match viewer.mode {
         ViewMode::Text => format!("Col {}", viewer.h_scroll),

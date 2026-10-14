@@ -16,12 +16,7 @@ fn plain(code: KeyCode) -> KeyEvent {
 }
 
 fn state_with(phase: UiPhase) -> State {
-    State {
-        left: PanelState::new(PathBuf::from("/left")),
-        right: PanelState::new(PathBuf::from("/right")),
-        phase,
-        ..State::empty(Theme::classic())
-    }
+    State { left: PanelState::new(PathBuf::from("/left")), right: PanelState::new(PathBuf::from("/right")), phase, ..State::empty(Theme::classic()) }
 }
 
 fn panels() -> State {
@@ -288,7 +283,10 @@ fn shift_ins_toggles_selection_and_ctrl_shift_ins_is_still_clipboard_paths() {
     // text-field-editing "Shift+Ins over the panels still toggles selection"
     // and "Ctrl+Shift+Ins SHALL remain the clipboard-paths action".
     assert_eq!(map(key(KeyCode::Insert, KeyModifiers::SHIFT), &panels()), Some(Command::ToggleSelectAtCursor));
-    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::CONTROL | KeyModifiers::SHIFT), &panels()), Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths)));
+    assert_eq!(
+        map(key(KeyCode::Insert, KeyModifiers::CONTROL | KeyModifiers::SHIFT), &panels()),
+        Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths))
+    );
     // And plain Insert is untouched, of course.
     assert_eq!(map(plain(KeyCode::Insert), &panels()), Some(Command::ToggleSelectAtCursor));
 }
@@ -575,7 +573,8 @@ fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns
     let viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
     assert_eq!(map(ctrl_y, &viewer), None, "the viewer owns its keys");
 
-    let editor = state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc").expect("valid UTF-8 fixture")));
+    let editor =
+        state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc").expect("valid UTF-8 fixture")));
     assert_eq!(map(ctrl_y, &editor), None, "the editor owns its keys");
 }
 
@@ -626,13 +625,7 @@ fn ctrl_o_maps_to_the_scrollback_view() {
 
 #[test]
 fn ctrl_f3_through_f7_pick_the_sort_modes() {
-    let expected = [
-        (3u8, SortMode::Name),
-        (4, SortMode::Extension),
-        (5, SortMode::Time),
-        (6, SortMode::Size),
-        (7, SortMode::Unsorted),
-    ];
+    let expected = [(3u8, SortMode::Name), (4, SortMode::Extension), (5, SortMode::Time), (6, SortMode::Size), (7, SortMode::Unsorted)];
     for (n, mode) in expected {
         assert_eq!(
             map(key(KeyCode::F(n), KeyModifiers::CONTROL), &panels()),
@@ -652,10 +645,7 @@ fn plain_f5_to_f7_still_mean_copy_mkdir_not_sort() {
 fn sort_keys_target_whichever_panel_is_active() {
     let mut state = panels();
     state.active = PanelSide::Right;
-    assert_eq!(
-        map(key(KeyCode::F(6), KeyModifiers::CONTROL), &state),
-        Some(Command::SetSortMode { side: PanelSide::Right, mode: SortMode::Size })
-    );
+    assert_eq!(map(key(KeyCode::F(6), KeyModifiers::CONTROL), &state), Some(Command::SetSortMode { side: PanelSide::Right, mode: SortMode::Size }));
 }
 
 #[test]
@@ -836,7 +826,10 @@ fn f3_opens_the_viewer_and_plain_f4_requests_the_editor() {
 
 #[test]
 fn ctrl_f4_still_means_sort_by_extension_not_the_editor() {
-    assert_eq!(map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()), Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension }));
+    assert_eq!(
+        map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()),
+        Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension })
+    );
 }
 
 #[test]
@@ -1173,10 +1166,7 @@ fn ctrl_c_types_a_literal_c_in_a_file_op_text_input() {
     // special case — it is not treated as "over the panels" for clipboard
     // purposes (clipboard-export "Clipboard key bindings": "over the
     // panels").
-    assert_eq!(
-        map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()),
-        Some(Command::TextEdit(TextEditOp::Insert('c')))
-    );
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()), Some(Command::TextEdit(TextEditOp::Insert('c'))));
 }
 
 #[test]
@@ -1386,10 +1376,7 @@ fn paste_into_the_command_line_over_the_panels_is_one_paste_op() {
     // "Paste a path into the command line": one `TextEdit(Paste(..))`, and
     // none of the pasted characters touch the panel cursor or selection.
     let state = panels();
-    assert_eq!(
-        map_paste(r"C:\Program Files\App", &state),
-        vec![Command::TextEdit(TextEditOp::Paste(r"C:\Program Files\App".to_string()))]
-    );
+    assert_eq!(map_paste(r"C:\Program Files\App", &state), vec![Command::TextEdit(TextEditOp::Paste(r"C:\Program Files\App".to_string()))]);
     let state = typing("cd ");
     assert_eq!(
         map_paste(r"D:\docs", &state),
@@ -1404,10 +1391,7 @@ fn paste_with_an_active_quick_filter_still_lands_in_the_command_line() {
     // command-line meaning while it is active, so a terminal paste does too.
     let mut state = panels();
     state.left.set_quick_filter(Some("re".to_string()));
-    assert_eq!(
-        map_paste("report.txt", &state),
-        vec![Command::TextEdit(TextEditOp::Paste("report.txt".to_string()))]
-    );
+    assert_eq!(map_paste("report.txt", &state), vec![Command::TextEdit(TextEditOp::Paste("report.txt".to_string()))]);
 }
 
 #[test]
@@ -1415,10 +1399,7 @@ fn a_multi_line_paste_is_flattened_and_never_executed() {
     // "Multi-line paste is flattened and not executed": one paste op joined
     // by single spaces — no command runs.
     let state = panels();
-    assert_eq!(
-        map_paste("dir /b\r\necho hi\n", &state),
-        vec![Command::TextEdit(TextEditOp::Paste("dir /b echo hi ".to_string()))]
-    );
+    assert_eq!(map_paste("dir /b\r\necho hi\n", &state), vec![Command::TextEdit(TextEditOp::Paste("dir /b echo hi ".to_string()))]);
 }
 
 #[test]
@@ -1449,13 +1430,7 @@ fn paste_into_the_editor_text_is_typed_characters_and_newlines() {
     let state = state_with(UiPhase::Editor(open_editor("abc")));
     assert_eq!(
         map_paste("x\r\ny\nz", &state),
-        vec![
-            Command::EditorChar('x'),
-            Command::EditorNewline,
-            Command::EditorChar('y'),
-            Command::EditorNewline,
-            Command::EditorChar('z'),
-        ],
+        vec![Command::EditorChar('x'), Command::EditorNewline, Command::EditorChar('y'), Command::EditorNewline, Command::EditorChar('z'),],
         "CRLF is one line break"
     );
     // The save-on-exit prompt is a yes/no dialog: a paste never answers it.
@@ -1473,25 +1448,16 @@ fn paste_into_the_editor_and_viewer_search_prompts_is_flattened_characters() {
     let mut editor = open_editor("abc");
     editor.search_prompt = Some(String::new());
     let state = state_with(UiPhase::Editor(editor));
-    assert_eq!(
-        map_paste("a\nb", &state),
-        vec![Command::EditorSearchChar('a'), Command::EditorSearchChar(' '), Command::EditorSearchChar('b')]
-    );
+    assert_eq!(map_paste("a\nb", &state), vec![Command::EditorSearchChar('a'), Command::EditorSearchChar(' '), Command::EditorSearchChar('b')]);
     let mut editor = open_editor("abc");
     editor.replace_prompt = Some(filecommand_core::editor::ReplacePrompt::Pattern(String::new()));
     let state = state_with(UiPhase::Editor(editor));
-    assert_eq!(
-        map_paste("a\nb", &state),
-        vec![Command::EditorReplaceChar('a'), Command::EditorReplaceChar(' '), Command::EditorReplaceChar('b')]
-    );
+    assert_eq!(map_paste("a\nb", &state), vec![Command::EditorReplaceChar('a'), Command::EditorReplaceChar(' '), Command::EditorReplaceChar('b')]);
 
     let mut viewer = open_viewer(filecommand_core::viewer::ViewMode::Text);
     viewer.search_input = Some(String::new());
     let state = state_with(UiPhase::Viewer(viewer));
-    assert_eq!(
-        map_paste("a\nb", &state),
-        vec![Command::ViewerSearchChar('a'), Command::ViewerSearchChar(' '), Command::ViewerSearchChar('b')]
-    );
+    assert_eq!(map_paste("a\nb", &state), vec![Command::ViewerSearchChar('a'), Command::ViewerSearchChar(' '), Command::ViewerSearchChar('b')]);
     // Without the prompt open, the viewer has no text sink at all.
     let state = state_with(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)));
     assert_eq!(map_paste("q", &state), Vec::new());
@@ -1553,7 +1519,14 @@ fn undersized_over_panels_and_viewer_lets_only_f10_and_esc_through() {
     for state in [undersized(UiPhase::Panels), undersized(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)))] {
         assert_eq!(map(plain(KeyCode::F(10)), &state), Some(Command::RequestQuit));
         assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::RequestQuit));
-        for k in [plain(KeyCode::Char('a')), plain(KeyCode::Enter), plain(KeyCode::Tab), plain(KeyCode::F(5)), plain(KeyCode::Down), key(KeyCode::Char('j'), KeyModifiers::CONTROL)] {
+        for k in [
+            plain(KeyCode::Char('a')),
+            plain(KeyCode::Enter),
+            plain(KeyCode::Tab),
+            plain(KeyCode::F(5)),
+            plain(KeyCode::Down),
+            key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
             assert_eq!(map(k, &state), None, "{k:?} must not reach the hidden screen");
         }
     }

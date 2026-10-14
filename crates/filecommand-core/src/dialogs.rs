@@ -54,12 +54,7 @@ pub fn clamp_overlay_dim(preferred: u16, minimum: u16, terminal: u16) -> u16 {
 pub fn overlay_rect(preferred: (u16, u16), minimum: (u16, u16), terminal: (u16, u16)) -> OverlayRect {
     let width = clamp_overlay_dim(preferred.0, minimum.0, terminal.0);
     let height = clamp_overlay_dim(preferred.1, minimum.1, terminal.1);
-    OverlayRect {
-        x: terminal.0.saturating_sub(width) / 2,
-        y: terminal.1.saturating_sub(height) / 2,
-        width,
-        height,
-    }
+    OverlayRect { x: terminal.0.saturating_sub(width) / 2, y: terminal.1.saturating_sub(height) / 2, width, height }
 }
 
 /// The open F2 user menu: just a cursor over `State::user_menu_entries`,
@@ -274,12 +269,7 @@ impl FileActionMenuState {
             entries.push(FileActionMenuEntry::Edit);
         }
         entries.push(FileActionMenuEntry::SendToClipboard);
-        entries.extend([
-            FileActionMenuEntry::Copy,
-            FileActionMenuEntry::Rename,
-            FileActionMenuEntry::Move,
-            FileActionMenuEntry::Delete,
-        ]);
+        entries.extend([FileActionMenuEntry::Copy, FileActionMenuEntry::Rename, FileActionMenuEntry::Move, FileActionMenuEntry::Delete]);
         FileActionMenuState { target_name, entries, cursor: 0, selection_scoped, opened_at_ms: 0, selected_at_ms: None }
     }
 

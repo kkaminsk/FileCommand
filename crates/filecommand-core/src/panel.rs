@@ -962,9 +962,16 @@ impl PanelState {
     /// [`Self::set_entries`] / the quick-filter mutators (design D5).
     #[inline]
     fn debug_check_filtered(&self) {
-        debug_assert_eq!(self.filtered.is_some(), self.quick_filter.is_some(), "quick_filter was written without rebuilding the visible-index cache; use set_quick_filter or the quick-filter mutators");
+        debug_assert_eq!(
+            self.filtered.is_some(),
+            self.quick_filter.is_some(),
+            "quick_filter was written without rebuilding the visible-index cache; use set_quick_filter or the quick-filter mutators"
+        );
         if let Some(cached) = &self.filtered {
-            debug_assert!(cached.last().is_none_or(|&i| i < self.entries.len()), "the visible-index cache is stale: entries were replaced without set_entries");
+            debug_assert!(
+                cached.last().is_none_or(|&i| i < self.entries.len()),
+                "the visible-index cache is stale: entries were replaced without set_entries"
+            );
         }
     }
 
@@ -1607,10 +1614,8 @@ mod tests {
     #[test]
     fn selection_status_counts_files_and_zeros_directories() {
         let mut p = PanelState::new(PathBuf::from("/"));
-        p.entries = vec![
-            Entry::new("a.txt", EntryKind::File, 100, None, false, false),
-            Entry::new("sub", EntryKind::Directory, 0, None, false, false),
-        ];
+        p.entries =
+            vec![Entry::new("a.txt", EntryKind::File, 100, None, false, false), Entry::new("sub", EntryKind::Directory, 0, None, false, false)];
         assert_eq!(p.selection_status(), None);
         p.select_matching("*");
         assert_eq!(p.selection_status(), Some("2 files selected, 100 bytes".to_string()));
@@ -1898,8 +1903,9 @@ mod tests {
         }
 
         fn arb_entry() -> impl Strategy<Value = Entry> {
-            (arb_name(), any::<bool>())
-                .prop_map(|(name, is_dir)| Entry::new(OsString::from(name), if is_dir { EntryKind::Directory } else { EntryKind::File }, 0, None, false, false))
+            (arb_name(), any::<bool>()).prop_map(|(name, is_dir)| {
+                Entry::new(OsString::from(name), if is_dir { EntryKind::Directory } else { EntryKind::File }, 0, None, false, false)
+            })
         }
 
         proptest! {
@@ -3187,7 +3193,11 @@ mod tests {
             if expected.len() >= 3 {
                 assert_eq!(p.visible_window(1, 2).collect::<Vec<_>>(), expected[1..3].to_vec(), "an inner window");
             }
-            assert_eq!(p.visible_window(expected.len().saturating_sub(1), 10).count(), expected.len().min(1), "a window running off the end is clipped");
+            assert_eq!(
+                p.visible_window(expected.len().saturating_sub(1), 10).count(),
+                expected.len().min(1),
+                "a window running off the end is clipped"
+            );
             assert_eq!(p.visible_window(expected.len() + 5, 3).count(), 0, "a window past the end is empty");
         }
 

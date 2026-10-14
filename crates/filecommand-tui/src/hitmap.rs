@@ -166,7 +166,10 @@ mod tests {
         /// Whether `inner` lies entirely within `outer` — not just its
         /// top-left corner, the whole rect.
         fn rect_nests_inside(outer: Rect, inner: Rect) -> bool {
-            inner.x >= outer.x && inner.y >= outer.y && inner.x + inner.width <= outer.x + outer.width && inner.y + inner.height <= outer.y + outer.height
+            inner.x >= outer.x
+                && inner.y >= outer.y
+                && inner.x + inner.width <= outer.x + outer.width
+                && inner.y + inner.height <= outer.y + outer.height
         }
 
         fn rects_overlap(a: Rect, b: Rect) -> bool {

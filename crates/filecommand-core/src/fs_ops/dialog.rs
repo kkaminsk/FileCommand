@@ -26,7 +26,14 @@ pub enum FileOpSetup {
     /// disclosure count as `DeleteConfirm`'s, rendered on the blank row
     /// below the field (selection "Operations disclose selected entries
     /// hidden by the quick filter"); 0 for Mkdir.
-    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: LineEdit, buttons: Option<DropButtons>, hidden_by_filter: usize },
+    DestinationInput {
+        kind: JobKind,
+        sources: Vec<SourceItem>,
+        source_dir: PathBuf,
+        input: LineEdit,
+        buttons: Option<DropButtons>,
+        hidden_by_filter: usize,
+    },
     DeleteConfirm {
         sources: Vec<SourceItem>,
         source_dir: PathBuf,
@@ -84,11 +91,23 @@ pub fn hidden_by_filter_disclosure(hidden_by_filter: usize, source_count: usize)
 /// Dialogs shown while a `Job` is in flight on the worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunningDialog {
-    Progress { kind: JobKind, progress: ProgressInfo },
+    Progress {
+        kind: JobKind,
+        progress: ProgressInfo,
+    },
     /// `rename_input` is a shared text field per text-field-editing (`Some`
     /// once the user picked Rename, starting empty).
-    Conflict { kind: JobKind, info: ConflictInfo, progress: ProgressInfo, rename_input: Option<LineEdit> },
-    Error { kind: JobKind, info: ErrorInfo, progress: ProgressInfo },
+    Conflict {
+        kind: JobKind,
+        info: ConflictInfo,
+        progress: ProgressInfo,
+        rename_input: Option<LineEdit>,
+    },
+    Error {
+        kind: JobKind,
+        info: ErrorInfo,
+        progress: ProgressInfo,
+    },
 }
 
 impl RunningDialog {

@@ -19,7 +19,8 @@ use filecommand_core::drives;
 use filecommand_core::editor::{EditorState, LoadResult};
 use filecommand_core::fs_ops::path::to_extended_path;
 use filecommand_core::fs_ops::{
-    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs, SkippedItem,
+    CancelFlag, ConflictChoice, ConflictInfo, ErrorChoice, ErrorInfo, ItemKind, Job, JobOutcome, JobSink, ProgressInfo, ProgressThrottle, RealFs,
+    SkippedItem,
 };
 use filecommand_core::git_info::{self, GitInfo};
 use filecommand_core::info::InfoValues;
@@ -332,8 +333,15 @@ impl Drop for GitQuerySlotGuard {
 /// "Silent absence on timeout and stale-result discarding" — and the slot
 /// is released when the timeout reply is *sent*, not when the orphaned walk
 /// eventually returns, which may be minutes later (design D3).
-fn run_git_query_slot<F>(slot: Arc<Mutex<GitQuerySlotState>>, panel: PanelSide, first: (PathBuf, u64), tx: Sender<Command>, token: WorkerToken, timeout: Duration, query: F)
-where
+fn run_git_query_slot<F>(
+    slot: Arc<Mutex<GitQuerySlotState>>,
+    panel: PanelSide,
+    first: (PathBuf, u64),
+    tx: Sender<Command>,
+    token: WorkerToken,
+    timeout: Duration,
+    query: F,
+) where
     F: Fn(&Path, &PublishedRoot) -> GitInfo + Send + Sync + 'static,
 {
     // Held for the runner's whole lifetime — including a panic unwind — so
@@ -1351,8 +1359,7 @@ mod tests {
         // starting a second walk of the slow repository (design D3).
         let (started_tx, started_rx) = mpsc::channel::<PathBuf>();
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
-        let fake =
-            FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
+        let fake = FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
         let slot = GitQuerySlot::new();
         let (tx, rx) = mpsc::channel();
         let timeout = std::time::Duration::from_millis(300);
@@ -1381,11 +1388,18 @@ mod tests {
         // the status walk stalled.
         let (started_tx, _started_rx) = mpsc::channel::<PathBuf>();
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
-        let fake =
-            FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
+        let fake = FakeGitQuery::new(started_tx, vec![(PathBuf::from("/repo/src"), FakeScript::PublishThenBlock(PathBuf::from("/repo"), gate_rx))]);
         let slot = GitQuerySlot::new();
         let (tx, rx) = mpsc::channel();
-        slot.request_with(PanelSide::Left, PathBuf::from("/repo/src"), 1, tx, WorkerGauge::new().token(), std::time::Duration::from_millis(100), fake_query(&fake));
+        slot.request_with(
+            PanelSide::Left,
+            PathBuf::from("/repo/src"),
+            1,
+            tx,
+            WorkerGauge::new().token(),
+            std::time::Duration::from_millis(100),
+            fake_query(&fake),
+        );
 
         let (path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(path, PathBuf::from("/repo/src"));
@@ -1405,7 +1419,15 @@ mod tests {
         let fake = FakeGitQuery::new(started_tx, vec![(PathBuf::from("/slow/deep"), FakeScript::Block(gate_rx))]);
         let slot = GitQuerySlot::new();
         let (tx, rx) = mpsc::channel();
-        slot.request_with(PanelSide::Left, PathBuf::from("/slow/deep"), 1, tx, WorkerGauge::new().token(), std::time::Duration::from_millis(100), fake_query(&fake));
+        slot.request_with(
+            PanelSide::Left,
+            PathBuf::from("/slow/deep"),
+            1,
+            tx,
+            WorkerGauge::new().token(),
+            std::time::Duration::from_millis(100),
+            fake_query(&fake),
+        );
 
         let (path, request, info, timed_out_root) = recv_git_reply(&rx);
         assert_eq!(path, PathBuf::from("/slow/deep"));
@@ -1671,7 +1693,11 @@ mod tests {
             vec![
                 Command::JobProgress(progress(1, 2_000, "a.txt")),
                 Command::JobProgress(progress(3, 6_000, "c.txt")),
-                Command::JobDone { outcome: JobOutcome::Completed { skipped: vec![] }, source_dir: PathBuf::from("/src"), dest_dir: PathBuf::from("/dst") },
+                Command::JobDone {
+                    outcome: JobOutcome::Completed { skipped: vec![] },
+                    source_dir: PathBuf::from("/src"),
+                    dest_dir: PathBuf::from("/dst")
+                },
             ],
             "the first update goes straight out, the newest held one precedes JobDone, the middle one is dropped"
         );
@@ -1993,7 +2019,9 @@ mod tests {
     fn a_failed_or_panicked_editor_save_reports_editor_save_failed() {
         let editor = EditorState::from_bytes(PathBuf::from("/x/edit.txt"), b"abc\n").unwrap();
         let (tx, rx) = mpsc::channel();
-        spawn_editor_save_with(Box::new(editor.clone()), false, tx, WorkerGauge::new().token(), |_| Err(io::Error::new(io::ErrorKind::StorageFull, "disk full")));
+        spawn_editor_save_with(Box::new(editor.clone()), false, tx, WorkerGauge::new().token(), |_| {
+            Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"))
+        });
         assert_eq!(recv(&rx), Command::EditorSaveFailed { message: "Cannot save edit.txt: disk full".to_string() });
 
         let (tx, rx) = mpsc::channel();
@@ -2055,10 +2083,15 @@ mod tests {
         assert!(rx.recv_timeout(Duration::from_millis(300)).is_err(), "a successful launch reports nothing");
 
         let (tx, rx) = mpsc::channel();
-        spawn_open_with_association_with(PanelSide::Left, PathBuf::from("/x/report.pdf"), tx, WorkerGauge::new().token(), |_| panic!("scripted launch panic"));
+        spawn_open_with_association_with(PanelSide::Left, PathBuf::from("/x/report.pdf"), tx, WorkerGauge::new().token(), |_| {
+            panic!("scripted launch panic")
+        });
         assert_eq!(
             recv(&rx),
-            Command::OpenWithAssociationFailed { side: PanelSide::Left, message: "Could not open report.pdf (internal error: scripted launch panic)".to_string() }
+            Command::OpenWithAssociationFailed {
+                side: PanelSide::Left,
+                message: "Could not open report.pdf (internal error: scripted launch panic)".to_string()
+            }
         );
     }
 
@@ -2145,7 +2178,9 @@ mod tests {
     #[test]
     fn a_panicked_find_walk_still_reports_the_search_done() {
         let (tx, rx) = mpsc::channel();
-        spawn_find_subtree_with(PathBuf::from("/root"), "x".to_string(), 11, CancelFlag::new(), tx, WorkerGauge::new().token(), |_, _, _| panic!("scripted find panic"));
+        spawn_find_subtree_with(PathBuf::from("/root"), "x".to_string(), 11, CancelFlag::new(), tx, WorkerGauge::new().token(), |_, _, _| {
+            panic!("scripted find panic")
+        });
         match recv(&rx) {
             Command::FindFileSearchDone { request } => assert_eq!(request, 11),
             other => panic!("expected FindFileSearchDone, got {other:?}"),
@@ -2202,7 +2237,14 @@ where
     let thread = std::thread::spawn(move || {
         let _token = token;
         let failure_tx = tx.clone();
-        let mut sink = ChannelSink { tx, reply_rx, cancel: cancel_for_thread, source_dir: source_dir.clone(), dest_dir: dest_dir.clone(), throttle: ProgressThrottle::new() };
+        let mut sink = ChannelSink {
+            tx,
+            reply_rx,
+            cancel: cancel_for_thread,
+            source_dir: source_dir.clone(),
+            dest_dir: dest_dir.clone(),
+            throttle: ProgressThrottle::new(),
+        };
         if let Err(msg) = guarded(move || body(&job, &mut sink)) {
             log_worker_panic("job", &msg);
             let skipped = vec![SkippedItem::skipped(source_dir.clone(), format!("internal error: {msg}"))];

@@ -27,7 +27,14 @@ const CANCEL_ROW: &str = "(C)ancel";
 /// while the in-place rename field is showing (it is a shared text field
 /// per text-field-editing, so the cursor sits at its caret), `None`
 /// otherwise.
-pub fn render_conflict(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, info: &ConflictInfo, rename_input: &Option<LineEdit>) -> Option<(u16, u16)> {
+pub fn render_conflict(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    info: &ConflictInfo,
+    rename_input: &Option<LineEdit>,
+) -> Option<(u16, u16)> {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let field_style = role_style(theme, Role::DialogInput, depth);
 

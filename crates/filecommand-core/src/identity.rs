@@ -39,12 +39,7 @@ pub fn copyright_line(year: i32) -> String {
 /// The four identity lines shown on the splash screen, in display order:
 /// product name, version, copyright, tribute.
 pub fn identity_lines(year: i32) -> [String; 4] {
-    [
-        PRODUCT_NAME.to_string(),
-        version_line(),
-        copyright_line(year),
-        TRIBUTE_LINE.to_string(),
-    ]
+    [PRODUCT_NAME.to_string(), version_line(), copyright_line(year), TRIBUTE_LINE.to_string()]
 }
 
 #[cfg(test)]

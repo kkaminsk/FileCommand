@@ -82,7 +82,10 @@ fn resolve_target(path: &Path) -> io::Result<PathBuf> {
 
 /// A `.<name>.<pid>.<n>.<suffix>` sibling of `target`.
 fn sibling_name(target: &Path, n: u32, suffix: &str) -> io::Result<PathBuf> {
-    let parent = target.parent().filter(|p| !p.as_os_str().is_empty()).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target path has no parent directory"))?;
+    let parent = target
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target path has no parent directory"))?;
     let name = target.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "target path has no file name"))?;
     let mut tmp = std::ffi::OsString::from(".");
     tmp.push(name);
@@ -113,7 +116,9 @@ fn create_temp(target: &Path, original: Option<&std::fs::Metadata>) -> io::Resul
 #[cfg(windows)]
 fn apply_original_metadata(options: &mut OpenOptions, original: Option<&std::fs::Metadata>) {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_SYSTEM};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_SYSTEM,
+    };
     const CARRIED: u32 = FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE | FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
     if let Some(meta) = original {
         let bits = meta.file_attributes() & CARRIED;
@@ -172,7 +177,9 @@ fn before_replace() -> io::Result<()> {
 #[cfg(windows)]
 fn replace(target: &Path, temp: &Path, original_exists: bool) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, ERROR_UNABLE_TO_REMOVE_REPLACED};
+    use windows_sys::Win32::Foundation::{
+        ERROR_FILE_NOT_FOUND, ERROR_UNABLE_TO_MOVE_REPLACEMENT, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2, ERROR_UNABLE_TO_REMOVE_REPLACED,
+    };
     use windows_sys::Win32::Storage::FileSystem::{ReplaceFileW, REPLACEFILE_IGNORE_ACL_ERRORS, REPLACEFILE_IGNORE_MERGE_ERRORS};
 
     if !original_exists {
@@ -192,7 +199,14 @@ fn replace(target: &Path, temp: &Path, original_exists: bool) -> io::Result<()> 
     // pointers are documented as reserved and passed as null. The call
     // reads the buffers only.
     let ok = unsafe {
-        ReplaceFileW(target_w.as_ptr(), temp_w.as_ptr(), backup_w.as_ptr(), REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS, std::ptr::null(), std::ptr::null())
+        ReplaceFileW(
+            target_w.as_ptr(),
+            temp_w.as_ptr(),
+            backup_w.as_ptr(),
+            REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+            std::ptr::null(),
+            std::ptr::null(),
+        )
     };
     if ok != 0 {
         // The backup is only a safety net for the swap itself; failing to
@@ -292,7 +306,11 @@ mod tests {
     /// Names in `dir` other than the target itself — any `.fc-tmp` or
     /// `.fc-bak` leftovers show up here.
     fn leftovers(dir: &Path, target: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).filter(|n| Some(n.as_str()) != target.file_name().and_then(|f| f.to_str())).collect();
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| Some(n.as_str()) != target.file_name().and_then(|f| f.to_str()))
+            .collect();
         names.sort();
         names
     }
