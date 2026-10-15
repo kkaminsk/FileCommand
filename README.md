@@ -12,6 +12,8 @@ mouse support, and switchable themes.
 The codebase stays cross-platform via `crossterm`, but only Windows is tested
 and supported.
 
+What changed in each release is in [CHANGELOG.md](CHANGELOG.md).
+
 ![FileCommand screenshot](Screen/deletefile.png)
 
 ## Contents
@@ -39,11 +41,25 @@ and supported.
 
 ## Installing
 
-The easiest way to get FileCommand on Windows is the bundled installer:
+The quickest way is a package manager:
 
-1. Build (or download) `FileCommandSetup.exe` — see
-   [`installer/README.md`](installer/README.md) for build instructions,
-   prerequisites (Rust, .NET SDK, WiX v4/v5 CLI), and a winget manifest.
+```powershell
+winget install BigHatGroup.FileCommand
+choco install filecommand
+```
+
+winget installs per-user by default (`--scope machine` for all users).
+Chocolatey installs machine-wide by default, following its convention;
+add `--params "'/Scope:user'"` for a per-user install. A new version can
+take a few days to appear in either catalog after its GitHub release,
+while it goes through their review.
+
+Or use the installer directly:
+
+1. Download `FileCommandSetup.exe` from the
+   [latest release](https://github.com/kkaminsk/FileCommand/releases/latest),
+   or build it — see [`installer/README.md`](installer/README.md) for build
+   instructions and prerequisites (Rust, .NET SDK, WiX v4/v5 CLI).
 2. Run it. By default it installs **per-user, with no elevation**, to
    `%LocalAppData%\Programs\BigHatGroup\FileCommand`, adds itself to your
    user `PATH`, and creates a Start Menu shortcut.
@@ -263,6 +279,12 @@ from an earlier version is migrated on first load.
   sort mode, filter, and display mode.
 - **Tab** switches which panel is active (the active panel's path renders
   inverse in its top border).
+- Large directories stream in with a live `Reading… N` count and stay
+  usable while they load.
+- Junctions and directory symlinks list and open like directories. The
+  panel keeps the link's own path, so `..` returns to the folder that
+  holds the link. An entry whose details can't be read is left out, and
+  the panel's status line says how many were skipped.
 - **The command line** sits below the panels and always shows the active
   panel's path as its prompt. It understands three built-in verbs (`cd`,
   `del`, `rmdir`) and nothing else — see [Command line](#command-line).
@@ -596,12 +618,23 @@ the hidden or system attribute; on other platforms, names beginning with
 
 Copy (F5), Move/Rename (F6), Mkdir (F7), and Delete (F8) run as cancellable
 background jobs with a progress dialog (file/byte counts, a cancel button).
-Overwrite conflicts prompt Overwrite/Skip/Rename/Overwrite All/Skip All;
+Overwrite conflicts prompt Overwrite/Skip/Rename/Overwrite All/Skip All, or
+Cancel (Esc or C) to stop the whole job;
 errors (permission denied, path too long, disk full, sharing violation)
 pause the job for Retry/Skip/Skip All/Abort, and skipped files are listed in
-a summary at the end. Same-volume moves are instant renames; cross-volume
-moves copy then delete only after the copy verifies. There is no recycle
-bin — deletes are permanent, and the confirmation dialog says so.
+a summary at the end. Quitting while a job runs cancels it and waits briefly
+for its cleanup before exiting.
+
+Copies are written to a temporary `<name>.~fc-partial` file next to the
+target and renamed into place only once complete, so a failed or cancelled
+copy never leaves a truncated file, and a failed Overwrite keeps the
+original. Copies keep attributes, timestamps, and alternate data streams.
+Copying a file onto itself is skipped rather than truncating it.
+Same-volume moves are instant renames. Cross-volume moves flush and verify
+each copied file before deleting its source, and never delete anything
+inside a junction or symlink target: only the link itself is removed.
+There is no recycle bin — deletes are permanent, and the confirmation
+dialog says so.
 
 ### Viewer (F3) and editor (F4)
 

@@ -35,12 +35,13 @@
 
 .PARAMETER CodeSigningDlib
     Path to Azure.CodeSigning.Dlib.dll. Defaults to the CodeSigning repo
-    checkout at C:\GitHub\CodeSigning. Only used with -Sign.
+    checked out next to this repo (for example C:\Temp\tsscat\CodeSigning
+    beside C:\Temp\tsscat\FileCommand). Only used with -Sign.
 
 .PARAMETER CodeSigningMetadata
     Path to the Trusted Signing metadata JSON (endpoint, account, cert
-    profile). Defaults to metadata-packager-mcp-cli.json in the
-    CodeSigning repo checkout. Only used with -Sign.
+    profile). Defaults to metadata-packager-mcp-cli.json in that sibling
+    CodeSigning checkout. Only used with -Sign.
 
 .PARAMETER SignToolPath
     Path to signtool.exe. Defaults to auto-detecting the newest Windows
@@ -61,8 +62,9 @@ param(
     [string]$OutDir = (Join-Path $PSScriptRoot 'out'),
     [switch]$SkipCargoBuild,
     [switch]$Sign,
-    [string]$CodeSigningDlib = 'C:\GitHub\CodeSigning\Microsoft.Trusted.Signing.Client.1.0.95\bin\x64\Azure.CodeSigning.Dlib.dll',
-    [string]$CodeSigningMetadata = 'C:\GitHub\CodeSigning\metadata-packager-mcp-cli.json',
+    # The CodeSigning repo is expected as a sibling of this repo's root.
+    [string]$CodeSigningDlib = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'CodeSigning\Microsoft.Trusted.Signing.Client.1.0.95\bin\x64\Azure.CodeSigning.Dlib.dll'),
+    [string]$CodeSigningMetadata = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'CodeSigning\metadata-packager-mcp-cli.json'),
     [string]$SignToolPath,
     [string]$TimestampServer = 'http://timestamp.acs.microsoft.com'
 )
