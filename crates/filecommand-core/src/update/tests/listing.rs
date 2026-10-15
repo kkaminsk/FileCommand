@@ -1380,7 +1380,7 @@ fn enter_descends_into_a_directory_link_and_parent_navigation_returns_to_the_lin
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.left.cwd, PathBuf::from("/proj/node_modules/lodash"), "the link's own path becomes the panel's directory");
     assert!(effects.contains(&start_listing(&state, PanelSide::Left, "/proj/node_modules/lodash")), "{effects:?}");
-    assert!(state.file_action_menu.is_none(), "Enter navigates rather than opening the file-action menu");
+    assert!(state.file_action_menu().is_none(), "Enter navigates rather than opening the file-action menu");
 
     // Ctrl+PgUp goes back to the directory containing the link, not to the
     // target's parent.
@@ -1397,7 +1397,7 @@ fn enter_on_a_dangling_link_does_not_start_a_listing() {
     let (state, effects) = update(state, Command::Enter);
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel's directory is unchanged");
     assert!(effects.iter().all(|e| !matches!(e, Effect::StartListing { .. })), "no listing starts: {effects:?}");
-    assert!(state.file_action_menu.is_some(), "a dangling link is a file entry: Enter opens the file-action menu");
+    assert!(state.file_action_menu().is_some(), "a dangling link is a file entry: Enter opens the file-action menu");
 }
 
 #[test]

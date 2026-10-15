@@ -13,10 +13,36 @@ use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::DialogLayout;
 use crate::style::role_style;
 
 const MIN_INNER_W: usize = 16;
 const MAX_INNER_W: usize = 50;
+
+/// The menu's geometry at `area` (reducer-overlay-structure design D8): its
+/// rectangle; its text — the title, then one padded ` label` row per visible
+/// entry; and each visible entry's row rectangle, indexed by position in
+/// `dialog.entries` so the index matches exactly what
+/// `FileActionMenuState::cursor` would land on (mouse-input "File-action
+/// menu entries are clickable").
+pub fn layout(area: Rect, dialog: &FileActionMenuState) -> DialogLayout {
+    let title = format!(" {} ", dialog.target_name.to_string_lossy());
+    let widest_label = dialog.entries.iter().map(|e| display_width(e.label())).max().unwrap_or(0);
+    let preferred_inner_w = (widest_label + 2).max(display_width(&title)).clamp(MIN_INNER_W, MAX_INNER_W);
+    let content_rows = dialog.entries.len() as u16;
+    let r = overlay_rect((preferred_inner_w as u16 + 2, content_rows + 2), (MIN_INNER_W as u16 + 2, 3), (area.width, area.height));
+    let rect = Rect { x: area.x + r.x, y: area.y + r.y, width: r.width, height: r.height };
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let visible_rows = rect.height.saturating_sub(2) as usize;
+
+    let mut lines = vec![truncate_with_ellipsis(&title, inner_w)];
+    let mut rows = Vec::with_capacity(dialog.entries.len().min(visible_rows));
+    for (i, entry) in dialog.entries.iter().take(visible_rows).enumerate() {
+        lines.push(pad_to_width(&truncate_with_ellipsis(&format!(" {}", entry.label()), inner_w), inner_w));
+        rows.push((Rect { x: rect.x + 1, y: rect.y + 1 + i as u16, width: inner_w as u16, height: 1 }, i));
+    }
+    DialogLayout { rect, buttons: Vec::new(), rows, lines }
+}
 
 /// Draws the Enter-on-file action menu. `now` is the reducer clock when
 /// animations are on (`State::anim_now`) and `None` for the final frame: the
@@ -24,66 +50,33 @@ const MAX_INNER_W: usize = 50;
 /// hotkey accent before settling, exactly as the F9 pull-downs and the F2
 /// user menu do (ui-animations "Pop-up menus unfold and highlights settle").
 pub fn render_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState, now: Option<u64>) {
-    super::unfold(buf, now, dialog.opened_at_ms, |b| draw_file_action_menu(b, area, theme, depth, dialog, now));
+    let l = layout(area, dialog);
+    super::unfold(buf, now, dialog.opened_at_ms, |b| draw_file_action_menu(b, theme, depth, dialog, now, &l));
 }
 
-fn draw_file_action_menu(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState, now: Option<u64>) {
+/// Paint the menu's finished frame from an already computed [`layout`];
+/// `dialog` supplies the highlight and its settle stamp. Callers animate it
+/// through `unfold` themselves, as [`render_file_action_menu`] does.
+pub fn draw_file_action_menu(buf: &mut Buffer, theme: &Theme, depth: ColorDepth, dialog: &FileActionMenuState, now: Option<u64>, l: &DialogLayout) {
     let body = role_style(theme, Role::DialogPrimary, depth);
     let settling = matches!((now, dialog.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
     let highlight = role_style(theme, if settling { Role::MenuHotkey } else { Role::MenuHighlight }, depth);
-
-    let title = format!(" {} ", dialog.target_name.to_string_lossy());
-    let widest_label = dialog.entries.iter().map(|e| display_width(e.label())).max().unwrap_or(0);
-    let preferred_inner_w = (widest_label + 2).max(display_width(&title)).clamp(MIN_INNER_W, MAX_INNER_W);
-    let content_rows = dialog.entries.len() as u16;
-    let r = overlay_rect((preferred_inner_w as u16 + 2, content_rows + 2), (MIN_INNER_W as u16 + 2, 3), (area.width, area.height));
-    let box_h = r.height;
-    let inner_w = r.width.saturating_sub(2) as usize;
-    let visible_rows = box_h.saturating_sub(2) as usize;
-    let x = area.x + r.x;
-    let y = area.y + r.y;
+    let inner_w = l.rect.width.saturating_sub(2) as usize;
+    let (x, y) = (l.rect.x, l.rect.y);
+    let Some((title, entries)) = l.lines.split_first() else { return };
 
     buf.set_string(x, y, format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(inner_w)), body);
-    let title_x = x + 1 + ((inner_w.saturating_sub(display_width(&title))) / 2) as u16;
-    buf.set_string(title_x, y, truncate_with_ellipsis(&title, inner_w), body);
+    let title_x = x + 1 + ((inner_w.saturating_sub(display_width(title))) / 2) as u16;
+    buf.set_string(title_x, y, title, body);
 
-    for (i, entry) in dialog.entries.iter().take(visible_rows).enumerate() {
-        let ry = y + 1 + i as u16;
-        let style = if i == dialog.cursor { highlight } else { body };
-        buf.set_string(x, ry, "\u{2551}", body);
-        buf.set_string(x + 1, ry, pad_to_width(&truncate_with_ellipsis(&format!(" {}", entry.label()), inner_w), inner_w), style);
-        buf.set_string(x + 1 + inner_w as u16, ry, "\u{2551}", body);
+    for ((row, i), text) in l.rows.iter().zip(entries) {
+        let style = if *i == dialog.cursor { highlight } else { body };
+        buf.set_string(x, row.y, "\u{2551}", body);
+        buf.set_string(row.x, row.y, text, style);
+        buf.set_string(x + 1 + inner_w as u16, row.y, "\u{2551}", body);
     }
 
-    buf.set_string(x, y + box_h - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body);
-}
-
-/// The open file-action menu's clickable row rects at `area` (the same
-/// full-screen `area` `render_file_action_menu` is given), indexed by
-/// position in `dialog.entries` so the index matches exactly what
-/// `FileActionMenuState::cursor` would land on (mouse-input "File-action
-/// menu entries are clickable"). Mirrors `render_file_action_menu`'s own
-/// box-geometry math (`overlay_rect`, `box_h`, `inner_w`, `visible_rows`,
-/// `x`, `y`) so a row rect can never land somewhere the box isn't actually
-/// drawn this frame.
-pub fn hit_items(area: Rect, dialog: &FileActionMenuState) -> Vec<(Rect, usize)> {
-    let title = format!(" {} ", dialog.target_name.to_string_lossy());
-    let widest_label = dialog.entries.iter().map(|e| display_width(e.label())).max().unwrap_or(0);
-    let preferred_inner_w = (widest_label + 2).max(display_width(&title)).clamp(MIN_INNER_W, MAX_INNER_W);
-    let content_rows = dialog.entries.len() as u16;
-    let r = overlay_rect((preferred_inner_w as u16 + 2, content_rows + 2), (MIN_INNER_W as u16 + 2, 3), (area.width, area.height));
-    let box_h = r.height;
-    let inner_w = r.width.saturating_sub(2);
-    let visible_rows = box_h.saturating_sub(2) as usize;
-    let x = area.x + r.x;
-    let y = area.y + r.y;
-
-    let mut out = Vec::with_capacity(dialog.entries.len().min(visible_rows));
-    for i in 0..dialog.entries.len().min(visible_rows) {
-        let ry = y + 1 + i as u16;
-        out.push((Rect { x: x + 1, y: ry, width: inner_w, height: 1 }, i));
-    }
-    out
+    buf.set_string(x, y + l.rect.height - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body);
 }
 
 #[cfg(test)]

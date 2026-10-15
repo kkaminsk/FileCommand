@@ -186,9 +186,9 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
     // ---- Ctrl+J fuzzy jump ------------------------------------------------
     assert!(state.dir_history.iter().any(|e| e.path == fx.sub()), "the earlier tab-2 navigation into sub must be recorded");
     state = step(state, Command::FuzzyJumpOpen, &tx, &rx, &git_slots, &workers);
-    assert!(state.fuzzy_jump.is_some());
+    assert!(state.fuzzy_jump().is_some());
     state = step(state, Command::FuzzyJumpConfirm, &tx, &rx, &git_slots, &workers);
-    assert!(state.fuzzy_jump.is_none(), "the dialog closes");
+    assert!(state.fuzzy_jump().is_none(), "the dialog closes");
     assert_eq!(state.left.cwd, fx.sub(), "Ctrl+J jumped the active panel to the most-frecent visited directory");
 
     // Back to `left`'s root before searching its subtree.
@@ -198,19 +198,19 @@ fn scripted_smoke_sequence_covers_edit_save_tabs_filter_jump_and_find() {
 
     // ---- Alt+F7 find file ---------------------------------------------
     state = step(state, Command::FindFileOpen, &tx, &rx, &git_slots, &workers);
-    assert_eq!(state.find_file.as_ref().unwrap().root, fx.left());
+    assert_eq!(state.find_file().unwrap().root, fx.left());
     for c in "nested".chars() {
         state = step(state, Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert(c)), &tx, &rx, &git_slots, &workers);
     }
     state = step(state, Command::FindFileSubmit, &tx, &rx, &git_slots, &workers);
     {
-        let dialog = state.find_file.as_ref().expect("find-file dialog still open");
+        let dialog = state.find_file().expect("find-file dialog still open");
         assert!(dialog.done, "the walk must have finished by the time `step` quiesces");
         assert_eq!(dialog.results.len(), 1, "exactly nested.txt should match `nested`: {:?}", dialog.results);
         assert_eq!(dialog.results[0].entry.name, "nested.txt");
     }
     state = step(state, Command::FindFileConfirm, &tx, &rx, &git_slots, &workers);
-    assert!(state.find_file.is_none(), "the dialog closes on confirm");
+    assert!(state.find_file().is_none(), "the dialog closes on confirm");
     assert_eq!(state.left.cwd, fx.sub(), "find-file navigated the active panel to the match's containing directory");
     let cursor_name = state.left.entries.get(state.left.cursor).map(|e| e.name.to_string_lossy().into_owned());
     assert_eq!(cursor_name.as_deref(), Some("nested.txt"), "the cursor must settle on the matched entry");

@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use filecommand_core::fs_ops::JobKind;
 use filecommand_core::update::{ClickMods, DropTarget};
-use filecommand_core::{Command, PanelSide, State, UiPhase};
+use filecommand_core::{input_layer, Command, InputLayer, Overlay, PanelSide, State};
 
 use crate::hitmap::{self, HitMap};
 
@@ -139,8 +139,8 @@ enum Context {
     PulldownOpen,
     /// A modal dialog that accepts button clicks only — file-op setup,
     /// running-job (conflict/error/progress), summary, or the quit-confirm
-    /// overlay (which can appear over any of the others, hence checked
-    /// first in `context`).
+    /// dialog (which can appear over any of the others, and is the topmost
+    /// layer of the precedence order).
     DialogButtons,
     /// The file-action menu is open: only its own row rects and click-
     /// outside-to-close are live — no hover-highlight-on-move (mouse-input
@@ -154,45 +154,36 @@ enum Context {
     Ignored,
 }
 
+/// The mode-gating table, keyed by the layer that owns input right now —
+/// the single precedence order `filecommand_core::input_layer` defines, the
+/// same one `map_key` and the reducer route by (reducer-overlay-structure
+/// design D2; mouse-input "Mouse is honoured only where the key would be").
 fn context(state: &State) -> Context {
-    // The quit-confirmation dialog can open above panels, the viewer, an
-    // open menu, or any other modal dialog/overlay (application-shell
-    // "Quit request keys and confirmation"), so it is checked before
-    // everything else here too, mirroring `core::update`'s own precedence.
-    if state.quit_confirm {
-        return Context::DialogButtons;
-    }
-    // Below the 60x16 floor the placeholder hides the active screen, so no
-    // click or wheel notch may reach it — checked after `quit_confirm` so
-    // the quit dialog's buttons, drawn over the placeholder, stay clickable
-    // (application-shell "Resize handling with 60x16 hard floor and
-    // placeholder"; resize-preserves-session-state design D3).
-    if state.undersized {
-        return Context::Ignored;
-    }
-    if state.startup_warning.is_some()
-        || state.drive_select.is_some()
-        || state.fuzzy_jump.is_some()
-        || state.find_file.is_some()
-        || state.user_menu.is_some()
-        || state.history_dialog.is_some()
-        || state.theme_picker.is_some()
-        || state.help.is_some()
-    {
-        return Context::Ignored;
-    }
-    if state.file_action_menu.is_some() {
-        return Context::FileActionMenuOpen;
-    }
-    match &state.phase {
-        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => Context::DialogButtons,
-        UiPhase::Panels if state.menu.is_some() => Context::PulldownOpen,
-        UiPhase::Panels => Context::Panels,
+    match input_layer(state) {
+        // The quit-confirmation dialog can open above panels, the viewer, an
+        // open menu, or any other modal dialog/overlay (application-shell
+        // "Quit request keys and confirmation"): its buttons are the only
+        // live target then.
+        InputLayer::QuitConfirm => Context::DialogButtons,
+        // Below the 60x16 floor the placeholder hides the active screen, so
+        // no click or wheel notch may reach it — the quit dialog's buttons,
+        // drawn over the placeholder, stay clickable through the arm above
+        // (application-shell "Resize handling with 60x16 hard floor and
+        // placeholder"; resize-preserves-session-state design D3).
+        InputLayer::Undersized => Context::Ignored,
+        InputLayer::FileOp => Context::DialogButtons,
         // Splash has nothing clickable; Viewer/Editor are never routed here
-        // at full size (see the module doc comment) — kept as an explicit
-        // arm rather than a catch-all so a future `UiPhase` variant doesn't
-        // silently fall through to "ignored" unnoticed.
-        UiPhase::Splash { .. } | UiPhase::Viewer(_) | UiPhase::Editor(_) => Context::Ignored,
+        // at full size (see the module doc comment).
+        InputLayer::Viewer | InputLayer::Editor | InputLayer::Splash => Context::Ignored,
+        // Each overlay keeps its own mouse policy: the F9 pull-down and the
+        // file-action menu take clicks on their own rows (and a click
+        // outside closes them); every other overlay ignores the mouse.
+        InputLayer::Overlay => match state.overlay() {
+            Some(Overlay::Menu(_)) => Context::PulldownOpen,
+            Some(Overlay::FileActionMenu(_)) => Context::FileActionMenuOpen,
+            _ => Context::Ignored,
+        },
+        InputLayer::Panels => Context::Panels,
     }
 }
 

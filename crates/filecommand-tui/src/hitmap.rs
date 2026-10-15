@@ -2,11 +2,13 @@
 //! translate a raw mouse event into what the user clicked without any
 //! coordinate or `crossterm::event::KeyModifiers` ever reaching
 //! `filecommand-core` (design D2; mouse-input "Hit-testing stays in the
-//! TUI"). Every field is built by the matching view module's own hit-test
-//! helper (`views::panel::hit_test`, `views::keybar::hit_slots`, ...),
-//! mirroring the exact geometry that module's renderer just drew — so the
-//! hit map can never describe a rect that isn't actually on screen this
-//! frame.
+//! TUI"). `views::render` fills it in the same dispatch that draws the
+//! frame: the panel, tab-strip, key-bar and command-line regions come from
+//! the `layout::compute` the panels were drawn with, and every dialog's and
+//! menu's buttons or rows from the `DialogLayout` its renderer just painted
+//! from (reducer-overlay-structure design D8; mouse-input "Click targets
+//! match the rendered geometry") — so the hit map can never describe a rect
+//! that isn't actually on screen this frame.
 
 use std::ffi::OsString;
 use std::path::PathBuf;

@@ -161,10 +161,10 @@ fn request_quit_opens_above_the_viewer_and_cancel_restores_it() {
 #[test]
 fn request_quit_opens_with_a_pull_down_menu_open_and_cancel_restores_it() {
     let (before, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
-    assert!(before.menu.is_some(), "precondition: the menu must be open");
+    assert!(before.menu().is_some(), "precondition: the menu must be open");
     let (state, effects) = update(before.clone(), Command::RequestQuit);
     assert!(state.quit_confirm);
-    assert_eq!(state.menu, before.menu, "the open menu must not be disturbed by RequestQuit");
+    assert_eq!(state.menu(), before.menu(), "the open menu must not be disturbed by RequestQuit");
     assert!(effects.is_empty());
     let (state, _) = update(state, Command::CancelQuit);
     assert_eq!(state, before, "cancel must leave the menu open, untouched, bit-for-bit");
@@ -173,10 +173,10 @@ fn request_quit_opens_with_a_pull_down_menu_open_and_cancel_restores_it() {
 #[test]
 fn request_quit_opens_with_a_modal_dialog_open_and_cancel_restores_it() {
     let (before, _) = update(test_state(UiPhase::Panels), Command::FuzzyJumpOpen);
-    assert!(before.fuzzy_jump.is_some(), "precondition: the fuzzy-jump dialog must be open");
+    assert!(before.fuzzy_jump().is_some(), "precondition: the fuzzy-jump dialog must be open");
     let (state, effects) = update(before.clone(), Command::RequestQuit);
     assert!(state.quit_confirm);
-    assert_eq!(state.fuzzy_jump, before.fuzzy_jump, "the open dialog must not be disturbed by RequestQuit");
+    assert_eq!(state.fuzzy_jump(), before.fuzzy_jump(), "the open dialog must not be disturbed by RequestQuit");
     assert!(effects.is_empty());
     let (state, _) = update(state, Command::CancelQuit);
     assert_eq!(state, before, "cancel must leave the modal dialog open, untouched, bit-for-bit");
@@ -690,7 +690,7 @@ fn cursor_targeted_commands_do_nothing_while_no_entry_is_visible() {
         let (state, effects) = update(state, cmd.clone());
         assert!(effects.is_empty(), "{cmd:?} must emit no effects");
         assert_eq!(state.phase, UiPhase::Panels, "{cmd:?} must not change the phase");
-        assert!(state.file_action_menu.is_none(), "{cmd:?} must not open the file-action menu");
+        assert!(state.file_action_menu().is_none(), "{cmd:?} must not open the file-action menu");
         assert_eq!(state.command_line, command_line_before, "{cmd:?} must not touch the command line");
     }
 }
@@ -970,10 +970,10 @@ fn find_file_pattern_edits_mid_string_until_submitted() {
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
-    assert_eq!(state.find_file.as_ref().unwrap().pattern.text(), "report");
+    assert_eq!(state.find_file().unwrap().pattern.text(), "report");
     let (state, _) = update(state, Command::FindFileSubmit);
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('x')));
-    assert_eq!(state.find_file.as_ref().unwrap().pattern.text(), "report", "the pattern is fixed once the walk is in flight");
+    assert_eq!(state.find_file().unwrap().pattern.text(), "report", "the pattern is fixed once the walk is in flight");
 }
 
 #[test]
@@ -986,11 +986,11 @@ fn fuzzy_jump_pattern_edited_mid_string_renarrows() {
     let (state, _) = update(state, Command::FuzzyJumpOpen);
     let state = "prj".chars().fold(state, |s, c| update(s, Command::TextEdit(TextEditOp::Insert(c))).0);
     let (state, _) = update(state, Command::FuzzyJumpMove(1));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
+    assert_eq!(state.fuzzy_jump().unwrap().cursor, 1);
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Left));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1, "a caret move never re-narrows");
+    assert_eq!(state.fuzzy_jump().unwrap().cursor, 1, "a caret move never re-narrows");
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
-    let fj = state.fuzzy_jump.as_ref().unwrap();
+    let fj = state.fuzzy_jump().unwrap();
     assert_eq!(fj.pattern.text(), "proj");
     assert_eq!(fj.cursor, 0, "the list re-narrows against `proj` from the top");
 }
@@ -1054,7 +1054,7 @@ fn enter_on_an_executable_target_opens_the_menu_with_run_first_and_does_not_spaw
     state.left.entries = vec![file_entry("setup.exe", 1)];
     let (state, effects) = update(state, Command::Enter);
     assert!(effects.is_empty(), "no direct spawn on the first Enter, got {effects:?}");
-    let menu = state.file_action_menu.as_ref().expect("Enter on a file opens the file-action menu");
+    let menu = state.file_action_menu().expect("Enter on a file opens the file-action menu");
     assert_eq!(menu.target_name, OsString::from("setup.exe"));
     assert_eq!(menu.entries[0], FileActionMenuEntry::Run, "an executable target lists Run first");
     assert_eq!(menu.entries[1], FileActionMenuEntry::Open, "Open follows Run for an executable (open-with-associated-app design D2)");
@@ -1086,7 +1086,7 @@ fn enter_on_a_plain_file_opens_the_action_menu_without_spawning_anything() {
     state.left.entries = vec![file_entry("readme.txt", 1)];
     let (state, effects) = update(state, Command::Enter);
     assert!(effects.is_empty());
-    let menu = state.file_action_menu.as_ref().expect("Enter on a non-executable file opens the file-action menu");
+    let menu = state.file_action_menu().expect("Enter on a non-executable file opens the file-action menu");
     assert_eq!(menu.target_name, OsString::from("readme.txt"));
     assert!(!menu.entries.contains(&FileActionMenuEntry::Run), "non-executable: no Run entry");
     assert_eq!(menu.entries[0], FileActionMenuEntry::Open, "non-executable: Open is listed first (open-with-associated-app design D2)");
@@ -1422,10 +1422,10 @@ fn a_delete_probe_reply_after_the_menu_opened_opens_no_dialog() {
     let state = type_line(state, r"rmdir \\nas\share\tmp");
     let (state, _) = update(state, Command::Enter);
     let (state, _) = update(state, Command::MenuOpen);
-    assert!(state.menu.is_some());
+    assert!(state.menu().is_some());
     let (state, effects) = update(state, Command::PathProbed { request: 3, kind: ProbeKind::Dir });
     assert!(effects.is_empty());
-    assert!(state.menu.is_some(), "the menu stays open");
+    assert!(state.menu().is_some(), "the menu stays open");
     assert_eq!(state.phase, UiPhase::Panels, "the delete-confirmation dialog does not open");
     assert_eq!(state.left.last_error, None, "no error either: the reply is simply dropped");
     assert_eq!(state.command_probe, None);
@@ -2033,7 +2033,7 @@ fn keybar_press_out_of_range_is_a_no_op() {
 fn menu_title_click_opens_the_named_pulldown() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::MenuTitleClick(MenuId::Files));
-    let menu = state.menu.expect("the bar opens");
+    let menu = state.menu().expect("the bar opens");
     assert_eq!(menu.active, MenuId::Files);
     assert!(menu.pulldown_open);
 }
@@ -2043,9 +2043,9 @@ fn menu_title_click_opens_the_named_pulldown() {
 #[test]
 fn menu_title_click_switches_from_an_already_open_menu() {
     let mut state = test_state(UiPhase::Panels);
-    state.menu = Some(MenuState::for_menu(MenuId::Left));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Left)));
     let (state, _) = update(state, Command::MenuTitleClick(MenuId::Options));
-    assert_eq!(state.menu.unwrap().active, MenuId::Options);
+    assert_eq!(state.menu().unwrap().active, MenuId::Options);
 }
 
 /// mouse-input "Menu item activation" — clicking `Files` then `Delete`
@@ -2054,10 +2054,10 @@ fn menu_title_click_switches_from_an_already_open_menu() {
 fn menu_item_click_activates_the_item_exactly_like_menu_activate() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("a.txt", 1)];
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     let delete_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Delete")).unwrap();
     let (state, _) = update(state, Command::MenuItemClick(delete_index));
-    assert!(state.menu.is_none(), "activating an item closes the bar");
+    assert!(state.menu().is_none(), "activating an item closes the bar");
     assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })));
 }
 
@@ -2068,10 +2068,10 @@ fn menu_item_click_on_a_separator_is_a_no_op() {
     // the disabled-item guard itself is covered by menu.rs's local-fixture
     // tests.
     let mut state = test_state(UiPhase::Panels);
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     let separator_index = crate::menu::entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Separator)).unwrap();
     let (state, effects) = update(state, Command::MenuItemClick(separator_index));
-    assert!(state.menu.is_some(), "an unselectable row never closes the bar");
+    assert!(state.menu().is_some(), "an unselectable row never closes the bar");
     assert!(effects.is_empty());
 }
 
@@ -2162,7 +2162,7 @@ fn open_action_menu_at_opens_the_menu_for_a_file() {
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Right, name: OsString::from("notes.txt") });
     assert_eq!(state.active, PanelSide::Right);
     assert_eq!(state.right.cursor, 0);
-    let menu = state.file_action_menu.expect("the menu opens for a file target");
+    let menu = state.file_action_menu().expect("the menu opens for a file target");
     assert_eq!(menu.target_name, OsString::from("notes.txt"));
     assert!(!menu.selection_scoped, "not a member of any selection");
 }
@@ -2175,7 +2175,7 @@ fn open_action_menu_at_on_a_directory_opens_the_menu_without_view_edit_or_run() 
     state.left.entries = vec![dir_entry("src")];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("src") });
     assert_eq!(state.left.cursor, 0, "the cursor moves to the target");
-    let menu = state.file_action_menu.expect("the menu opens for a directory target too");
+    let menu = state.file_action_menu().expect("the menu opens for a directory target too");
     assert_eq!(
         menu.entries,
         vec![
@@ -2195,7 +2195,7 @@ fn open_action_menu_at_on_the_parent_entry_is_a_no_op() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![Entry::new(OsString::from(".."), EntryKind::ParentDir, 0, None, false, false)];
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("..") });
-    assert!(state.file_action_menu.is_none(), "`..` is never a valid action-menu target");
+    assert!(state.file_action_menu().is_none(), "`..` is never a valid action-menu target");
 }
 
 /// file-action-menu "Directory targets and selection-scoped invocation" —
@@ -2210,7 +2210,7 @@ fn open_action_menu_at_on_a_selected_entry_scopes_delete_to_the_whole_selection(
     state.left.selected.insert(OsString::from("b.txt"));
     state.left.selected.insert(OsString::from("c.txt"));
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
-    let menu = state.file_action_menu.as_ref().unwrap();
+    let menu = state.file_action_menu().unwrap();
     assert!(menu.selection_scoped);
 
     let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
@@ -2230,7 +2230,7 @@ fn open_action_menu_at_on_an_unselected_entry_stays_single_target() {
     state.left.entries = vec![file_entry("a.txt", 1), file_entry("b.txt", 2)];
     state.left.selected.insert(OsString::from("a.txt"));
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
-    let menu = state.file_action_menu.as_ref().unwrap();
+    let menu = state.file_action_menu().unwrap();
     assert!(!menu.selection_scoped);
 
     let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
@@ -2254,7 +2254,7 @@ fn enter_on_a_selected_entry_still_opens_a_single_target_menu() {
     state.left.selected.insert(OsString::from("c.txt"));
     state.left.cursor = 1; // b.txt, itself selected
     let (state, _) = update(state, Command::Enter);
-    let menu = state.file_action_menu.as_ref().unwrap();
+    let menu = state.file_action_menu().unwrap();
     assert!(!menu.selection_scoped, "Enter-key invocation SHALL remain single-target and file-only");
 }
 
@@ -2279,15 +2279,15 @@ fn assert_survives_shrink_and_enlarge(state: State) -> State {
     assert!(shrunk.undersized, "50x12 is below the floor");
     assert_eq!(shrunk.term_size, (50, 12));
     assert_eq!(shrunk.phase, before.phase, "the shrink must not touch the phase");
-    assert_eq!(shrunk.menu, before.menu);
-    assert_eq!(shrunk.drive_select, before.drive_select);
-    assert_eq!(shrunk.fuzzy_jump, before.fuzzy_jump);
-    assert_eq!(shrunk.find_file, before.find_file);
-    assert_eq!(shrunk.user_menu, before.user_menu);
-    assert_eq!(shrunk.history_dialog, before.history_dialog);
-    assert_eq!(shrunk.theme_picker, before.theme_picker);
-    assert_eq!(shrunk.file_action_menu, before.file_action_menu);
-    assert_eq!(shrunk.help, before.help);
+    assert_eq!(shrunk.menu(), before.menu());
+    assert_eq!(shrunk.drive_select(), before.drive_select());
+    assert_eq!(shrunk.fuzzy_jump(), before.fuzzy_jump());
+    assert_eq!(shrunk.find_file(), before.find_file());
+    assert_eq!(shrunk.user_menu(), before.user_menu());
+    assert_eq!(shrunk.history_dialog(), before.history_dialog());
+    assert_eq!(shrunk.theme_picker(), before.theme_picker());
+    assert_eq!(shrunk.file_action_menu(), before.file_action_menu());
+    assert_eq!(shrunk.help(), before.help());
     assert_eq!(shrunk.quick_search, before.quick_search);
     assert_eq!(shrunk.command_line, before.command_line);
     assert_eq!(shrunk.left.quick_filter, before.left.quick_filter);
@@ -2433,15 +2433,15 @@ type OpenOverlay = Box<dyn Fn(&mut State)>;
 #[test]
 fn undersized_preserves_every_overlay_over_the_panels() {
     let overlays: Vec<(&str, OpenOverlay)> = vec![
-        ("F9 menu", Box::new(|s| s.menu = Some(MenuState::opened()))),
-        ("drive select", Box::new(|s| s.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C', 'D'], Some('C'))))),
-        ("fuzzy jump", Box::new(|s| s.fuzzy_jump = Some(FuzzyJumpState::new()))),
-        ("find file", Box::new(|s| s.find_file = Some(FindFileState::new(PathBuf::from("/left"))))),
-        ("user menu", Box::new(|s| s.user_menu = Some(UserMenuState::new()))),
-        ("history dialog", Box::new(|s| s.history_dialog = Some(HistoryDialogState::new()))),
-        ("theme picker", Box::new(|s| s.theme_picker = Some(ThemePickerState::open("nc-classic")))),
-        ("file-action menu", Box::new(|s| s.file_action_menu = Some(FileActionMenuState::new(OsString::from("a.txt"), false)))),
-        ("help", Box::new(|s| s.help = Some(HelpState::new()))),
+        ("F9 menu", Box::new(|s| s.open_overlay(Overlay::Menu(MenuState::opened())))),
+        ("drive select", Box::new(|s| s.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['C', 'D'], Some('C')))))),
+        ("fuzzy jump", Box::new(|s| s.open_overlay(Overlay::FuzzyJump(FuzzyJumpState::new())))),
+        ("find file", Box::new(|s| s.open_overlay(Overlay::FindFile(FindFileState::new(PathBuf::from("/left")))))),
+        ("user menu", Box::new(|s| s.open_overlay(Overlay::UserMenu(UserMenuState::new())))),
+        ("history dialog", Box::new(|s| s.open_overlay(Overlay::HistoryDialog(HistoryDialogState::new())))),
+        ("theme picker", Box::new(|s| s.open_overlay(Overlay::ThemePicker(ThemePickerState::open("nc-classic"))))),
+        ("file-action menu", Box::new(|s| s.open_overlay(Overlay::FileActionMenu(FileActionMenuState::new(OsString::from("a.txt"), false))))),
+        ("help", Box::new(|s| s.open_overlay(Overlay::Help(HelpState::new())))),
         ("quick filter", Box::new(|s| s.left.set_quick_filter(Some("rep".to_string())))),
         ("type-ahead", Box::new(|s| s.quick_search = Some("no".to_string()))),
         ("command-line text", Box::new(|s| s.command_line = LineEdit::from("dir /w"))),

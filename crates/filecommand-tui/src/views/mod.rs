@@ -34,14 +34,59 @@ use filecommand_core::line_edit::LineEdit;
 use filecommand_core::listing::display_width;
 use filecommand_core::panel::PanelState;
 use filecommand_core::theme::{ColorDepth, Role};
+use filecommand_core::update::ButtonId;
 use filecommand_core::viewer::ByteSource;
-use filecommand_core::{PanelSide, State, UiPhase};
+use filecommand_core::{Overlay, PanelSide, State, UiPhase};
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::Rect;
 
 use crate::hitmap::HitMap;
 use crate::layout;
 use crate::style::role_style;
+
+// ---------------------------------------------------------------------
+// Dialog geometry shared by the renderer and the hit map
+// (reducer-overlay-structure design D8)
+// ---------------------------------------------------------------------
+
+/// One dialog's or menu's geometry for a frame: computed once by the
+/// module's `layout` function, then both painted from (`draw_*`) and
+/// recorded into the [`HitMap`] by `render`'s dispatch — so the cells a
+/// click maps to a button or row are, by construction, exactly the cells
+/// where that button's label or that row is drawn (mouse-input "Click
+/// targets match the rendered geometry"). The rectangle itself still comes
+/// from the unified overlay geometry rule (`filecommand_core::dialogs::
+/// overlay_rect`; responsive-layout "Unified overlay geometry").
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DialogLayout {
+    /// The dialog's rectangle on screen, frame included.
+    pub rect: Rect,
+    /// Each clickable button's cells — exactly the cells its label occupies
+    /// — and what it activates.
+    pub buttons: Vec<(Rect, ButtonId)>,
+    /// Each clickable row (menus), keyed by its position in the model's
+    /// entry list.
+    pub rows: Vec<(Rect, usize)>,
+    /// The content strings the renderer paints, built once here so a
+    /// button's hit rectangle and its painted label come from the same text.
+    /// What each entry is depends on the dialog; see its `layout`.
+    pub lines: Vec<String>,
+}
+
+/// The cells each `label` occupies inside `text`, drawn starting at `(x,
+/// y)`: the button span the hit map records for it. A label the row's
+/// truncation dropped gets no span, so a clipped dialog never offers a
+/// button it does not show.
+pub fn label_spans<T: Copy>(text: &str, x: u16, y: u16, labels: &[(&str, T)]) -> Vec<(Rect, T)> {
+    labels
+        .iter()
+        .filter_map(|(label, id)| {
+            let byte_idx = text.find(label)?;
+            let col = display_width(&text[..byte_idx]) as u16;
+            Some((Rect { x: x + col, y, width: display_width(label) as u16, height: 1 }, *id))
+        })
+        .collect()
+}
 
 // ---------------------------------------------------------------------
 // Shared single-line text field (text-field-editing; design D5)
@@ -79,7 +124,7 @@ pub fn draw_text_field(buf: &mut Buffer, x: u16, y: u16, width: usize, edit: &Li
 // the surface's exact bounding rectangle — are known without any per-view
 // geometry code, and only the revealed part is copied onto the real buffer.
 // Content under the window is the real finished surface, never placeholder
-// art, and hit-maps (built from final geometry in `build_hitmap`) are
+// art, and hit-maps (built from the final layouts in `render`) are
 // unaffected. With `now == None` (animations off) or once the duration has
 // elapsed, the view draws straight onto the buffer: byte-identical to the
 // pre-animation rendering.
@@ -252,15 +297,23 @@ pub struct RenderOutput {
 /// `ByteSource`, `core::State` never does); it is ignored in every other
 /// phase.
 ///
+/// The frame is drawn in the layers of the single precedence order
+/// (`filecommand_core::input_layer`; reducer-overlay-structure design D2/D8),
+/// bottom-up: the active screen — the phase, with the overlay in
+/// `State::overlay` above it, or the "terminal too small" placeholder in
+/// their place below the floor — then the quit-confirmation dialog, then the
+/// startup warning, which stays visible over whatever is showing, the splash
+/// and the placeholder included. Each layer's arm computes its geometry once
+/// (`DialogLayout`), draws from it, and records its clickable cells into the
+/// [`HitMap`], so the hit map can never disagree with what is on screen.
+///
 /// Returns [`RenderOutput`]: the real terminal cursor's `(x, y)` position
-/// when the current phase wants one shown (`UiPhase::Editor`, for the
-/// caret, or a focused single-line text field per text-field-editing) —
-/// `None` otherwise, which the caller must treat as "leave the cursor
-/// hidden" since a stale position from a previous frame's phase would
-/// otherwise linger — alongside the [`HitMap`] `input::map_mouse`
-/// needs for the next frame's mouse events (design D2; this is the same
-/// return value the M4 caret position already was, just extended rather
-/// than replaced).
+/// when the topmost layer wants one shown (`UiPhase::Editor`, for the caret,
+/// or a focused single-line text field per text-field-editing) — `None`
+/// otherwise, which the caller must treat as "leave the cursor hidden" since
+/// a stale position from a previous frame's phase would otherwise linger —
+/// alongside the [`HitMap`] `input::map_mouse` needs for the next frame's
+/// mouse events (design D2).
 pub fn render(
     buf: &mut Buffer,
     area: Rect,
@@ -277,108 +330,66 @@ pub fn render(
     // above it — styles itself from this single value so the whole screen
     // repaints consistently as the highlight moves.
     let render_theme = state.render_theme();
-    let cursor = render_phase(buf, area, state, &render_theme, depth, identity_lines, clock_text, viewer_source);
-    // The quit-confirmation dialog is drawn above whatever the current phase
+    let theme = &render_theme;
+    let now = state.anim_now();
+    let mut hm = HitMap::default();
+
+    // Below the 60x16 floor the "terminal too small" placeholder is drawn in
+    // place of whatever screen is active, which stays intact underneath it
+    // and is redrawn as-is once the terminal is enlarged (application-shell
+    // "Resize handling with 60x16 hard floor and placeholder"; resize-
+    // preserves-session-state design D5). No phase view ever lays out at a
+    // sub-floor size, no text field owns the cursor, and nothing of the
+    // hidden screen is recorded in the hit map — only the quit dialog's
+    // buttons, added below, are clickable there.
+    let mut cursor = if state.undersized {
+        placeholder::render_placeholder(buf, area, theme, depth);
+        None
+    } else {
+        render_screen(buf, area, state, theme, depth, identity_lines, clock_text, viewer_source, &mut hm)
+    };
+
+    // The quit-confirmation dialog is drawn above whatever the screen
     // painted — panels, the viewer, an open menu, or any other modal
     // dialog/overlay — since it lives beside the phase rather than inside
     // it and can open over any of them (application-shell "Quit request
-    // keys and confirmation"; design D5).
-    // Its iris keys on its own stamp, so it opens over a dialog without
-    // making that dialog re-animate (ui-animations "Modal dialogs open with
-    // an iris").
-    let now = state.anim_now();
+    // keys and confirmation"; design D5). Its iris keys on its own stamp, so
+    // it opens over a dialog without making that dialog re-animate
+    // (ui-animations "Modal dialogs open with an iris").
     if state.quit_confirm {
-        iris(buf, now, state.quit_opened_at_ms, |b| quit_dialog::render_quit_dialog(b, area, &render_theme, depth));
+        let l = quit_dialog::layout(area);
+        iris(buf, now, state.quit_opened_at_ms, |b| quit_dialog::draw_quit_dialog(b, theme, depth, &l));
+        hm.dialog_buttons.extend(l.buttons);
+        cursor = None;
     }
-    // The startup-warning modal is drawn last, over whatever the current
-    // phase already painted — it can only ever be raised at the very start
-    // of a session (currently: a malformed `usermenu.toml`), so it must stay
-    // visible regardless of which phase (even the splash screen) happens to
-    // be on screen underneath it (user-menu "Malformed file warns and falls
-    // back without overwriting").
-    if let Some(message) = &state.startup_warning {
-        iris(buf, now, state.dialog_opened_at_ms, |b| startup_warning::render_startup_warning(b, area, &render_theme, depth, message));
+    // The startup-warning modal is drawn last, over whatever is already
+    // painted — it is raised at the very start of a session or after the
+    // user-menu file was edited, so it must stay visible regardless of which
+    // phase (even the splash screen, or the placeholder) happens to be on
+    // screen underneath it (user-menu "Malformed file warns and falls back
+    // without overwriting"). The mouse is ignored while it is up, so it
+    // records no hits.
+    if let Some(Overlay::StartupWarning(message)) = state.overlay() {
+        iris(buf, now, state.dialog_opened_at_ms, |b| startup_warning::render_startup_warning(b, area, theme, depth, message));
+        cursor = None;
     }
     // While either of those topmost modals is up, it — not any text field
     // underneath — owns the keyboard, so the terminal cursor hides
     // (text-field-editing "Field rendering keeps the caret visible": the
     // cursor shows only while a field is focused).
-    let cursor = if state.quit_confirm || state.startup_warning.is_some() { None } else { cursor };
-    RenderOutput { cursor, hitmap: build_hitmap(area, state) }
+    RenderOutput { cursor, hitmap: hm }
 }
 
-/// Builds the frame's [`HitMap`] by asking each relevant view module for the
-/// clickable regions it just drew — `panel::hit_test`, `keybar::hit_slots`,
-/// `menubar::hit_titles`/`hit_items`, and each open dialog's own
-/// `hit_buttons` — mirroring `render_phase`'s own "what's open" dispatch so
-/// the two can never disagree about what's actually on screen this frame
-/// (mouse-input "Hit-testing stays in the TUI"; design D2). Never draws
-/// anything itself.
-fn build_hitmap(area: Rect, state: &State) -> HitMap {
-    let mut hm = HitMap::default();
-    // Below the floor `render_phase` drew the placeholder, not the phase, so
-    // nothing of the hidden screen is recorded — only the quit dialog's
-    // buttons (added below, independent of the phase) are clickable there,
-    // and a stale panel hit map cannot outlive the shrink (resize-preserves-
-    // session-state design D5).
-    match &state.phase {
-        _ if state.undersized => {}
-        UiPhase::Panels | UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => {
-            let l = layout::compute((area.width, area.height), state.split_percent);
-            *hm.panel_mut(PanelSide::Left) = panel::hit_test(l.left, &state.left);
-            *hm.panel_mut(PanelSide::Right) = panel::hit_test(l.right, &state.right);
-            hm.cmdline = l.cmdline;
-            hm.keybar = keybar::hit_slots(l.keybar);
-            if let Some(menu) = &state.menu {
-                hm.menu_titles = menubar::hit_titles(area);
-                hm.menu_items = menubar::hit_items(area, menu);
-            }
-            if let Some(dialog) = &state.file_action_menu {
-                hm.file_action_menu_items = file_action_menu::hit_items(area, dialog);
-            }
-            match &state.phase {
-                UiPhase::FileOpSetup(setup) => {
-                    // Exactly one of these is ever non-empty for a given
-                    // `setup` — `delete_confirm::hit_buttons` no-ops outside
-                    // `DeleteConfirm`, `destination_input::hit_buttons`
-                    // outside a drop-initiated `DestinationInput` — so
-                    // concatenating both is simply "whichever dialog is
-                    // actually showing its buttons this frame."
-                    hm.dialog_buttons = delete_confirm::hit_buttons(area, setup);
-                    hm.dialog_buttons.extend(destination_input::hit_buttons(area, setup));
-                }
-                UiPhase::FileOpRunning { dialog, .. } => {
-                    hm.dialog_buttons = match dialog {
-                        RunningDialog::Progress { .. } => progress_dialog::hit_buttons(area),
-                        RunningDialog::Conflict { rename_input, .. } => conflict_dialog::hit_buttons(area, rename_input),
-                        RunningDialog::Error { info, .. } => error_dialog::hit_buttons(area, info),
-                    };
-                }
-                UiPhase::FileOpSummary(skipped) => hm.dialog_buttons = skipped_summary::hit_buttons(area, skipped),
-                _ => {}
-            }
-        }
-        // Splash has nothing clickable; Viewer/Editor's wheel-only
-        // handling is dispatched directly by the event loop from
-        // `state.phase` (mirroring how it already calls `map_viewer_key`/
-        // `map_editor_key` directly rather than through `map_key`), so
-        // neither needs a hit map at all.
-        _ => {}
-    }
-    // The quit-confirmation dialog is drawn above whatever the phase
-    // painted (see `render`, above) and is reachable from every context, so
-    // its buttons are recorded the same way, independent of the match above.
-    if state.quit_confirm {
-        hm.dialog_buttons.extend(quit_dialog::hit_buttons(area));
-    }
-    hm
-}
-
-// The phase renderer genuinely needs every one of these inputs (buffer,
-// area, state, theme, depth, identity, clock, viewer source); bundling them
-// into a struct would only move the same eight values one level down.
+// The screen renderer genuinely needs every one of these inputs (buffer,
+// area, state, theme, depth, identity, clock, viewer source, hit map);
+// bundling them into a struct would only move the same values one level
+// down.
+/// The active screen at full size: the phase, and — over the panels — the
+/// modal overlay in `State::overlay` at its z-position, then the file-op
+/// dialog. Records the clickable regions it draws into `hm`. Returns the
+/// terminal cursor position the screen wants, if any.
 #[allow(clippy::too_many_arguments)]
-fn render_phase(
+fn render_screen(
     buf: &mut Buffer,
     area: Rect,
     state: &State,
@@ -387,23 +398,19 @@ fn render_phase(
     identity_lines: &[String; 4],
     clock_text: &str,
     viewer_source: Option<&ByteSource>,
+    hm: &mut HitMap,
 ) -> Option<(u16, u16)> {
-    // Below the 60x16 floor the "terminal too small" placeholder is drawn in
-    // place of whatever phase is active, which stays intact underneath it
-    // and is redrawn as-is once the terminal is enlarged (application-shell
-    // "Resize handling with 60x16 hard floor and placeholder"; resize-
-    // preserves-session-state design D5). No phase view ever lays out at a
-    // sub-floor size, and no text field owns the cursor.
-    if state.undersized {
-        placeholder::render_placeholder(buf, area, theme, depth);
-        return None;
-    }
     match &state.phase {
+        // Splash has nothing clickable.
         UiPhase::Splash { started_at_ms } => {
             let elapsed = elapsed_since(state.anim_now(), *started_at_ms);
             splash::render_splash(buf, area, theme, depth, identity_lines, elapsed);
             None
         }
+        // Viewer/Editor's wheel-only handling is dispatched directly by the
+        // event loop from `state.phase` (mirroring how it already calls
+        // `map_viewer_key`/`map_editor_key` directly rather than through
+        // `map_key`), so neither needs a hit map at all.
         UiPhase::Viewer(v) => {
             viewer::render_viewer(buf, area, v, theme, depth, viewer_source);
             None
@@ -467,102 +474,133 @@ fn render_phase(
                 cmdline_caret = command_line::render_command_line(b, l.cmdline, theme, depth, &state.prompt(), &state.command_line);
                 keybar::render_keybar(b, l.keybar, theme, depth, state.drag.is_some());
             });
+            // The panel, tab-strip, key-bar, and command-line regions come
+            // from the same `layout::compute` the panels were just drawn
+            // with (mouse-input "Hit-testing stays in the TUI").
+            *hm.panel_mut(PanelSide::Left) = panel::hit_test(l.left, &state.left);
+            *hm.panel_mut(PanelSide::Right) = panel::hit_test(l.right, &state.right);
+            hm.cmdline = l.cmdline;
+            hm.keybar = keybar::hit_slots(l.keybar);
 
+            // The one modal overlay in the slot, drawn at its z-position
+            // over the base screen and under the file-op dialog (design D8).
             // The F9 bar overlays the panels' top borders (and the clock)
-            // rather than reserving a row of its own. It sweeps in and its
-            // pull-down unfolds inside `render_menu_bar`.
-            if let Some(menu) = &state.menu {
-                menubar::render_menu_bar(buf, area, theme, depth, menu, now);
-            }
-            // Every modal dialog below opens through the same iris, keyed on
-            // the single `dialog_opened_at_ms` stamp — only one of them is
-            // ever visible at a time (ui-animations "Modal dialogs open with
-            // an iris").
+            // rather than reserving a row of its own; the pop-up menus
+            // unfold on their own stamps; every modal dialog opens through
+            // the same iris, keyed on the single `dialog_opened_at_ms`
+            // stamp. An overlay with a text field hands the cursor to it;
+            // any other hides the cursor; the startup warning is drawn by
+            // `render` above everything else.
             let opened = state.dialog_opened_at_ms;
-            if let Some(dialog) = &state.drive_select {
-                iris(buf, now, opened, |b| drive_select::render_drive_select(b, area, theme, depth, dialog));
-            }
-            let mut fuzzy_caret = None;
-            if let Some(dialog) = &state.fuzzy_jump {
-                // Ranked with the epoch clock, as the reducer's Enter and
-                // cursor handlers rank, so the drawn order is the acted-on
-                // order (history-persistence-hardening design D1).
-                iris(buf, now, opened, |b| {
-                    fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.epoch_ms)
-                });
-            }
-            let mut find_caret = None;
-            if let Some(dialog) = &state.find_file {
-                iris(buf, now, opened, |b| find_caret = find_file::render_find_file(b, area, theme, depth, dialog));
-            }
-            if let Some(dialog) = &state.user_menu {
-                user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries, now);
-            }
-            if let Some(dialog) = &state.history_dialog {
-                history_dialog::render_history_dialog(buf, area, theme, depth, dialog, &state.history, now);
-            }
-            if let Some(dialog) = &state.theme_picker {
-                // The dialog itself styles from the previewed `theme`, but
-                // its active-theme marker stays bound to `state.theme.name`
-                // — the applied theme — even while a different theme is
-                // being previewed (design D2; theme-selection "Live theme
-                // preview while the picker is open").
-                iris(buf, now, opened, |b| theme_picker::render_theme_picker(b, area, theme, depth, dialog, &state.theme.name));
-            }
-            if let Some(dialog) = &state.help {
-                iris(buf, now, opened, |b| help::render_help(b, area, theme, depth, dialog, identity_lines));
-            }
-            if let Some(dialog) = &state.file_action_menu {
-                file_action_menu::render_file_action_menu(buf, area, theme, depth, dialog, now);
+            let mut cursor = cmdline_caret;
+            match state.overlay() {
+                None => {}
+                Some(Overlay::Menu(menu)) => {
+                    let ml = menubar::layout(area, menu);
+                    menubar::draw_menu_bar(buf, theme, depth, menu, now, &ml);
+                    hm.menu_titles = ml.titles;
+                    hm.menu_items = ml.pulldown.map(|p| p.rows).unwrap_or_default();
+                    cursor = None;
+                }
+                Some(Overlay::DriveSelect(dialog)) => {
+                    iris(buf, now, opened, |b| drive_select::render_drive_select(b, area, theme, depth, dialog));
+                    cursor = None;
+                }
+                Some(Overlay::FuzzyJump(dialog)) => {
+                    // Ranked with the epoch clock, as the reducer's Enter and
+                    // cursor handlers rank, so the drawn order is the
+                    // acted-on order (history-persistence-hardening design
+                    // D1).
+                    let mut fuzzy_caret = None;
+                    iris(buf, now, opened, |b| {
+                        fuzzy_caret = fuzzy_jump::render_fuzzy_jump(b, area, theme, depth, dialog, &state.dir_history, state.epoch_ms)
+                    });
+                    cursor = fuzzy_caret;
+                }
+                Some(Overlay::FindFile(dialog)) => {
+                    let mut find_caret = None;
+                    iris(buf, now, opened, |b| find_caret = find_file::render_find_file(b, area, theme, depth, dialog));
+                    cursor = find_caret;
+                }
+                Some(Overlay::UserMenu(dialog)) => {
+                    user_menu::render_user_menu(buf, area, theme, depth, dialog, &state.user_menu_entries, now);
+                    cursor = None;
+                }
+                Some(Overlay::HistoryDialog(dialog)) => {
+                    history_dialog::render_history_dialog(buf, area, theme, depth, dialog, &state.history, now);
+                    cursor = None;
+                }
+                Some(Overlay::ThemePicker(dialog)) => {
+                    // The dialog itself styles from the previewed `theme`,
+                    // but its active-theme marker stays bound to
+                    // `state.theme.name` — the applied theme — even while a
+                    // different theme is being previewed (design D2;
+                    // theme-selection "Live theme preview while the picker
+                    // is open").
+                    iris(buf, now, opened, |b| theme_picker::render_theme_picker(b, area, theme, depth, dialog, &state.theme.name));
+                    cursor = None;
+                }
+                Some(Overlay::Help(dialog)) => {
+                    iris(buf, now, opened, |b| help::render_help(b, area, theme, depth, dialog, identity_lines));
+                    cursor = None;
+                }
+                Some(Overlay::FileActionMenu(dialog)) => {
+                    let fl = file_action_menu::layout(area, dialog);
+                    unfold(buf, now, dialog.opened_at_ms, |b| file_action_menu::draw_file_action_menu(b, theme, depth, dialog, now, &fl));
+                    hm.file_action_menu_items = fl.rows;
+                    cursor = None;
+                }
+                Some(Overlay::StartupWarning(_)) => cursor = None,
             }
 
-            let mut file_op_caret = None;
+            // The file-operation dialog, above the panels and any overlay.
+            // Each arm computes its layout once, draws from it, and records
+            // its buttons (design D8).
             match &state.phase {
-                UiPhase::FileOpSetup(setup) => iris(buf, now, opened, |b| {
-                    file_op_caret = destination_input::render_destination_input(b, area, theme, depth, setup);
-                    delete_confirm::render_delete_confirm(b, area, theme, depth, setup);
-                }),
+                UiPhase::FileOpSetup(setup) => {
+                    // Exactly one of these two is ever non-empty for a given
+                    // `setup`: `delete_confirm::layout` is empty outside
+                    // `DeleteConfirm`, `destination_input::layout` outside
+                    // the other two variants, and only a drop-initiated
+                    // `DestinationInput` carries buttons at all.
+                    let dl = delete_confirm::layout(area, setup);
+                    let il = destination_input::layout(area, setup);
+                    let mut file_op_caret = None;
+                    iris(buf, now, opened, |b| {
+                        file_op_caret = destination_input::draw_destination_input(b, theme, depth, setup, &il);
+                        delete_confirm::draw_delete_confirm(b, theme, depth, &dl);
+                    });
+                    hm.dialog_buttons = dl.buttons;
+                    hm.dialog_buttons.extend(il.buttons);
+                    cursor = file_op_caret;
+                }
                 UiPhase::FileOpRunning { dialog, .. } => match dialog {
                     RunningDialog::Progress { kind, progress } => {
-                        iris(buf, now, opened, |b| progress_dialog::render_progress(b, area, theme, depth, *kind, progress));
+                        let pl = progress_dialog::layout(area, *kind, progress);
+                        iris(buf, now, opened, |b| progress_dialog::draw_progress(b, theme, depth, progress, &pl));
+                        hm.dialog_buttons = pl.buttons;
+                        cursor = None;
                     }
                     RunningDialog::Conflict { info, rename_input, .. } => {
-                        iris(buf, now, opened, |b| file_op_caret = conflict_dialog::render_conflict(b, area, theme, depth, info, rename_input));
+                        let cl = conflict_dialog::layout(area, info, rename_input);
+                        let mut file_op_caret = None;
+                        iris(buf, now, opened, |b| file_op_caret = conflict_dialog::draw_conflict(b, theme, depth, rename_input, &cl));
+                        hm.dialog_buttons = cl.buttons;
+                        cursor = file_op_caret;
                     }
                     RunningDialog::Error { info, .. } => {
-                        iris(buf, now, opened, |b| error_dialog::render_error(b, area, theme, depth, info));
+                        let el = error_dialog::layout(area, info);
+                        iris(buf, now, opened, |b| error_dialog::draw_error(b, theme, depth, &el));
+                        hm.dialog_buttons = el.buttons;
+                        cursor = None;
                     }
                 },
                 UiPhase::FileOpSummary(skipped) => {
-                    iris(buf, now, opened, |b| skipped_summary::render_skipped_summary(b, area, theme, depth, skipped));
+                    let sl = skipped_summary::layout(area, skipped);
+                    iris(buf, now, opened, |b| skipped_summary::draw_skipped_summary(b, theme, depth, &sl));
+                    hm.dialog_buttons = sl.buttons;
+                    cursor = None;
                 }
-                _ => {}
-            }
-
-            // The command line's caret is the default; any overlay above
-            // either hands the cursor to its own text field or hides it
-            // (text-field-editing "Field rendering keeps the caret
-            // visible": "SHALL show the terminal cursor at the caret's
-            // screen position while the field is focused" — and only then).
-            let mut cursor = cmdline_caret;
-            if state.menu.is_some()
-                || state.drive_select.is_some()
-                || state.user_menu.is_some()
-                || state.history_dialog.is_some()
-                || state.theme_picker.is_some()
-                || state.help.is_some()
-                || state.file_action_menu.is_some()
-            {
-                cursor = None;
-            }
-            if state.fuzzy_jump.is_some() {
-                cursor = fuzzy_caret;
-            }
-            if state.find_file.is_some() {
-                cursor = find_caret;
-            }
-            match &state.phase {
-                UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => cursor = file_op_caret,
                 _ => {}
             }
             cursor
@@ -591,3 +629,6 @@ fn clock_fits_without_colliding(right_area: Rect, right_panel: &PanelState, acti
     let clock_end = right_area.x + right_area.width;
     !(title_x < clock_end && clock_start < title_end)
 }
+
+#[cfg(test)]
+mod tests;

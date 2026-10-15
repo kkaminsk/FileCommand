@@ -30,7 +30,7 @@ fn edit_user_menu_file_uses_the_configured_external_editor() {
         }
         other => panic!("expected RunExternalEditor, got {other:?}"),
     }
-    assert!(state.user_menu.is_none(), "no overlay opened");
+    assert!(state.user_menu().is_none(), "no overlay opened");
 }
 
 #[test]
@@ -48,7 +48,7 @@ fn user_menu_reloaded_applies_a_wellformed_file() {
     assert!(effects.is_empty());
     assert_eq!(state.user_menu_entries.len(), 1);
     assert_eq!(state.user_menu_entries[0].label, "New", "the reloaded entries replace the old ones");
-    assert_eq!(state.startup_warning, None);
+    assert_eq!(state.startup_warning(), None);
 }
 
 /// configuration-files "Warnings after editing the user menu": a
@@ -66,7 +66,7 @@ fn user_menu_reloaded_with_warnings_applies_entries_and_shows_the_summary() {
     assert!(effects.is_empty());
     assert_eq!(state.user_menu_entries.len(), 1);
     assert_eq!(state.user_menu_entries[0].label, "New", "the edited entries replace the F2 menu");
-    let warning = state.startup_warning.expect("the warnings raise the dialog");
+    let warning = state.startup_warning().expect("the warnings raise the dialog");
     assert!(warning.starts_with("usermenu.toml line 4:"), "names the file and line: {warning}");
     assert!(warning.contains("icon"), "names the unknown key: {warning}");
 }
@@ -85,7 +85,7 @@ fn user_menu_reloaded_malformed_warns_and_keeps_the_previous_entries() {
     let (state, effects) = update(state, Command::UserMenuReloaded(result));
     assert!(effects.is_empty());
     assert_eq!(state.user_menu_entries[0].label, "Previous", "the previous entries are kept, not the defaults");
-    let warning = state.startup_warning.expect("the malformed reload raises the warning dialog");
+    let warning = state.startup_warning().expect("the malformed reload raises the warning dialog");
     assert!(warning.contains(config::USERMENU_FILE), "the warning names the file: {warning}");
 }
 

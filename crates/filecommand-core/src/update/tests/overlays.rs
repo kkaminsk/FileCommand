@@ -12,7 +12,7 @@ fn file_action_menu_does_not_consume_or_alter_the_selection() {
     let selected_before = state.left.selected.clone();
 
     let (state, _) = update(state, Command::Enter);
-    let menu = state.file_action_menu.as_ref().expect("menu opens");
+    let menu = state.file_action_menu().expect("menu opens");
     assert_eq!(menu.target_name, OsString::from("report.txt"), "the menu targets only the cursor entry");
     assert_eq!(state.left.selected, selected_before, "opening the menu does not touch the selection");
     assert_eq!(state.left.selected.len(), 5);
@@ -28,7 +28,7 @@ fn file_action_menu_does_not_open_when_the_command_buffer_is_non_empty() {
     state.left.entries = vec![file_entry("readme.txt", 1)];
     let state = type_line(state, "cd nosuchdir");
     let (state, effects) = update(state, Command::Enter);
-    assert!(state.file_action_menu.is_none(), "a non-empty command buffer takes precedence over the menu");
+    assert!(state.file_action_menu().is_none(), "a non-empty command buffer takes precedence over the menu");
     // The unlisted target is checked asynchronously (offload-blocking-io):
     // the Enter itself spawns nothing and starts no listing.
     assert!(
@@ -43,7 +43,7 @@ fn file_action_menu_does_not_open_for_a_directory_which_still_navigates() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![dir_entry("sub")];
     let (state, effects) = update(state, Command::Enter);
-    assert!(state.file_action_menu.is_none(), "Enter on a directory must not open the menu");
+    assert!(state.file_action_menu().is_none(), "Enter on a directory must not open the menu");
     assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Left, "/left/sub")]);
 }
 
@@ -53,9 +53,9 @@ fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
     // Non-executable: Open, View, Edit, Send to clipboard, Copy, Rename,
     // Move, Delete (8 entries).
     let (state, _) = update(state, Command::FileActionMenuMove(-5));
-    assert_eq!(state.file_action_menu.as_ref().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
+    assert_eq!(state.file_action_menu().unwrap().cursor, 0, "Up from the first entry holds, it does not wrap");
     let (state, _) = update(state, Command::FileActionMenuMove(100));
-    let menu = state.file_action_menu.as_ref().unwrap();
+    let menu = state.file_action_menu().unwrap();
     assert_eq!(menu.cursor, menu.entries.len() - 1, "Down past the last entry clamps, it does not wrap");
     assert_eq!(menu.selected(), FileActionMenuEntry::Delete);
 }
@@ -64,7 +64,7 @@ fn file_action_menu_up_down_moves_the_highlight_clamped_at_both_ends() {
 fn file_action_menu_esc_closes_with_no_action_and_leaves_the_cursor_and_panel_untouched() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
     let (state, effects) = update(state, Command::FileActionMenuCancel);
-    assert!(state.file_action_menu.is_none());
+    assert!(state.file_action_menu().is_none());
     assert!(effects.is_empty());
     assert_eq!(state.phase, UiPhase::Panels);
     assert_eq!(state.left.cursor, 0);
@@ -74,7 +74,7 @@ fn file_action_menu_esc_closes_with_no_action_and_leaves_the_cursor_and_panel_un
 fn file_action_menu_first_letter_hotkey_activates_directly() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
     let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
-    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    assert!(state.file_action_menu().is_none(), "the hotkey closes the menu");
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { sources, .. }) => {
             assert_eq!(sources.len(), 1);
@@ -88,7 +88,7 @@ fn file_action_menu_first_letter_hotkey_activates_directly() {
 fn file_action_menu_unknown_hotkey_is_a_no_op() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
     let (state, effects) = update(state, Command::FileActionMenuHotkey('Z'));
-    assert!(state.file_action_menu.is_some(), "an unmatched hotkey leaves the menu open");
+    assert!(state.file_action_menu().is_some(), "an unmatched hotkey leaves the menu open");
     assert!(effects.is_empty());
 }
 
@@ -104,7 +104,7 @@ fn file_action_menu_targets_the_entry_it_opened_on_even_if_the_cursor_drifts_fro
     state.left.entries = vec![file_entry("b.txt", 1)];
     state.left.cursor = 0;
     let (state, _) = update(state, Command::Enter); // opens the menu on b.txt
-    let menu = state.file_action_menu.as_ref().unwrap();
+    let menu = state.file_action_menu().unwrap();
     assert_eq!(menu.target_name, OsString::from("b.txt"));
 
     // A background listing chunk inserts a.txt, which sorts ahead of
@@ -128,7 +128,7 @@ fn file_action_menu_view_routes_to_the_f3_viewer_path() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
     let (state, _) = update(state, Command::FileActionMenuMove(1)); // Open is highlighted first; one Down lands on View
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
-    assert!(state.file_action_menu.is_none());
+    assert!(state.file_action_menu().is_none());
     assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/notes.txt") }]);
     assert_eq!(state.phase, UiPhase::Panels, "opening is I/O; the phase flips only once ViewerOpened comes back");
 }
@@ -138,7 +138,7 @@ fn file_action_menu_edit_routes_to_the_f4_edit_path() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
     let (state, _) = update(state, Command::FileActionMenuMove(2)); // Open, View, Edit
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
-    assert!(state.file_action_menu.is_none());
+    assert!(state.file_action_menu().is_none());
     assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
@@ -224,9 +224,9 @@ fn enter_enter_on_a_document_emits_open_with_association_for_the_target() {
     let mut state = test_state(UiPhase::Panels);
     state.left.entries = vec![file_entry("report.pdf", 1)];
     let (state, _) = update(state, Command::Enter);
-    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition: Open highlighted");
+    assert_eq!(state.file_action_menu().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition: Open highlighted");
     let (state, effects) = update(state, Command::FileActionMenuConfirm);
-    assert!(state.file_action_menu.is_none(), "activating Open closes the menu");
+    assert!(state.file_action_menu().is_none(), "activating Open closes the menu");
     assert_eq!(
         effects,
         vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]
@@ -240,7 +240,7 @@ fn enter_enter_on_a_document_emits_open_with_association_for_the_target() {
 fn file_action_menu_o_hotkey_activates_open() {
     let state = opened_menu_state(&["report.pdf"], "report.pdf");
     let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
-    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    assert!(state.file_action_menu().is_none(), "the hotkey closes the menu");
     assert_eq!(
         effects,
         vec![Effect::OpenWithAssociation { side: PanelSide::Left, path: PathBuf::from("/left/report.pdf"), cwd: PathBuf::from("/left") }]
@@ -272,7 +272,7 @@ fn open_on_a_selected_target_emits_one_effect_for_that_target_only() {
         state.left.selected.insert(OsString::from(n));
     }
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("b.txt") });
-    assert!(state.file_action_menu.as_ref().unwrap().selection_scoped, "setup precondition: opened on a selection member");
+    assert!(state.file_action_menu().unwrap().selection_scoped, "setup precondition: opened on a selection member");
 
     let (state, effects) = update(state, Command::FileActionMenuHotkey('O'));
     assert_eq!(
@@ -328,7 +328,7 @@ fn open_with_association_failed_lands_on_the_recorded_side_not_the_active_panel(
 #[test]
 fn f9_opens_the_bar_with_the_left_pulldown_showing() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
-    let menu = state.menu.expect("F9 opens the bar");
+    let menu = state.menu().expect("F9 opens the bar");
     assert_eq!(menu.active, MenuId::Left);
     assert!(menu.pulldown_open);
 }
@@ -337,19 +337,19 @@ fn f9_opens_the_bar_with_the_left_pulldown_showing() {
 fn esc_closes_the_pulldown_first_then_the_bar() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuCollapse);
-    let menu = state.menu.as_ref().expect("the bar stays open after the first Esc");
+    let menu = state.menu().expect("the bar stays open after the first Esc");
     assert!(!menu.pulldown_open);
     assert_eq!(menu.active, MenuId::Left, "the active title stays highlighted");
 
     let (state, _) = update(state, Command::MenuCollapse);
-    assert!(state.menu.is_none(), "the second Esc closes the bar");
+    assert!(state.menu().is_none(), "the second Esc closes the bar");
 }
 
 #[test]
 fn hotkey_letter_jumps_to_another_menu_with_its_pulldown_open() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('c'));
-    let menu = state.menu.expect("bar still open");
+    let menu = state.menu().expect("bar still open");
     assert_eq!(menu.active, MenuId::Commands);
     assert!(menu.pulldown_open);
 }
@@ -358,16 +358,16 @@ fn hotkey_letter_jumps_to_another_menu_with_its_pulldown_open() {
 fn horizontal_movement_keeps_a_pulldown_open_and_wraps() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuNextMenu);
-    assert_eq!(state.menu.as_ref().unwrap().active, MenuId::Files);
-    assert!(state.menu.as_ref().unwrap().pulldown_open);
+    assert_eq!(state.menu().unwrap().active, MenuId::Files);
+    assert!(state.menu().unwrap().pulldown_open);
 
     // Left -> Files -> Commands -> Options -> Right -> wraps to Left.
     let state = (0..4).fold(state, |s, _| update(s, Command::MenuNextMenu).0);
-    assert_eq!(state.menu.as_ref().unwrap().active, MenuId::Left);
+    assert_eq!(state.menu().unwrap().active, MenuId::Left);
 
     let (state, _) = update(state, Command::MenuPrevMenu);
-    assert_eq!(state.menu.as_ref().unwrap().active, MenuId::Right);
-    assert!(state.menu.as_ref().unwrap().pulldown_open);
+    assert_eq!(state.menu().unwrap().active, MenuId::Right);
+    assert!(state.menu().unwrap().pulldown_open);
 }
 
 #[test]
@@ -376,11 +376,11 @@ fn vertical_selection_skips_separators() {
     let (state, _) = update(state, Command::MenuHotkey('f'));
     // Files opens on View, its first item; every shipped item is enabled
     // (pulldown-menu-completion), so only separators are ever skipped.
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
+    assert_eq!(state.menu().unwrap().selected_item().map(|i| i.label), Some("View"));
     let (state, _) = update(state, Command::MenuSelectNext);
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Edit"));
+    assert_eq!(state.menu().unwrap().selected_item().map(|i| i.label), Some("Edit"));
     let (state, _) = update(state, Command::MenuSelectPrev);
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
+    assert_eq!(state.menu().unwrap().selected_item().map(|i| i.label), Some("View"));
 }
 
 #[test]
@@ -394,7 +394,7 @@ fn enter_dispatches_the_selected_item_and_closes_the_overlay() {
     let (state, _) = update(state, Command::MenuSelectNext);
     let (state, _) = update(state, Command::MenuActivate); // Copy
 
-    assert!(state.menu.is_none(), "activating an item closes the whole overlay");
+    assert!(state.menu().is_none(), "activating an item closes the whole overlay");
     assert!(
         matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DestinationInput { kind: JobKind::Copy, .. })),
         "the item's action ran, got {:?}",
@@ -412,7 +412,7 @@ fn left_menu_sorts_the_left_panel_even_when_the_right_one_is_focused() {
                                                        // Opens on Brief; Down walks Full, Tree, Quick view, Info, then (the
                                                        // separator skipped, not counted) Name, Extension, Modif. time, Size.
     let state = (0..8).fold(state, |s, _| update(s, Command::MenuSelectNext).0);
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("Size"));
+    assert_eq!(state.menu().unwrap().selected_item().map(|i| i.label), Some("Size"));
     let (state, _) = update(state, Command::MenuActivate);
 
     assert_eq!(state.left.sort_mode, SortMode::Size, "the Left menu targets the left panel regardless of focus");
@@ -441,8 +441,8 @@ fn activating_options_themes_opens_the_theme_picker_and_closes_the_menu() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('o')); // Options: Themes is first-selectable
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none(), "activating an item closes the whole menu overlay");
-    assert!(state.theme_picker.is_some(), "Options -> Themes opens the picker");
+    assert!(state.menu().is_none(), "activating an item closes the whole menu overlay");
+    assert!(state.theme_picker().is_some(), "Options -> Themes opens the picker");
     assert!(effects.is_empty());
 }
 
@@ -455,7 +455,7 @@ fn panel_keys_do_not_leak_through_an_open_menu() {
     // the bar is open, but the overlay must not be disturbed if it does.
     let (state, _) = update(state, Command::MenuSelectNext);
     assert_eq!(state.left.cursor, 0);
-    assert!(state.menu.is_some());
+    assert!(state.menu().is_some());
 }
 
 #[test]
@@ -500,9 +500,9 @@ fn files_menu_view_follows_the_f3_path() {
     state.left.entries = vec![file_entry("notes.txt", 1)];
     let (state, _) = update(state, Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('f'));
-    assert_eq!(state.menu.as_ref().unwrap().selected_item().map(|i| i.label), Some("View"));
+    assert_eq!(state.menu().unwrap().selected_item().map(|i| i.label), Some("View"));
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none(), "activating an item closes the whole overlay");
+    assert!(state.menu().is_none(), "activating an item closes the whole overlay");
     assert_eq!(effects, vec![Effect::OpenViewer { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
@@ -516,7 +516,7 @@ fn files_menu_edit_follows_the_f4_path() {
     let (state, _) = update(state, Command::MenuHotkey('f'));
     let (state, _) = update(state, Command::MenuSelectNext); // Edit
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
+    assert!(state.menu().is_none());
     assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
@@ -531,9 +531,9 @@ fn right_menu_filter_activates_the_right_panel_with_its_quick_filter_open() {
     let (state, _) = update(state, Command::MenuHotkey('r'));
     let filter_index = crate::menu::entries(MenuId::Right).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Filter")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = filter_index;
+    state.menu_mut().unwrap().selected = filter_index;
     let (state, _) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
+    assert!(state.menu().is_none());
     assert_eq!(state.right.quick_filter.as_deref(), Some(""), "the right panel's quick filter opened");
     assert_eq!(state.left.quick_filter, None, "the left panel is untouched");
     assert_eq!(state.active, PanelSide::Right, "the filtered panel became active so typing reaches it");
@@ -552,9 +552,9 @@ fn left_menu_new_tab_opens_a_tab_on_the_left_without_moving_focus() {
     let (state, _) = update(state, Command::MenuOpen); // the Left menu is first
     let tab_index = crate::menu::entries(MenuId::Left).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "New tab")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = tab_index;
+    state.menu_mut().unwrap().selected = tab_index;
     let (state, _) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
+    assert!(state.menu().is_none());
     assert_eq!(state.left.tab_count(), 2, "the left panel gained a tab");
     assert_eq!(state.right.tab_count(), 1, "the right panel is untouched");
     assert_eq!(state.active, PanelSide::Right, "focus stays on the right panel");
@@ -569,7 +569,7 @@ fn left_menu_close_tab_closes_a_left_tab_without_moving_focus() {
     let (state, _) = update(state, Command::MenuOpen);
     let close_index = crate::menu::entries(MenuId::Left).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Close tab")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = close_index;
+    state.menu_mut().unwrap().selected = close_index;
     let (state, _) = update(state, Command::MenuActivate);
     assert_eq!(state.left.tab_count(), 1, "the left panel's tab closed");
     assert_eq!(state.active, PanelSide::Right, "focus stays on the right panel");
@@ -582,10 +582,10 @@ fn commands_menu_history_opens_the_history_dialog() {
     let (state, _) = update(state, Command::MenuHotkey('c'));
     let history_index = crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "History")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = history_index;
+    state.menu_mut().unwrap().selected = history_index;
     let (state, _) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
-    assert!(state.history_dialog.is_some(), "Commands -> History opens the dialog");
+    assert!(state.menu().is_none());
+    assert!(state.history_dialog().is_some(), "Commands -> History opens the dialog");
 }
 
 /// Commands → Swap panels issues the swap (see the swap tests below).
@@ -597,9 +597,9 @@ fn commands_menu_swap_panels_swaps_the_panels() {
     let (state, _) = update(state, Command::MenuHotkey('c'));
     let swap_index = crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Swap panels")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = swap_index;
+    state.menu_mut().unwrap().selected = swap_index;
     let (state, _) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
+    assert!(state.menu().is_none());
     assert_eq!(state.left.cwd, PathBuf::from("/right"));
     assert_eq!(state.right.cwd, PathBuf::from("/left"));
 }
@@ -615,9 +615,9 @@ fn commands_menu_menu_file_edit_opens_the_user_menu_file_in_the_editor() {
     let edit_index =
         crate::menu::entries(MenuId::Commands).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Menu file edit")).unwrap();
     let mut state = state;
-    state.menu.as_mut().unwrap().selected = edit_index;
+    state.menu_mut().unwrap().selected = edit_index;
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none());
+    assert!(state.menu().is_none());
     assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/profile/usermenu.toml") }]);
 }
 
@@ -637,7 +637,7 @@ fn history_dialog_open_lists_history_newest_first() {
     let state = history_state(&["cd C:\\work", "cd D:\\"]);
     let (state, effects) = update(state, Command::HistoryDialogOpen);
     assert!(effects.is_empty());
-    let dialog = state.history_dialog.expect("the dialog opens");
+    let dialog = state.history_dialog().expect("the dialog opens");
     assert_eq!(dialog.cursor, 0, "the highlight starts on the newest entry");
 }
 
@@ -649,7 +649,7 @@ fn history_dialog_confirm_places_the_entry_with_the_caret_at_the_end() {
     let (state, _) = update(state, Command::HistoryDialogOpen);
     let (state, _) = update(state, Command::HistoryDialogMove(1));
     let (state, effects) = update(state, Command::HistoryDialogConfirm);
-    assert!(state.history_dialog.is_none(), "Enter closes the dialog");
+    assert!(state.history_dialog().is_none(), "Enter closes the dialog");
     assert!(effects.is_empty(), "nothing runs — the entry is only placed");
     assert_eq!(state.command_line.text(), "cd C:\\work");
     assert_eq!(state.command_line.caret(), "cd C:\\work".chars().count(), "the caret sits at the end");
@@ -674,7 +674,7 @@ fn history_dialog_cancel_leaves_the_buffer_alone() {
     state.command_line = LineEdit::from("cd x");
     let (state, _) = update(state, Command::HistoryDialogOpen);
     let (state, effects) = update(state, Command::HistoryDialogCancel);
-    assert!(state.history_dialog.is_none(), "Esc closes the dialog");
+    assert!(state.history_dialog().is_none(), "Esc closes the dialog");
     assert!(effects.is_empty());
     assert_eq!(state.command_line.text(), "cd x", "the buffer is unchanged");
 }
@@ -687,11 +687,11 @@ fn history_dialog_empty_history_shows_no_history_and_enter_does_nothing() {
     let (state, _) = update(state, Command::HistoryDialogOpen);
     let before = state.command_line.clone();
     let (state, effects) = update(state, Command::HistoryDialogConfirm);
-    assert!(state.history_dialog.is_some(), "Enter on the empty history keeps the dialog open");
+    assert!(state.history_dialog().is_some(), "Enter on the empty history keeps the dialog open");
     assert!(effects.is_empty());
     assert_eq!(state.command_line, before, "the buffer is unchanged");
     let (state, _) = update(state, Command::HistoryDialogCancel);
-    assert!(state.history_dialog.is_none(), "Esc still closes it");
+    assert!(state.history_dialog().is_none(), "Esc still closes it");
 }
 
 #[test]
@@ -699,11 +699,11 @@ fn history_dialog_move_clamps_at_both_ends() {
     let state = history_state(&["one", "two", "three"]);
     let (state, _) = update(state, Command::HistoryDialogOpen);
     let (state, _) = update(state, Command::HistoryDialogMove(-1));
-    assert_eq!(state.history_dialog.unwrap().cursor, 0, "Up at the top stays put");
+    assert_eq!(state.history_dialog().unwrap().cursor, 0, "Up at the top stays put");
     let (state, _) = update(state, Command::HistoryDialogMove(isize::MAX / 2)); // End/PgDn
-    assert_eq!(state.history_dialog.unwrap().cursor, 2, "End lands on the oldest entry");
+    assert_eq!(state.history_dialog().unwrap().cursor, 2, "End lands on the oldest entry");
     let (state, _) = update(state, Command::HistoryDialogMove(1));
-    assert_eq!(state.history_dialog.unwrap().cursor, 2, "Down at the bottom stays put");
+    assert_eq!(state.history_dialog().unwrap().cursor, 2, "Down at the bottom stays put");
 }
 
 #[test]
@@ -735,7 +735,7 @@ fn alt_f1_and_alt_f2_target_their_own_panels() {
 #[test]
 fn drive_list_opens_the_dialog_and_requests_every_label_lazily() {
     let (state, effects) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['A', 'C', 'D'] });
-    let dialog = state.drive_select.as_ref().expect("the dialog opened");
+    let dialog = state.drive_select().expect("the dialog opened");
     assert_eq!(dialog.target, PanelSide::Left);
     assert_eq!(dialog.drives.len(), 3, "every letter is present on the first frame");
     assert!(dialog.drives.iter().all(|d| d.label.is_none()), "labels are still pending");
@@ -755,30 +755,30 @@ fn the_dialog_opens_on_the_target_panel_s_current_drive() {
     let mut state = test_state(UiPhase::Panels);
     state.right.cwd = PathBuf::from(r"D:\work");
     let (state, _) = update(state, Command::DriveListReady { target: PanelSide::Right, drives: vec!['C', 'D'] });
-    assert_eq!(state.drive_select.unwrap().selected_letter(), Some('D'));
+    assert_eq!(state.drive_select().unwrap().selected_letter(), Some('D'));
 }
 
 #[test]
 fn a_resolved_label_fills_in_place_without_moving_other_rows() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['A', 'C'] });
-    let generation = state.drive_select.as_ref().unwrap().generation;
+    let generation = state.drive_select().unwrap().generation;
     let (state, effects) =
         update(state, Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation });
     assert!(effects.is_empty());
-    let dialog = state.drive_select.unwrap();
+    let dialog = state.drive_select().unwrap();
     assert_eq!(dialog.drives, vec![DriveEntry { letter: 'A', label: None }, DriveEntry { letter: 'C', label: Some("OS".to_string()) }]);
 }
 
 #[test]
 fn a_label_arriving_after_the_dialog_closed_is_discarded() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
-    let generation = state.drive_select.as_ref().unwrap().generation;
+    let generation = state.drive_select().unwrap().generation;
     let (state, _) = update(state, Command::DriveSelectCancel);
-    assert!(state.drive_select.is_none());
+    assert!(state.drive_select().is_none());
 
     let (state, effects) =
         update(state, Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation });
-    assert!(state.drive_select.is_none(), "a stale result must not resurrect the dialog");
+    assert!(state.drive_select().is_none(), "a stale result must not resurrect the dialog");
     assert!(effects.is_empty());
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "and must not touch the panel");
 }
@@ -786,14 +786,14 @@ fn a_label_arriving_after_the_dialog_closed_is_discarded() {
 #[test]
 fn a_label_for_a_superseded_target_panel_is_discarded() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
-    let first_generation = state.drive_select.as_ref().unwrap().generation;
+    let first_generation = state.drive_select().unwrap().generation;
     // The dialog was reopened for the other panel before the label landed.
     let (state, _) = update(state, Command::DriveListReady { target: PanelSide::Right, drives: vec!['C'] });
     let (state, _) = update(
         state,
         Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("OS".to_string()), generation: first_generation },
     );
-    assert_eq!(state.drive_select.unwrap().drives[0].label, None);
+    assert_eq!(state.drive_select().unwrap().drives[0].label, None);
 }
 
 #[test]
@@ -803,24 +803,24 @@ fn a_stale_drive_label_from_a_quick_reopen_of_the_same_target_is_discarded_but_t
     // first fetch lands (Alt+F1, Esc, Alt+F1 again). `target` alone can't
     // tell the two sessions apart — only `generation` can.
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
-    let first_generation = state.drive_select.as_ref().unwrap().generation;
+    let first_generation = state.drive_select().unwrap().generation;
 
     let (state, _) = update(state, Command::DriveSelectCancel);
     let (state, _) = update(state, Command::DriveListReady { target: PanelSide::Left, drives: vec!['C'] });
-    let second_generation = state.drive_select.as_ref().unwrap().generation;
+    let second_generation = state.drive_select().unwrap().generation;
     assert_ne!(first_generation, second_generation, "reopening mints a fresh generation");
 
     let (state, _) = update(
         state,
         Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("STALE".to_string()), generation: first_generation },
     );
-    assert_eq!(state.drive_select.as_ref().unwrap().drives[0].label, None, "the stale (first-generation) answer is dropped");
+    assert_eq!(state.drive_select().unwrap().drives[0].label, None, "the stale (first-generation) answer is dropped");
 
     let (state, _) = update(
         state,
         Command::DriveLabelResolved { target: PanelSide::Left, letter: 'C', label: Some("FRESH".to_string()), generation: second_generation },
     );
-    assert_eq!(state.drive_select.unwrap().drives[0].label, Some("FRESH".to_string()), "the current generation's answer applies");
+    assert_eq!(state.drive_select().unwrap().drives[0].label, Some("FRESH".to_string()), "the current generation's answer applies");
 }
 
 #[test]
@@ -829,7 +829,7 @@ fn esc_dismisses_the_dialog_leaving_the_panel_where_it_was() {
     state.left.cwd = PathBuf::from(r"C:\Users");
     let (state, _) = update(state, Command::DriveListReady { target: PanelSide::Left, drives: vec!['C', 'D'] });
     let (state, effects) = update(state, Command::DriveSelectCancel);
-    assert!(state.drive_select.is_none());
+    assert!(state.drive_select().is_none());
     assert!(effects.is_empty());
     assert_eq!(state.left.cwd, PathBuf::from(r"C:\Users"));
 }
@@ -839,7 +839,7 @@ fn selecting_a_drive_switches_the_target_panel_to_its_root() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Right, drives: vec!['C', 'D'] });
     let (state, _) = update(state, Command::DriveSelectMove(1));
     let (state, effects) = update(state, Command::DriveSelectConfirm);
-    assert!(state.drive_select.is_none(), "confirming closes the dialog");
+    assert!(state.drive_select().is_none(), "confirming closes the dialog");
     assert_eq!(state.right.cwd, PathBuf::from(r"D:\"));
     assert_eq!(without_git_info_effects(effects), vec![start_listing(&state, PanelSide::Right, r"D:\")]);
 }
@@ -859,18 +859,18 @@ fn selecting_an_unavailable_drive_surfaces_the_panel_error_state() {
 fn drive_select_claims_navigation_keys_while_open() {
     let (state, _) = update(test_state(UiPhase::Panels), Command::DriveListReady { target: PanelSide::Left, drives: vec!['A', 'C', 'D'] });
     let (state, _) = update(state, Command::DriveSelectMove(2));
-    assert_eq!(state.drive_select.as_ref().unwrap().selected_letter(), Some('D'));
+    assert_eq!(state.drive_select().unwrap().selected_letter(), Some('D'));
     let (state, _) = update(state, Command::DriveSelectMove(-1));
-    assert_eq!(state.drive_select.unwrap().selected_letter(), Some('C'));
+    assert_eq!(state.drive_select().unwrap().selected_letter(), Some('C'));
 }
 
 #[test]
 fn fuzzy_jump_open_and_esc_close_without_navigating() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FuzzyJumpOpen);
-    assert!(state.fuzzy_jump.is_some());
+    assert!(state.fuzzy_jump().is_some());
     let (state, effects) = update(state, Command::FuzzyJumpCancel);
-    assert!(state.fuzzy_jump.is_none());
+    assert!(state.fuzzy_jump().is_none());
     assert!(effects.is_empty());
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "the panel is unchanged");
 }
@@ -881,9 +881,9 @@ fn fuzzy_jump_typing_and_backspace_edit_the_pattern() {
     let (state, _) = update(state, Command::FuzzyJumpOpen);
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('d')));
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Insert('o')));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern.text(), "do");
+    assert_eq!(state.fuzzy_jump().unwrap().pattern.text(), "do");
     let (state, _) = update(state, Command::TextEdit(TextEditOp::Backspace));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().pattern.text(), "d");
+    assert_eq!(state.fuzzy_jump().unwrap().pattern.text(), "d");
 }
 
 #[test]
@@ -895,7 +895,7 @@ fn fuzzy_jump_confirm_navigates_the_active_panel_to_the_highlighted_directory() 
     // No pattern typed: the full frecency-ranked list shows, most frecent
     // first, so the default (cursor 0) highlight is `C:\High`.
     let (state, effects) = update(state, Command::FuzzyJumpConfirm);
-    assert!(state.fuzzy_jump.is_none(), "the dialog closes");
+    assert!(state.fuzzy_jump().is_none(), "the dialog closes");
     assert_eq!(state.right.cwd, PathBuf::from(r"C:\High"));
     assert_eq!(state.left.cwd, PathBuf::from("/left"), "the opposite panel is unaffected");
     assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Right, .. })));
@@ -907,9 +907,9 @@ fn fuzzy_jump_move_clamps_within_the_currently_filtered_list() {
     state.dir_history = vec![history_entry(r"C:\A", 1, 0), history_entry(r"C:\B", 1, 0)];
     let (state, _) = update(state, Command::FuzzyJumpOpen);
     let (state, _) = update(state, Command::FuzzyJumpMove(-5));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 0);
+    assert_eq!(state.fuzzy_jump().unwrap().cursor, 0);
     let (state, _) = update(state, Command::FuzzyJumpMove(5));
-    assert_eq!(state.fuzzy_jump.as_ref().unwrap().cursor, 1);
+    assert_eq!(state.fuzzy_jump().unwrap().cursor, 1);
 }
 
 /// R-13 regression (fuzzy-jump "Recency survives a restart"; history-
@@ -966,7 +966,7 @@ fn find_file_open_roots_at_the_active_panels_directory() {
     state.active = PanelSide::Right;
     state.right.cwd = PathBuf::from(r"C:\proj");
     let (state, _) = update(state, Command::FindFileOpen);
-    assert_eq!(state.find_file.as_ref().unwrap().root, PathBuf::from(r"C:\proj"));
+    assert_eq!(state.find_file().unwrap().root, PathBuf::from(r"C:\proj"));
 }
 
 #[test]
@@ -980,7 +980,7 @@ fn find_file_submit_mints_a_request_and_dispatches_the_walk_effect() {
         [Effect::FindInSubtree { root, pattern, request }] => {
             assert_eq!(root, &PathBuf::from(r"C:\proj"));
             assert_eq!(pattern, "r");
-            assert_eq!(state.find_file.as_ref().unwrap().request, Some(*request));
+            assert_eq!(state.find_file().unwrap().request, Some(*request));
         }
         other => panic!("expected exactly one FindInSubtree effect, got {other:?}"),
     }
@@ -992,7 +992,7 @@ fn find_file_matches_from_a_superseded_request_are_dropped() {
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit); // request 1
     let (state, _) = update(state, Command::FindFileMatch { request: 999, m: find_match("a.txt", "a.txt") });
-    assert!(state.find_file.as_ref().unwrap().results.is_empty(), "a stale-request match must be dropped");
+    assert!(state.find_file().unwrap().results.is_empty(), "a stale-request match must be dropped");
 }
 
 #[test]
@@ -1001,10 +1001,10 @@ fn find_file_confirm_navigates_in_place_and_seeds_the_cursor_target() {
     state.left.cwd = PathBuf::from(r"C:\proj");
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit);
-    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let request = state.find_file().unwrap().request.unwrap();
     let (state, _) = update(state, Command::FindFileMatch { request, m: find_match(r"sub\report.txt", "report.txt") });
     let (state, effects) = update(state, Command::FindFileConfirm);
-    assert!(state.find_file.is_none(), "the dialog closes");
+    assert!(state.find_file().is_none(), "the dialog closes");
     assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj\sub"), "navigates to the match's containing directory");
     assert_eq!(state.left.pending_cursor_target, Some(OsString::from("report.txt")));
     assert!(without_git_info_effects(effects).iter().any(|e| matches!(e, Effect::StartListing { panel: PanelSide::Left, .. })));
@@ -1016,7 +1016,7 @@ fn find_file_confirm_with_a_root_level_match_navigates_to_the_root() {
     state.left.cwd = PathBuf::from(r"C:\proj");
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit);
-    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let request = state.find_file().unwrap().request.unwrap();
     let (state, _) = update(state, Command::FindFileMatch { request, m: find_match("readme.txt", "readme.txt") });
     let (state, _) = update(state, Command::FindFileConfirm);
     assert_eq!(state.left.cwd, PathBuf::from(r"C:\proj"));
@@ -1027,9 +1027,9 @@ fn find_file_cancel_abandons_the_search_without_navigating() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit);
-    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let request = state.find_file().unwrap().request.unwrap();
     let (state, effects) = update(state, Command::FindFileCancel);
-    assert!(state.find_file.is_none());
+    assert!(state.find_file().is_none());
     // The running walk is told to stop (find-file "Esc stops the walk");
     // nothing else — in particular no navigation — happens.
     assert_eq!(effects, vec![Effect::CancelRequest(request)]);
@@ -1048,7 +1048,7 @@ fn find_file_cancel_and_confirm_stop_a_running_walk_but_not_a_finished_one() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, _) = update(state, Command::FindFileSubmit);
-    let request = state.find_file.as_ref().unwrap().request.unwrap();
+    let request = state.find_file().unwrap().request.unwrap();
     let (_, effects) = update(state.clone(), Command::FindFileCancel);
     assert_eq!(effects, vec![Effect::CancelRequest(request)], "Esc stops the walk");
 
@@ -1076,7 +1076,7 @@ fn find_file_cancel_before_any_search_was_submitted_emits_nothing() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::FindFileOpen);
     let (state, effects) = update(state, Command::FindFileCancel);
-    assert!(state.find_file.is_none());
+    assert!(state.find_file().is_none());
     assert!(effects.is_empty(), "no walk was ever started, so there is nothing to stop");
 }
 
@@ -1139,7 +1139,7 @@ fn user_menu_confirm_dispatches_the_highlighted_commands_shell_passthrough() {
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, _) = update(state, Command::UserMenuMove(1));
     let (state, effects) = update(state, Command::UserMenuConfirm);
-    assert!(state.user_menu.is_none(), "the menu closes");
+    assert!(state.user_menu().is_none(), "the menu closes");
     match effects.as_slice() {
         [Effect::RunShellCommand(inv, side)] => {
             assert_eq!(inv.cwd, PathBuf::from(r"C:\Projects\app"));
@@ -1156,7 +1156,7 @@ fn user_menu_esc_closes_without_running_anything() {
     state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, effects) = update(state, Command::UserMenuCancel);
-    assert!(state.user_menu.is_none());
+    assert!(state.user_menu().is_none());
     assert!(effects.is_empty());
 }
 
@@ -1165,9 +1165,9 @@ fn user_menu_move_clamps_and_confirm_on_an_empty_menu_is_a_harmless_close() {
     let state = test_state(UiPhase::Panels); // user_menu_entries is empty
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, _) = update(state, Command::UserMenuMove(5));
-    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 0);
+    assert_eq!(state.user_menu().unwrap().cursor, 0);
     let (state, effects) = update(state, Command::UserMenuConfirm);
-    assert!(state.user_menu.is_none());
+    assert!(state.user_menu().is_none());
     assert!(effects.is_empty(), "nothing to run on an empty menu");
 }
 
@@ -1185,9 +1185,9 @@ fn user_menu_down_past_the_last_user_entry_lands_on_themes_and_clamps_there() {
     let (state, _) = update(state, Command::UserMenuOpen);
     // Two user entries (indices 0, 1) plus the built-in slot at index 2.
     let (state, _) = update(state, Command::UserMenuMove(2));
-    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 2, "Down from the last user entry lands on the built-in Themes slot");
+    assert_eq!(state.user_menu().unwrap().cursor, 2, "Down from the last user entry lands on the built-in Themes slot");
     let (state, _) = update(state, Command::UserMenuMove(1));
-    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 2, "the built-in slot is the end of the domain: Down holds, it does not wrap");
+    assert_eq!(state.user_menu().unwrap().cursor, 2, "the built-in slot is the end of the domain: Down holds, it does not wrap");
 }
 
 #[test]
@@ -1197,10 +1197,10 @@ fn user_menu_confirm_on_themes_opens_the_picker_pre_highlighted_with_no_shell_ef
     state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "A".to_string(), command: "echo a".to_string() }];
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, _) = update(state, Command::UserMenuMove(1)); // off the one user entry, onto the built-in slot
-    assert_eq!(state.user_menu.as_ref().unwrap().cursor, 1);
+    assert_eq!(state.user_menu().unwrap().cursor, 1);
     let (state, effects) = update(state, Command::UserMenuConfirm);
-    assert!(state.user_menu.is_none(), "the F2 menu closes");
-    let picker = state.theme_picker.expect("Confirm on the built-in slot opens the theme picker");
+    assert!(state.user_menu().is_none(), "the F2 menu closes");
+    let picker = state.theme_picker().expect("Confirm on the built-in slot opens the theme picker");
     let expected = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "terminal-green").unwrap();
     assert_eq!(picker.highlight, expected, "the active theme's row is pre-highlighted, same as the Options -> Themes route");
     assert!(effects.is_empty(), "no shell effect is emitted for the built-in slot");
@@ -1214,8 +1214,8 @@ fn user_menu_confirm_on_a_user_entry_still_runs_it_via_the_shell_unaffected_by_t
     state.user_menu_entries = vec![crate::config::UserMenuEntry { label: "Build".to_string(), command: "cargo build".to_string() }];
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, effects) = update(state, Command::UserMenuConfirm);
-    assert!(state.user_menu.is_none());
-    assert!(state.theme_picker.is_none(), "a user entry never opens the theme picker");
+    assert!(state.user_menu().is_none());
+    assert!(state.theme_picker().is_none(), "a user entry never opens the theme picker");
     match effects.as_slice() {
         [Effect::RunShellCommand(inv, side)] => {
             assert_eq!(inv.cwd, PathBuf::from(r"C:\Projects\app"));
@@ -1233,10 +1233,10 @@ fn theme_picker_esc_after_f2_origin_returns_to_the_panels_without_reopening_the_
     let (state, _) = update(state, Command::UserMenuOpen);
     let (state, _) = update(state, Command::UserMenuMove(1)); // onto the built-in Themes slot
     let (state, _) = update(state, Command::UserMenuConfirm);
-    assert!(state.user_menu.is_none() && state.theme_picker.is_some());
+    assert!(state.user_menu().is_none() && state.theme_picker().is_some());
     let (state, effects) = update(state, Command::ThemePickerCancel);
-    assert!(state.theme_picker.is_none(), "the picker closes");
-    assert!(state.user_menu.is_none(), "Esc lands on the panels, not back on the F2 menu (design D5)");
+    assert!(state.theme_picker().is_none(), "the picker closes");
+    assert!(state.user_menu().is_none(), "Esc lands on the panels, not back on the F2 menu (design D5)");
     assert!(effects.is_empty());
 }
 
@@ -1251,8 +1251,8 @@ fn theme_picker_opens_from_the_options_menu_with_the_active_theme_highlighted() 
     let (state, _) = update(state, Command::MenuOpen);
     let (state, _) = update(state, Command::MenuHotkey('o'));
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none(), "the menu overlay closes");
-    let picker = state.theme_picker.expect("Options -> Themes opens the picker");
+    assert!(state.menu().is_none(), "the menu overlay closes");
+    let picker = state.theme_picker().expect("Options -> Themes opens the picker");
     let expected = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "terminal-green").unwrap();
     assert_eq!(picker.highlight, expected, "the active theme's row is pre-highlighted");
     assert!(effects.is_empty());
@@ -1262,11 +1262,11 @@ fn theme_picker_opens_from_the_options_menu_with_the_active_theme_highlighted() 
 fn theme_picker_up_down_moves_the_highlight_over_the_theme_list() {
     let state = test_state(UiPhase::Panels); // active theme is nc-classic (index 0)
     let (state, _) = update(state, Command::ThemePickerOpen);
-    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 0);
+    assert_eq!(state.theme_picker().unwrap().highlight, 0);
     let (state, _) = update(state, Command::ThemePickerMove(1));
-    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 1);
+    assert_eq!(state.theme_picker().unwrap().highlight, 1);
     let (state, _) = update(state, Command::ThemePickerMove(-1));
-    assert_eq!(state.theme_picker.as_ref().unwrap().highlight, 0, "Up from the first row holds, it does not wrap");
+    assert_eq!(state.theme_picker().unwrap().highlight, 0, "Up from the first row holds, it does not wrap");
 }
 
 #[test]
@@ -1277,7 +1277,7 @@ fn theme_picker_enter_applies_the_highlighted_theme_immediately_and_persists_it(
     let target = crate::theme::BUILTIN_THEME_NAMES.iter().position(|n| *n == "yellow-storm").unwrap();
     let (state, _) = update(state, Command::ThemePickerMove(target as isize));
     let (state, effects) = update(state, Command::ThemePickerConfirm);
-    assert!(state.theme_picker.is_none(), "the dialog closes");
+    assert!(state.theme_picker().is_none(), "the dialog closes");
     assert_eq!(state.theme.name, "yellow-storm", "the active theme switches in this same reducer step");
     assert_eq!(effects, vec![Effect::PersistTheme("yellow-storm".to_string())]);
 }
@@ -1288,7 +1288,7 @@ fn theme_picker_esc_changes_nothing() {
     let (state, _) = update(state, Command::ThemePickerOpen);
     let (state, _) = update(state, Command::ThemePickerMove(3)); // highlight some other theme
     let (state, effects) = update(state, Command::ThemePickerCancel);
-    assert!(state.theme_picker.is_none(), "the dialog closes");
+    assert!(state.theme_picker().is_none(), "the dialog closes");
     assert_eq!(state.theme.name, "nc-classic", "the active theme is untouched");
     assert!(effects.is_empty(), "nothing is persisted on cancel");
 }
@@ -1348,7 +1348,7 @@ fn render_theme_after_confirm_equals_the_newly_applied_theme() {
 fn help_opens_with_about_filecommand_highlighted_first() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::HelpOpen);
-    let help = state.help.unwrap();
+    let help = state.help().unwrap();
     assert_eq!(help.cursor, 0);
     assert_eq!(crate::dialogs::HELP_TOPICS[help.cursor], "About FileCommand");
     assert!(help.page.is_none());
@@ -1360,8 +1360,8 @@ fn help_activate_on_about_opens_the_about_dialog_not_a_page() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::HelpActivate);
-    assert!(state.help.as_ref().unwrap().about_open);
-    assert!(state.help.as_ref().unwrap().page.is_none());
+    assert!(state.help().unwrap().about_open);
+    assert!(state.help().unwrap().page.is_none());
 }
 
 #[test]
@@ -1370,7 +1370,7 @@ fn help_activate_on_a_topic_opens_its_page() {
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::HelpMove(1)); // "Keyboard reference"
     let (state, _) = update(state, Command::HelpActivate);
-    assert_eq!(state.help.as_ref().unwrap().page, Some(1));
+    assert_eq!(state.help().unwrap().page, Some(1));
 }
 
 #[test]
@@ -1379,15 +1379,15 @@ fn help_cancel_returns_a_page_to_the_list_then_closes_the_window() {
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::HelpMove(1));
     let (state, _) = update(state, Command::HelpActivate);
-    assert!(state.help.as_ref().unwrap().page.is_some());
+    assert!(state.help().unwrap().page.is_some());
 
     let (state, _) = update(state, Command::HelpCancel);
-    assert!(state.help.is_some(), "Esc from a page returns to the list, not closing the window");
-    assert!(state.help.as_ref().unwrap().page.is_none());
-    assert_eq!(state.help.as_ref().unwrap().cursor, 1, "the highlight is preserved");
+    assert!(state.help().is_some(), "Esc from a page returns to the list, not closing the window");
+    assert!(state.help().unwrap().page.is_none());
+    assert_eq!(state.help().unwrap().cursor, 1, "the highlight is preserved");
 
     let (state, _) = update(state, Command::HelpCancel);
-    assert!(state.help.is_none(), "Esc from the list closes the window");
+    assert!(state.help().is_none(), "Esc from the list closes the window");
 }
 
 #[test]
@@ -1396,9 +1396,9 @@ fn help_cancel_dismisses_about_back_to_the_list_with_about_still_highlighted() {
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::HelpActivate); // opens About
     let (state, _) = update(state, Command::HelpCancel);
-    assert!(state.help.is_some());
-    assert!(!state.help.as_ref().unwrap().about_open);
-    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+    assert!(state.help().is_some());
+    assert!(!state.help().unwrap().about_open);
+    assert_eq!(state.help().unwrap().cursor, 0);
 }
 
 #[test]
@@ -1406,10 +1406,10 @@ fn help_move_does_not_walk_past_the_ends_of_the_topic_list() {
     let state = test_state(UiPhase::Panels);
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::HelpMove(-5));
-    assert_eq!(state.help.as_ref().unwrap().cursor, 0);
+    assert_eq!(state.help().unwrap().cursor, 0);
     let last = crate::dialogs::HELP_TOPICS.len() - 1;
     let state = (0..20).fold(state, |s, _| update(s, Command::HelpMove(1)).0);
-    assert_eq!(state.help.as_ref().unwrap().cursor, last);
+    assert_eq!(state.help().unwrap().cursor, last);
 }
 
 // ---------------------------------------------------------------------
@@ -1419,18 +1419,18 @@ fn help_move_does_not_walk_past_the_ends_of_the_topic_list() {
 #[test]
 fn dismiss_startup_warning_clears_it() {
     let mut state = test_state(UiPhase::Panels);
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     let (state, effects) = update(state, Command::DismissStartupWarning);
-    assert_eq!(state.startup_warning, None);
+    assert_eq!(state.startup_warning(), None);
     assert!(effects.is_empty());
 }
 
 #[test]
 fn dismiss_startup_warning_is_a_no_op_when_nothing_is_warned() {
     let state = test_state(UiPhase::Panels);
-    assert_eq!(state.startup_warning, None);
+    assert_eq!(state.startup_warning(), None);
     let (state, effects) = update(state, Command::DismissStartupWarning);
-    assert_eq!(state.startup_warning, None);
+    assert_eq!(state.startup_warning(), None);
     assert!(effects.is_empty());
 }
 
@@ -1446,9 +1446,9 @@ fn dismiss_startup_warning_is_a_no_op_when_nothing_is_warned() {
 #[test]
 fn file_action_menu_item_click_activates_the_item_exactly_like_confirm() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt");
-    let edit_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Edit).unwrap();
+    let edit_index = state.file_action_menu().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Edit).unwrap();
     let (state, effects) = update(state, Command::FileActionMenuItemClick(edit_index));
-    assert!(state.file_action_menu.is_none(), "activating an entry closes the menu");
+    assert!(state.file_action_menu().is_none(), "activating an entry closes the menu");
     assert_eq!(effects, vec![Effect::OpenEditor { request: 3, path: PathBuf::from("/left/notes.txt") }]);
 }
 
@@ -1479,10 +1479,10 @@ fn file_action_menu_item_click_out_of_range_is_a_no_op() {
 #[test]
 fn file_action_menu_item_click_on_a_non_highlighted_row_activates_the_clicked_row() {
     let state = opened_menu_state(&["notes.txt"], "notes.txt"); // Open highlighted first
-    assert_eq!(state.file_action_menu.as_ref().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition");
-    let delete_index = state.file_action_menu.as_ref().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Delete).unwrap();
+    assert_eq!(state.file_action_menu().unwrap().selected(), FileActionMenuEntry::Open, "setup precondition");
+    let delete_index = state.file_action_menu().unwrap().entries.iter().position(|e| *e == FileActionMenuEntry::Delete).unwrap();
     let (state, _) = update(state, Command::FileActionMenuItemClick(delete_index));
-    assert!(state.file_action_menu.is_none());
+    assert!(state.file_action_menu().is_none());
     assert!(matches!(state.phase, UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { .. })), "Delete was activated, not Open");
 }
 
@@ -1498,7 +1498,7 @@ fn clocked(phase: UiPhase, ms: u64) -> State {
 #[test]
 fn opening_the_bar_stamps_every_clock_from_the_reducer_clock() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
-    let menu = state.menu.expect("the bar opens");
+    let menu = state.menu().expect("the bar opens");
     assert_eq!(menu.opened_at_ms, 1_000);
     assert_eq!(menu.pulldown_opened_at_ms, 1_000);
     assert_eq!(menu.selected_at_ms, None, "opening is the unfold's job, not a highlight flash");
@@ -1511,7 +1511,7 @@ fn stamps_come_from_the_last_tick_reading_not_a_live_clock() {
     let b = update(clocked(UiPhase::Panels, 42), Command::MenuOpen).0;
     assert_eq!(a, b);
     let later = update(clocked(UiPhase::Panels, 43), Command::MenuOpen).0;
-    assert_eq!(later.menu.unwrap().opened_at_ms, 43);
+    assert_eq!(later.menu().unwrap().opened_at_ms, 43);
 }
 
 #[test]
@@ -1519,7 +1519,7 @@ fn horizontal_traversal_restamps_the_pulldown_but_not_the_bar() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
     let (state, _) = update(state, Command::Tick { now_ms: 1_040, epoch_ms: 1_040 });
     let (state, _) = update(state, Command::MenuNextMenu);
-    let menu = state.menu.expect("still open");
+    let menu = state.menu().expect("still open");
     assert_eq!(menu.active, MenuId::Files);
     assert!(menu.pulldown_open, "traversal never shows a closed intermediate state");
     assert_eq!(menu.opened_at_ms, 1_000, "the bar itself did not reopen");
@@ -1532,13 +1532,13 @@ fn hotkey_jump_and_title_click_restamp_the_pulldown_and_keep_the_bar_stamp() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
     let (state, _) = update(state, Command::Tick { now_ms: 1_030, epoch_ms: 1_030 });
     let (jumped, _) = update(state.clone(), Command::MenuHotkey('c'));
-    let menu = jumped.menu.expect("open");
+    let menu = jumped.menu().expect("open");
     assert_eq!(menu.active, MenuId::Commands);
     assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_030));
 
     // A title click rebuilds the whole `MenuState`; the bar stamp must survive.
     let (clicked, _) = update(state, Command::MenuTitleClick(MenuId::Options));
-    let menu = clicked.menu.expect("open");
+    let menu = clicked.menu().expect("open");
     assert_eq!(menu.active, MenuId::Options);
     assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_030));
 }
@@ -1548,24 +1548,24 @@ fn moving_the_highlight_stamps_only_the_highlight() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
     let (state, _) = update(state, Command::Tick { now_ms: 1_200, epoch_ms: 1_200 });
     let (state, _) = update(state, Command::MenuSelectNext);
-    let menu = state.menu.clone().expect("open");
+    let menu = state.menu().cloned().expect("open");
     assert_eq!(menu.selected_at_ms, Some(1_200));
     assert_eq!((menu.opened_at_ms, menu.pulldown_opened_at_ms), (1_000, 1_000));
 
     // A later tick with no selection change leaves the stamp alone.
     let (state, _) = update(state, Command::Tick { now_ms: 1_500, epoch_ms: 1_500 });
-    assert_eq!(state.menu.unwrap().selected_at_ms, Some(1_200));
+    assert_eq!(state.menu().unwrap().selected_at_ms, Some(1_200));
 }
 
 #[test]
 fn reopening_a_collapsed_pulldown_unfolds_it_again() {
     let (state, _) = update(clocked(UiPhase::Panels, 1_000), Command::MenuOpen);
     let (state, _) = update(state, Command::MenuCollapse);
-    assert!(!state.menu.as_ref().unwrap().pulldown_open);
+    assert!(!state.menu().unwrap().pulldown_open);
     let (state, _) = update(state, Command::Tick { now_ms: 1_300, epoch_ms: 1_300 });
     // The hotkey of the *same* menu (`Left`) reopens its pull-down.
     let (state, _) = update(state, Command::MenuHotkey('l'));
-    let menu = state.menu.expect("open");
+    let menu = state.menu().expect("open");
     assert_eq!(menu.active, MenuId::Left);
     assert!(menu.pulldown_open, "the hotkey reopens the collapsed pull-down");
     assert_eq!(menu.pulldown_opened_at_ms, 1_300);
@@ -1578,11 +1578,11 @@ fn user_menu_stamps_open_and_highlight_moves() {
     state.user_menu_entries =
         vec![UserMenuEntry { label: "A".to_string(), command: "a".to_string() }, UserMenuEntry { label: "B".to_string(), command: "b".to_string() }];
     let (state, _) = update(state, Command::UserMenuOpen);
-    let menu = state.user_menu.expect("opens");
+    let menu = state.user_menu().expect("opens");
     assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (2_000, None));
 
     let (state, _) = update(State { clock_ms: 2_080, ..state }, Command::UserMenuMove(1));
-    let menu = state.user_menu.expect("open");
+    let menu = state.user_menu().expect("open");
     assert_eq!(menu.cursor, 1);
     assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (2_000, Some(2_080)));
 }
@@ -1592,11 +1592,11 @@ fn file_action_menu_stamps_open_and_highlight_moves() {
     let mut state = clocked(UiPhase::Panels, 3_000);
     state.left.entries = vec![file_entry("a.txt", 1)];
     let (state, _) = update(state, Command::Enter);
-    let menu = state.file_action_menu.clone().expect("Enter on a file opens the action menu");
+    let menu = state.file_action_menu().cloned().expect("Enter on a file opens the action menu");
     assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (3_000, None));
 
     let (state, _) = update(State { clock_ms: 3_060, ..state }, Command::FileActionMenuMove(1));
-    let menu = state.file_action_menu.expect("open");
+    let menu = state.file_action_menu().expect("open");
     assert_eq!((menu.opened_at_ms, menu.selected_at_ms), (3_000, Some(3_060)));
 }
 
@@ -1607,15 +1607,15 @@ fn dialogs_stamp_when_they_open() {
     assert_eq!(state.dialog_opened_at_ms, 500);
 
     let (state, _) = update(clocked(UiPhase::Panels, 700), Command::HelpOpen);
-    assert!(state.help.is_some());
+    assert!(state.help().is_some());
     assert_eq!(state.dialog_opened_at_ms, 700);
 
     let (state, _) = update(clocked(UiPhase::Panels, 900), Command::FuzzyJumpOpen);
-    assert!(state.fuzzy_jump.is_some());
+    assert!(state.fuzzy_jump().is_some());
     assert_eq!(state.dialog_opened_at_ms, 900);
 
     let (state, _) = update(clocked(UiPhase::Panels, 1_100), Command::ThemePickerOpen);
-    assert!(state.theme_picker.is_some());
+    assert!(state.theme_picker().is_some());
     assert_eq!(state.dialog_opened_at_ms, 1_100);
 }
 
@@ -1643,7 +1643,7 @@ fn a_replacement_dialog_restamps_but_progress_updates_do_not() {
 fn closing_a_dialog_stamps_nothing() {
     let (state, _) = update(clocked(UiPhase::Panels, 700), Command::HelpOpen);
     let (state, _) = update(State { clock_ms: 900, ..state }, Command::HelpCancel);
-    assert!(state.help.is_none());
+    assert!(state.help().is_none());
     assert_eq!(state.dialog_opened_at_ms, 700);
 }
 
@@ -1657,7 +1657,7 @@ fn the_quit_dialog_has_its_own_stamp_and_never_restamps_the_dialog_beneath() {
 
     // Cancelling restores the context exactly and leaves both stamps alone.
     let (state, _) = update(State { clock_ms: 1_200, ..state }, Command::CancelQuit);
-    assert!(!state.quit_confirm && state.help.is_some());
+    assert!(!state.quit_confirm && state.help().is_some());
     assert_eq!((state.quit_opened_at_ms, state.dialog_opened_at_ms), (950, 700));
 }
 
@@ -1731,8 +1731,8 @@ fn input_during_an_animation_applies_to_the_final_state() {
         state
     };
     let (on, off) = (open(true), open(false));
-    assert_eq!(on.menu.as_ref().map(|m| (m.active, m.pulldown_open, m.selected)), off.menu.as_ref().map(|m| (m.active, m.pulldown_open, m.selected)));
-    assert_ne!(on.menu.unwrap().selected, MenuState::opened().selected, "Down really moved the highlight");
+    assert_eq!(on.menu().map(|m| (m.active, m.pulldown_open, m.selected)), off.menu().map(|m| (m.active, m.pulldown_open, m.selected)));
+    assert_ne!(on.menu().unwrap().selected, MenuState::opened().selected, "Down really moved the highlight");
 }
 
 #[test]

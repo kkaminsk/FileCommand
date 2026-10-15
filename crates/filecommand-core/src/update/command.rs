@@ -46,7 +46,7 @@ pub enum DropTarget {
 /// by every later `DragOver`/`DragDrop`, since the proposed verb is
 /// recomputed from the modifiers of each of those events (design D2) and the
 /// hovered target can change on every pointer move. Lives beside `UiPhase`,
-/// like `State::menu`/`drive_select`/etc., rather than inside it — a drag
+/// like the overlay slot `State::overlay`, rather than inside it — a drag
 /// overlays the live panels, it is not itself a phase.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DragState {

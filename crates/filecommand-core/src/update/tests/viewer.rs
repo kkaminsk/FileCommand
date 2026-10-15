@@ -396,10 +396,10 @@ fn an_open_reply_arriving_with_the_menu_open_is_discarded() {
     state.left.entries = vec![file_entry("notes.txt", 10)];
     let (state, _) = update(state, Command::RequestEditor);
     let (state, _) = update(state, Command::MenuOpen);
-    assert!(state.menu.is_some());
+    assert!(state.menu().is_some());
     let (state, effects) = update(state, Command::EditorOpened { request: 3, editor: Box::new(editor_with(&["abc"])) });
     assert!(effects.is_empty());
-    assert!(state.menu.is_some(), "the menu stays open");
+    assert!(state.menu().is_some(), "the menu stays open");
     assert_eq!(state.phase, UiPhase::Panels, "the editor does not open");
     assert_eq!(state.pending_open, None, "the late result is discarded and the pending open cleared");
     assert_eq!(state.left.pending_note, None, "the `Opening…` note comes down");
@@ -411,7 +411,7 @@ fn an_open_reply_arriving_with_the_menu_open_is_discarded() {
     let (state, _) = update(state, Command::HelpOpen);
     let (state, _) = update(state, Command::ViewerOpened { request: 3, path: PathBuf::from("/left/notes.txt"), file_len: 10 });
     assert_eq!(state.phase, UiPhase::Panels, "the viewer does not open over the Help window");
-    assert!(state.help.is_some());
+    assert!(state.help().is_some());
 
     // A reply after the user left the panels (a file operation dialog).
     let mut state = test_state(UiPhase::Panels);

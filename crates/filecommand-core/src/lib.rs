@@ -31,4 +31,6 @@ pub mod theme;
 pub mod update;
 pub mod viewer;
 
-pub use update::{update, ButtonId, ClickMods, Command, DragState, DropTarget, Effect, PanelSide, ProbeKind, State, UiPhase};
+pub use update::{
+    input_layer, update, ButtonId, ClickMods, Command, DragState, DropTarget, Effect, InputLayer, Overlay, PanelSide, ProbeKind, State, UiPhase,
+};

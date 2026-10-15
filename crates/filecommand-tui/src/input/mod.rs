@@ -20,97 +20,83 @@ use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::ViewerState;
-use filecommand_core::{Command, PanelSide, State, UiPhase};
+use filecommand_core::{input_layer, Command, InputLayer, Overlay, PanelSide, State, UiPhase};
 
 mod mouse;
 pub use mouse::{map_mouse, MouseTracker};
 
+/// Map a pressed key to the command it means in `state`, routing it to the
+/// layer that owns input right now — the single precedence order
+/// `filecommand_core::input_layer` defines (reducer-overlay-structure design
+/// D2; application-shell "Modal overlays are mutually exclusive by
+/// construction") — and then, for the overlay layer, to the open overlay's
+/// own mapper. The mapping itself still performs no state mutation and no
+/// I/O.
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
-    // The quit-confirmation dialog is the topmost modal overlay of all: it
-    // can open above panels, the viewer, an open menu, or any other modal
-    // dialog/overlay, so it is checked before every other overlay below
-    // (application-shell "Quit request keys and confirmation"; design D5).
-    // The event loop routes here for it even while `state.phase` is
-    // `Viewer`/`Editor` — see `app.rs` — except in the editor, whose own
-    // Ctrl+C=Copy binding means this flag can never become true there.
-    if state.quit_confirm {
-        return map_quit_confirm_key(key);
-    }
-    // Modal overlays come first: while one is up it owns every key it
-    // understands, regardless of the phase underneath. The startup-warning
-    // modal is checked first of all since it can only ever be up at the
-    // very start of a session, before anything else has had a chance to
-    // open (user-menu "Malformed file warns and falls back without
-    // overwriting").
-    if state.startup_warning.is_some() {
-        return map_startup_warning_key(key);
-    }
-    // Below the 60x16 floor the placeholder hides whatever screen is active
-    // — panels, an open overlay, a dialog, the viewer or the editor — and
-    // input must never reach a screen the user cannot see. Only the two
-    // dialogs above, which are drawn over the placeholder, keep their keys
-    // (application-shell "Resize handling with 60x16 hard floor and
-    // placeholder"; resize-preserves-session-state design D3).
-    if state.undersized {
-        return map_undersized_key(key, state);
-    }
-    if state.drive_select.is_some() {
-        return map_drive_select_key(key);
-    }
-    if state.menu.is_some() {
-        return map_menu_key(key);
-    }
-    // The M5 dialogs are likewise modal overlays beside the phase.
-    if state.fuzzy_jump.is_some() {
-        return map_fuzzy_jump_key(key);
-    }
-    if let Some(dialog) = &state.find_file {
-        return map_find_file_key(key, dialog);
-    }
-    if state.user_menu.is_some() {
-        return map_user_menu_key(key);
-    }
-    if state.history_dialog.is_some() {
-        return map_history_dialog_key(key);
-    }
-    if state.theme_picker.is_some() {
-        return map_theme_picker_key(key);
-    }
-    if let Some(dialog) = &state.help {
-        return map_help_key(key, dialog);
-    }
-    // The Enter-on-file action menu is likewise a modal overlay beside the
-    // phase (it opens without changing `state.phase` away from `Panels`),
-    // so it must be checked before the phase match below claims panel/
-    // command-line keys (file-action-menu "Enter on a file opens the action
-    // menu").
-    if let Some(dialog) = &state.file_action_menu {
-        return map_file_action_menu_key(key, dialog);
-    }
-
-    match &state.phase {
-        UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
-        UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
-        UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
+    match input_layer(state) {
+        // The quit-confirmation dialog is the topmost layer of all: it can
+        // open above panels, the viewer, an open menu, or any other modal
+        // dialog/overlay (application-shell "Quit request keys and
+        // confirmation"; design D5). The event loop routes here for it even
+        // while `state.phase` is `Viewer`/`Editor` — see `app.rs` — except
+        // in the editor, whose own Ctrl+C=Copy binding means this flag can
+        // never become true there.
+        InputLayer::QuitConfirm => map_quit_confirm_key(key),
+        // Below the 60x16 floor the placeholder hides whatever screen is
+        // active — panels, an open overlay, a dialog, the viewer or the
+        // editor — and input must never reach a screen the user cannot see.
+        // Only the quit dialog above and the startup warning (an overlay the
+        // precedence function keeps above this layer), both drawn over the
+        // placeholder, keep their keys (application-shell "Resize handling
+        // with 60x16 hard floor and placeholder"; resize-preserves-session-
+        // state design D3).
+        InputLayer::Undersized => map_undersized_key(key, state),
+        InputLayer::FileOp => match &state.phase {
+            UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
+            UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
+            UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
+            _ => None,
+        },
         // The viewer owns its own key routing (`map_viewer_key`), which
         // needs I/O (a backward/forward line-start scan) that this pure
         // mapper cannot perform — the event loop calls it directly instead
         // of `map_key` while the viewer is open (viewer: Frame-less
-        // full-screen chrome — "Viewer owns focus while open").
-        UiPhase::Viewer(_) => None,
-        // The editor likewise owns its own key routing (`map_editor_key`).
-        // It needs no I/O, but its page-size parameter is the editor body's
-        // row count (term_size.1 - 2, full width, no panel layout) rather
-        // than `map_key`'s panel-layout-derived `page_size`, so the event
-        // loop calls it directly the same way it does for the viewer
+        // full-screen chrome — "Viewer owns focus while open"). The editor
+        // likewise owns its own key routing (`map_editor_key`). It needs no
+        // I/O, but its page-size parameter is the editor body's row count
+        // (term_size.1 - 2, full width, no panel layout) rather than
+        // `map_key`'s panel-layout-derived `page_size`, so the event loop
+        // calls it directly the same way it does for the viewer
         // (builtin-editor "Full-screen editor chrome").
-        UiPhase::Editor(_) => None,
-        _ => {
+        InputLayer::Viewer | InputLayer::Editor => None,
+        // While a modal overlay is up it owns every key it understands,
+        // regardless of the phase underneath; a key its mapper does not bind
+        // is ignored and never reaches the panels or the command line
+        // (application-shell "Unbound keys never reach the panels or the
+        // command line").
+        InputLayer::Overlay => state.overlay().and_then(|overlay| map_overlay_key(key, overlay)),
+        InputLayer::Splash | InputLayer::Panels => {
             if state.quick_search.is_some() {
                 return map_quick_search_key(key, page_size);
             }
             map_panel_key(key, state, page_size, keys)
         }
+    }
+}
+
+/// The open overlay's own key mapping.
+fn map_overlay_key(key: KeyEvent, overlay: &Overlay) -> Option<Command> {
+    match overlay {
+        Overlay::Menu(_) => map_menu_key(key),
+        Overlay::DriveSelect(_) => map_drive_select_key(key),
+        Overlay::FuzzyJump(_) => map_fuzzy_jump_key(key),
+        Overlay::FindFile(dialog) => map_find_file_key(key, dialog),
+        Overlay::UserMenu(_) => map_user_menu_key(key),
+        Overlay::HistoryDialog(_) => map_history_dialog_key(key),
+        Overlay::ThemePicker(_) => map_theme_picker_key(key),
+        Overlay::FileActionMenu(dialog) => map_file_action_menu_key(key, dialog),
+        Overlay::Help(dialog) => map_help_key(key, dialog),
+        Overlay::StartupWarning(_) => map_startup_warning_key(key),
     }
 }
 
@@ -219,9 +205,11 @@ pub fn map_paste(text: &str, state: &State) -> Vec<Command> {
     if text.is_empty() {
         return Vec::new();
     }
-    // The quit-confirmation dialog outranks even the viewer/editor's own
-    // routing, exactly as in `map_key` — a paste never answers it.
-    if state.quit_confirm {
+    // The same layer order as `map_key` (`input_layer`): the quit-
+    // confirmation dialog outranks even the viewer/editor's own routing — a
+    // paste never answers it — and nothing reaches a screen the placeholder
+    // hides.
+    if matches!(input_layer(state), InputLayer::QuitConfirm | InputLayer::Undersized) {
         return Vec::new();
     }
     match &state.phase {

@@ -732,7 +732,7 @@ fn a_drop_computes_the_hidden_count_against_the_source_panel() {
 fn a_selection_scoped_menu_delete_discloses_the_hidden_count() {
     let state = five_selected_two_hidden_state();
     let (state, _) = update(state, Command::OpenActionMenuAt { side: PanelSide::Left, name: OsString::from("a.txt") });
-    assert!(state.file_action_menu.as_ref().unwrap().selection_scoped, "setup precondition: right-click on a selected entry");
+    assert!(state.file_action_menu().unwrap().selection_scoped, "setup precondition: right-click on a selected entry");
     let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
@@ -748,7 +748,7 @@ fn an_enter_opened_menu_delete_is_single_target_with_no_disclosure() {
     let mut state = five_selected_two_hidden_state();
     state.left.cursor = 0; // a.txt, visible under the filter and itself selected
     let (state, _) = update(state, Command::Enter);
-    assert!(state.file_action_menu.is_some());
+    assert!(state.file_action_menu().is_some());
     let (state, _) = update(state, Command::FileActionMenuHotkey('D'));
     match state.phase {
         UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm { ref sources, hidden_by_filter, .. }) => {
@@ -1322,9 +1322,9 @@ fn files_menu_activate_on_copy_to_clipboard_runs_the_files_action() {
         .iter()
         .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy to clipboard"))
         .unwrap();
-    state.menu.as_mut().unwrap().selected = target;
+    state.menu_mut().unwrap().selected = target;
     let (state, effects) = update(state, Command::MenuActivate);
-    assert!(state.menu.is_none(), "activating the item closes the whole menu overlay");
+    assert!(state.menu().is_none(), "activating the item closes the whole menu overlay");
     assert_eq!(
         effects,
         vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\a.txt")] })]
@@ -1344,7 +1344,7 @@ fn send_to_clipboard_action_menu_entry_targets_only_the_menus_entry() {
     let state = opened_menu_state_from(state, "notes.txt");
 
     let (state, effects) = update(state, Command::FileActionMenuHotkey('S'));
-    assert!(state.file_action_menu.is_none(), "the hotkey closes the menu");
+    assert!(state.file_action_menu().is_none(), "the hotkey closes the menu");
     assert_eq!(
         effects,
         vec![Effect::SetClipboard(ClipboardPayload { kind: ClipboardPayloadKind::Files, items: vec![PathBuf::from(r"C:\NORTON\notes.txt")] })]
@@ -1359,7 +1359,7 @@ fn send_to_clipboard_action_menu_entry_targets_only_the_menus_entry() {
 fn opened_menu_state_from(mut state: State, cursor_on: &str) -> State {
     state.left.cursor = state.left.entries.iter().position(|e| e.name == cursor_on).unwrap();
     let (state, _) = update(state, Command::Enter);
-    assert!(state.file_action_menu.is_some(), "setup precondition: the menu must be open");
+    assert!(state.file_action_menu().is_some(), "setup precondition: the menu must be open");
     state
 }
 
@@ -1818,15 +1818,15 @@ mod drag_proptests {
     }
 
     fn any_overlay_open(state: &State) -> bool {
-        state.menu.is_some()
-            || state.drive_select.is_some()
-            || state.fuzzy_jump.is_some()
-            || state.find_file.is_some()
-            || state.user_menu.is_some()
-            || state.theme_picker.is_some()
-            || state.file_action_menu.is_some()
-            || state.help.is_some()
-            || state.startup_warning.is_some()
+        state.menu().is_some()
+            || state.drive_select().is_some()
+            || state.fuzzy_jump().is_some()
+            || state.find_file().is_some()
+            || state.user_menu().is_some()
+            || state.theme_picker().is_some()
+            || state.file_action_menu().is_some()
+            || state.help().is_some()
+            || state.startup_warning().is_some()
             || state.quit_confirm
     }
 

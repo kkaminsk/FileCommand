@@ -21,7 +21,7 @@ use filecommand_core::menu::{MenuId, MenuState};
 use filecommand_core::panel::{ClipboardFeedback, DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
-use filecommand_core::{DragState, DropTarget, PanelSide, State, UiPhase};
+use filecommand_core::{DragState, DropTarget, Overlay, PanelSide, State, UiPhase};
 
 use filecommand_tui::views;
 
@@ -533,7 +533,7 @@ fn quit_confirm_dialog_renders_above_an_open_pull_down_menu() {
     // task 4.5: the dialog can be raised while an F9 pull-down menu is open
     // — same topmost-overlay contract as above the viewer.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     state.quit_confirm = true;
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the open pull-down");
@@ -669,13 +669,13 @@ fn the_f9_bar_hides_the_clock_and_closing_it_restores_the_clock() {
     let without_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(without_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock shows with the bar closed");
 
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let with_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!with_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is hidden while F9 is open");
 
-    // Esc-ing the bar closed (state.menu back to None) restores it — same
+    // Esc-ing the bar closed (state.menu() back to None) restores it — same
     // as any other frame where the bar isn't open.
-    state.menu = None;
+    state.close_overlay();
     let restored = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(restored.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is restored once the bar closes");
 }
@@ -698,7 +698,7 @@ fn the_clock_hides_entirely_rather_than_colliding_with_a_long_path_title() {
 #[test]
 fn snapshot_menu_bar_with_left_pulldown_open() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.lines().next().unwrap().contains("Left"));
     insta::assert_snapshot!("menu_bar_left_pulldown", text);
@@ -707,7 +707,7 @@ fn snapshot_menu_bar_with_left_pulldown_open() {
 #[test]
 fn snapshot_menu_bar_with_files_pulldown_open() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("menu_bar_files_pulldown", text);
 }
@@ -717,7 +717,7 @@ fn snapshot_menu_bar_with_pulldown_closed() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut menu = MenuState::opened();
     menu.pulldown_open = false;
-    state.menu = Some(menu);
+    state.open_overlay(Overlay::Menu(menu));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("menu_bar_no_pulldown", text.lines().next().unwrap());
 }
@@ -726,7 +726,7 @@ fn snapshot_menu_bar_with_pulldown_closed() {
 fn the_menu_bar_replaces_the_panels_top_border_row() {
     let plain = render_to_text(80, 24, &base_state(UiPhase::Panels, Theme::classic()), ColorDepth::Ansi16);
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let with_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
 
     assert!(plain.lines().next().unwrap().contains('\u{2554}'), "normally the top row is panel border");
@@ -740,7 +740,7 @@ fn the_menu_bar_replaces_the_panels_top_border_row() {
 #[test]
 fn snapshot_drive_select_dialog_labels_pending() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['A', 'C', 'D', 'Z'], Some('C')));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['A', 'C', 'D', 'Z'], Some('C'))));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("drive_select_labels_pending", text);
 }
@@ -754,7 +754,7 @@ fn snapshot_drive_select_dialog_labels_resolved() {
     dialog.apply_label('Z', Some("net".to_string()));
     // A: has no media, so its fetch never resolves and its column stays
     // blank — which must not hold up the rest of the dialog.
-    state.drive_select = Some(dialog);
+    state.open_overlay(Overlay::DriveSelect(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("drive_select_labels_resolved", text);
 }
@@ -1589,7 +1589,7 @@ fn snapshot_fuzzy_jump_dialog() {
         filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Documents"), visit_count: 5, last_visited_ms: 1_000 },
         filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Downloads"), visit_count: 1, last_visited_ms: 500 },
     ];
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Fuzzy jump"));
     assert!(text.contains("Documents") && text.contains("Downloads"));
@@ -1611,7 +1611,7 @@ fn snapshot_find_file_dialog_with_streamed_results() {
         },
     );
     dialog.mark_done(1);
-    state.find_file = Some(dialog);
+    state.open_overlay(Overlay::FindFile(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Find file"));
     assert!(text.contains(r"docs\readme.txt"));
@@ -1625,7 +1625,7 @@ fn snapshot_find_file_dialog_no_matches() {
     dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('z'));
     dialog.submit(1);
     dialog.mark_done(1);
-    state.find_file = Some(dialog);
+    state.open_overlay(Overlay::FindFile(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("No matches"));
     insta::assert_snapshot!("find_file_dialog_no_matches", text);
@@ -1639,7 +1639,7 @@ fn snapshot_user_menu_dialog_with_entries() {
         filecommand_core::config::UserMenuEntry { label: "Backup".to_string(), command: r"robocopy . D:\backup /E".to_string() },
         filecommand_core::config::UserMenuEntry { label: "Checksum".to_string(), command: "certutil -hashfile x SHA256".to_string() },
     ];
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Compress") && text.contains("Backup") && text.contains("Checksum"));
     assert!(!text.contains("robocopy"), "the command string is never shown, only the label");
@@ -1651,7 +1651,7 @@ fn snapshot_user_menu_dialog_with_entries() {
 #[test]
 fn snapshot_user_menu_dialog_empty_state() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("no entries"));
     assert!(text.contains("Themes"), "the built-in Themes row renders below the placeholder even with no user entries");
@@ -1669,7 +1669,7 @@ fn snapshot_user_menu_dialog_empty_state() {
 fn snapshot_history_dialog_populated() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.history = vec!["cd C:\\work".to_string(), "del old.log".to_string(), "cd D:\\".to_string()];
-    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("History"));
     // Newest first: `cd D:\` renders above `del old.log`, above `cd C:\work`.
@@ -1683,7 +1683,7 @@ fn snapshot_history_dialog_populated() {
 #[test]
 fn snapshot_history_dialog_empty() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("(no history)"));
     insta::assert_snapshot!("history_dialog_empty", text);
@@ -1721,7 +1721,7 @@ fn snapshot_panels_after_ctrl_u_swap() {
 #[test]
 fn snapshot_theme_picker_dialog_with_active_theme_marked() {
     let mut state = base_state(UiPhase::Panels, Theme::terminal_green());
-    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("terminal-green"));
+    state.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState::open("terminal-green")));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Themes"));
     for name in filecommand_core::theme::BUILTIN_THEME_NAMES {
@@ -1766,7 +1766,7 @@ fn snapshot_theme_picker_dialog_previews_a_non_active_highlighted_theme() {
 
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let highlight = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
-    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState { highlight });
+    state.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState { highlight }));
 
     let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
     let text = buffer_to_text(&buf);
@@ -1803,7 +1803,7 @@ fn theme_picker_open_with_the_active_theme_highlighted_is_byte_identical_to_the_
     let before = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
 
     let mut opened = state;
-    opened.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("nc-classic"));
+    opened.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState::open("nc-classic")));
     let after = render_to_buffer(80, 24, &opened, ColorDepth::Ansi16);
 
     // Derive the dialog's exact footprint from its own box-drawing corners
@@ -1890,8 +1890,8 @@ fn snapshot_file_action_menu_dialog_non_executable() {
     // Open, View, Edit, Send to clipboard, Copy, Rename, Move, Delete with
     // Open highlighted first, and no Run entry.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false));
-    let menu = state.file_action_menu.as_ref().unwrap();
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false)));
+    let menu = state.file_action_menu().unwrap();
     assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
     assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -1910,8 +1910,8 @@ fn snapshot_file_action_menu_dialog_executable() {
     // (open-with-associated-app design D2): an executable target lists Run
     // first (default-highlighted), then Open, then View.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true));
-    let menu = state.file_action_menu.as_ref().unwrap();
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true)));
+    let menu = state.file_action_menu().unwrap();
     assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Run, "Run stays highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Run"), "an executable target must list Run");
@@ -1930,8 +1930,13 @@ fn snapshot_file_action_menu_dialog_directory() {
     // Delete — Open first and highlighted, no View/Edit/Run — and Open
     // shows the directory in the platform file browser.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::open(std::ffi::OsString::from("docs"), true, false, false));
-    let menu = state.file_action_menu.as_ref().unwrap();
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::open(
+        std::ffi::OsString::from("docs"),
+        true,
+        false,
+        false,
+    )));
+    let menu = state.file_action_menu().unwrap();
     assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
     assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -1945,7 +1950,7 @@ fn snapshot_file_action_menu_dialog_directory() {
 #[test]
 fn snapshot_help_window_topic_list() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Help"));
     assert!(text.contains("About FileCommand"));
@@ -1958,7 +1963,7 @@ fn snapshot_help_window_topic_page() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut help = filecommand_core::dialogs::HelpState::new();
     help.page = Some(1); // Keyboard reference
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("modifier variants"));
     assert!(!text.contains("About FileCommand"), "the list is replaced by the page");
@@ -1970,7 +1975,7 @@ fn snapshot_about_dialog_over_help_window() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut help = filecommand_core::dialogs::HelpState::new();
     help.about_open = true;
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("License: MIT OR Apache-2.0"));
     assert!(text.contains("OK"));
@@ -1983,7 +1988,7 @@ fn snapshot_startup_warning_dialog_overlays_the_panels() {
     // warning dialog (not a panel mini-status) at startup (user-menu
     // "Malformed file warns and falls back without overwriting").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Warning"));
     assert!(text.contains("usermenu.toml is malformed"));
@@ -1997,7 +2002,7 @@ fn snapshot_startup_warning_dialog_overlays_the_splash_screen_too() {
     // with the splash screen — it must still be visible on top of it rather
     // than getting lost underneath.
     let mut state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Warning"));
     assert!(text.contains("usermenu.toml is malformed"));

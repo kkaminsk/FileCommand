@@ -79,7 +79,7 @@ fn quit_dialog_outranks_every_other_overlay_and_phase() {
     assert_eq!(map(plain(KeyCode::Char('y')), &over_viewer), Some(Command::ConfirmQuit));
 
     let mut over_menu = panels();
-    over_menu.menu = Some(MenuState::opened());
+    over_menu.open_overlay(Overlay::Menu(MenuState::opened()));
     over_menu.quit_confirm = true;
     assert_eq!(map(plain(KeyCode::Esc), &over_menu), Some(Command::CancelQuit), "not MenuCollapse");
 }
@@ -192,9 +192,9 @@ fn every_dialog_field_shares_the_editing_key_set() {
     }));
     let conflict = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
     let mut find = panels();
-    find.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    find.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
     let mut fuzzy = panels();
-    fuzzy.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    fuzzy.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
 
     for state in [&rename, &conflict, &find, &fuzzy] {
         assert_eq!(map(plain(KeyCode::Left), state), Some(Command::TextEdit(TextEditOp::Left)), "Left");
@@ -226,7 +226,7 @@ fn find_file_editing_keys_stop_once_the_search_is_submitted() {
     let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
     submitted.submit(1);
     let mut state = panels();
-    state.find_file = Some(submitted);
+    state.open_overlay(Overlay::FindFile(submitted));
     assert_eq!(map(plain(KeyCode::Left), &state), None, "no field owns Left once the walk is running");
     assert_eq!(map(plain(KeyCode::Char('x')), &state), None, "the pattern no longer accepts text");
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FindFileMove(-1)));
@@ -555,19 +555,19 @@ fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns
     assert_eq!(map(ctrl_y, &destination), Some(Command::TextEdit(TextEditOp::Insert('y'))), "text fields still type a literal y");
 
     let mut state = typing("dir");
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(ctrl_y, &state), None, "an open pull-down claims the key and ignores it");
 
     let mut state = typing("dir");
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     assert_eq!(map(ctrl_y, &state), None, "the fuzzy-jump dialog claims the key and ignores it");
 
     let mut state = typing("dir");
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     assert_eq!(map(ctrl_y, &state), None, "the user menu claims the key and ignores it");
 
     let mut state = typing("dir");
-    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
     assert_eq!(map(ctrl_y, &state), None, "the help window claims the key and ignores it");
 
     let viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
@@ -664,7 +664,7 @@ fn ctrl_l_toggles_info_for_the_active_panel() {
 #[test]
 fn drive_dialog_claims_navigation_confirm_and_cancel() {
     let mut state = panels();
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['A', 'C'], None));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['A', 'C'], None)));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::DriveSelectMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::DriveSelectMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DriveSelectConfirm));
@@ -674,7 +674,7 @@ fn drive_dialog_claims_navigation_confirm_and_cancel() {
 #[test]
 fn the_drive_dialog_swallows_keys_that_would_otherwise_type() {
     let mut state = panels();
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], None));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['C'], None)));
     assert_eq!(map(plain(KeyCode::Char('d')), &state), None, "typing must not leak past the dialog");
     assert_eq!(map(plain(KeyCode::F(5)), &state), None);
 }
@@ -691,7 +691,7 @@ fn f9_opens_the_menu_bar() {
 #[test]
 fn menu_navigation_keys_route_to_the_state_machine() {
     let mut state = panels();
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::MenuSelectPrev));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MenuSelectNext));
     assert_eq!(map(plain(KeyCode::Left), &state), Some(Command::MenuPrevMenu));
@@ -704,25 +704,23 @@ fn menu_navigation_keys_route_to_the_state_machine() {
 #[test]
 fn a_letter_while_the_bar_is_open_is_a_hotkey_not_typing() {
     let mut state = panels();
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::MenuHotkey('c')));
 }
 
 #[test]
 fn the_menu_claims_keys_ahead_of_the_command_line() {
     let mut state = typing("dir");
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::MenuSelectPrev), "not history recall");
     assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::MenuHotkey('x')), "not a typed character");
 }
 
-#[test]
-fn the_drive_dialog_outranks_the_menu() {
-    let mut state = panels();
-    state.menu = Some(MenuState::opened());
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], None));
-    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DriveSelectCancel));
-}
+// `the_drive_dialog_outranks_the_menu` used to build a state with both the
+// menu and the drive dialog open — impossible now that both live in the one
+// overlay slot. It lives on as the reducer test
+// `drive_list_ready_replaces_an_open_menu_in_the_slot` (reducer-overlay-
+// structure design D6).
 
 // ---------------------------------------------------------------------
 // M3: typing-sink arbitration
@@ -1129,7 +1127,7 @@ fn ctrl_c_in_the_built_in_editor_still_copies() {
 #[test]
 fn ctrl_c_no_longer_requests_quit_with_a_pull_down_menu_open() {
     let mut state = panels();
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
 }
 
@@ -1139,19 +1137,19 @@ fn ctrl_c_no_longer_requests_quit_from_modal_dialogs_and_overlays() {
     // phase: fuzzy jump, find file, user menu, drive select, and the
     // file-op running dialog all now ignore Ctrl+C outright.
     let mut fuzzy = panels();
-    fuzzy.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    fuzzy.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &fuzzy), None);
 
     let mut find = panels();
-    find.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    find.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &find), None);
 
     let mut user_menu = panels();
-    user_menu.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    user_menu.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &user_menu), None);
 
     let mut drive = panels();
-    drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec![], None));
+    drive.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec![], None)));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &drive), None);
 
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &progress_state()), None);
@@ -1234,7 +1232,7 @@ fn f1_f2_and_alt_f7_open_help_user_menu_and_find_file() {
 #[test]
 fn fuzzy_jump_dialog_owns_typing_movement_and_dismissal() {
     let mut state = panels();
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::TextEdit(TextEditOp::Insert('d'))));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::TextEdit(TextEditOp::Backspace)));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FuzzyJumpMove(-1)));
@@ -1246,7 +1244,7 @@ fn fuzzy_jump_dialog_owns_typing_movement_and_dismissal() {
 #[test]
 fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation() {
     let mut state = panels();
-    state.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    state.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
     assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::TextEdit(TextEditOp::Insert('r'))));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::TextEdit(TextEditOp::Backspace)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FindFileSubmit));
@@ -1254,7 +1252,7 @@ fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation()
 
     let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
     submitted.submit(1);
-    state.find_file = Some(submitted);
+    state.overlay = Some(Overlay::FindFile(submitted));
     assert_eq!(map(plain(KeyCode::Char('r')), &state), None, "the pattern is fixed once a search is in flight");
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FindFileMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::FindFileMove(1)));
@@ -1265,7 +1263,7 @@ fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation()
 #[test]
 fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
     let mut state = panels();
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::UserMenuMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::UserMenuMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::UserMenuConfirm));
@@ -1278,7 +1276,7 @@ fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
 fn history_dialog_owns_movement_confirm_and_dismissal() {
     let mut state = panels();
     state.history = vec!["cd C:\\work".to_string()];
-    state.history_dialog = Some(filecommand_core::dialogs::HistoryDialogState::new());
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::HistoryDialogMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HistoryDialogMove(1)));
     // Home/End/PgUp/PgDn map to huge deltas, the same convention
@@ -1299,20 +1297,20 @@ fn history_dialog_owns_movement_confirm_and_dismissal() {
 fn help_dialog_precedence_list_then_page_then_about() {
     let mut state = panels();
     let mut help = filecommand_core::dialogs::HelpState::new();
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HelpMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpActivate));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
 
     help.page = Some(1);
-    state.help = Some(help);
+    state.overlay = Some(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Down), &state), None, "a topic page does not scroll a list that isn't shown");
 
     help.page = None;
     help.about_open = true;
-    state.help = Some(help);
+    state.overlay = Some(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::HelpCancel));
@@ -1325,7 +1323,7 @@ fn help_ignores_ctrl_c_but_plain_c_still_cancels() {
     // must fall through to `_ => None` rather than closing Help, while the
     // plain key is untouched.
     let mut state = panels();
-    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::HelpCancel));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
@@ -1336,7 +1334,7 @@ fn help_ignores_ctrl_c_but_plain_c_still_cancels() {
 fn m5_dialogs_outrank_the_command_line_and_quick_search() {
     let mut state = typing("dir");
     state.quick_search = Some("z".to_string());
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::TextEdit(TextEditOp::Insert('a'))));
 }
 
@@ -1347,21 +1345,24 @@ fn m5_dialogs_outrank_the_command_line_and_quick_search() {
 #[test]
 fn startup_warning_is_dismissed_by_any_key() {
     let mut state = panels();
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DismissStartupWarning));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DismissStartupWarning));
     assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::DismissStartupWarning));
 }
 
 #[test]
-fn startup_warning_outranks_every_other_modal_and_typing_sink() {
+fn startup_warning_outranks_every_typing_sink() {
     // The dialog can only ever be up at session start, before anything else
     // has had a chance to open, but it must still win the precedence check
-    // deterministically rather than relying on that invariant alone.
+    // deterministically over the typing sinks underneath it — a quick
+    // search and a composed command line — rather than relying on that
+    // invariant alone. (It cannot share the slot with another overlay, so
+    // the menu this test used to stack beneath it is gone — reducer-overlay-
+    // structure design D6.)
     let mut state = typing("dir");
-    state.startup_warning = Some("usermenu.toml is malformed".to_string());
+    state.set_startup_warning("usermenu.toml is malformed".to_string());
     state.quick_search = Some("z".to_string());
-    state.menu = Some(MenuState::opened());
     assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::DismissStartupWarning));
 }
 
@@ -1413,13 +1414,13 @@ fn paste_into_a_dialog_field_is_one_paste_op() {
 #[test]
 fn paste_into_the_find_file_pattern_is_one_paste_op() {
     let mut state = panels();
-    state.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    state.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
     assert_eq!(map_paste("*.rs", &state), vec![Command::TextEdit(TextEditOp::Paste("*.rs".to_string()))]);
     // Once the search is in flight the pattern is fixed, so a paste goes
     // nowhere (find-file "Find-file invocation").
     let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
     submitted.submit(1);
-    state.find_file = Some(submitted);
+    state.overlay = Some(Overlay::FindFile(submitted));
     assert_eq!(map_paste("*.rs", &state), Vec::new());
 }
 
@@ -1477,7 +1478,7 @@ fn paste_with_no_focused_text_input_is_ignored() {
     assert_eq!(map_paste("y", &delete), Vec::new());
 
     let mut menu_open = panels();
-    menu_open.menu = Some(MenuState::opened());
+    menu_open.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map_paste("q", &menu_open), Vec::new(), "a menu's hotkey letters are not text input");
 
     let mut quitting = panels();
@@ -1485,7 +1486,7 @@ fn paste_with_no_focused_text_input_is_ignored() {
     assert_eq!(map_paste("y", &quitting), Vec::new(), "the quit dialog is never answered by a paste");
 
     let mut warning = panels();
-    warning.startup_warning = Some("warn".to_string());
+    warning.set_startup_warning("warn".to_string());
     assert_eq!(map_paste("x", &warning), Vec::new());
 
     assert_eq!(map_paste("", &panels()), Vec::new(), "an empty paste produces nothing");
@@ -1537,12 +1538,12 @@ fn undersized_hides_open_overlays_from_the_keyboard() {
     // A key is never routed blindly to a menu, dialog or typing sink the
     // user cannot see (design D3 "Hidden overlay").
     let mut menu = undersized(UiPhase::Panels);
-    menu.menu = Some(MenuState::opened());
+    menu.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(plain(KeyCode::Enter), &menu), None, "Enter must not activate a hidden menu item");
     assert_eq!(map(plain(KeyCode::Esc), &menu), Some(Command::RequestQuit), "Esc asks to quit rather than closing the hidden menu");
 
     let mut drive = undersized(UiPhase::Panels);
-    drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], Some('C')));
+    drive.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['C'], Some('C'))));
     assert_eq!(map(plain(KeyCode::Enter), &drive), None);
 
     let mut typing = undersized(UiPhase::Panels);
@@ -1575,7 +1576,70 @@ fn undersized_keeps_the_quit_and_startup_warning_dialog_keys() {
     assert_eq!(map(plain(KeyCode::Enter), &over_viewer), Some(Command::ConfirmQuit));
 
     let mut warning = undersized(UiPhase::Panels);
-    warning.startup_warning = Some("usermenu.toml is malformed".to_string());
+    warning.set_startup_warning("usermenu.toml is malformed".to_string());
     assert_eq!(map(plain(KeyCode::Esc), &warning), Some(Command::DismissStartupWarning));
     assert_eq!(map(plain(KeyCode::Char('x')), &warning), Some(Command::DismissStartupWarning));
+}
+
+// ---------------------------------------------------------------------
+// reducer-overlay-structure: one precedence order, one overlay slot
+// (application-shell "Modal overlays are mutually exclusive by
+// construction"; tasks 6.2, 6.3, 6.6)
+// ---------------------------------------------------------------------
+
+/// 6.2 "Another overlay's shortcut is ignored while an overlay is open":
+/// with the fuzzy-jump dialog up, F9 and Alt+F1 map to nothing, so neither
+/// the menu nor the drive dialog can open and the dialog's pattern and
+/// highlight are untouched.
+#[test]
+fn another_overlays_shortcut_maps_to_nothing_while_fuzzy_jump_is_open() {
+    let mut dialog = filecommand_core::quicksearch::FuzzyJumpState::new();
+    dialog.apply(&TextEditOp::Insert('p'));
+    let mut state = panels();
+    state.open_overlay(Overlay::FuzzyJump(dialog.clone()));
+    assert_eq!(map(plain(KeyCode::F(9)), &state), None, "F9 does not open the menu");
+    assert_eq!(map(key(KeyCode::F(1), KeyModifiers::ALT), &state), None, "Alt+F1 does not open drive select");
+    assert_eq!(map(key(KeyCode::F(2), KeyModifiers::ALT), &state), None, "Alt+F2 does not open drive select");
+    assert_eq!(map(plain(KeyCode::F(1)), &state), None, "F1 does not open Help");
+    assert_eq!(state.fuzzy_jump(), Some(&dialog), "the slot and the pattern are unchanged");
+    assert_eq!(state.fuzzy_jump().unwrap().pattern.text(), "p");
+}
+
+/// 6.3 "Unbound keys never reach the panels or the command line": a
+/// printable the user menu does not bind maps to nothing, so the command
+/// line and the panel cursor cannot change.
+#[test]
+fn an_unbound_printable_maps_to_nothing_while_the_user_menu_is_open() {
+    let mut state = typing("dir");
+    state.left.entries =
+        vec![Entry::new("a.txt", EntryKind::File, 1, None, false, false), Entry::new("b.txt", EntryKind::File, 1, None, false, false)];
+    state.left.cursor = 1;
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
+    for c in ['q', 'Z', '7', ' ', '/'] {
+        assert_eq!(map(plain(KeyCode::Char(c)), &state), None, "{c:?} is ignored");
+    }
+    assert_eq!(map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state), None, "type-ahead never starts under an overlay");
+    assert_eq!(state.command_line.text(), "dir");
+    assert_eq!(state.left.cursor, 1);
+}
+
+/// 6.6 "The quit dialog stacks above an open overlay": after the reducer
+/// cancels the quit dialog the pull-down is still in the slot, and the next
+/// key maps to a menu command again.
+#[test]
+fn after_cancelling_quit_over_a_pulldown_the_next_key_is_a_menu_command() {
+    let mut state = panels();
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
+    assert_eq!(
+        map(plain(KeyCode::F(10)), &state),
+        Some(Command::MenuClose),
+        "F10 over a pull-down closes it; the quit request comes from Esc or the menu"
+    );
+    let (state, _) = filecommand_core::update(state, Command::RequestQuit);
+    assert_eq!(map(plain(KeyCode::Down), &state), None, "the quit dialog owns the keys above the menu");
+    assert_eq!(map(plain(KeyCode::Char('n')), &state), Some(Command::CancelQuit));
+    let (state, _) = filecommand_core::update(state, Command::CancelQuit);
+    assert_eq!(state.menu().map(|m| m.active), Some(MenuId::Files), "the pull-down is exactly as it was");
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MenuSelectNext));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::MenuCollapse));
 }

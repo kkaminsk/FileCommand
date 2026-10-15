@@ -23,7 +23,7 @@ use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
-use filecommand_core::{anim, config, drives, identity, update, Command, Effect, PanelSide, State, UiPhase};
+use filecommand_core::{anim, config, drives, identity, input_layer, update, Command, Effect, InputLayer, PanelSide, State, UiPhase};
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
@@ -519,11 +519,11 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
     if let Some(warning) = resolve_warning {
         set_startup_warning(&mut state, warning);
     }
-    // Session-only: this only ever sets `state.startup_warning` in memory,
+    // Session-only: this only ever sets the startup warning in memory,
     // never touches `config.toml` (theme-selection "Override is
     // session-only"; design D4). `apply_user_menu` below may overwrite this
     // with its own warning if both fire at once — matching the pre-existing
-    // single-`startup_warning`-field behavior, with the superseded warning
+    // last-writer-wins behavior, with the superseded warning
     // kept in the diagnostic log.
     if let Some(warning) = theme_warning {
         set_startup_warning(&mut state, warning);
@@ -1069,26 +1069,23 @@ impl BurstHandler for LoopHandler<'_> {
 
 /// The loop's per-key mapping (idle-aware-event-loop design D5), factored
 /// out of the loop body so the first key of an iteration and every drained
-/// burst key go through the same routing: the quit-confirmation dialog
-/// outranks the viewer/editor's own direct dispatch (application-shell
-/// "Quit request keys and confirmation"; design D5), then the viewer and
-/// editor map through their own functions, then everything else goes
-/// through `input::map_key`. The "terminal too small" placeholder takes the
-/// same precedence as the quit dialog: while `state.undersized` is set the
-/// viewer's and editor's direct dispatch is bypassed so `map_key`'s
-/// undersized arm can gate every key (resize-preserves-session-state design
-/// D3).
+/// burst key go through the same routing. The layer that owns input comes
+/// from the single precedence order (`filecommand_core::input_layer`;
+/// reducer-overlay-structure design D2): the viewer and editor layers map
+/// through their own functions — the viewer's needs the open `ByteSource`,
+/// the editor's its own page size — and every other layer goes through
+/// `input::map_key`, which routes by the same function. That is what makes
+/// the quit-confirmation dialog outrank the viewer/editor's direct dispatch
+/// (application-shell "Quit request keys and confirmation"; design D5), and
+/// the "terminal too small" placeholder gate every key of a hidden viewer or
+/// editor (resize-preserves-session-state design D3).
 fn map_pressed_key(key: KeyEvent, state: &State, keys: &config::Keys, viewer_source: Option<&ByteSource>) -> Option<Command> {
-    if state.quit_confirm || state.undersized {
-        let page_size = active_panel_page_size(state);
-        return input::map_key(key, state, page_size, keys);
-    }
-    match &state.phase {
-        UiPhase::Viewer(viewer) => {
+    match (input_layer(state), &state.phase) {
+        (InputLayer::Viewer, UiPhase::Viewer(viewer)) => {
             let rows_visible = views::viewer::body_rows(state.term_size.1);
             input::map_viewer_key(key, viewer, rows_visible).and_then(|action| resolve_viewer_navigation(viewer, viewer_source, action, rows_visible))
         }
-        UiPhase::Editor(editor) => {
+        (InputLayer::Editor, UiPhase::Editor(editor)) => {
             let rows_visible = views::editor::body_rows(state.term_size.1);
             input::map_editor_key(key, editor, rows_visible)
         }
@@ -1171,7 +1168,7 @@ fn drain_key_burst(
 
 /// Resolve the startup theme from `config.theme` and an optional `--theme`
 /// launch override, returning the theme to start with plus an optional
-/// warning message for `state.startup_warning`.
+/// warning message for the startup-warning dialog.
 ///
 /// `override_name`: `None` when `--theme` was not passed (no warning is
 /// ever produced in that case); `Some("")` when `--theme` was passed with no
@@ -1232,22 +1229,24 @@ fn apply_launch_options(state: &mut State, launch: &LaunchOptions) {
     }
 }
 
-/// The one writer of `state.startup_warning` (error-diagnostics design
-/// D3): the dialog slot stays last-writer-wins, but every warning —
-/// including ones a later assignment replaces — is recorded in the
+/// The one writer of the startup warning at startup (error-diagnostics
+/// design D3): the dialog stays last-writer-wins — `State::set_startup_
+/// warning` replaces an existing warning's message rather than asserting an
+/// empty overlay slot (reducer-overlay-structure design D5) — but every
+/// warning, including ones a later assignment replaces, is recorded in the
 /// diagnostic log (application-shell "Optional diagnostic log": "Superseded
 /// startup warnings are still recorded"). With the log disabled this is
-/// exactly the old bare assignment.
+/// exactly the core setter.
 fn set_startup_warning(state: &mut State, warning: String) {
     diag::log("startup", &warning);
-    state.startup_warning = Some(warning);
+    state.set_startup_warning(warning);
 }
 
 /// Stamp the startup-warning dialog's open time so it irises in like every
 /// other modal. It is raised here, in `run`, rather than by a reducer
 /// command, so the reducer's own stamping post-condition never sees it open.
 fn stamp_startup_warning(state: &mut State) {
-    if state.startup_warning.is_some() {
+    if state.startup_warning().is_some() {
         state.dialog_opened_at_ms = state.clock_ms;
     }
 }
@@ -1257,7 +1256,7 @@ fn stamp_startup_warning(state: &mut State) {
 /// terminal. On a malformed `usermenu.toml`, `config::load_user_menu` has
 /// already fallen back to default entries in memory without touching the
 /// file; this raises the spec-required dismissable startup-warning dialog
-/// (`state.startup_warning`) rather than a panel mini-status, since the
+/// (`state.startup_warning()`) rather than a panel mini-status, since the
 /// warning concerns the whole session, not either panel specifically
 /// (user-menu "Malformed file warns and falls back without overwriting").
 fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
@@ -1291,7 +1290,7 @@ fn apply_configuration_warnings(state: &mut State, warnings: &[String]) {
     for warning in warnings {
         diag::log("config", warning);
     }
-    if state.startup_warning.is_none() {
+    if state.startup_warning().is_none() {
         if let Some(summary) = config::summarize_warnings(warnings) {
             set_startup_warning(state, summary);
         }
@@ -2280,7 +2279,7 @@ mod tests {
         state.clock_ms = 1234;
         stamp_startup_warning(&mut state);
         assert_eq!(state.dialog_opened_at_ms, 0, "no warning: nothing to stamp");
-        state.startup_warning = Some("usermenu.toml is malformed".to_string());
+        state.set_startup_warning("usermenu.toml is malformed".to_string());
         stamp_startup_warning(&mut state);
         assert_eq!(state.dialog_opened_at_ms, 1234);
     }
@@ -2703,7 +2702,7 @@ mod tests {
         let (state, _) = State::initial(theme, (80, 24), 0, 0, PathBuf::from("."), PathBuf::from("."), false);
         let (state, _) = update(state, Command::ThemePickerOpen);
         let target = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
-        let current = state.theme_picker.as_ref().unwrap().highlight;
+        let current = state.theme_picker().unwrap().highlight;
         let (state, _) = update(state, Command::ThemePickerMove(target as isize - current as isize));
         let (state, effects) = update(state, Command::ThemePickerConfirm);
         assert_eq!(state.theme.name, "purple-lights", "the picker's choice wins, not the launch override");
@@ -2714,7 +2713,7 @@ mod tests {
     /// `usermenu.toml` used to only set the left panel's inline
     /// `last_error` (with a comment noting there was no startup-warning
     /// dialog); the spec requires a dismissable modal instead. Verifies
-    /// `apply_user_menu` raises `state.startup_warning`, falls back to
+    /// `apply_user_menu` raises `state.startup_warning()`, falls back to
     /// default entries, and never touches either panel's `last_error`.
     #[test]
     fn apply_user_menu_raises_the_startup_warning_dialog_on_malformed_content() {
@@ -2730,9 +2729,9 @@ mod tests {
         apply_user_menu(&mut state, malformed);
         assert_eq!(state.user_menu_entries, default_entries, "falls back to default entries");
         assert!(
-            state.startup_warning.as_deref().is_some_and(|m| m.contains(config::USERMENU_FILE)),
+            state.startup_warning().is_some_and(|m| m.contains(config::USERMENU_FILE)),
             "expected a startup warning naming the malformed file: {:?}",
-            state.startup_warning
+            state.startup_warning()
         );
         assert_eq!(state.left.last_error, None, "the warning is a dedicated modal, not a panel mini-status");
         assert_eq!(state.right.last_error, None);
@@ -2746,7 +2745,7 @@ mod tests {
             config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false, problem: None };
         apply_user_menu(&mut state, ok);
         assert_eq!(state.user_menu_entries, entries);
-        assert_eq!(state.startup_warning, None);
+        assert_eq!(state.startup_warning(), None);
     }
 
     /// configuration-files "Non-UTF-8 usermenu.toml is kept, not
@@ -2763,7 +2762,7 @@ mod tests {
             problem: Some(config::UserMenuProblem::NotUtf8),
         };
         apply_user_menu(&mut state, result);
-        let warning = state.startup_warning.expect("a not-UTF-8 user menu raises the dialog");
+        let warning = state.startup_warning().expect("a not-UTF-8 user menu raises the dialog");
         assert!(warning.starts_with("usermenu.toml is not UTF-8 text"), "{warning}");
         assert!(warning.contains("re-save it as UTF-8"), "{warning}");
     }
@@ -2795,7 +2794,7 @@ mod tests {
             area,
             &state.theme,
             ColorDepth::Ansi16,
-            state.fuzzy_jump.as_ref().unwrap(),
+            state.fuzzy_jump().unwrap(),
             &state.dir_history,
             state.epoch_ms,
         );
@@ -2824,7 +2823,7 @@ mod tests {
         warnings.extend(menu.warnings.iter().map(ToString::to_string));
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         apply_configuration_warnings(&mut state, &warnings);
-        let shown = state.startup_warning.expect("the summary is shown");
+        let shown = state.startup_warning().expect("the summary is shown");
         assert!(shown.starts_with("config.toml line 1: unknown setting \"colour\""), "{shown}");
         assert!(shown.ends_with("(+2 more)"), "{shown}");
     }
@@ -2839,7 +2838,7 @@ mod tests {
         set_startup_warning(&mut state, profile_warning.clone());
         let warnings = vec!["config.toml line 2: unknown setting \"colour\"; ignored".to_string()];
         apply_configuration_warnings(&mut state, &warnings);
-        assert_eq!(state.startup_warning.as_deref(), Some(profile_warning.as_str()));
+        assert_eq!(state.startup_warning(), Some(profile_warning.as_str()));
     }
 
     /// configuration-files "Theme override warning keeps precedence": the
@@ -2854,7 +2853,7 @@ mod tests {
         let (_, theme_warning) = resolve_startup_theme(&config.config, Some("no-such-theme"));
         set_startup_warning(&mut state, theme_warning.expect("unknown --theme warns"));
         apply_configuration_warnings(&mut state, &summary);
-        let shown = state.startup_warning.clone().unwrap();
+        let shown = state.startup_warning().unwrap().to_string();
         assert!(shown.contains("--theme no-such-theme"), "{shown}");
 
         let mut state = State::empty(Theme::classic());
@@ -2867,7 +2866,7 @@ mod tests {
         };
         apply_user_menu(&mut state, malformed);
         apply_configuration_warnings(&mut state, &summary);
-        let shown = state.startup_warning.unwrap();
+        let shown = state.startup_warning().unwrap();
         assert!(shown.contains("usermenu.toml is malformed"), "{shown}");
     }
 
@@ -2876,7 +2875,7 @@ mod tests {
     fn no_configuration_warnings_leave_the_startup_warning_alone() {
         let mut state = State::empty(Theme::classic());
         apply_configuration_warnings(&mut state, &[]);
-        assert_eq!(state.startup_warning, None);
+        assert_eq!(state.startup_warning(), None);
         let parsed = config::parse("splash = false # c\ntheme = \"nc-mono\" # c\n[mouse] # c\nenabled = true\n");
         assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }

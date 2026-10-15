@@ -14,6 +14,7 @@ mod file_op;
 mod listing;
 mod overlays;
 mod panels;
+mod routing;
 mod viewer;
 
 fn test_state(phase: UiPhase) -> State {
@@ -137,7 +138,7 @@ fn opened_menu_state(names: &[&str], cursor_on: &str) -> State {
     state.left.entries = names.iter().map(|n| file_entry(n, 1)).collect();
     state.left.cursor = names.iter().position(|n| *n == cursor_on).unwrap();
     let (state, _) = update(state, Command::Enter);
-    assert!(state.file_action_menu.is_some(), "setup precondition: the menu must be open");
+    assert!(state.file_action_menu().is_some(), "setup precondition: the menu must be open");
     state
 }
 

@@ -9,7 +9,7 @@
 //! and tests reference one definition. It reads no clock and draws nothing.
 
 use crate::dialogs::OverlayRect;
-use crate::update::{State, UiPhase};
+use crate::update::{Overlay, State, UiPhase};
 
 /// Full progress, in per-mille. Progress is carried as an integer so the
 /// helpers below stay exact and snapshot-stable (no float rounding).
@@ -113,7 +113,7 @@ fn animation_running(state: &State) -> bool {
             return true;
         }
     }
-    if let Some(menu) = &state.menu {
+    if let Some(menu) = state.menu() {
         if within(menu.opened_at_ms, MENU_BAR_SWEEP_MS) {
             return true;
         }
@@ -123,17 +123,17 @@ fn animation_running(state: &State) -> bool {
             return true;
         }
     }
-    if let Some(menu) = &state.user_menu {
+    if let Some(menu) = state.user_menu() {
         if popup(menu.opened_at_ms, menu.selected_at_ms) {
             return true;
         }
     }
-    if let Some(menu) = &state.file_action_menu {
+    if let Some(menu) = state.file_action_menu() {
         if popup(menu.opened_at_ms, menu.selected_at_ms) {
             return true;
         }
     }
-    if let Some(dialog) = &state.history_dialog {
+    if let Some(dialog) = state.history_dialog() {
         if popup(dialog.opened_at_ms, dialog.selected_at_ms) {
             return true;
         }
@@ -156,12 +156,17 @@ fn animation_running(state: &State) -> bool {
 /// menus animate on their own stamps and are not listed here.
 fn dialog_visible(state: &State) -> bool {
     matches!(state.phase, UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_))
-        || state.drive_select.is_some()
-        || state.fuzzy_jump.is_some()
-        || state.find_file.is_some()
-        || state.theme_picker.is_some()
-        || state.help.is_some()
-        || state.startup_warning.is_some()
+        || matches!(
+            state.overlay(),
+            Some(
+                Overlay::DriveSelect(_)
+                    | Overlay::FuzzyJump(_)
+                    | Overlay::FindFile(_)
+                    | Overlay::ThemePicker(_)
+                    | Overlay::Help(_)
+                    | Overlay::StartupWarning(_)
+            )
+        )
 }
 
 /// Progress through `duration_ms` after `elapsed_ms`, in per-mille
@@ -366,7 +371,7 @@ mod tests {
         let mut menu = MenuState::opened();
         menu.pulldown_open = false;
         menu.opened_at_ms = 2_000;
-        state.menu = Some(menu);
+        state.open_overlay(Overlay::Menu(menu));
         assert_surface(state, 2_000, MENU_BAR_SWEEP_MS);
     }
 
@@ -376,11 +381,11 @@ mod tests {
         let mut menu = MenuState::opened();
         menu.opened_at_ms = 1_000; // the bar's own sweep long finished
         menu.pulldown_opened_at_ms = 2_500;
-        state.menu = Some(menu);
+        state.open_overlay(Overlay::Menu(menu));
         assert_surface(state.clone(), 2_500, POPUP_UNFOLD_MS);
 
-        state.menu.as_mut().unwrap().pulldown_opened_at_ms = 2_000; // unfold done
-        state.menu.as_mut().unwrap().selected_at_ms = Some(3_000);
+        state.menu_mut().unwrap().pulldown_opened_at_ms = 2_000; // unfold done
+        state.menu_mut().unwrap().selected_at_ms = Some(3_000);
         assert_surface(state, 3_000, HIGHLIGHT_SETTLE_MS);
     }
 
@@ -392,7 +397,7 @@ mod tests {
         menu.opened_at_ms = 1_000;
         menu.pulldown_opened_at_ms = 2_500;
         menu.selected_at_ms = Some(2_500);
-        state.menu = Some(menu);
+        state.open_overlay(Overlay::Menu(menu));
         state.clock_ms = 2_500;
         assert_eq!(next_wake_ms(&state), None, "a closed pull-down renders nothing animated");
     }
@@ -402,14 +407,16 @@ mod tests {
         for slot in ["user_menu", "file_action_menu", "history_dialog"] {
             let mut state = animated_state_at(0);
             match slot {
-                "user_menu" => state.user_menu = Some(crate::dialogs::UserMenuState { cursor: 0, opened_at_ms: 4_000, selected_at_ms: None }),
+                "user_menu" => {
+                    state.open_overlay(Overlay::UserMenu(crate::dialogs::UserMenuState { cursor: 0, opened_at_ms: 4_000, selected_at_ms: None }))
+                }
                 "file_action_menu" => {
-                    state.file_action_menu = Some(crate::dialogs::FileActionMenuState::new("f.txt".into(), false));
-                    state.file_action_menu.as_mut().unwrap().opened_at_ms = 4_000;
+                    state.open_overlay(Overlay::FileActionMenu(crate::dialogs::FileActionMenuState::new("f.txt".into(), false)));
+                    state.file_action_menu_mut().unwrap().opened_at_ms = 4_000;
                 }
                 _ => {
-                    state.history_dialog = Some(crate::dialogs::HistoryDialogState::default());
-                    state.history_dialog.as_mut().unwrap().opened_at_ms = 4_000;
+                    state.open_overlay(Overlay::HistoryDialog(crate::dialogs::HistoryDialogState::default()));
+                    state.history_dialog_mut().unwrap().opened_at_ms = 4_000;
                 }
             }
             assert_surface(state.clone(), 4_000, POPUP_UNFOLD_MS);
@@ -418,9 +425,9 @@ mod tests {
             let mut state = state;
             let settle_at = 4_000 + POPUP_UNFOLD_MS;
             match slot {
-                "user_menu" => state.user_menu.as_mut().unwrap().selected_at_ms = Some(settle_at),
-                "file_action_menu" => state.file_action_menu.as_mut().unwrap().selected_at_ms = Some(settle_at),
-                _ => state.history_dialog.as_mut().unwrap().selected_at_ms = Some(settle_at),
+                "user_menu" => state.user_menu_mut().unwrap().selected_at_ms = Some(settle_at),
+                "file_action_menu" => state.file_action_menu_mut().unwrap().selected_at_ms = Some(settle_at),
+                _ => state.history_dialog_mut().unwrap().selected_at_ms = Some(settle_at),
             }
             assert_surface(state, settle_at, HIGHLIGHT_SETTLE_MS);
         }
@@ -432,7 +439,7 @@ mod tests {
         state.dialog_opened_at_ms = 5_000;
         state.clock_ms = 5_000;
         assert_eq!(next_wake_ms(&state), None, "no dialog visible: the stamp alone animates nothing");
-        state.startup_warning = Some("warn".to_string());
+        state.set_startup_warning("warn".to_string());
         assert_surface(state, 5_000, DIALOG_IRIS_MS);
     }
 
@@ -452,7 +459,7 @@ mod tests {
         let mut state = State::empty(Theme::classic());
         state.clock_ms = 7_000;
         state.panels_revealed_at_ms = Some(7_000);
-        state.menu = Some(MenuState::opened());
+        state.open_overlay(Overlay::Menu(MenuState::opened()));
         state.quit_confirm = true;
         state.quit_opened_at_ms = 7_000;
         assert_eq!(next_wake_ms(&state), None);

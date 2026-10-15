@@ -203,18 +203,7 @@ pub(super) fn apply_path_probed(state: &mut State, request: u64, kind: ProbeKind
 /// dialog or a full-screen surface over whatever the user has since opened
 /// (offload-blocking-io design D1/D4).
 pub(super) fn panels_own_input(state: &State) -> bool {
-    matches!(state.phase, UiPhase::Panels)
-        && state.menu.is_none()
-        && state.drive_select.is_none()
-        && state.fuzzy_jump.is_none()
-        && state.find_file.is_none()
-        && state.user_menu.is_none()
-        && state.history_dialog.is_none()
-        && state.theme_picker.is_none()
-        && state.file_action_menu.is_none()
-        && state.help.is_none()
-        && state.startup_warning.is_none()
-        && !state.quit_confirm
+    matches!(state.phase, UiPhase::Panels) && state.overlay.is_none() && !state.quit_confirm
 }
 
 /// `del <target>` (`want_dir == false`) / `rmdir <target>`
@@ -533,7 +522,7 @@ pub(super) fn handle_enter(state: &mut State) -> Vec<Effect> {
         EntryKind::File => {
             let name = entry.name.clone();
             let executable = shell::is_executable_name(&name.to_string_lossy(), &state.shell.pathext);
-            state.file_action_menu = Some(FileActionMenuState::new(name, executable));
+            state.open_overlay(Overlay::FileActionMenu(FileActionMenuState::new(name, executable)));
             vec![]
         }
         EntryKind::ParentDir => handle_parent(state, side),
@@ -894,21 +883,34 @@ pub(super) fn handle_panels(mut state: State, cmd: Command, mut effects: Vec<Eff
             p.clear_quick_filter();
         }
 
-        Command::FuzzyJumpOpen => state.fuzzy_jump = Some(FuzzyJumpState::new()),
+        // The overlay openers. Each runs with the slot empty — this arm is
+        // reached only when no open overlay claimed the command, and an
+        // overlay that leads to another closes itself first — which
+        // `open_overlay` checks in debug builds (reducer-overlay-structure
+        // design D5).
+        Command::FuzzyJumpOpen => state.open_overlay(Overlay::FuzzyJump(FuzzyJumpState::new())),
         Command::FindFileOpen => {
             let root = state.active_panel().cwd.clone();
-            state.find_file = Some(FindFileState::new(root));
+            state.open_overlay(Overlay::FindFile(FindFileState::new(root)));
         }
-        Command::UserMenuOpen => state.user_menu = Some(UserMenuState::new()),
-        Command::HistoryDialogOpen => state.history_dialog = Some(HistoryDialogState::new()),
+        Command::UserMenuOpen => state.open_overlay(Overlay::UserMenu(UserMenuState::new())),
+        Command::HistoryDialogOpen => state.open_overlay(Overlay::HistoryDialog(HistoryDialogState::new())),
         Command::SwapPanels => effects.extend(handle_swap_panels(&mut state)),
         Command::EditUserMenuFile => effects.extend(handle_edit_user_menu_file(&mut state)),
         Command::UserMenuReloaded(result) => apply_user_menu_reload(&mut state, result),
-        Command::ThemePickerOpen => state.theme_picker = Some(ThemePickerState::open(&state.theme.name)),
-        Command::HelpOpen => state.help = Some(HelpState::new()),
+        Command::ThemePickerOpen => {
+            let picker = ThemePickerState::open(&state.theme.name);
+            state.open_overlay(Overlay::ThemePicker(picker));
+        }
+        Command::HelpOpen => state.open_overlay(Overlay::Help(HelpState::new())),
 
-        Command::MenuOpen => state.menu = Some(MenuState::opened()),
+        Command::MenuOpen => state.open_overlay(Overlay::Menu(MenuState::opened())),
         Command::OpenDriveSelect(side) => effects.push(Effect::EnumerateDrives(side)),
+        // The one asynchronous opener. The reply is drained before the next
+        // input is read, so no other overlay can have opened in between
+        // today; should one ever have, the drive list replaces it — the same
+        // winner the key router has always given drive select
+        // (reducer-overlay-structure design D5).
         Command::DriveListReady { target, drives } => {
             let current = drives::drive_letter_of(&state.panel(target).cwd);
             let generation = state.next_request_id();
@@ -917,7 +919,7 @@ pub(super) fn handle_panels(mut state: State, cmd: Command, mut effects: Vec<Eff
             }
             let mut dialog = DriveSelect::new(target, drives, current);
             dialog.generation = generation;
-            state.drive_select = Some(dialog);
+            state.overlay = Some(Overlay::DriveSelect(dialog));
         }
         Command::ToggleInfoMode(side) => effects.extend(toggle_info_mode(&mut state, side)),
 
@@ -954,12 +956,10 @@ pub(super) fn handle_panels(mut state: State, cmd: Command, mut effects: Vec<Eff
                 return update_impl(state, next);
             }
         }
-        Command::MenuTitleClick(id) => state.menu = Some(MenuState::for_menu(id)),
-        Command::MenuItemClick(index) => {
-            if let Some(next) = handle_menu_item_click(&mut state, index) {
-                return update_impl(state, next);
-            }
-        }
+        // A title click with the bar closed opens that pull-down; with the
+        // bar open, the menu overlay itself claims the click (and
+        // `MenuItemClick`), so neither reaches here then.
+        Command::MenuTitleClick(id) => state.open_overlay(Overlay::Menu(MenuState::for_menu(id))),
         Command::OpenActionMenuAt { side, name } => effects.extend(handle_open_action_menu_at(&mut state, side, name)),
 
         // Mouse drag-and-drop (mouse-panel-drag; design D2/D4).

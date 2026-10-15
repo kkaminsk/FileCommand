@@ -15,7 +15,7 @@ use std::mem::{discriminant, Discriminant};
 
 use crate::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use crate::menu::{MenuId, MenuState};
-use crate::update::{State, UiPhase};
+use crate::update::{Overlay, State, UiPhase};
 
 /// What the F9 menu looked like before the transition.
 struct MenuMark {
@@ -44,12 +44,10 @@ struct DialogMark {
     setup: Option<Discriminant<FileOpSetup>>,
     running: Option<Discriminant<RunningDialog>>,
     summary: bool,
-    drive_select: bool,
-    fuzzy_jump: bool,
-    find_file: bool,
-    theme_picker: bool,
-    help: bool,
-    startup_warning: bool,
+    /// Which of the overlays that iris in (drive select, fuzzy jump, find
+    /// file, theme picker, help, the startup warning) is in the slot. The
+    /// pop-up menus animate on their own stamps and are not counted here.
+    iris_overlay: Option<Discriminant<Overlay>>,
 }
 
 impl DialogMark {
@@ -64,25 +62,22 @@ impl DialogMark {
                 _ => None,
             },
             summary: matches!(state.phase, UiPhase::FileOpSummary(_)),
-            drive_select: state.drive_select.is_some(),
-            fuzzy_jump: state.fuzzy_jump.is_some(),
-            find_file: state.find_file.is_some(),
-            theme_picker: state.theme_picker.is_some(),
-            help: state.help.is_some(),
-            startup_warning: state.startup_warning.is_some(),
+            iris_overlay: match state.overlay() {
+                Some(
+                    overlay @ (Overlay::DriveSelect(_)
+                    | Overlay::FuzzyJump(_)
+                    | Overlay::FindFile(_)
+                    | Overlay::ThemePicker(_)
+                    | Overlay::Help(_)
+                    | Overlay::StartupWarning(_)),
+                ) => Some(discriminant(overlay)),
+                _ => None,
+            },
         }
     }
 
     fn any(&self) -> bool {
-        self.setup.is_some()
-            || self.running.is_some()
-            || self.summary
-            || self.drive_select
-            || self.fuzzy_jump
-            || self.find_file
-            || self.theme_picker
-            || self.help
-            || self.startup_warning
+        self.setup.is_some() || self.running.is_some() || self.summary || self.iris_overlay.is_some()
     }
 }
 
@@ -100,7 +95,7 @@ pub(crate) struct Snapshot {
 impl Snapshot {
     pub(crate) fn capture(state: &State) -> Snapshot {
         Snapshot {
-            menu: state.menu.as_ref().map(|m| MenuMark {
+            menu: state.menu().map(|m| MenuMark {
                 active: m.active,
                 pulldown_open: m.pulldown_open,
                 selected: m.selected,
@@ -108,17 +103,13 @@ impl Snapshot {
                 pulldown_opened_at_ms: m.pulldown_opened_at_ms,
                 selected_at_ms: m.selected_at_ms,
             }),
-            user_menu: state.user_menu.as_ref().map(|m| PopupMark {
+            user_menu: state.user_menu().map(|m| PopupMark { cursor: m.cursor, opened_at_ms: m.opened_at_ms, selected_at_ms: m.selected_at_ms }),
+            file_action_menu: state.file_action_menu().map(|m| PopupMark {
                 cursor: m.cursor,
                 opened_at_ms: m.opened_at_ms,
                 selected_at_ms: m.selected_at_ms,
             }),
-            file_action_menu: state.file_action_menu.as_ref().map(|m| PopupMark {
-                cursor: m.cursor,
-                opened_at_ms: m.opened_at_ms,
-                selected_at_ms: m.selected_at_ms,
-            }),
-            history_dialog: state.history_dialog.as_ref().map(|d| PopupMark {
+            history_dialog: state.history_dialog().map(|d| PopupMark {
                 cursor: d.cursor,
                 opened_at_ms: d.opened_at_ms,
                 selected_at_ms: d.selected_at_ms,
@@ -134,20 +125,20 @@ impl Snapshot {
     pub(crate) fn apply(self, state: &mut State) {
         let now = state.clock_ms;
 
-        if let Some(menu) = state.menu.as_mut() {
+        if let Some(menu) = state.menu_mut() {
             stamp_menu(self.menu.as_ref(), menu, now);
         }
-        if let Some(menu) = state.user_menu.as_mut() {
+        if let Some(menu) = state.user_menu_mut() {
             let (opened, selected) = stamp_popup(self.user_menu.as_ref(), menu.cursor, now);
             menu.opened_at_ms = opened;
             menu.selected_at_ms = selected;
         }
-        if let Some(menu) = state.file_action_menu.as_mut() {
+        if let Some(menu) = state.file_action_menu_mut() {
             let (opened, selected) = stamp_popup(self.file_action_menu.as_ref(), menu.cursor, now);
             menu.opened_at_ms = opened;
             menu.selected_at_ms = selected;
         }
-        if let Some(dialog) = state.history_dialog.as_mut() {
+        if let Some(dialog) = state.history_dialog_mut() {
             let (opened, selected) = stamp_popup(self.history_dialog.as_ref(), dialog.cursor, now);
             dialog.opened_at_ms = opened;
             dialog.selected_at_ms = selected;

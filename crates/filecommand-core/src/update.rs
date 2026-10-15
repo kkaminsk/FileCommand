@@ -39,7 +39,7 @@ mod viewer;
 
 pub use command::*;
 pub use listing::panel_viewport_rows;
-pub use overlays::{button_command, menu_action_command};
+pub use overlays::{button_command, menu_action_command, Overlay};
 pub use panels::{parse_cd, parse_del, parse_rmdir, resolve_cd_target};
 
 use editor::*;
@@ -77,9 +77,10 @@ impl PanelSide {
 
 /// Top-level UI phase. Governs how commands are interpreted by `update`.
 ///
-/// The F9 menu and the drive-select dialog deliberately live *beside* the
-/// phase (as `State::menu` / `State::drive_select`) rather than inside it:
-/// they overlay the panels without replacing whatever phase is underneath.
+/// The modal overlays (the F9 menu, the drive-select dialog, and the rest of
+/// [`Overlay`]) deliberately live *beside* the phase, in [`State::overlay`],
+/// rather than inside it: they overlay the panels without replacing whatever
+/// phase is underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiPhase {
     Splash {
@@ -129,10 +130,14 @@ pub struct State {
     /// not the command line — consumes plain printable keys. Exactly one
     /// typing sink ever sees a given key.
     pub quick_search: Option<String>,
-    /// The F9 menu overlay, or `None` when the bar is closed.
-    pub menu: Option<MenuState>,
-    /// The Alt+F1/F2 drive-select dialog, or `None` when closed.
-    pub drive_select: Option<DriveSelect>,
+    /// The one modal overlay open above the phase, or `None` (reducer-
+    /// overlay-structure design D1). Set through [`State::open_overlay`]
+    /// (which debug-asserts the slot is empty) and
+    /// [`State::set_startup_warning`], read through [`State::overlay`] and
+    /// the typed accessors (`menu()`, `fuzzy_jump()`, …). It lives beside the
+    /// phase: an overlay opens over the panels (or, for the startup warning,
+    /// over whatever phase is showing) without replacing them.
+    pub overlay: Option<Overlay>,
     /// Shell program + PATHEXT, snapshotted from config/environment at
     /// startup so `update` stays a pure function of `State`.
     pub shell: ShellConfig,
@@ -183,42 +188,12 @@ pub struct State {
     /// startup (user-menu "Parse label and command entries from
     /// usermenu.toml").
     pub user_menu_entries: Vec<UserMenuEntry>,
-    /// The Ctrl+J fuzzy-jump dialog, or `None` when closed.
-    pub fuzzy_jump: Option<FuzzyJumpState>,
-    /// The Alt+F7 find-file dialog, or `None` when closed.
-    pub find_file: Option<FindFileState>,
-    /// The F2 user-menu overlay, or `None` when closed.
-    pub user_menu: Option<UserMenuState>,
-    /// The Alt+F8 command-history dialog, or `None` when closed
-    /// (command-line "Command history dialog (Alt+F8)"). Modeled the same
-    /// "one-shot `Option<T>` overlay" way as `user_menu` above.
-    pub history_dialog: Option<HistoryDialogState>,
     /// The `usermenu.toml` path the application resolved at startup (the
     /// profile directory's file — config-profile-directory), opened by
     /// Commands → Menu file edit / `Command::EditUserMenuFile` and reloaded
     /// via `Command::UserMenuReloaded` when the editor returns (user-menu
     /// "Edit the user menu file from the Commands menu"; design D4).
     pub user_menu_path: PathBuf,
-    /// The Options → Themes picker overlay, or `None` when closed
-    /// (theme-selection "Options menu opens the theme picker").
-    pub theme_picker: Option<ThemePickerState>,
-    /// The Enter-on-file action menu, or `None` when closed. Opened by
-    /// `handle_enter` and dismissed by activating an entry or Esc
-    /// (file-action-menu "Enter on a file opens the action menu").
-    pub file_action_menu: Option<FileActionMenuState>,
-    /// The F1 Help window (and, nested within it, the About dialog), or
-    /// `None` when closed.
-    pub help: Option<HelpState>,
-    /// A dismissable startup-warning modal, or `None` when there is nothing
-    /// to warn about. Currently raised only for a malformed `usermenu.toml`
-    /// (user-menu falls back to default entries without overwriting the
-    /// file, per §6) — modeled the same "one-shot `Option<T>` overlay,
-    /// dismissed by a dedicated `Command`" way as `drive_select`/
-    /// `fuzzy_jump`/`find_file`/`user_menu`/`help`, rather than a panel
-    /// mini-status, since it must be visible regardless of which panel (if
-    /// either) it concerns (user-menu "Malformed file warns and falls back
-    /// without overwriting").
-    pub startup_warning: Option<String>,
     /// The quit-confirmation dialog, or `false` when closed. Modeled as a
     /// bare `bool` — like `EditorState::quit_confirm` for the built-in
     /// editor's own F10 quit prompt — rather than an `Option<T>`, since the
@@ -230,10 +205,10 @@ pub struct State {
     /// "Quit request keys and confirmation"; design D5).
     pub quit_confirm: bool,
     /// A mouse drag-and-drop in progress, or `None` otherwise
-    /// (mouse-panel-drag). Lives beside the phase like `menu`/`drive_select`
-    /// — it overlays the live panels rather than replacing them. Cleared by
-    /// a reducer post-condition (see `update`'s wrapper below) whenever a
-    /// command leaves `UiPhase::Panels` or opens any of the overlays above,
+    /// (mouse-panel-drag). Lives beside the phase like `overlay` — it
+    /// overlays the live panels rather than replacing them. Cleared by a
+    /// reducer post-condition (see `update`'s wrapper below) whenever a
+    /// command leaves `UiPhase::Panels` or opens an overlay,
     /// so it can never survive into a context where a drop could complete
     /// (mouse-drag "Cancel and phase-change clear the drag"; design D5).
     pub drag: Option<DragState>,
@@ -324,7 +299,7 @@ impl State {
     /// touches persistence (theme-selection: "Live theme preview while the
     /// picker is open").
     pub fn render_theme(&self) -> Theme {
-        if let Some(picker) = &self.theme_picker {
+        if let Some(picker) = self.theme_picker() {
             if let Some(name) = crate::theme::BUILTIN_THEME_NAMES.get(picker.highlight) {
                 if let Some(theme) = Theme::by_name(name) {
                     return theme;
@@ -345,8 +320,7 @@ impl State {
             history: Vec::new(),
             history_cursor: None,
             quick_search: None,
-            menu: None,
-            drive_select: None,
+            overlay: None,
             shell: ShellConfig::default(),
             editor: None,
             phase: UiPhase::Panels,
@@ -359,15 +333,7 @@ impl State {
             clock_ms: 0,
             epoch_ms: 0,
             user_menu_entries: Vec::new(),
-            fuzzy_jump: None,
-            find_file: None,
-            user_menu: None,
-            history_dialog: None,
             user_menu_path: PathBuf::new(),
-            theme_picker: None,
-            file_action_menu: None,
-            help: None,
-            startup_warning: None,
             quit_confirm: false,
             drag: None,
             animations: false,
@@ -382,6 +348,52 @@ impl State {
 
     fn too_small(size: (u16, u16)) -> bool {
         size.0 < MIN_COLS || size.1 < MIN_ROWS
+    }
+
+    /// The open modal overlay, if any (design D1).
+    pub fn overlay(&self) -> Option<&Overlay> {
+        self.overlay.as_ref()
+    }
+
+    /// Open `overlay` in the slot. Every synchronous opener runs with the
+    /// slot empty — overlays open only from the `Panels` arm, which a command
+    /// reaches only when no open overlay claimed it, and an overlay that
+    /// leads to another closes itself first (`OverlayStep::Replace`/
+    /// `CloseThen`) — so a non-empty slot here is a routing bug, caught in
+    /// debug builds (design D5). A release build keeps the newer overlay.
+    pub fn open_overlay(&mut self, overlay: Overlay) {
+        debug_assert!(self.overlay.is_none(), "open_overlay over an open {:?}", self.overlay.as_ref().map(std::mem::discriminant));
+        self.overlay = Some(overlay);
+    }
+
+    /// Close whatever overlay is open, returning it.
+    pub fn close_overlay(&mut self) -> Option<Overlay> {
+        self.overlay.take()
+    }
+
+    /// Raise (or replace) the startup warning: the one overlay whose openers
+    /// are last-writer-wins — `app::run`'s startup assignments, the user-menu
+    /// reload after an edit — so it installs over an empty slot and replaces
+    /// the message of an existing warning, rather than asserting an empty
+    /// slot like [`State::open_overlay`] (design D5). It debug-asserts that
+    /// the slot holds nothing else: the warning is raised at session start
+    /// and after the editor over `usermenu.toml` returns, both with no other
+    /// overlay open.
+    pub fn set_startup_warning(&mut self, message: String) {
+        debug_assert!(
+            matches!(self.overlay, None | Some(Overlay::StartupWarning(_))),
+            "startup warning over an open {:?}",
+            self.overlay.as_ref().map(std::mem::discriminant)
+        );
+        self.overlay = Some(Overlay::StartupWarning(message));
+    }
+
+    /// The startup warning's message while that overlay is open.
+    pub fn startup_warning(&self) -> Option<&str> {
+        match &self.overlay {
+            Some(Overlay::StartupWarning(message)) => Some(message),
+            _ => None,
+        }
     }
 
     /// Mint a new, never-repeated request id. Used to tag an outstanding
@@ -444,6 +456,118 @@ impl State {
     }
 }
 
+/// The typed read accessors over [`State::overlay`] (design D1): each
+/// returns its overlay's state while that variant is open, and `None`
+/// otherwise, so TUI readers and tests never match on the slot by hand.
+macro_rules! overlay_accessors {
+    ($($(#[$doc:meta])* $name:ident / $name_mut:ident => $variant:ident($ty:ty);)*) => {
+        impl State {
+            $(
+                $(#[$doc])*
+                pub fn $name(&self) -> Option<&$ty> {
+                    match &self.overlay {
+                        Some(Overlay::$variant(v)) => Some(v),
+                        _ => None,
+                    }
+                }
+
+                $(#[$doc])*
+                pub fn $name_mut(&mut self) -> Option<&mut $ty> {
+                    match &mut self.overlay {
+                        Some(Overlay::$variant(v)) => Some(v),
+                        _ => None,
+                    }
+                }
+            )*
+        }
+    };
+}
+
+overlay_accessors! {
+    /// The F9 menu while it is open.
+    menu / menu_mut => Menu(MenuState);
+    /// The drive-select dialog while it is open.
+    drive_select / drive_select_mut => DriveSelect(DriveSelect);
+    /// The Ctrl+J fuzzy-jump dialog while it is open.
+    fuzzy_jump / fuzzy_jump_mut => FuzzyJump(FuzzyJumpState);
+    /// The Alt+F7 find-file dialog while it is open.
+    find_file / find_file_mut => FindFile(FindFileState);
+    /// The F2 user menu while it is open.
+    user_menu / user_menu_mut => UserMenu(UserMenuState);
+    /// The Alt+F8 command-history dialog while it is open.
+    history_dialog / history_dialog_mut => HistoryDialog(HistoryDialogState);
+    /// The Options → Themes picker while it is open.
+    theme_picker / theme_picker_mut => ThemePicker(ThemePickerState);
+    /// The Enter-on-file action menu while it is open.
+    file_action_menu / file_action_menu_mut => FileActionMenu(FileActionMenuState);
+    /// The F1 Help window while it is open.
+    help / help_mut => Help(HelpState);
+}
+
+/// Which layer owns input right now — the single precedence order the
+/// reducer's routing, the TUI's key and mouse routing, and its render and
+/// hit-map dispatch all follow (reducer-overlay-structure design D2;
+/// application-shell "Modal overlays are mutually exclusive by
+/// construction"). Highest first: the quit confirmation; the "terminal too
+/// small" placeholder; a file-operation dialog; the viewer; the editor; the
+/// open overlay; the panels or the startup splash. A layer handles only the
+/// commands it claims and lets everything else pass to the layers below it,
+/// so worker replies still reach a running job while the quit dialog is
+/// open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputLayer {
+    /// The quit-confirmation dialog, reachable from every context.
+    QuitConfirm,
+    /// The terminal is below the 60x16 floor: the placeholder hides the
+    /// active screen, and only F10/Esc (a quit request) get through
+    /// (application-shell "Resize handling with 60x16 hard floor and
+    /// placeholder"). An open startup warning keeps its keys above it.
+    Undersized,
+    /// A file-operation dialog: setup, running job, or end-of-job summary.
+    FileOp,
+    /// The F3 viewer.
+    Viewer,
+    /// The F4 built-in editor.
+    Editor,
+    /// The open modal overlay in [`State::overlay`].
+    Overlay,
+    /// The panels and the command line.
+    Panels,
+    /// The startup splash.
+    Splash,
+}
+
+/// The layer that owns input for `state` (design D2). See [`InputLayer`] for
+/// the order.
+pub fn input_layer(state: &State) -> InputLayer {
+    if state.quit_confirm {
+        return InputLayer::QuitConfirm;
+    }
+    // The startup warning is drawn over the placeholder and keeps its keys
+    // there (resize-preserves-session-state design D3); every other screen
+    // is hidden, so nothing may reach it.
+    if state.undersized && !matches!(state.overlay, Some(Overlay::StartupWarning(_))) {
+        return InputLayer::Undersized;
+    }
+    screen_layer(state)
+}
+
+/// The layer beneath the quit confirmation and the placeholder: what the
+/// active screen itself is. This is the order the reducer routes a command
+/// the quit layer did not claim through — the placeholder gates keys in the
+/// TUI only, never the worker replies and timer ticks that must keep
+/// reaching the hidden screen.
+fn screen_layer(state: &State) -> InputLayer {
+    match &state.phase {
+        UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_) => InputLayer::FileOp,
+        UiPhase::Viewer(_) => InputLayer::Viewer,
+        UiPhase::Editor(_) => InputLayer::Editor,
+        UiPhase::Splash { .. } | UiPhase::Panels if state.overlay.is_some() => InputLayer::Overlay,
+        UiPhase::Splash { .. } => InputLayer::Splash,
+        UiPhase::Panels => InputLayer::Panels,
+    }
+}
+
 /// The pure state transition. Equal `(state, command)` always yields equal
 /// `(state, Vec<Effect>)`. A thin wrapper around `update_impl` that
 /// enforces the one invariant that must hold no matter which internal path a
@@ -482,28 +606,16 @@ pub fn update(state: State, cmd: Command) -> (State, Vec<Effect>) {
 }
 
 /// Whether `state.drag` is allowed to remain `Some`: only in
-/// `UiPhase::Panels` with none of the modal overlays below open — the same
-/// set `input::mouse::context` (mouse-basics) already gates ordinary mouse
-/// input behind, extended with `quit_confirm` since it uniquely overlays
-/// every other context too (mouse-drag "Cancel and phase-change clear the
-/// drag": job completion, listing failure, F9, quit request, resize below
-/// the minimum — every one of those either leaves `UiPhase::Panels` or sets
-/// one of these fields; the resize sets `undersized`, since the phase no
-/// longer changes to signal it — design D6).
+/// `UiPhase::Panels` with no modal overlay open — the same set
+/// `input::mouse::context` (mouse-basics) already gates ordinary mouse input
+/// behind, extended with `quit_confirm` since it uniquely overlays every
+/// other context too (mouse-drag "Cancel and phase-change clear the drag":
+/// job completion, listing failure, F9, quit request, resize below the
+/// minimum — every one of those either leaves `UiPhase::Panels` or sets one
+/// of these fields; the resize sets `undersized`, since the phase no longer
+/// changes to signal it — design D6).
 fn drag_allowed(state: &State) -> bool {
-    matches!(state.phase, UiPhase::Panels)
-        && !state.undersized
-        && state.menu.is_none()
-        && state.drive_select.is_none()
-        && state.fuzzy_jump.is_none()
-        && state.find_file.is_none()
-        && state.user_menu.is_none()
-        && state.history_dialog.is_none()
-        && state.theme_picker.is_none()
-        && state.file_action_menu.is_none()
-        && state.help.is_none()
-        && state.startup_warning.is_none()
-        && !state.quit_confirm
+    matches!(state.phase, UiPhase::Panels) && !state.undersized && state.overlay.is_none() && !state.quit_confirm
 }
 
 /// The actual state-transition logic. Never call this directly outside
@@ -592,8 +704,11 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // Async drive/Info results are applied only when they still describe
     // what is on screen; a stale answer is dropped, never rendered.
     match cmd {
+        // Applied only while the slot holds the drive-select dialog this
+        // label was fetched for, so a late label can never touch another
+        // overlay (reducer-overlay-structure design D5).
         Command::DriveLabelResolved { target, letter, label, generation } => {
-            if let Some(dialog) = &mut state.drive_select {
+            if let Some(dialog) = state.drive_select_mut() {
                 if dialog.target == target && dialog.generation == generation {
                     dialog.apply_label(letter, label);
                 }
@@ -715,18 +830,23 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         _ => {}
     }
 
-    // The quit-confirmation dialog is a modal overlay beside the phase, like
-    // the M5 dialogs below, but uniquely reachable from *every* context —
-    // panels, the viewer, an open menu, and every other modal dialog/
-    // overlay, including while a file operation is running — so it is
-    // handled here, ahead of the phase-specific short-circuits that follow,
-    // rather than gated behind any one of them (application-shell "Quit
-    // request keys and confirmation"; design D5).
+    // From here on the command is routed through the layers of the single
+    // precedence order (`input_layer`; reducer-overlay-structure design D2):
+    // each layer handles only the commands it claims, and everything else
+    // falls through to the next layer down.
+    //
+    // The quit-confirmation dialog is the topmost layer, uniquely reachable
+    // from *every* context — panels, the viewer, an open overlay, and every
+    // dialog, including while a file operation is running — so it is handled
+    // here, ahead of every layer below, rather than gated behind any one of
+    // them (application-shell "Quit request keys and confirmation"; design
+    // D5). It claims only `ConfirmQuit` and `CancelQuit`; worker replies and
+    // everything else pass beneath it.
     if let Command::RequestQuit = cmd {
         state.quit_confirm = true;
         return (state, effects);
     }
-    if state.quit_confirm {
+    if input_layer(&state) == InputLayer::QuitConfirm {
         match cmd {
             Command::ConfirmQuit => {
                 // Confirming while a job is running aborts it first, through
@@ -754,10 +874,16 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
         }
     }
 
-    // File-op setup/running/summary phases (and the job events that drive
-    // them) are handled uniformly here, independent of the Splash/Panels
-    // phases below.
-    if matches!(state.phase, UiPhase::FileOpSetup(_) | UiPhase::FileOpRunning { .. } | UiPhase::FileOpSummary(_))
+    // The layers below the quit confirmation, in the same order
+    // (`screen_layer`: the placeholder gates keys in the TUI only, so the
+    // reducer looks straight through it).
+    let layer = screen_layer(&state);
+
+    // File-op setup/running/summary phases are handled uniformly here,
+    // independent of the Splash/Panels phases below. This layer also claims
+    // the job events that drive them from every phase, so a running job's
+    // replies reach it beneath the quit dialog.
+    if layer == InputLayer::FileOp
         || matches!(cmd, Command::JobProgress(_) | Command::JobConflict(_) | Command::JobError(_) | Command::JobDone { .. })
     {
         effects.extend(handle_file_op(&mut state, cmd));
@@ -767,7 +893,7 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // The F3 viewer replaces the panels full-screen and owns input focus
     // while open (viewer: Frame-less full-screen chrome — "Viewer owns
     // focus while open"), so its commands are handled uniformly here.
-    if matches!(state.phase, UiPhase::Viewer(_)) {
+    if layer == InputLayer::Viewer {
         effects.extend(handle_viewer(&mut state, cmd));
         return (state, effects);
     }
@@ -775,62 +901,42 @@ fn update_impl(mut state: State, cmd: Command) -> (State, Vec<Effect>) {
     // The F4 built-in editor, likewise, replaces the panels full-screen and
     // owns input focus while open (builtin-editor "Full-screen editor
     // chrome").
-    if matches!(state.phase, UiPhase::Editor(_)) {
+    if layer == InputLayer::Editor {
         effects.extend(handle_editor(&mut state, cmd));
         return (state, effects);
     }
 
-    // The drive-select dialog and the F9 menu are modal over the panels:
-    // while one is open it claims the keys it understands.
-    if state.drive_select.is_some() && is_drive_select_command(&cmd) {
-        effects.extend(handle_drive_select(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.menu.is_some() && is_menu_command(&cmd) {
-        let follow_up = handle_menu(&mut state, cmd);
-        if let Some(next) = follow_up {
-            // An activated item re-enters as the command it stands for, so a
-            // menu action and its keyboard shortcut share one implementation.
-            let (state, more) = update_impl(state, next);
-            return (state, more);
+    // The open modal overlay claims the commands it understands and nothing
+    // else: take it out of the slot, hand its state to its handler, and
+    // restore the slot from the step the handler returns (design D3). A
+    // command it does not claim falls through to the base layer with the
+    // overlay back in place, exactly as before.
+    if let Some(mut overlay) = state.overlay.take() {
+        if overlay.claims(&cmd) {
+            return match overlay.handle(&mut state, cmd) {
+                OverlayStep::Keep(more) => {
+                    state.overlay = Some(overlay);
+                    effects.extend(more);
+                    (state, effects)
+                }
+                OverlayStep::Close(more) => {
+                    effects.extend(more);
+                    (state, effects)
+                }
+                OverlayStep::Replace(next, more) => {
+                    state.overlay = Some(next);
+                    effects.extend(more);
+                    (state, effects)
+                }
+                // An activated menu item re-enters as the command it stands
+                // for, so a menu action and its keyboard shortcut share one
+                // implementation — and the item's dialog opens into the slot
+                // the menu just left (application-shell "A menu item opens
+                // its dialog in place of the menu").
+                OverlayStep::CloseThen(next) => update_impl(state, next),
+            };
         }
-        return (state, effects);
-    }
-    // The M5 dialogs (fuzzy jump, find file, user menu, Help/About) are
-    // likewise modal overlays beside the phase, each claiming only the
-    // commands it understands while open — the same shape as the two blocks
-    // above.
-    if state.fuzzy_jump.is_some() && is_fuzzy_jump_command(&cmd) {
-        effects.extend(handle_fuzzy_jump(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.find_file.is_some() && is_find_file_command(&cmd) {
-        effects.extend(handle_find_file(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.user_menu.is_some() && is_user_menu_command(&cmd) {
-        effects.extend(handle_user_menu(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.history_dialog.is_some() && is_history_dialog_command(&cmd) {
-        effects.extend(handle_history_dialog(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.theme_picker.is_some() && is_theme_picker_command(&cmd) {
-        effects.extend(handle_theme_picker(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.file_action_menu.is_some() && is_file_action_menu_command(&cmd) {
-        effects.extend(handle_file_action_menu(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.help.is_some() && is_help_command(&cmd) {
-        effects.extend(handle_help(&mut state, cmd));
-        return (state, effects);
-    }
-    if state.startup_warning.is_some() && matches!(cmd, Command::DismissStartupWarning) {
-        state.startup_warning = None;
-        return (state, effects);
+        state.overlay = Some(overlay);
     }
 
     match &state.phase {

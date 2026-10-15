@@ -17,7 +17,7 @@ use filecommand_core::listing::{DateTime, Entry, EntryKind};
 use filecommand_core::menu::MenuState;
 use filecommand_core::panel::{ListingProgress, PanelState, SortDirection};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
-use filecommand_core::{update, Command, State, UiPhase};
+use filecommand_core::{update, Command, Overlay, State, UiPhase};
 
 use filecommand_tui::style::role_style;
 use filecommand_tui::views;
@@ -113,7 +113,7 @@ fn menu_state() -> State {
     let mut menu = MenuState::opened();
     menu.opened_at_ms = T0;
     menu.pulldown_opened_at_ms = T0;
-    State { menu: Some(menu), ..animated_state() }
+    State { overlay: Some(Overlay::Menu(menu)), ..animated_state() }
 }
 
 /// F7 through the real reducer, so the dialog stamp is whatever production
@@ -153,7 +153,7 @@ fn menu_bar_sweeps_in_left_to_right() {
     // left half of the top row is the bar, the right half still shows the
     // panels' top borders and the clock.
     let mut state = menu_state();
-    state.menu.as_mut().unwrap().pulldown_open = false;
+    state.menu_mut().unwrap().pulldown_open = false;
     insta::assert_snapshot!("menu_bar_sweep_50ms", render_text(&at(&state, 50)));
 }
 
@@ -239,7 +239,7 @@ fn highlight_flashes_in_the_hotkey_accent_then_settles() {
     // highlight down one row through the reducer.
     let pressed = T0 + 300;
     let (state, _) = update(State { clock_ms: pressed, ..menu_state() }, Command::MenuSelectNext);
-    let moved = state.menu.as_ref().unwrap();
+    let moved = state.menu().unwrap();
     assert_eq!(moved.selected_at_ms, Some(pressed));
     let row = 2 + moved.selected as u16; // pull-down top frame is row 1, items start at row 2
 
@@ -324,7 +324,7 @@ fn column_of(row: &str, needle: &str) -> u16 {
 /// one, always closes with the bottom frame edge directly under its last
 /// row, grows monotonically, and is complete at `POPUP_UNFOLD_MS`.
 fn assert_unfolds_top_down(name: &str, state: &State) {
-    let panels = render_buffer(&State { menu: None, user_menu: None, file_action_menu: None, ..state.clone() });
+    let panels = render_buffer(&State { overlay: None, ..state.clone() });
     let (_, fy0, _, fy1) = diff_bounds(&render_buffer(&finished(state)), &panels).unwrap_or_else(|| panic!("{name}: draws nothing"));
     let full_h = fy1 - fy0 + 1;
 
@@ -353,14 +353,14 @@ fn user_menu_and_action_menu_unfold_like_the_pulldowns() {
     let mut base = animated_state();
     base.user_menu_entries = (1..=6).map(|i| UserMenuEntry { label: format!("Entry {i}"), command: format!("cmd{i}") }).collect();
     let (user_menu, _) = update(base.clone(), Command::UserMenuOpen);
-    assert_eq!(user_menu.user_menu.as_ref().unwrap().opened_at_ms, T0);
+    assert_eq!(user_menu.user_menu().unwrap().opened_at_ms, T0);
     assert_unfolds_top_down("F2 user menu", &user_menu);
 
     // Enter on a file opens the action menu (the cursor starts on `docs`; move to a file).
     let mut base = animated_state();
     base.left.cursor = 2; // Cargo.toml
     let (action_menu, _) = update(base, Command::Enter);
-    assert_eq!(action_menu.file_action_menu.as_ref().expect("Enter on a file opens the menu").opened_at_ms, T0);
+    assert_eq!(action_menu.file_action_menu().expect("Enter on a file opens the menu").opened_at_ms, T0);
     assert_unfolds_top_down("Enter action menu", &action_menu);
 }
 
@@ -377,7 +377,7 @@ fn user_menu_and_action_menu_highlights_settle() {
     base.user_menu_entries = (1..=3).map(|i| UserMenuEntry { label: format!("Entry {i}"), command: format!("c{i}") }).collect();
     let (state, _) = update(base, Command::UserMenuOpen);
     let (state, _) = update(State { clock_ms: pressed, ..state }, Command::UserMenuMove(1));
-    assert_eq!(state.user_menu.as_ref().unwrap().selected_at_ms, Some(pressed));
+    assert_eq!(state.user_menu().unwrap().selected_at_ms, Some(pressed));
     // Find the highlighted row by its label: "Entry 2".
     let fg_of_entry_2 = |t: u64| {
         let buf = render_buffer(&State { clock_ms: pressed + t, ..state.clone() });
@@ -392,7 +392,7 @@ fn user_menu_and_action_menu_highlights_settle() {
     base.left.cursor = 2;
     let (state, _) = update(base, Command::Enter);
     let (state, _) = update(State { clock_ms: pressed, ..state }, Command::FileActionMenuMove(1));
-    let second = state.file_action_menu.as_ref().unwrap().entries[1].label();
+    let second = state.file_action_menu().unwrap().entries[1].label();
     let fg_of_second = |t: u64| {
         let buf = render_buffer(&State { clock_ms: pressed + t, ..state.clone() });
         let rows = text(&buf);
