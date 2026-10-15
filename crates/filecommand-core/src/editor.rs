@@ -13,15 +13,27 @@
 //! long-path abstraction (design D9) — mirroring how [`crate::config`] and
 //! the viewer's `byte_source` already do direct-but-extended-path-aware
 //! whole-file I/O, while [`crate::fs_ops::fs::FileSystem`] remains reserved
-//! for the copy/move/delete file-management engine it already models. Every
-//! other method here is a pure buffer transformation, unit-testable without
-//! touching a filesystem or a terminal (§8).
+//! for the copy/move/delete file-management engine it already models. The
+//! save itself goes through [`crate::durable::replace_file`] so it is
+//! atomic and keeps the file's metadata (editor-encoding-safety; design
+//! D4). Every other method here is a pure buffer transformation,
+//! unit-testable without touching a filesystem or a terminal (§8).
+//!
+//! The editor edits UTF-8 text only. [`classify_editor_bytes`] refuses
+//! UTF-16, NUL-containing and otherwise non-UTF-8 content at open so the
+//! buffer never holds anything F2 could not write back byte-exactly (apart
+//! from edits and line-ending normalization); such files are redirected to
+//! the F3 viewer (design D1). A UTF-8 byte-order mark is stripped into
+//! [`EditorState::has_bom`] and written back on save (design D3).
 
 use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::fs_ops::path::to_extended_path;
-use crate::viewer::decode::{decode_lossy, logical_lines};
+use crate::viewer::decode::logical_lines;
+
+/// The UTF-8 byte-order mark, stripped at load and written back on save.
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
 
 /// Files at or above this size are redirected to the F3 viewer instead of
 /// being loaded into the editor (builtin-editor "Editor invocation and size
@@ -115,14 +127,65 @@ pub struct Caret {
     pub col: usize,
 }
 
-/// The result of a size-gated open attempt (builtin-editor "Editor
-/// invocation and size cap").
+/// Why a file under the size cap still cannot be loaded into the built-in
+/// editor (builtin-editor "Editor invocation and size cap"; design D1). The
+/// variants are ordered by the check that produces them; the first match
+/// wins, chosen so the notice tells the user the most it can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotEditableReason {
+    /// Starts with a UTF-16 byte-order mark (`FF FE` or `FE FF`; this also
+    /// catches UTF-32LE's `FF FE 00 00`).
+    Utf16,
+    /// Contains a NUL (`0x00`) byte anywhere — a real binary, or BOM-less
+    /// UTF-16 whose ASCII range is full of NULs.
+    Binary,
+    /// Not valid UTF-8 (after an optional UTF-8 byte-order mark).
+    NotUtf8,
+}
+
+/// Validated editor input: the UTF-8 text after any byte-order mark, plus
+/// whether that mark was present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorText<'a> {
+    pub text: &'a str,
+    pub has_bom: bool,
+}
+
+/// Decide whether `bytes` are editable UTF-8 text (design D1). Checks run in
+/// this order, the first match wins: a UTF-16 BOM → [`NotEditableReason::Utf16`];
+/// any NUL byte → [`NotEditableReason::Binary`]; then an optional UTF-8 BOM
+/// is noted and the remainder must pass strict `from_utf8`, else
+/// [`NotEditableReason::NotUtf8`]. Pure, so every boundary is unit-testable
+/// without a file.
+pub fn classify_editor_bytes(bytes: &[u8]) -> Result<EditorText<'_>, NotEditableReason> {
+    if bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) {
+        return Err(NotEditableReason::Utf16);
+    }
+    if bytes.contains(&0) {
+        return Err(NotEditableReason::Binary);
+    }
+    let (has_bom, rest) = match bytes.strip_prefix(&UTF8_BOM) {
+        Some(rest) => (true, rest),
+        None => (false, bytes),
+    };
+    let text = std::str::from_utf8(rest).map_err(|_| NotEditableReason::NotUtf8)?;
+    Ok(EditorText { text, has_bom })
+}
+
+/// The result of a size- and encoding-gated open attempt (builtin-editor
+/// "Editor invocation and size cap").
 #[derive(Debug)]
 pub enum LoadResult {
-    Loaded(EditorState),
+    /// Boxed so the result is not sized by the whole editor buffer
+    /// (clippy `large_enum_variant`).
+    Loaded(Box<EditorState>),
     /// The file is `size` bytes, at or above [`EDITOR_MAX_BYTES`]; the
     /// caller should redirect to the F3 viewer instead.
     TooLarge { size: u64 },
+    /// The file is under the cap but is not UTF-8 text the editor can write
+    /// back byte-exactly; the caller should redirect to the F3 viewer with a
+    /// reason-specific notice (design D1/D2).
+    NotEditable { reason: NotEditableReason },
 }
 
 /// The F4-in-editor search-and-replace prompt's two stages: the literal
@@ -181,20 +244,35 @@ pub struct EditorState {
     pub quit_confirm: bool,
     /// The message from the most recent failed F2 save (including a failed
     /// save attempted as part of the save-on-exit confirm), or `None`.
-    /// Cleared by the next edit or successful save.
+    /// Cleared by the next edit or successful save (design D6).
     pub save_error: Option<String>,
+    /// `true` from the moment F2 (or the save-on-exit confirm's "Y")
+    /// dispatches `Effect::SaveEditor` until `Command::EditorSaved`/
+    /// `EditorSaveFailed` replies. The save runs on a worker thread; while
+    /// it is outstanding the editor accepts no edits, caret moves, or
+    /// further save/quit commands and shows a `Saving…` notice on its last
+    /// body row (application-shell "Slow storage never blocks the event
+    /// loop"; offload-blocking-io design D6).
+    pub save_pending: bool,
+    /// Whether the file began with a UTF-8 byte-order mark on load. The mark
+    /// is kept out of the buffer — it is zero-width, so as a buffer
+    /// character the caret could silently type in front of it or delete it
+    /// — and written back by `Self::to_bytes` (builtin-editor "UTF-8
+    /// byte-order mark is written back"; design D3).
+    pub has_bom: bool,
 }
 
 impl EditorState {
-    /// Build a fresh editor session from already-read file bytes: UTF-8
-    /// lossy decode, split into logical lines, dominant line ending
-    /// detected from the raw bytes, caret at the start of the first line.
-    /// Pure — no I/O — so load behavior is unit-testable without a temp
-    /// file (builtin-editor "Small file opens in the editor").
-    pub fn from_bytes(path: PathBuf, bytes: &[u8]) -> EditorState {
-        let text = decode_lossy(bytes);
-        let lines = logical_lines(&text);
-        EditorState {
+    /// Build a fresh editor session from already-read file bytes: strict
+    /// UTF-8 validation via [`classify_editor_bytes`] (the BOM stripped
+    /// into [`Self::has_bom`]), split into logical lines, dominant line
+    /// ending detected from the raw bytes, caret at the start of the first
+    /// line. Pure — no I/O — so load behavior is unit-testable without a
+    /// temp file (builtin-editor "Small file opens in the editor").
+    pub fn from_bytes(path: PathBuf, bytes: &[u8]) -> Result<EditorState, NotEditableReason> {
+        let EditorText { text, has_bom } = classify_editor_bytes(bytes)?;
+        let lines = logical_lines(text);
+        Ok(EditorState {
             path,
             lines: lines.clone(),
             caret: Caret::default(),
@@ -211,15 +289,19 @@ impl EditorState {
             replace_prompt: None,
             quit_confirm: false,
             save_error: None,
-        }
+            save_pending: false,
+            has_bom,
+        })
     }
 
     /// Open `path` for editing: stat it first and redirect to
     /// [`LoadResult::TooLarge`] without reading its content when it is at
     /// or above [`EDITOR_MAX_BYTES`] (builtin-editor "Large file redirects
-    /// to the viewer"), otherwise read and decode it in full. Routed
-    /// through [`to_extended_path`] for the `\\?\` long-path abstraction
-    /// (design D9).
+    /// to the viewer"), otherwise read it in full and classify the bytes —
+    /// content the editor cannot write back byte-exactly is redirected as
+    /// [`LoadResult::NotEditable`] instead of being loaded (design D1).
+    /// Routed through [`to_extended_path`] for the `\\?\` long-path
+    /// abstraction (design D9).
     pub fn open(path: &Path) -> io::Result<LoadResult> {
         let extended = to_extended_path(path);
         let size = std::fs::metadata(&extended)?.len();
@@ -227,7 +309,10 @@ impl EditorState {
             return Ok(LoadResult::TooLarge { size });
         }
         let bytes = std::fs::read(&extended)?;
-        Ok(LoadResult::Loaded(EditorState::from_bytes(path.to_path_buf(), &bytes)))
+        Ok(match EditorState::from_bytes(path.to_path_buf(), &bytes) {
+            Ok(editor) => LoadResult::Loaded(Box::new(editor)),
+            Err(reason) => LoadResult::NotEditable { reason },
+        })
     }
 
     /// Whether the buffer differs from the last-saved (or loaded) state
@@ -236,13 +321,17 @@ impl EditorState {
         self.lines != self.saved_snapshot
     }
 
-    /// The buffer encoded exactly as it would be written to disk: UTF-8,
-    /// joined with the recorded line ending (so a file that ended without a
-    /// trailing newline still doesn't gain one, and vice versa). Shared by
-    /// [`Self::save`] and [`Self::byte_len`] so the header's byte-size
-    /// figure always matches what F2 would actually write.
+    /// The buffer encoded exactly as it would be written to disk: the UTF-8
+    /// byte-order mark when the file had one, then UTF-8 joined with the
+    /// recorded line ending (so a file that ended without a trailing newline
+    /// still doesn't gain one, and vice versa). Shared by [`Self::save`] and
+    /// [`Self::byte_len`] so the header's byte-size figure always matches
+    /// what F2 would actually write, BOM included (design D3).
     fn to_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
+        if self.has_bom {
+            bytes.extend_from_slice(&UTF8_BOM);
+        }
         for (i, line) in self.lines.iter().enumerate() {
             if i > 0 {
                 bytes.extend_from_slice(self.line_ending.as_str().as_bytes());
@@ -258,13 +347,17 @@ impl EditorState {
         self.to_bytes().len() as u64
     }
 
-    /// F2: write the buffer back to `self.path` in place, UTF-8 encoded,
-    /// using the recorded line ending between lines (so a file that ended
-    /// without a trailing newline still doesn't gain one, and vice versa),
-    /// then clear the modified state (builtin-editor "Save in place …").
+    /// F2: save the buffer to `self.path` — UTF-8 (BOM restored if the file
+    /// had one), the recorded line ending between lines — atomically
+    /// through [`crate::durable::replace_file`], so a failure at any step
+    /// leaves the original byte-for-byte intact and the buffer modified
+    /// (builtin-editor "Save in place with line-ending and encoding
+    /// preservation"; design D4). A read-only file is refused up front and
+    /// never made writable (design D5). On success the modified state and
+    /// any earlier save failure are cleared.
     pub fn save(&mut self) -> io::Result<()> {
-        let bytes = self.to_bytes();
-        std::fs::write(to_extended_path(&self.path), &bytes)?;
+        check_writable(&self.path)?;
+        crate::durable::replace_file(&self.path, &self.to_bytes())?;
         self.saved_snapshot = self.lines.clone();
         self.save_error = None;
         Ok(())
@@ -281,6 +374,7 @@ impl EditorState {
     /// text entry").
     pub fn type_char(&mut self, c: char) {
         self.snapshot_for_undo();
+        self.save_error = None;
         let mut chars: Vec<char> = self.lines[self.caret.line].chars().collect();
         match self.mode {
             EntryMode::Insert => {
@@ -303,6 +397,7 @@ impl EditorState {
     /// to the start of the new (second) line.
     pub fn insert_newline(&mut self) {
         self.snapshot_for_undo();
+        self.save_error = None;
         let chars: Vec<char> = self.lines[self.caret.line].chars().collect();
         let at = self.caret.col.min(chars.len());
         let tail: String = chars[at..].iter().collect();
@@ -321,6 +416,7 @@ impl EditorState {
             return;
         }
         self.snapshot_for_undo();
+        self.save_error = None;
         if self.caret.col == 0 {
             let current = self.lines.remove(self.caret.line);
             let prev_len = self.lines[self.caret.line - 1].chars().count();
@@ -361,6 +457,7 @@ impl EditorState {
     pub fn cut_selection(&mut self) {
         let Some((start, end)) = self.selection_range() else { return };
         self.snapshot_for_undo();
+        self.save_error = None;
         let removed: Vec<String> = self.lines.drain(start..=end).collect();
         self.clipboard = removed;
         if self.lines.is_empty() {
@@ -387,6 +484,7 @@ impl EditorState {
             return;
         }
         self.snapshot_for_undo();
+        self.save_error = None;
         let at = self.caret.line.min(self.lines.len());
         for (i, line) in self.clipboard.iter().enumerate() {
             self.lines.insert(at + i, line.clone());
@@ -424,6 +522,7 @@ impl EditorState {
         let found = self.search_from(self.caret.line, self.caret.col, pattern).or_else(|| self.search_from(0, 0, pattern));
         let Some((line, col)) = found else { return false };
         self.snapshot_for_undo();
+        self.save_error = None;
         let chars: Vec<char> = self.lines[line].chars().collect();
         let pat_len = pattern.chars().count();
         let mut new_chars = chars[..col].to_vec();
@@ -473,6 +572,7 @@ impl EditorState {
     /// (builtin-editor "Undo does not go back more than one level").
     pub fn undo(&mut self) {
         if let Some(prev) = self.undo_snapshot.take() {
+            self.save_error = None;
             self.lines = prev;
             if self.lines.is_empty() {
                 self.lines.push(String::new());
@@ -563,6 +663,24 @@ impl EditorState {
     }
 }
 
+/// Refuse to save over a read-only file (builtin-editor "Read-only file is
+/// not saved"; design D5): an existing target whose read-only bit is set
+/// yields `PermissionDenied` with `<name> is read-only — not saved`, before
+/// any temporary file is created. The attribute is never cleared to force
+/// the save through. A target that no longer exists is fine — the save will
+/// recreate it.
+fn check_writable(path: &Path) -> io::Result<()> {
+    match std::fs::metadata(to_extended_path(path)) {
+        Ok(meta) if meta.permissions().readonly() => {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("{name} is read-only — not saved")))
+        }
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,14 +703,23 @@ mod tests {
             replace_prompt: None,
             quit_confirm: false,
             save_error: None,
+            save_pending: false,
+            has_bom: false,
         }
     }
 
     fn temp_file(name: &str, contents: &[u8]) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("filecommand-editor-test-{}-{}", std::process::id(), name));
+        let path = dir.join("file.txt");
+        // A previous failed run may have left the fixture read-only, which
+        // would block the cleanup below.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.permissions().readonly() {
+                set_readonly(&path, false);
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("file.txt");
         std::fs::write(&path, contents).unwrap();
         path
     }
@@ -615,7 +742,19 @@ mod tests {
         let path = temp_file("too-large", &big);
         match EditorState::open(&path).unwrap() {
             LoadResult::TooLarge { size } => assert_eq!(size, EDITOR_MAX_BYTES),
-            LoadResult::Loaded(_) => panic!("expected TooLarge"),
+            other => panic!("expected TooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_redirects_a_too_large_file_before_classifying_its_bytes() {
+        // A NUL-filled file at the cap is reported as TooLarge, not Binary:
+        // the size gate runs first and never reads the content (design D1).
+        let big = vec![0u8; EDITOR_MAX_BYTES as usize];
+        let path = temp_file("too-large-binary", &big);
+        match EditorState::open(&path).unwrap() {
+            LoadResult::TooLarge { size } => assert_eq!(size, EDITOR_MAX_BYTES),
+            other => panic!("expected TooLarge, got {other:?}"),
         }
     }
 
@@ -627,9 +766,254 @@ mod tests {
                 assert_eq!(editor.lines, vec!["line one".to_string(), "line two".to_string(), "".to_string()]);
                 assert_eq!(editor.caret, Caret { line: 0, col: 0 });
                 assert!(!editor.is_modified());
+                assert!(!editor.has_bom);
             }
-            LoadResult::TooLarge { .. } => panic!("expected Loaded"),
+            other => panic!("expected Loaded, got {other:?}"),
         }
+    }
+
+    // -- byte classification (design D1) ---------------------------------
+
+    #[test]
+    fn classify_utf16_boms_as_utf16_before_anything_else() {
+        assert_eq!(classify_editor_bytes(&[0xFF, 0xFE, b'h', 0, b'i', 0]), Err(NotEditableReason::Utf16));
+        assert_eq!(classify_editor_bytes(&[0xFE, 0xFF, 0, b'h', 0, b'i']), Err(NotEditableReason::Utf16));
+        // UTF-32LE starts with the UTF-16LE BOM and is reported the same way.
+        assert_eq!(classify_editor_bytes(&[0xFF, 0xFE, 0x00, 0x00, b'h', 0, 0, 0]), Err(NotEditableReason::Utf16));
+    }
+
+    #[test]
+    fn classify_an_embedded_nul_as_binary() {
+        assert_eq!(classify_editor_bytes(b"plain ascii\x00with a nul"), Err(NotEditableReason::Binary));
+        // BOM-less UTF-16 ASCII is NULs interleaved with letters: Binary is
+        // still an accurate description.
+        assert_eq!(classify_editor_bytes(&[b'h', 0, b'i', 0]), Err(NotEditableReason::Binary));
+    }
+
+    #[test]
+    fn classify_invalid_utf8_as_not_utf8() {
+        // A lone Windows-1252 `é`.
+        assert_eq!(classify_editor_bytes(b"caf\xE9"), Err(NotEditableReason::NotUtf8));
+        // A multi-byte sequence truncated at end of file.
+        assert_eq!(classify_editor_bytes(b"caf\xC3"), Err(NotEditableReason::NotUtf8));
+        // A UTF-8 BOM does not excuse an invalid remainder.
+        assert_eq!(classify_editor_bytes(b"\xEF\xBB\xBFcaf\xE9"), Err(NotEditableReason::NotUtf8));
+    }
+
+    #[test]
+    fn classify_accepts_empty_plain_and_bom_prefixed_utf8() {
+        assert_eq!(classify_editor_bytes(b""), Ok(EditorText { text: "", has_bom: false }));
+        assert_eq!(classify_editor_bytes("héllo\r\n".as_bytes()), Ok(EditorText { text: "héllo\r\n", has_bom: false }));
+        assert_eq!(classify_editor_bytes(b"\xEF\xBB\xBFhello"), Ok(EditorText { text: "hello", has_bom: true }));
+        // Control characters other than NUL are valid UTF-8 and round-trip.
+        assert_eq!(classify_editor_bytes(b"\x1B[0m\ttab\x07"), Ok(EditorText { text: "\x1B[0m\ttab\x07", has_bom: false }));
+    }
+
+    #[test]
+    fn open_redirects_a_windows_1252_file_and_leaves_it_unchanged() {
+        let original: &[u8] = b"@echo off\r\necho caf\xE9\r\n";
+        let path = temp_file("cp1252", original);
+        match EditorState::open(&path).unwrap() {
+            LoadResult::NotEditable { reason } => assert_eq!(reason, NotEditableReason::NotUtf8),
+            other => panic!("expected NotEditable, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), original, "the file on disk is byte-identical");
+    }
+
+    #[test]
+    fn open_redirects_utf16_and_nul_files() {
+        let utf16 = temp_file("utf16", &[0xFF, 0xFE, b'h', 0, b'i', 0]);
+        assert!(matches!(EditorState::open(&utf16).unwrap(), LoadResult::NotEditable { reason: NotEditableReason::Utf16 }));
+        let nul = temp_file("nul", b"abc\x00def");
+        assert!(matches!(EditorState::open(&nul).unwrap(), LoadResult::NotEditable { reason: NotEditableReason::Binary }));
+    }
+
+    // -- UTF-8 byte-order mark (design D3) --------------------------------
+
+    #[test]
+    fn a_bom_file_opens_without_the_bom_in_the_buffer_and_writes_it_back() {
+        let path = temp_file("bom", b"\xEF\xBB\xBFhello\nworld\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        assert!(editor.has_bom);
+        assert_eq!(editor.lines[0], "hello", "no U+FEFF in the first line");
+        assert!(!editor.lines[0].starts_with('\u{FEFF}'));
+        assert_eq!(editor.caret, Caret { line: 0, col: 0 });
+        assert_eq!(editor.byte_len(), 3 + "hello\nworld\n".len() as u64, "byte_len includes the 3 BOM bytes");
+        assert!(!editor.is_modified());
+
+        editor.move_home();
+        editor.type_char('X');
+        editor.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"\xEF\xBB\xBFXhello\nworld\n", "exactly one BOM, then the edited text");
+        assert_eq!(std::fs::read(&path).unwrap().len() as u64, editor.byte_len());
+    }
+
+    #[test]
+    fn a_file_without_a_bom_does_not_gain_one() {
+        let path = temp_file("no-bom", b"hello\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        assert!(!editor.has_bom);
+        editor.type_char('X');
+        editor.save().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Xhello\n");
+    }
+
+    // -- save safety (design D4/D5/D6) ------------------------------------
+
+    fn set_readonly(path: &Path, readonly: bool) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(readonly);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn saving_a_read_only_file_is_refused_and_leaves_it_untouched() {
+        let path = temp_file("readonly", b"locked\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        set_readonly(&path, true);
+        editor.type_char('X');
+
+        let err = editor.save().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(err.to_string(), "file.txt is read-only — not saved");
+        assert!(editor.is_modified(), "the buffer stays modified");
+        assert_eq!(std::fs::read(&path).unwrap(), b"locked\n", "the file is unchanged");
+        assert!(std::fs::metadata(&path).unwrap().permissions().readonly(), "still read-only");
+        let siblings: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("file.txt")], "no temporary file was created");
+        set_readonly(&path, false);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_original_intact_and_the_buffer_modified() {
+        let path = temp_file("failed-save", b"original\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        editor.type_char('X');
+        crate::durable::fault::arm(crate::durable::fault::Fault::AfterBytes(2));
+        let err = editor.save().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::StorageFull);
+        assert!(editor.is_modified());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original\n");
+        let siblings: Vec<_> = std::fs::read_dir(path.parent().unwrap()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(siblings, vec![std::ffi::OsString::from("file.txt")], "no temporary file remains");
+    }
+
+    #[test]
+    fn the_next_edit_clears_a_save_failure_message() {
+        let path = temp_file("save-error-clears", b"locked\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        set_readonly(&path, true);
+        editor.type_char('X');
+        let err = editor.save().unwrap_err();
+        // The reducer stores the failure on `save_error` (`Command::EditorSaveFailed`).
+        editor.save_error = Some(err.to_string());
+        editor.type_char('Y');
+        assert_eq!(editor.save_error, None, "typing clears the message");
+        set_readonly(&path, false);
+    }
+
+    #[test]
+    fn every_buffer_mutation_clears_a_save_failure_message() {
+        type Mutation = fn(&mut EditorState);
+        let mutations: Vec<(&str, Mutation)> = vec![
+            ("type_char", |e| e.type_char('x')),
+            ("insert_newline", |e| e.insert_newline()),
+            ("backspace", |e| {
+                e.caret.col = 1;
+                e.backspace()
+            }),
+            ("cut_selection", |e| {
+                e.start_mark();
+                e.cut_selection()
+            }),
+            ("paste", |e| {
+                e.clipboard = vec!["p".to_string()];
+                e.paste()
+            }),
+            ("replace_first", |e| {
+                assert!(e.replace_first("a", "b"));
+            }),
+            ("undo", |e| {
+                e.type_char('x');
+                e.save_error = Some("boom".to_string());
+                e.undo()
+            }),
+        ];
+        for (name, mutate) in mutations {
+            let mut e = state(&["abc"]);
+            e.save_error = Some("boom".to_string());
+            mutate(&mut e);
+            assert_eq!(e.save_error, None, "{name} clears save_error");
+        }
+    }
+
+    #[test]
+    fn a_successful_save_clears_a_save_failure_message() {
+        let path = temp_file("save-ok-clears", b"hello\n");
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        editor.type_char('X');
+        editor.save_error = Some("earlier failure".to_string());
+        editor.save().unwrap();
+        assert_eq!(editor.save_error, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hidden_system_attributes_and_creation_time_survive_a_save_on_windows() {
+        use std::os::windows::fs::MetadataExt;
+        const HIDDEN: u32 = 0x2;
+        const SYSTEM: u32 = 0x4;
+        let path = temp_file("win-attrs", b"hidden text\r\n");
+        let status = std::process::Command::new("attrib").arg("+H").arg("+S").arg(&path).status().unwrap();
+        assert!(status.success(), "attrib +H +S");
+        let before = std::fs::metadata(&path).unwrap();
+        let created = before.created().unwrap();
+
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        editor.type_char('X');
+        editor.save().unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"Xhidden text\r\n");
+        assert_ne!(after.file_attributes() & HIDDEN, 0, "still hidden");
+        assert_ne!(after.file_attributes() & SYSTEM, 0, "still system");
+        assert_eq!(after.created().unwrap(), created, "creation time unchanged");
+        let _ = std::process::Command::new("attrib").arg("-H").arg("-S").arg(&path).status();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_zone_identifier_stream_survives_a_save_on_windows() {
+        let path = temp_file("win-ads", b"Write-Host hi\r\n");
+        let stream = format!("{}:Zone.Identifier", path.display());
+        let zone: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+        std::fs::write(&stream, zone).unwrap();
+
+        let LoadResult::Loaded(mut editor) = EditorState::open(&path).unwrap() else { panic!("expected Loaded") };
+        editor.type_char('X');
+        editor.save().unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"XWrite-Host hi\r\n");
+        assert_eq!(std::fs::read(&stream).unwrap(), zone, "the stream survives with its previous content");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_replaces_the_target_and_keeps_the_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let real = temp_file("symlink-target", b"old\n");
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let link = real.parent().unwrap().join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let LoadResult::Loaded(mut editor) = EditorState::open(&link).unwrap() else { panic!("expected Loaded") };
+        editor.type_char('X');
+        editor.save().unwrap();
+
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(), "the link is still a symlink");
+        assert_eq!(std::fs::read(&real).unwrap(), b"Xold\n", "the link target was replaced");
+        assert_eq!(std::fs::metadata(&real).unwrap().permissions().mode() & 0o777, 0o640, "mode preserved");
     }
 
     // -- line-ending detection & CRLF/LF round trip ---------------------

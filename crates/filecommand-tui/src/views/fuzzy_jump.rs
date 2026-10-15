@@ -19,12 +19,20 @@ const MAX_LIST_ROWS: usize = 10;
 /// + separator + bottom frame.
 const CHROME_ROWS: u16 = 4;
 
-pub fn render_fuzzy_jump(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, dialog: &FuzzyJumpState, history: &[FrecencyEntry], now_ms: u64) {
+pub fn render_fuzzy_jump(
+    buf: &mut Buffer,
+    area: Rect,
+    theme: &Theme,
+    depth: ColorDepth,
+    dialog: &FuzzyJumpState,
+    history: &[FrecencyEntry],
+    now_ms: u64,
+) -> Option<(u16, u16)> {
     let body_style = role_style(theme, Role::DialogPrimary, depth);
     let input_style = role_style(theme, Role::DialogInput, depth);
     let highlight_style = role_style(theme, Role::MenuHighlight, depth);
 
-    let ranked = rank_directories(history, &dialog.pattern, now_ms);
+    let ranked = rank_directories(history, dialog.pattern.text(), now_ms);
     let preferred_list_rows = ranked.len().clamp(1, MAX_LIST_ROWS);
     let preferred_inner_w = MAX_INNER_W.max(display_width(TITLE));
     let preferred_h = CHROME_ROWS + preferred_list_rows as u16;
@@ -42,12 +50,11 @@ pub fn render_fuzzy_jump(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Col
     let title_x = x + 1 + ((inner_w.saturating_sub(display_width(TITLE))) / 2) as u16;
     buf.set_string(title_x, y, truncate_with_ellipsis(TITLE, inner_w), body_style);
 
-    // Pattern input row, an empty-caret dot when nothing has been typed yet
-    // — matching the bracket-and-dots idiom used elsewhere for an empty
-    // single-line field.
-    let input_text = if dialog.pattern.is_empty() { ".".repeat(inner_w) } else { pad_to_width(&dialog.pattern, inner_w) };
+    // The pattern input row: a shared text field per text-field-editing,
+    // dot-padded out to the field width (the bracket-and-dots idiom), with
+    // the terminal cursor at its caret.
     buf.set_string(x, y + 1, "\u{2551}", body_style);
-    buf.set_string(x + 1, y + 1, &input_text, input_style);
+    let caret_x = crate::views::draw_text_field(buf, x + 1, y + 1, inner_w, &dialog.pattern, input_style);
     buf.set_string(x + 1 + inner_w as u16, y + 1, "\u{2551}", body_style);
 
     buf.set_string(x, y + 2, format!("\u{2560}{}\u{2563}", "\u{2500}".repeat(inner_w)), body_style);
@@ -65,6 +72,7 @@ pub fn render_fuzzy_jump(buf: &mut Buffer, area: Rect, theme: &Theme, depth: Col
     }
 
     buf.set_string(x, y + box_h - 1, format!("\u{255A}{}\u{255D}", "\u{2550}".repeat(inner_w)), body_style);
+    Some((caret_x, y + 1))
 }
 
 #[cfg(test)]
@@ -122,7 +130,7 @@ mod tests {
     #[test]
     fn typed_pattern_appears_in_the_input_row() {
         let mut dialog = FuzzyJumpState::new();
-        dialog.pattern = "docu".to_string();
+        dialog.pattern = filecommand_core::line_edit::LineEdit::from("docu");
         let rows = render(&dialog, &[]).join("\n");
         assert!(rows.contains("docu"));
     }

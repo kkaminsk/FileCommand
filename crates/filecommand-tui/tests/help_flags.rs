@@ -1,17 +1,14 @@
-/// Integration tests for -h / -? / --help flags (help-flags OpenSpec change).
-///
-/// Uses CARGO_BIN_EXE_filecommand (set by cargo at test build time) to invoke
-/// the real binary and assert exit-code 0 + version string in stdout without
-/// the TUI ever being launched.
+//! Integration tests for -h / -? / --help flags (help-flags OpenSpec change).
+//!
+//! Uses CARGO_BIN_EXE_filecommand (set by cargo at test build time) to invoke
+//! the real binary and assert exit-code 0 + version string in stdout without
+//! the TUI ever being launched.
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BIN: &str = env!("CARGO_BIN_EXE_filecommand");
 
 fn run(arg: &str) -> std::process::Output {
-    std::process::Command::new(BIN)
-        .arg(arg)
-        .output()
-        .unwrap_or_else(|e| panic!("failed to spawn {BIN}: {e}"))
+    std::process::Command::new(BIN).arg(arg).output().unwrap_or_else(|e| panic!("failed to spawn {BIN}: {e}"))
 }
 
 #[test]
@@ -51,4 +48,22 @@ fn help_long_prints_version() {
     let out = run("--help");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains(VERSION), "--help stdout should contain version {VERSION}:\n{stdout}");
+}
+
+#[test]
+fn help_lists_the_noanimations_flag() {
+    // ui-animations "Flag is documented in usage".
+    let out = run("--help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--noanimations"), "--help should list --noanimations:\n{stdout}");
+}
+
+#[test]
+fn help_lists_the_log_flag_and_environment_variable() {
+    // error-diagnostics; application-shell "Optional diagnostic log":
+    // "Usage lists the log options".
+    let out = run("--help");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("--log <path>"), "--help should list --log <path>:\n{stdout}");
+    assert!(stdout.contains("FILECOMMAND_LOG"), "--help should mention FILECOMMAND_LOG:\n{stdout}");
 }

@@ -16,12 +16,7 @@ fn plain(code: KeyCode) -> KeyEvent {
 }
 
 fn state_with(phase: UiPhase) -> State {
-    State {
-        left: PanelState::new(PathBuf::from("/left")),
-        right: PanelState::new(PathBuf::from("/right")),
-        phase,
-        ..State::empty(Theme::classic())
-    }
+    State { left: PanelState::new(PathBuf::from("/left")), right: PanelState::new(PathBuf::from("/right")), phase, ..State::empty(Theme::classic()) }
 }
 
 fn panels() -> State {
@@ -29,7 +24,7 @@ fn panels() -> State {
 }
 
 fn typing(text: &str) -> State {
-    State { command_line: text.to_string(), ..panels() }
+    State { command_line: filecommand_core::line_edit::LineEdit::from(text), ..panels() }
 }
 
 fn map(key: KeyEvent, state: &State) -> Option<Command> {
@@ -84,7 +79,7 @@ fn quit_dialog_outranks_every_other_overlay_and_phase() {
     assert_eq!(map(plain(KeyCode::Char('y')), &over_viewer), Some(Command::ConfirmQuit));
 
     let mut over_menu = panels();
-    over_menu.menu = Some(MenuState::opened());
+    over_menu.open_overlay(Overlay::Menu(MenuState::opened()));
     over_menu.quit_confirm = true;
     assert_eq!(map(plain(KeyCode::Esc), &over_menu), Some(Command::CancelQuit), "not MenuCollapse");
 }
@@ -142,18 +137,158 @@ fn destination_input_state() -> State {
         kind: filecommand_core::fs_ops::JobKind::Copy,
         sources: vec![],
         source_dir: PathBuf::from("/left"),
-        input: String::new(),
+        input: filecommand_core::line_edit::LineEdit::default(),
         buttons: None,
+        hidden_by_filter: 0,
     }))
 }
 
 #[test]
 fn destination_input_routes_typing_and_confirm_cancel() {
     let state = destination_input_state();
-    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::FileOpInputChar('x')));
-    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::FileOpInputBackspace));
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::TextEdit(TextEditOp::Insert('x'))));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::TextEdit(TextEditOp::Backspace)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FileOpConfirm));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpCancel));
+}
+
+// ---------------------------------------------------------------------
+// line-editing-in-text-fields: the shared text-field key set
+// (text-field-editing "Caret model and editing keys"; tasks.md 3.1/3.3)
+// ---------------------------------------------------------------------
+
+#[test]
+fn dialog_fields_map_the_full_editing_key_set() {
+    // The destination dialog stands in for every field here; the arms all
+    // share `map_text_edit_key` (proven by the next test).
+    let state = destination_input_state();
+    assert_eq!(map(plain(KeyCode::Left), &state), Some(Command::TextEdit(TextEditOp::Left)));
+    assert_eq!(map(plain(KeyCode::Right), &state), Some(Command::TextEdit(TextEditOp::Right)));
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::TextEdit(TextEditOp::Home)));
+    assert_eq!(map(plain(KeyCode::End), &state), Some(Command::TextEdit(TextEditOp::End)));
+    assert_eq!(map(plain(KeyCode::Delete), &state), Some(Command::TextEdit(TextEditOp::Delete)));
+    assert_eq!(map(key(KeyCode::Left, KeyModifiers::CONTROL), &state), Some(Command::TextEdit(TextEditOp::WordLeft)));
+    assert_eq!(map(key(KeyCode::Right, KeyModifiers::CONTROL), &state), Some(Command::TextEdit(TextEditOp::WordRight)));
+    assert_eq!(map(key(KeyCode::Backspace, KeyModifiers::CONTROL), &state), Some(Command::TextEdit(TextEditOp::DeleteWordBack)));
+    // Some terminals deliver Ctrl+Backspace as Ctrl+H — both are mapped
+    // (design Risks).
+    assert_eq!(map(key(KeyCode::Char('h'), KeyModifiers::CONTROL), &state), Some(Command::TextEdit(TextEditOp::DeleteWordBack)));
+    assert_eq!(map(key(KeyCode::Delete, KeyModifiers::CONTROL), &state), Some(Command::TextEdit(TextEditOp::DeleteWordForward)));
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::SHIFT), &state), Some(Command::RequestPaste));
+    assert_eq!(map(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &state), Some(Command::RequestPaste));
+    assert_eq!(map(plain(KeyCode::Char('q')), &state), Some(Command::TextEdit(TextEditOp::Insert('q'))));
+}
+
+#[test]
+fn every_dialog_field_shares_the_editing_key_set() {
+    // The rename, conflict-rename, find-file, and fuzzy-jump arms route
+    // through the same `map_text_edit_key` as the destination field: one
+    // caret key, one word key, and both paste chords each.
+    let rename = state_with(UiPhase::FileOpSetup(FileOpSetup::RenameInput {
+        source_dir: PathBuf::from("/left"),
+        original_name: "a.txt".into(),
+        is_dir: false,
+        input: filecommand_core::line_edit::LineEdit::from("a.txt"),
+    }));
+    let conflict = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
+    let mut find = panels();
+    find.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
+    let mut fuzzy = panels();
+    fuzzy.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
+
+    for state in [&rename, &conflict, &find, &fuzzy] {
+        assert_eq!(map(plain(KeyCode::Left), state), Some(Command::TextEdit(TextEditOp::Left)), "Left");
+        assert_eq!(map(key(KeyCode::Right, KeyModifiers::CONTROL), state), Some(Command::TextEdit(TextEditOp::WordRight)), "Ctrl+Right");
+        assert_eq!(map(key(KeyCode::Backspace, KeyModifiers::CONTROL), state), Some(Command::TextEdit(TextEditOp::DeleteWordBack)), "Ctrl+Backspace");
+        assert_eq!(map(key(KeyCode::Insert, KeyModifiers::SHIFT), state), Some(Command::RequestPaste), "Shift+Ins");
+        assert_eq!(map(key(KeyCode::Char('v'), KeyModifiers::CONTROL), state), Some(Command::RequestPaste), "Ctrl+V");
+        assert_eq!(map(plain(KeyCode::Char('z')), state), Some(Command::TextEdit(TextEditOp::Insert('z'))), "printable");
+    }
+}
+
+#[test]
+fn conflict_rename_uses_the_shared_keys_only_while_the_field_is_up() {
+    // Before Rename is activated the conflict dialog's keys are its
+    // mnemonics; the editing keys must not leak into that stage.
+    let state = conflict_state(None);
+    assert_eq!(map(plain(KeyCode::Left), &state), None);
+    assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::FileOpBeginRename));
+    let state = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::TextEdit(TextEditOp::Home)));
+    assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::TextEdit(TextEditOp::Insert('r'))));
+}
+
+#[test]
+fn find_file_editing_keys_stop_once_the_search_is_submitted() {
+    // The pattern is fixed once a search is in flight (find-file "Find-file
+    // invocation"), so the field's keys go quiet and Up/Down move over the
+    // results instead.
+    let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
+    submitted.submit(1);
+    let mut state = panels();
+    state.open_overlay(Overlay::FindFile(submitted));
+    assert_eq!(map(plain(KeyCode::Left), &state), None, "no field owns Left once the walk is running");
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), None, "the pattern no longer accepts text");
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FindFileMove(-1)));
+}
+
+#[test]
+fn left_and_right_move_the_command_line_caret_only_while_typing() {
+    // command-line "Caret editing mid-line" / "Left on an empty line does
+    // nothing to the panel" (design D3).
+    assert_eq!(map(plain(KeyCode::Left), &typing("cd srv")), Some(Command::TextEdit(TextEditOp::Left)));
+    assert_eq!(map(plain(KeyCode::Right), &typing("cd srv")), Some(Command::TextEdit(TextEditOp::Right)));
+    assert_eq!(map(plain(KeyCode::Left), &panels()), None, "Left on an empty line maps to nothing");
+    assert_eq!(map(plain(KeyCode::Right), &panels()), None, "Right on an empty line maps to nothing");
+}
+
+#[test]
+fn ctrl_backspace_deletes_the_word_before_the_caret_while_typing() {
+    // command-line "Command-line prompt and printable-key routing"; design
+    // D3 — including the Ctrl+H delivery some terminals produce.
+    assert_eq!(map(key(KeyCode::Backspace, KeyModifiers::CONTROL), &typing("cd srv")), Some(Command::TextEdit(TextEditOp::DeleteWordBack)));
+    assert_eq!(map(key(KeyCode::Char('h'), KeyModifiers::CONTROL), &typing("cd srv")), Some(Command::TextEdit(TextEditOp::DeleteWordBack)));
+    // On an empty line Ctrl+Backspace keeps its long-standing ParentDir
+    // meaning (the Backspace arm has never filtered modifiers); Ctrl+H stays
+    // unbound there, exactly as before.
+    assert_eq!(map(key(KeyCode::Backspace, KeyModifiers::CONTROL), &panels()), Some(Command::ParentDir));
+    assert_eq!(map(key(KeyCode::Char('h'), KeyModifiers::CONTROL), &panels()), None);
+}
+
+#[test]
+fn ctrl_v_pastes_into_the_command_line_over_the_panels() {
+    // text-field-editing "Paste into a text field": "Over the panels, Ctrl+V
+    // SHALL paste into the command line" — empty line or mid-composition.
+    assert_eq!(map(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &panels()), Some(Command::RequestPaste));
+    assert_eq!(map(key(KeyCode::Char('v'), KeyModifiers::CONTROL), &typing("cd ")), Some(Command::RequestPaste));
+}
+
+#[test]
+fn home_end_delete_shift_ins_and_ctrl_arrows_keep_their_panel_meanings_while_typing() {
+    // design D3: none of these may become command-line editing keys, even
+    // mid-composition.
+    let state = typing("cd docs");
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::MoveCursor(CursorMove::Home)));
+    assert_eq!(map(plain(KeyCode::End), &state), Some(Command::MoveCursor(CursorMove::End)));
+    assert_eq!(map(plain(KeyCode::PageUp), &state), Some(Command::MoveCursor(CursorMove::Up(5))));
+    assert_eq!(map(plain(KeyCode::PageDown), &state), Some(Command::MoveCursor(CursorMove::Down(5))));
+    assert_eq!(map(plain(KeyCode::Delete), &state), Some(Command::RequestDelete), "Delete still opens the delete confirmation");
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::SHIFT), &state), Some(Command::ToggleSelectAtCursor), "Shift+Ins still toggles selection");
+    assert_eq!(map(key(KeyCode::Left, KeyModifiers::CONTROL), &state), Some(Command::SplitShrink));
+    assert_eq!(map(key(KeyCode::Right, KeyModifiers::CONTROL), &state), Some(Command::SplitGrow));
+}
+
+#[test]
+fn shift_ins_toggles_selection_and_ctrl_shift_ins_is_still_clipboard_paths() {
+    // text-field-editing "Shift+Ins over the panels still toggles selection"
+    // and "Ctrl+Shift+Ins SHALL remain the clipboard-paths action".
+    assert_eq!(map(key(KeyCode::Insert, KeyModifiers::SHIFT), &panels()), Some(Command::ToggleSelectAtCursor));
+    assert_eq!(
+        map(key(KeyCode::Insert, KeyModifiers::CONTROL | KeyModifiers::SHIFT), &panels()),
+        Some(Command::CopyToClipboard(ClipboardPayloadKind::Paths))
+    );
+    // And plain Insert is untouched, of course.
+    assert_eq!(map(plain(KeyCode::Insert), &panels()), Some(Command::ToggleSelectAtCursor));
 }
 
 #[test]
@@ -163,6 +298,7 @@ fn delete_confirm_routes_y_n() {
         source_dir: PathBuf::from("/left"),
         needs_second_confirm: false,
         confirmed_once: false,
+        hidden_by_filter: 0,
     }));
     assert_eq!(map(plain(KeyCode::Char('y')), &state), Some(Command::FileOpConfirm));
     assert_eq!(map(plain(KeyCode::Char('n')), &state), Some(Command::FileOpCancel));
@@ -196,7 +332,7 @@ fn progress_dialog_plain_c_still_cancels_but_ctrl_c_is_ignored() {
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
 }
 
-fn conflict_state(rename_input: Option<String>) -> State {
+fn conflict_state(rename_input: Option<filecommand_core::line_edit::LineEdit>) -> State {
     state_with(UiPhase::FileOpRunning {
         source_dir: PathBuf::from("/left"),
         dest_dir: PathBuf::from("/right"),
@@ -228,10 +364,52 @@ fn conflict_dialog_routes_mnemonic_keys() {
 
 #[test]
 fn conflict_dialog_rename_mode_routes_typing_instead_of_mnemonics() {
-    let state = conflict_state(Some(String::new()));
-    assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::FileOpInputChar('o')));
+    let state = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
+    assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::TextEdit(TextEditOp::Insert('o'))));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FileOpConfirm));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpCancel));
+}
+
+/// operation-dialogs "Overwrite-conflict dialog" scenarios "Esc cancels the
+/// job from the conflict dialog" and "The Cancel control and hotkey match
+/// Esc" (process-lifecycle-hardening task 4.4): with no rename field open,
+/// Esc and a plain `c`/`C` all issue the Cancel answer; Ctrl+C stays
+/// unmapped here as it is on the Progress dialog.
+#[test]
+fn conflict_dialog_esc_and_plain_c_cancel_the_job() {
+    let state = conflict_state(None);
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)));
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
+}
+
+/// Scenario "Esc in the Rename field returns to the choices": with the
+/// field open, Esc still closes the field (`FileOpCancel`) and never
+/// cancels the job; a typed `c` is text, not the hotkey.
+#[test]
+fn conflict_dialog_esc_in_the_rename_field_closes_the_field_not_the_job() {
+    let state = conflict_state(Some(filecommand_core::line_edit::LineEdit::default()));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpCancel));
+    assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::TextEdit(TextEditOp::Insert('c'))));
+}
+
+/// operation-dialogs "Cancellation is observed while a job waits for an
+/// answer" scenario "Esc on the error-recovery dialog aborts": pinned
+/// (process-lifecycle-hardening task 4.4) — the mapping predates the
+/// scenario.
+#[test]
+fn error_dialog_esc_chooses_abort() {
+    let state = state_with(UiPhase::FileOpRunning {
+        source_dir: PathBuf::from("/left"),
+        dest_dir: PathBuf::from("/left"),
+        dialog: RunningDialog::Error {
+            kind: filecommand_core::fs_ops::JobKind::Delete,
+            info: filecommand_core::fs_ops::ErrorInfo { path: PathBuf::from("/left/locked.db"), message: "in use".into() },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(1, 1),
+        },
+    });
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FileOpErrorChoice(ErrorChoice::Abort)));
 }
 
 #[test]
@@ -263,9 +441,9 @@ fn summary_phase_dismisses_on_any_key() {
 
 #[test]
 fn printable_keys_route_to_the_command_line() {
-    assert_eq!(map(plain(KeyCode::Char('d')), &panels()), Some(Command::CommandLineChar('d')));
-    assert_eq!(map(plain(KeyCode::Char(' ')), &panels()), Some(Command::CommandLineChar(' ')));
-    assert_eq!(map(key(KeyCode::Char('D'), KeyModifiers::SHIFT), &panels()), Some(Command::CommandLineChar('D')));
+    assert_eq!(map(plain(KeyCode::Char('d')), &panels()), Some(Command::TextEdit(TextEditOp::Insert('d'))));
+    assert_eq!(map(plain(KeyCode::Char(' ')), &panels()), Some(Command::TextEdit(TextEditOp::Insert(' '))));
+    assert_eq!(map(key(KeyCode::Char('D'), KeyModifiers::SHIFT), &panels()), Some(Command::TextEdit(TextEditOp::Insert('D'))));
 }
 
 #[test]
@@ -304,14 +482,14 @@ fn esc_cancels_an_in_progress_drag_instead_of_requesting_quit() {
 
 #[test]
 fn backspacing_to_empty_releases_up_down_to_the_panel() {
-    // Backspace is now the only way to hand Up/Down back to the panel
-    // cursor: it already pops the buffer in `core::update`, and the mapper
-    // recomputes `typing` fresh from the (now empty) buffer on the very
-    // next key (command-line "Command history navigation": "Backspacing the
-    // buffer to empty SHALL be the mechanism that hands Up/Down back to the
-    // panel").
+    // Backspace is one of the two ways to hand Up/Down back to the panel
+    // cursor (the clear-line chord is the other — see
+    // `ctrl_y_clears_a_composed_line`): it already pops the buffer in
+    // `core::update`, and the mapper recomputes `typing` fresh from the
+    // (now empty) buffer on the very next key (command-line "Command
+    // history navigation").
     assert_eq!(map(plain(KeyCode::Up), &typing("d")), Some(Command::CommandLineHistoryPrev));
-    assert_eq!(map(plain(KeyCode::Backspace), &typing("d")), Some(Command::CommandLineBackspace));
+    assert_eq!(map(plain(KeyCode::Backspace), &typing("d")), Some(Command::TextEdit(TextEditOp::Backspace)));
     // Once the buffer is empty again, Up/Down move the panel cursor.
     assert_eq!(map(plain(KeyCode::Up), &panels()), Some(Command::MoveCursor(CursorMove::Up(1))));
     assert_eq!(map(plain(KeyCode::Down), &panels()), Some(Command::MoveCursor(CursorMove::Down(1))));
@@ -319,13 +497,91 @@ fn backspacing_to_empty_releases_up_down_to_the_panel() {
 
 #[test]
 fn backspace_edits_the_buffer_while_typing() {
-    assert_eq!(map(plain(KeyCode::Backspace), &typing("dir")), Some(Command::CommandLineBackspace));
+    assert_eq!(map(plain(KeyCode::Backspace), &typing("dir")), Some(Command::TextEdit(TextEditOp::Backspace)));
+}
+
+#[test]
+fn ctrl_y_clears_a_composed_line() {
+    // command-line "Clear the command line with a dedicated key": "Ctrl+Y
+    // clears a composed line".
+    assert_eq!(map(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &typing("cd Program Files")), Some(Command::CommandLineClear));
+}
+
+#[test]
+fn ctrl_y_on_an_empty_line_does_nothing() {
+    // command-line "Clear the command line with a dedicated key": "Ctrl+Y
+    // on an empty line does nothing" — no quit dialog, no cursor movement
+    // (design D2: a mistaken press never does anything surprising).
+    assert_eq!(map(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &panels()), None);
+}
+
+#[test]
+fn clear_line_binding_is_config_overridable() {
+    // command-line "Clear the command line with a dedicated key":
+    // "Rebinding the clear key" — `key.clear_line = "ctrl+k"` makes Ctrl+K
+    // the clear chord and leaves Ctrl+Y inert.
+    let keys = Keys { clear_line: filecommand_core::config::KeyBinding::new(true, false, false, "k"), ..Keys::default() };
+    let state = typing("dir");
+    assert_eq!(map_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL), &state, 5, &keys), Some(Command::CommandLineClear));
+    assert_eq!(map_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL), &state, 5, &keys), None, "the default chord no longer applies once rebound");
+}
+
+#[test]
+fn command_line_clear_is_never_emitted_while_a_dialog_menu_viewer_or_editor_owns_input() {
+    // The chord is bound only while the panels own input (command-line
+    // "Clear the command line with a dedicated key"): no overlay or
+    // full-screen phase ever emits `CommandLineClear`, and their existing
+    // handling — including the unguarded `y` arms that treat Ctrl+Y as a
+    // plain `y` (command-line-clear-key design, Context) — is unchanged.
+    // The buffer is non-empty throughout, so the outcomes below always
+    // reflect the overlay's own keymap, never the empty-line guard.
+    let ctrl_y = key(KeyCode::Char('y'), KeyModifiers::CONTROL);
+
+    let mut state = typing("dir");
+    state.quit_confirm = true;
+    assert_eq!(map(ctrl_y, &state), Some(Command::ConfirmQuit), "the quit-confirm's unguarded y arm is unchanged");
+    assert_ne!(map(ctrl_y, &state), Some(Command::CommandLineClear));
+
+    let delete_confirm = state_with(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter: 0,
+    }));
+    assert_eq!(map(ctrl_y, &delete_confirm), Some(Command::FileOpConfirm), "the delete-confirm's unguarded y arm is unchanged");
+
+    let destination = destination_input_state();
+    assert_eq!(map(ctrl_y, &destination), Some(Command::TextEdit(TextEditOp::Insert('y'))), "text fields still type a literal y");
+
+    let mut state = typing("dir");
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
+    assert_eq!(map(ctrl_y, &state), None, "an open pull-down claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
+    assert_eq!(map(ctrl_y, &state), None, "the fuzzy-jump dialog claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
+    assert_eq!(map(ctrl_y, &state), None, "the user menu claims the key and ignores it");
+
+    let mut state = typing("dir");
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
+    assert_eq!(map(ctrl_y, &state), None, "the help window claims the key and ignores it");
+
+    let viewer = state_with(UiPhase::Viewer(filecommand_core::viewer::ViewerState::new(PathBuf::from("f.txt"), 100)));
+    assert_eq!(map(ctrl_y, &viewer), None, "the viewer owns its keys");
+
+    let editor =
+        state_with(UiPhase::Editor(filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), b"abc").expect("valid UTF-8 fixture")));
+    assert_eq!(map(ctrl_y, &editor), None, "the editor owns its keys");
 }
 
 #[test]
 fn plus_minus_star_type_into_a_non_empty_buffer_instead_of_selecting() {
-    assert_eq!(map(plain(KeyCode::Char('+')), &typing("echo 1")), Some(Command::CommandLineChar('+')));
-    assert_eq!(map(plain(KeyCode::Char('*')), &typing("dir ")), Some(Command::CommandLineChar('*')));
+    assert_eq!(map(plain(KeyCode::Char('+')), &typing("echo 1")), Some(Command::TextEdit(TextEditOp::Insert('+'))));
+    assert_eq!(map(plain(KeyCode::Char('*')), &typing("dir ")), Some(Command::TextEdit(TextEditOp::Insert('*'))));
 }
 
 #[test]
@@ -369,13 +625,7 @@ fn ctrl_o_maps_to_the_scrollback_view() {
 
 #[test]
 fn ctrl_f3_through_f7_pick_the_sort_modes() {
-    let expected = [
-        (3u8, SortMode::Name),
-        (4, SortMode::Extension),
-        (5, SortMode::Time),
-        (6, SortMode::Size),
-        (7, SortMode::Unsorted),
-    ];
+    let expected = [(3u8, SortMode::Name), (4, SortMode::Extension), (5, SortMode::Time), (6, SortMode::Size), (7, SortMode::Unsorted)];
     for (n, mode) in expected {
         assert_eq!(
             map(key(KeyCode::F(n), KeyModifiers::CONTROL), &panels()),
@@ -395,10 +645,7 @@ fn plain_f5_to_f7_still_mean_copy_mkdir_not_sort() {
 fn sort_keys_target_whichever_panel_is_active() {
     let mut state = panels();
     state.active = PanelSide::Right;
-    assert_eq!(
-        map(key(KeyCode::F(6), KeyModifiers::CONTROL), &state),
-        Some(Command::SetSortMode { side: PanelSide::Right, mode: SortMode::Size })
-    );
+    assert_eq!(map(key(KeyCode::F(6), KeyModifiers::CONTROL), &state), Some(Command::SetSortMode { side: PanelSide::Right, mode: SortMode::Size }));
 }
 
 #[test]
@@ -417,7 +664,7 @@ fn ctrl_l_toggles_info_for_the_active_panel() {
 #[test]
 fn drive_dialog_claims_navigation_confirm_and_cancel() {
     let mut state = panels();
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['A', 'C'], None));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['A', 'C'], None)));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::DriveSelectMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::DriveSelectMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DriveSelectConfirm));
@@ -427,7 +674,7 @@ fn drive_dialog_claims_navigation_confirm_and_cancel() {
 #[test]
 fn the_drive_dialog_swallows_keys_that_would_otherwise_type() {
     let mut state = panels();
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], None));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['C'], None)));
     assert_eq!(map(plain(KeyCode::Char('d')), &state), None, "typing must not leak past the dialog");
     assert_eq!(map(plain(KeyCode::F(5)), &state), None);
 }
@@ -444,7 +691,7 @@ fn f9_opens_the_menu_bar() {
 #[test]
 fn menu_navigation_keys_route_to_the_state_machine() {
     let mut state = panels();
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::MenuSelectPrev));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MenuSelectNext));
     assert_eq!(map(plain(KeyCode::Left), &state), Some(Command::MenuPrevMenu));
@@ -457,25 +704,23 @@ fn menu_navigation_keys_route_to_the_state_machine() {
 #[test]
 fn a_letter_while_the_bar_is_open_is_a_hotkey_not_typing() {
     let mut state = panels();
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::MenuHotkey('c')));
 }
 
 #[test]
 fn the_menu_claims_keys_ahead_of_the_command_line() {
     let mut state = typing("dir");
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::MenuSelectPrev), "not history recall");
     assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::MenuHotkey('x')), "not a typed character");
 }
 
-#[test]
-fn the_drive_dialog_outranks_the_menu() {
-    let mut state = panels();
-    state.menu = Some(MenuState::opened());
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['C'], None));
-    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DriveSelectCancel));
-}
+// `the_drive_dialog_outranks_the_menu` used to build a state with both the
+// menu and the drive dialog open — impossible now that both live in the one
+// overlay slot. It lives on as the reducer test
+// `drive_list_ready_replaces_an_open_menu_in_the_slot` (reducer-overlay-
+// structure design D6).
 
 // ---------------------------------------------------------------------
 // M3: typing-sink arbitration
@@ -514,7 +759,7 @@ fn exactly_one_typing_sink_claims_any_given_key() {
     for c in ['a', 'z', '1', '.', ' '] {
         let while_typing = map(plain(KeyCode::Char(c)), &panels());
         let while_searching = map(plain(KeyCode::Char(c)), &searching);
-        assert!(matches!(while_typing, Some(Command::CommandLineChar(_)) | Some(Command::GroupSelectAll)));
+        assert!(matches!(while_typing, Some(Command::TextEdit(TextEditOp::Insert(_))) | Some(Command::GroupSelectAll)));
         assert!(matches!(while_searching, Some(Command::QuickSearchChar(_))));
         assert_ne!(while_typing, while_searching, "`{c}` was claimed by both sinks");
     }
@@ -550,8 +795,8 @@ fn a_movement_key_exits_quick_search_and_is_still_applied_to_the_panel() {
 fn a_dialog_outranks_both_typing_sinks() {
     let mut state = destination_input_state();
     state.quick_search = Some("r".to_string());
-    state.command_line = "dir".to_string();
-    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::FileOpInputChar('x')));
+    state.command_line = filecommand_core::line_edit::LineEdit::from("dir");
+    assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::TextEdit(TextEditOp::Insert('x'))));
 }
 
 #[test]
@@ -559,8 +804,8 @@ fn entries_are_irrelevant_to_key_mapping() {
     // The mapper reads modes, not contents: a populated panel maps the same
     // keys as an empty one.
     let mut state = panels();
-    state.left.entries = vec![Entry { name: "a.txt".into(), kind: EntryKind::File, size: 1, modified: None }];
-    assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::CommandLineChar('d')));
+    state.left.entries = vec![Entry::new("a.txt", EntryKind::File, 1, None, false, false)];
+    assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::TextEdit(TextEditOp::Insert('d'))));
 }
 
 // ---------------------------------------------------------------------
@@ -579,7 +824,10 @@ fn f3_opens_the_viewer_and_plain_f4_requests_the_editor() {
 
 #[test]
 fn ctrl_f4_still_means_sort_by_extension_not_the_editor() {
-    assert_eq!(map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()), Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension }));
+    assert_eq!(
+        map(key(KeyCode::F(4), KeyModifiers::CONTROL), &panels()),
+        Some(Command::SetSortMode { side: PanelSide::Left, mode: SortMode::Extension })
+    );
 }
 
 #[test]
@@ -646,7 +894,7 @@ fn viewer_search_prompt_owns_the_keyboard_while_open() {
 // ---------------------------------------------------------------------
 
 fn open_editor(text: &str) -> filecommand_core::editor::EditorState {
-    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes())
+    filecommand_core::editor::EditorState::from_bytes(PathBuf::from("f.txt"), text.as_bytes()).expect("valid UTF-8 fixture")
 }
 
 #[test]
@@ -738,14 +986,14 @@ fn editor_quit_confirm_owns_y_n_and_esc_over_everything_else() {
 #[test]
 fn ctrl_p_and_ctrl_j_open_quick_filter_and_fuzzy_jump_by_default() {
     let state = panels();
-    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Left)));
     assert_eq!(map(key(KeyCode::Char('j'), KeyModifiers::CONTROL), &state), Some(Command::FuzzyJumpOpen));
 }
 
 #[test]
 fn quick_filter_owns_printables_and_backspace_but_not_esc_or_movement() {
     let mut state = panels();
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(plain(KeyCode::Char('p')), &state), Some(Command::QuickFilterChar('p')));
     assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::QuickFilterBackspace));
     // Esc no longer exits the filter — it falls through to the unconditional
@@ -766,18 +1014,18 @@ fn quick_filter_activation_key_toggles_the_filter_off_when_active() {
     // instead (quick-filter "Clearing the quick filter": "the activation
     // key toggles the filter").
     let mut state = panels();
-    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart));
-    state.left.quick_filter = Some("re".to_string());
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Left)));
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterEnd));
 }
 
 #[test]
 fn quick_filter_is_scoped_to_the_active_panel_only() {
     let mut state = panels();
-    state.right.quick_filter = Some("x".to_string()); // right is inactive here
+    state.right.set_quick_filter(Some("x".to_string())); // right is inactive here
     assert_eq!(
         map(plain(KeyCode::Char('a')), &state),
-        Some(Command::CommandLineChar('a')),
+        Some(Command::TextEdit(TextEditOp::Insert('a'))),
         "the inactive panel's filter must not steal printables from the command line"
     );
 }
@@ -790,7 +1038,7 @@ fn alt_letter_does_not_start_type_ahead_while_the_quick_filter_is_active() {
     // the activation key toggling the filter off is the documented way out
     // of the filter first (quick-filter "Clearing the quick filter").
     let mut state = panels();
-    state.left.quick_filter = Some("re".to_string());
+    state.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(
         map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state),
         None,
@@ -818,7 +1066,7 @@ fn ctrl_c_copies_files_from_panels_in_any_command_line_state() {
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &typing("dir")), files);
 
     let mut filtering = panels();
-    filtering.left.quick_filter = Some("re".to_string());
+    filtering.left.set_quick_filter(Some("re".to_string()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &filtering), files);
 }
 
@@ -872,14 +1120,14 @@ fn ctrl_c_in_the_built_in_editor_still_copies() {
     // The sole exclusion: the editor's own Ctrl+C=Copy binding must survive
     // untouched (application-shell "Quit request keys and confirmation":
     // "in the built-in editor Ctrl+C SHALL remain Copy").
-    let e = EditorState::from_bytes(PathBuf::from("f.txt"), b"");
+    let e = EditorState::from_bytes(PathBuf::from("f.txt"), b"").expect("valid UTF-8 fixture");
     assert_eq!(map_editor_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &e, 20), Some(Command::EditorCopy));
 }
 
 #[test]
 fn ctrl_c_no_longer_requests_quit_with_a_pull_down_menu_open() {
     let mut state = panels();
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
 }
 
@@ -889,19 +1137,19 @@ fn ctrl_c_no_longer_requests_quit_from_modal_dialogs_and_overlays() {
     // phase: fuzzy jump, find file, user menu, drive select, and the
     // file-op running dialog all now ignore Ctrl+C outright.
     let mut fuzzy = panels();
-    fuzzy.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    fuzzy.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &fuzzy), None);
 
     let mut find = panels();
-    find.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
+    find.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &find), None);
 
     let mut user_menu = panels();
-    user_menu.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    user_menu.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &user_menu), None);
 
     let mut drive = panels();
-    drive.drive_select = Some(DriveSelect::new(PanelSide::Left, vec![], None));
+    drive.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec![], None)));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &drive), None);
 
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &progress_state()), None);
@@ -916,10 +1164,7 @@ fn ctrl_c_types_a_literal_c_in_a_file_op_text_input() {
     // special case — it is not treated as "over the panels" for clipboard
     // purposes (clipboard-export "Clipboard key bindings": "over the
     // panels").
-    assert_eq!(
-        map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()),
-        Some(Command::FileOpInputChar('c'))
-    );
+    assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &destination_input_state()), Some(Command::TextEdit(TextEditOp::Insert('c'))));
 }
 
 #[test]
@@ -936,10 +1181,41 @@ fn quick_search_treats_ctrl_c_as_an_unrecognized_key_and_ends_type_ahead() {
 #[test]
 fn ctrl_t_ctrl_w_and_alt_digit_map_to_tab_commands() {
     let state = panels();
-    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab));
-    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab));
+    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab(PanelSide::Left)));
+    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab(PanelSide::Left)));
     assert_eq!(map(key(KeyCode::Char('3'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(3)));
     assert_eq!(map(key(KeyCode::Char('9'), KeyModifiers::ALT), &state), Some(Command::SwitchTab(9)));
+}
+
+#[test]
+fn tab_commands_carry_the_active_panel_side() {
+    // pulldown-menu-completion design D1: the keymap passes `state.active`;
+    // the Left/Right menus pass their own side instead.
+    let mut state = panels();
+    state.active = PanelSide::Right;
+    assert_eq!(map(key(KeyCode::Char('t'), KeyModifiers::CONTROL), &state), Some(Command::OpenTab(PanelSide::Right)));
+    assert_eq!(map(key(KeyCode::Char('w'), KeyModifiers::CONTROL), &state), Some(Command::CloseTab(PanelSide::Right)));
+    assert_eq!(map(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &state), Some(Command::QuickFilterStart(PanelSide::Right)));
+}
+
+#[test]
+fn ctrl_u_maps_to_swap_panels() {
+    let state = panels();
+    assert_eq!(map(key(KeyCode::Char('u'), KeyModifiers::CONTROL), &state), Some(Command::SwapPanels));
+    assert_eq!(map(key(KeyCode::Char('U'), KeyModifiers::CONTROL), &state), Some(Command::SwapPanels));
+    // Alt+U / plain u are unaffected.
+    assert_eq!(map(key(KeyCode::Char('u'), KeyModifiers::ALT), &state), Some(Command::QuickSearchStart('u')));
+    assert_eq!(map(plain(KeyCode::Char('u')), &state), Some(Command::TextEdit(TextEditOp::Insert('u'))));
+}
+
+#[test]
+fn alt_f8_opens_the_history_dialog_plain_f8_still_deletes() {
+    let state = panels();
+    // The guarded Alt+F8 arm takes precedence over the unguarded F(8) arm,
+    // exactly as Alt+F7 does for find-file (command-line "Command history
+    // dialog (Alt+F8)").
+    assert_eq!(map(key(KeyCode::F(8), KeyModifiers::ALT), &state), Some(Command::HistoryDialogOpen));
+    assert_eq!(map(plain(KeyCode::F(8)), &state), Some(Command::RequestDelete));
 }
 
 #[test]
@@ -956,9 +1232,9 @@ fn f1_f2_and_alt_f7_open_help_user_menu_and_find_file() {
 #[test]
 fn fuzzy_jump_dialog_owns_typing_movement_and_dismissal() {
     let mut state = panels();
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
-    assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::FuzzyJumpChar('d')));
-    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::FuzzyJumpBackspace));
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
+    assert_eq!(map(plain(KeyCode::Char('d')), &state), Some(Command::TextEdit(TextEditOp::Insert('d'))));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::TextEdit(TextEditOp::Backspace)));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FuzzyJumpMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::FuzzyJumpMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FuzzyJumpConfirm));
@@ -968,15 +1244,15 @@ fn fuzzy_jump_dialog_owns_typing_movement_and_dismissal() {
 #[test]
 fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation() {
     let mut state = panels();
-    state.find_file = Some(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left")));
-    assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::FindFileChar('r')));
-    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::FindFileBackspace));
+    state.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
+    assert_eq!(map(plain(KeyCode::Char('r')), &state), Some(Command::TextEdit(TextEditOp::Insert('r'))));
+    assert_eq!(map(plain(KeyCode::Backspace), &state), Some(Command::TextEdit(TextEditOp::Backspace)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::FindFileSubmit));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::FindFileCancel));
 
     let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
     submitted.submit(1);
-    state.find_file = Some(submitted);
+    state.overlay = Some(Overlay::FindFile(submitted));
     assert_eq!(map(plain(KeyCode::Char('r')), &state), None, "the pattern is fixed once a search is in flight");
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::FindFileMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::FindFileMove(1)));
@@ -987,7 +1263,7 @@ fn find_file_dialog_input_stage_owns_typing_then_switches_to_result_navigation()
 #[test]
 fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
     let mut state = panels();
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::UserMenuMove(-1)));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::UserMenuMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::UserMenuConfirm));
@@ -997,23 +1273,44 @@ fn user_menu_dialog_owns_movement_confirm_and_dismissal() {
 }
 
 #[test]
+fn history_dialog_owns_movement_confirm_and_dismissal() {
+    let mut state = panels();
+    state.history = vec!["cd C:\\work".to_string()];
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
+    assert_eq!(map(plain(KeyCode::Up), &state), Some(Command::HistoryDialogMove(-1)));
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HistoryDialogMove(1)));
+    // Home/End/PgUp/PgDn map to huge deltas, the same convention
+    // drive-select uses; the reducer's clamped cursor turns them into the
+    // exact ends (command-line "Command history dialog (Alt+F8)").
+    assert_eq!(map(plain(KeyCode::Home), &state), Some(Command::HistoryDialogMove(isize::MIN / 2)));
+    assert_eq!(map(plain(KeyCode::PageUp), &state), Some(Command::HistoryDialogMove(isize::MIN / 2)));
+    assert_eq!(map(plain(KeyCode::End), &state), Some(Command::HistoryDialogMove(isize::MAX / 2)));
+    assert_eq!(map(plain(KeyCode::PageDown), &state), Some(Command::HistoryDialogMove(isize::MAX / 2)));
+    assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HistoryDialogConfirm));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HistoryDialogCancel));
+    // A list overlay, not a text field: printables never reach the command
+    // line while it is open.
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), None);
+}
+
+#[test]
 fn help_dialog_precedence_list_then_page_then_about() {
     let mut state = panels();
     let mut help = filecommand_core::dialogs::HelpState::new();
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::HelpMove(1)));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpActivate));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
 
     help.page = Some(1);
-    state.help = Some(help);
+    state.overlay = Some(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Down), &state), None, "a topic page does not scroll a list that isn't shown");
 
     help.page = None;
     help.about_open = true;
-    state.help = Some(help);
+    state.overlay = Some(Overlay::Help(help));
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Char('o')), &state), Some(Command::HelpCancel));
@@ -1026,7 +1323,7 @@ fn help_ignores_ctrl_c_but_plain_c_still_cancels() {
     // must fall through to `_ => None` rather than closing Help, while the
     // plain key is untouched.
     let mut state = panels();
-    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
     assert_eq!(map(plain(KeyCode::Char('c')), &state), Some(Command::HelpCancel));
     assert_eq!(map(plain(KeyCode::Char('C')), &state), Some(Command::HelpCancel));
     assert_eq!(map(key(KeyCode::Char('c'), KeyModifiers::CONTROL), &state), None);
@@ -1037,8 +1334,8 @@ fn help_ignores_ctrl_c_but_plain_c_still_cancels() {
 fn m5_dialogs_outrank_the_command_line_and_quick_search() {
     let mut state = typing("dir");
     state.quick_search = Some("z".to_string());
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
-    assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::FuzzyJumpChar('a')));
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
+    assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::TextEdit(TextEditOp::Insert('a'))));
 }
 
 // ---------------------------------------------------------------------
@@ -1048,20 +1345,301 @@ fn m5_dialogs_outrank_the_command_line_and_quick_search() {
 #[test]
 fn startup_warning_is_dismissed_by_any_key() {
     let mut state = panels();
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::DismissStartupWarning));
     assert_eq!(map(plain(KeyCode::Enter), &state), Some(Command::DismissStartupWarning));
     assert_eq!(map(plain(KeyCode::Char('x')), &state), Some(Command::DismissStartupWarning));
 }
 
 #[test]
-fn startup_warning_outranks_every_other_modal_and_typing_sink() {
+fn startup_warning_outranks_every_typing_sink() {
     // The dialog can only ever be up at session start, before anything else
     // has had a chance to open, but it must still win the precedence check
-    // deterministically rather than relying on that invariant alone.
+    // deterministically over the typing sinks underneath it — a quick
+    // search and a composed command line — rather than relying on that
+    // invariant alone. (It cannot share the slot with another overlay, so
+    // the menu this test used to stack beneath it is gone — reducer-overlay-
+    // structure design D6.)
     let mut state = typing("dir");
-    state.startup_warning = Some("usermenu.toml is malformed".to_string());
+    state.set_startup_warning("usermenu.toml is malformed".to_string());
     state.quick_search = Some("z".to_string());
-    state.menu = Some(MenuState::opened());
     assert_eq!(map(plain(KeyCode::Char('a')), &state), Some(Command::DismissStartupWarning));
+}
+
+// ---------------------------------------------------------------------
+// idle-aware-event-loop: `map_paste` — a terminal bracketed paste arrives
+// as one paste (text-field-editing "Terminal paste arrives as one paste";
+// design D6; task 3.5)
+// ---------------------------------------------------------------------
+
+#[test]
+fn paste_into_the_command_line_over_the_panels_is_one_paste_op() {
+    // "Paste a path into the command line": one `TextEdit(Paste(..))`, and
+    // none of the pasted characters touch the panel cursor or selection.
+    let state = panels();
+    assert_eq!(map_paste(r"C:\Program Files\App", &state), vec![Command::TextEdit(TextEditOp::Paste(r"C:\Program Files\App".to_string()))]);
+    let state = typing("cd ");
+    assert_eq!(
+        map_paste(r"D:\docs", &state),
+        vec![Command::TextEdit(TextEditOp::Paste(r"D:\docs".to_string()))],
+        "mid-composition too, exactly as Ctrl+V"
+    );
+}
+
+#[test]
+fn paste_with_an_active_quick_filter_still_lands_in_the_command_line() {
+    // The quick filter claims only plain printables; Ctrl+V keeps its
+    // command-line meaning while it is active, so a terminal paste does too.
+    let mut state = panels();
+    state.left.set_quick_filter(Some("re".to_string()));
+    assert_eq!(map_paste("report.txt", &state), vec![Command::TextEdit(TextEditOp::Paste("report.txt".to_string()))]);
+}
+
+#[test]
+fn a_multi_line_paste_is_flattened_and_never_executed() {
+    // "Multi-line paste is flattened and not executed": one paste op joined
+    // by single spaces — no command runs.
+    let state = panels();
+    assert_eq!(map_paste("dir /b\r\necho hi\n", &state), vec![Command::TextEdit(TextEditOp::Paste("dir /b echo hi ".to_string()))]);
+}
+
+#[test]
+fn paste_into_a_dialog_field_is_one_paste_op() {
+    // "Paste into a dialog field": the destination field stands in for every
+    // field sharing `map_text_edit_key` (rename, conflict-rename, fuzzy jump).
+    let state = destination_input_state();
+    assert_eq!(map_paste("backup", &state), vec![Command::TextEdit(TextEditOp::Paste("backup".to_string()))]);
+}
+
+#[test]
+fn paste_into_the_find_file_pattern_is_one_paste_op() {
+    let mut state = panels();
+    state.open_overlay(Overlay::FindFile(filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"))));
+    assert_eq!(map_paste("*.rs", &state), vec![Command::TextEdit(TextEditOp::Paste("*.rs".to_string()))]);
+    // Once the search is in flight the pattern is fixed, so a paste goes
+    // nowhere (find-file "Find-file invocation").
+    let mut submitted = filecommand_core::find_file::FindFileState::new(PathBuf::from("/left"));
+    submitted.submit(1);
+    state.overlay = Some(Overlay::FindFile(submitted));
+    assert_eq!(map_paste("*.rs", &state), Vec::new());
+}
+
+#[test]
+fn paste_into_the_editor_text_is_typed_characters_and_newlines() {
+    // "A paste into the built-in editor's text SHALL be inserted at the
+    // caret as if typed, line breaks included."
+    let state = state_with(UiPhase::Editor(open_editor("abc")));
+    assert_eq!(
+        map_paste("x\r\ny\nz", &state),
+        vec![Command::EditorChar('x'), Command::EditorNewline, Command::EditorChar('y'), Command::EditorNewline, Command::EditorChar('z'),],
+        "CRLF is one line break"
+    );
+    // The save-on-exit prompt is a yes/no dialog: a paste never answers it.
+    let mut quitting = state_with(UiPhase::Editor(open_editor("abc")));
+    if let UiPhase::Editor(editor) = &mut quitting.phase {
+        editor.quit_confirm = true;
+    }
+    assert_eq!(map_paste("y", &quitting), Vec::new());
+}
+
+#[test]
+fn paste_into_the_editor_and_viewer_search_prompts_is_flattened_characters() {
+    // Per-character prompt commands, line breaks flattened to spaces — a
+    // pasted line break never confirms the prompt.
+    let mut editor = open_editor("abc");
+    editor.search_prompt = Some(String::new());
+    let state = state_with(UiPhase::Editor(editor));
+    assert_eq!(map_paste("a\nb", &state), vec![Command::EditorSearchChar('a'), Command::EditorSearchChar(' '), Command::EditorSearchChar('b')]);
+    let mut editor = open_editor("abc");
+    editor.replace_prompt = Some(filecommand_core::editor::ReplacePrompt::Pattern(String::new()));
+    let state = state_with(UiPhase::Editor(editor));
+    assert_eq!(map_paste("a\nb", &state), vec![Command::EditorReplaceChar('a'), Command::EditorReplaceChar(' '), Command::EditorReplaceChar('b')]);
+
+    let mut viewer = open_viewer(filecommand_core::viewer::ViewMode::Text);
+    viewer.search_input = Some(String::new());
+    let state = state_with(UiPhase::Viewer(viewer));
+    assert_eq!(map_paste("a\nb", &state), vec![Command::ViewerSearchChar('a'), Command::ViewerSearchChar(' '), Command::ViewerSearchChar('b')]);
+    // Without the prompt open, the viewer has no text sink at all.
+    let state = state_with(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)));
+    assert_eq!(map_paste("q", &state), Vec::new());
+}
+
+#[test]
+fn paste_with_no_focused_text_input_is_ignored() {
+    // "Paste with no focused text input is ignored": a pasted `y` must not
+    // answer the delete confirmation.
+    let delete = state_with(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter: 0,
+    }));
+    assert_eq!(map_paste("y", &delete), Vec::new());
+
+    let mut menu_open = panels();
+    menu_open.open_overlay(Overlay::Menu(MenuState::opened()));
+    assert_eq!(map_paste("q", &menu_open), Vec::new(), "a menu's hotkey letters are not text input");
+
+    let mut quitting = panels();
+    quitting.quit_confirm = true;
+    assert_eq!(map_paste("y", &quitting), Vec::new(), "the quit dialog is never answered by a paste");
+
+    let mut warning = panels();
+    warning.set_startup_warning("warn".to_string());
+    assert_eq!(map_paste("x", &warning), Vec::new());
+
+    assert_eq!(map_paste("", &panels()), Vec::new(), "an empty paste produces nothing");
+}
+
+// ---------------------------------------------------------------------
+// resize-preserves-session-state task 5.1: while the "terminal too small"
+// placeholder hides the screen, no key reaches it (application-shell
+// "Resize handling with 60x16 hard floor and placeholder"; design D3)
+// ---------------------------------------------------------------------
+
+fn undersized(phase: UiPhase) -> State {
+    State { undersized: true, term_size: (50, 12), ..state_with(phase) }
+}
+
+#[test]
+fn undersized_over_the_editor_ignores_every_key_including_quit() {
+    // "Typing over the hidden editor does nothing": letters, Enter, F2, F10
+    // and Esc all map to nothing, so no edit, save, quit prompt or quit
+    // dialog can happen to a buffer the user cannot see.
+    let state = undersized(UiPhase::Editor(open_editor("abc\n")));
+    for k in [plain(KeyCode::Char('a')), plain(KeyCode::Enter), plain(KeyCode::F(2)), plain(KeyCode::F(10)), plain(KeyCode::Esc)] {
+        assert_eq!(map(k, &state), None, "{k:?} must be ignored over the hidden editor");
+    }
+}
+
+#[test]
+fn undersized_over_panels_and_viewer_lets_only_f10_and_esc_through() {
+    // "F10 over the placeholder asks to quit": the quit dialog is drawn over
+    // the placeholder; everything else is ignored.
+    for state in [undersized(UiPhase::Panels), undersized(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)))] {
+        assert_eq!(map(plain(KeyCode::F(10)), &state), Some(Command::RequestQuit));
+        assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::RequestQuit));
+        for k in [
+            plain(KeyCode::Char('a')),
+            plain(KeyCode::Enter),
+            plain(KeyCode::Tab),
+            plain(KeyCode::F(5)),
+            plain(KeyCode::Down),
+            key(KeyCode::Char('j'), KeyModifiers::CONTROL),
+        ] {
+            assert_eq!(map(k, &state), None, "{k:?} must not reach the hidden screen");
+        }
+    }
+}
+
+#[test]
+fn undersized_hides_open_overlays_from_the_keyboard() {
+    // A key is never routed blindly to a menu, dialog or typing sink the
+    // user cannot see (design D3 "Hidden overlay").
+    let mut menu = undersized(UiPhase::Panels);
+    menu.open_overlay(Overlay::Menu(MenuState::opened()));
+    assert_eq!(map(plain(KeyCode::Enter), &menu), None, "Enter must not activate a hidden menu item");
+    assert_eq!(map(plain(KeyCode::Esc), &menu), Some(Command::RequestQuit), "Esc asks to quit rather than closing the hidden menu");
+
+    let mut drive = undersized(UiPhase::Panels);
+    drive.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['C'], Some('C'))));
+    assert_eq!(map(plain(KeyCode::Enter), &drive), None);
+
+    let mut typing = undersized(UiPhase::Panels);
+    typing.command_line = filecommand_core::line_edit::LineEdit::from("dir");
+    assert_eq!(map(plain(KeyCode::Char('x')), &typing), None, "no text reaches the hidden command line");
+    assert_eq!(map(plain(KeyCode::Enter), &typing), None, "the hidden command line is never executed");
+
+    let delete = undersized(UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: vec![],
+        source_dir: PathBuf::from("/left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter: 0,
+    }));
+    assert_eq!(map(plain(KeyCode::Enter), &delete), None, "a hidden delete confirmation cannot be confirmed");
+    assert_eq!(map(plain(KeyCode::Esc), &delete), Some(Command::RequestQuit));
+}
+
+#[test]
+fn undersized_keeps_the_quit_and_startup_warning_dialog_keys() {
+    // Both dialogs are drawn over the placeholder, so their keys still work.
+    let mut quitting = undersized(UiPhase::Panels);
+    quitting.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Char('y')), &quitting), Some(Command::ConfirmQuit));
+    assert_eq!(map(plain(KeyCode::Char('n')), &quitting), Some(Command::CancelQuit));
+    assert_eq!(map(plain(KeyCode::Esc), &quitting), Some(Command::CancelQuit));
+
+    let mut over_viewer = undersized(UiPhase::Viewer(open_viewer(filecommand_core::viewer::ViewMode::Text)));
+    over_viewer.quit_confirm = true;
+    assert_eq!(map(plain(KeyCode::Enter), &over_viewer), Some(Command::ConfirmQuit));
+
+    let mut warning = undersized(UiPhase::Panels);
+    warning.set_startup_warning("usermenu.toml is malformed".to_string());
+    assert_eq!(map(plain(KeyCode::Esc), &warning), Some(Command::DismissStartupWarning));
+    assert_eq!(map(plain(KeyCode::Char('x')), &warning), Some(Command::DismissStartupWarning));
+}
+
+// ---------------------------------------------------------------------
+// reducer-overlay-structure: one precedence order, one overlay slot
+// (application-shell "Modal overlays are mutually exclusive by
+// construction"; tasks 6.2, 6.3, 6.6)
+// ---------------------------------------------------------------------
+
+/// 6.2 "Another overlay's shortcut is ignored while an overlay is open":
+/// with the fuzzy-jump dialog up, F9 and Alt+F1 map to nothing, so neither
+/// the menu nor the drive dialog can open and the dialog's pattern and
+/// highlight are untouched.
+#[test]
+fn another_overlays_shortcut_maps_to_nothing_while_fuzzy_jump_is_open() {
+    let mut dialog = filecommand_core::quicksearch::FuzzyJumpState::new();
+    dialog.apply(&TextEditOp::Insert('p'));
+    let mut state = panels();
+    state.open_overlay(Overlay::FuzzyJump(dialog.clone()));
+    assert_eq!(map(plain(KeyCode::F(9)), &state), None, "F9 does not open the menu");
+    assert_eq!(map(key(KeyCode::F(1), KeyModifiers::ALT), &state), None, "Alt+F1 does not open drive select");
+    assert_eq!(map(key(KeyCode::F(2), KeyModifiers::ALT), &state), None, "Alt+F2 does not open drive select");
+    assert_eq!(map(plain(KeyCode::F(1)), &state), None, "F1 does not open Help");
+    assert_eq!(state.fuzzy_jump(), Some(&dialog), "the slot and the pattern are unchanged");
+    assert_eq!(state.fuzzy_jump().unwrap().pattern.text(), "p");
+}
+
+/// 6.3 "Unbound keys never reach the panels or the command line": a
+/// printable the user menu does not bind maps to nothing, so the command
+/// line and the panel cursor cannot change.
+#[test]
+fn an_unbound_printable_maps_to_nothing_while_the_user_menu_is_open() {
+    let mut state = typing("dir");
+    state.left.entries =
+        vec![Entry::new("a.txt", EntryKind::File, 1, None, false, false), Entry::new("b.txt", EntryKind::File, 1, None, false, false)];
+    state.left.cursor = 1;
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
+    for c in ['q', 'Z', '7', ' ', '/'] {
+        assert_eq!(map(plain(KeyCode::Char(c)), &state), None, "{c:?} is ignored");
+    }
+    assert_eq!(map(key(KeyCode::Char('r'), KeyModifiers::ALT), &state), None, "type-ahead never starts under an overlay");
+    assert_eq!(state.command_line.text(), "dir");
+    assert_eq!(state.left.cursor, 1);
+}
+
+/// 6.6 "The quit dialog stacks above an open overlay": after the reducer
+/// cancels the quit dialog the pull-down is still in the slot, and the next
+/// key maps to a menu command again.
+#[test]
+fn after_cancelling_quit_over_a_pulldown_the_next_key_is_a_menu_command() {
+    let mut state = panels();
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
+    assert_eq!(
+        map(plain(KeyCode::F(10)), &state),
+        Some(Command::MenuClose),
+        "F10 over a pull-down closes it; the quit request comes from Esc or the menu"
+    );
+    let (state, _) = filecommand_core::update(state, Command::RequestQuit);
+    assert_eq!(map(plain(KeyCode::Down), &state), None, "the quit dialog owns the keys above the menu");
+    assert_eq!(map(plain(KeyCode::Char('n')), &state), Some(Command::CancelQuit));
+    let (state, _) = filecommand_core::update(state, Command::CancelQuit);
+    assert_eq!(state.menu().map(|m| m.active), Some(MenuId::Files), "the pull-down is exactly as it was");
+    assert_eq!(map(plain(KeyCode::Down), &state), Some(Command::MenuSelectNext));
+    assert_eq!(map(plain(KeyCode::Esc), &state), Some(Command::MenuCollapse));
 }

@@ -40,34 +40,25 @@ impl WallClock for RealWallClock {
     fn now_local(&self) -> (u8, u8) {
         platform::now_local()
     }
+
+    /// `SystemTime` since the Unix epoch, saturating to 0 should the clock
+    /// read before it (history-persistence-hardening design D1).
+    fn epoch_ms(&self) -> u64 {
+        now_unix_ms()
+    }
 }
 
 #[cfg(windows)]
 mod platform {
-    /// Mirrors the Win32 `SYSTEMTIME` layout; only the fields
-    /// `GetLocalTime` requires a home for are read.
-    #[repr(C)]
-    #[derive(Default)]
-    struct SystemTime {
-        year: u16,
-        month: u16,
-        day_of_week: u16,
-        day: u16,
-        hour: u16,
-        minute: u16,
-        second: u16,
-        milliseconds: u16,
-    }
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn GetLocalTime(system_time: *mut SystemTime);
-    }
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+    use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 
     pub fn now_local() -> (u8, u8) {
-        let mut st = SystemTime::default();
+        let mut st = SYSTEMTIME { wYear: 0, wMonth: 0, wDayOfWeek: 0, wDay: 0, wHour: 0, wMinute: 0, wSecond: 0, wMilliseconds: 0 };
+        // SAFETY: `st` is a live, fully initialized `SYSTEMTIME` that the
+        // call overwrites in place; nothing else is touched.
         unsafe { GetLocalTime(&mut st) };
-        (st.hour as u8, st.minute as u8)
+        (st.wHour as u8, st.wMinute as u8)
     }
 }
 
@@ -79,5 +70,38 @@ mod platform {
         let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         let minutes_total = (secs / 60) % (24 * 60);
         ((minutes_total / 60) as u8, (minutes_total % 60) as u8)
+    }
+}
+
+/// The current wall-clock time as unix milliseconds. The header clock's
+/// minute boundary is computed from this (see [`ms_until_next_minute`]);
+/// std's `SystemTime` suffices — no platform FFI needed for a wall reading.
+pub fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
+}
+
+/// Milliseconds from `unix_ms` until the next wall-clock minute boundary —
+/// the idle loop's deadline for repainting the header clock
+/// (idle-aware-event-loop design D2; application-shell "Header clock still
+/// advances while idle"). Local-timezone offsets are whole minutes, so unix
+/// arithmetic lands exactly on the boundary the rendered `h:mm a` flips at.
+/// Always in `1..=60_000`, so the loop parks at most one minute.
+pub fn ms_until_next_minute(unix_ms: u64) -> u64 {
+    60_000 - unix_ms % 60_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ms_until_next_minute_at_known_instants() {
+        assert_eq!(ms_until_next_minute(0), 60_000, "exactly on a boundary waits a full minute");
+        assert_eq!(ms_until_next_minute(1), 59_999);
+        assert_eq!(ms_until_next_minute(59_999), 1, "one ms before the flip");
+        assert_eq!(ms_until_next_minute(60_000), 60_000, "the boundary itself starts a new minute");
+        assert_eq!(ms_until_next_minute(61_500), 58_500);
+        // A real wall-clock reading: 2026-10-12T15:04:23.250Z.
+        assert_eq!(ms_until_next_minute(1_787_441_063_250), 36_750);
     }
 }

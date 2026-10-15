@@ -9,6 +9,17 @@
 //! `CryptCreateHash`, and friends. Declare it explicitly so a plain `cargo
 //! build`/`cargo test` succeeds without every downstream crate having to
 //! carry this workaround (crate README "Build requirements").
+//!
+//! The link list of `libgit2-sys 0.17` does not depend on cargo features,
+//! and the objects that need `advapi32` are compiled whatever the features
+//! are, so building `git2` with `default-features = false` (no SSH/HTTPS;
+//! ci-and-build-tooling design D5) does not make this unnecessary.
+//! Checked during that change by removing the line once on Rust 1.88 and
+//! 1.98: the test binaries still linked, but only because a transitive
+//! `winapi` build script in the dev-dependency graph happens to emit
+//! `rustc-link-lib=dylib=advapi32` (`target/debug/build/winapi-*/output`).
+//! That is incidental and can disappear with any dependency bump, so the
+//! explicit line stays.
 
 fn main() {
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

@@ -5,7 +5,9 @@ TBD - created by archiving change m4-viewer-and-external-editor. Update Purpose 
 ## Requirements
 ### Requirement: Instant open of arbitrarily large files
 
-The viewer SHALL open any file, including multi-GB files, with first paint independent of file size. It MUST memory-map the file (falling back to positioned chunk reads when mapping is unavailable) and MUST NOT build a full line index or perform any whole-file scan on open. Only the bytes required for the visible screen SHALL be read to produce the first frame. The mapped length SHALL be treated as a snapshot taken at open, and all navigation offsets MUST be clamped to that length.
+The viewer SHALL open any file, including multi-GB files, with first paint independent of file size. It MUST read the file through bounded positioned reads on an open handle, on every platform, and MUST NOT memory-map the file. It MUST NOT build a full line index or perform any whole-file scan on open. Only the bytes required for the visible screen SHALL be read to produce the first frame. The file length SHALL be treated as a snapshot taken at open, and all navigation offsets MUST be clamped to that length.
+
+The viewer MUST NOT prevent other programs from changing the file while it is shown. On Windows it SHALL open the file with read, write, and delete sharing (`FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE`), so other programs can keep appending to, truncating, deleting, or renaming the file. A file that is truncated or otherwise shrinks while it is shown MUST NOT crash or hang the application: a read beyond the file's new end SHALL return only the bytes that still exist, and the viewer SHALL keep rendering and navigating within the snapshot length. When the viewer closes, it and any F7 search still running for it SHALL release the file.
 
 #### Scenario: First frame reads only the visible window
 
@@ -13,16 +15,39 @@ The viewer SHALL open any file, including multi-GB files, with first paint indep
 - **THEN** the viewer paints the first screen without reading the whole file and without constructing a line index
 - **AND** only the byte range needed for the visible rows is read from the file
 
-#### Scenario: Mapping unavailable falls back to chunk reads
+#### Scenario: Network and special files are read the same way
 
-- **WHEN** the file cannot be memory-mapped (e.g. a network path or special file)
-- **THEN** the viewer serves the visible window via positioned chunk reads instead of panicking
-- **AND** the rendered content is identical to the mmap path for the same byte range
+- **WHEN** F3 opens a file on a network path, or a zero-length file
+- **THEN** the viewer serves the visible window through the same positioned reads it uses for every other file, without panicking
+- **AND** the rendered content is identical to what any other read of that byte range returns
 
 #### Scenario: Offsets clamped to the snapshot length
 
 - **WHEN** navigation would move the top anchor beyond the length captured at open
-- **THEN** the top offset is clamped to the file length and the view does not read past the mapped snapshot
+- **THEN** the top offset is clamped to the file length and the view does not read past the snapshot length
+
+#### Scenario: Another program keeps writing to the viewed file
+
+- **WHEN** a log file is open in the viewer and the program writing it appends more lines
+- **THEN** the writes succeed
+- **AND** the viewer keeps showing the file up to the length captured at open
+
+#### Scenario: Viewed file can be truncated, rotated, or deleted
+
+- **WHEN** a file is open in the viewer and another program truncates it, renames it away, or deletes it
+- **THEN** that operation succeeds on every platform, including Windows
+
+#### Scenario: Truncation while viewing never crashes
+
+- **WHEN** a 10 MB file is open in the viewer and another program truncates it to 1 KB
+- **AND** the user scrolls or jumps to an offset past the new end
+- **THEN** the application keeps running, rows past the new end render empty, and navigation stays within the snapshot length
+
+#### Scenario: Closing the viewer releases the file
+
+- **WHEN** the user closes the viewer, including while an F7 search is still scanning the file
+- **THEN** the viewer's handle is closed and the search stops scanning and closes its handle
+- **AND** no FileCommand thread holds the file open afterwards
 
 ### Requirement: Text and hex modes with F4 mode toggle
 
@@ -128,4 +153,18 @@ The viewer SHALL render as a frame-less full-screen view replacing the panels, w
 
 - **WHEN** the user presses F10 in the viewer
 - **THEN** the viewer closes and focus returns to the panels
+
+### Requirement: Search stops when superseded or when the viewer closes
+
+The system SHALL stop an F7 search that is still scanning when the viewer closes or when the user starts another F7 search in the same viewer. The search SHALL check for this before reading each chunk, SHALL stop at the next chunk boundary once signalled, SHALL release its own handle on the file, and SHALL deliver no result. A superseded search's result SHALL never move the view or set the match highlight.
+
+#### Scenario: Closing the viewer stops a running search
+
+- **WHEN** an F7 search for a pattern that does not occur is scanning a multi-GB file and the user presses F10
+- **THEN** the viewer closes, the search stops within one chunk read, and the search no longer holds the file open
+
+#### Scenario: A newer search supersedes a running one
+
+- **WHEN** F7 search A is still scanning and the user starts F7 search B in the same viewer
+- **THEN** search A stops at its next chunk boundary and only search B's result moves the view and highlights a match
 

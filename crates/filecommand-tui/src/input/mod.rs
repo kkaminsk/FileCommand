@@ -15,89 +15,105 @@ use filecommand_core::editor::{EditorMove, EditorState};
 use filecommand_core::find_file::FindFileState;
 use filecommand_core::fs_ops::dialog::{FileOpSetup, RunningDialog};
 use filecommand_core::fs_ops::{ConflictChoice, ErrorChoice};
+use filecommand_core::line_edit::{flatten_line_breaks, TextEditOp};
 use filecommand_core::listing::SortMode;
 use filecommand_core::panel::CursorMove;
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::ViewerState;
-use filecommand_core::{Command, PanelSide, State, UiPhase};
+use filecommand_core::{input_layer, Command, InputLayer, Overlay, PanelSide, State, UiPhase};
 
 mod mouse;
 pub use mouse::{map_mouse, MouseTracker};
 
+/// Map a pressed key to the command it means in `state`, routing it to the
+/// layer that owns input right now — the single precedence order
+/// `filecommand_core::input_layer` defines (reducer-overlay-structure design
+/// D2; application-shell "Modal overlays are mutually exclusive by
+/// construction") — and then, for the overlay layer, to the open overlay's
+/// own mapper. The mapping itself still performs no state mutation and no
+/// I/O.
 pub fn map_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) -> Option<Command> {
-    // The quit-confirmation dialog is the topmost modal overlay of all: it
-    // can open above panels, the viewer, an open menu, or any other modal
-    // dialog/overlay, so it is checked before every other overlay below
-    // (application-shell "Quit request keys and confirmation"; design D5).
-    // The event loop routes here for it even while `state.phase` is
-    // `Viewer`/`Editor` — see `app.rs` — except in the editor, whose own
-    // Ctrl+C=Copy binding means this flag can never become true there.
-    if state.quit_confirm {
-        return map_quit_confirm_key(key);
-    }
-    // Modal overlays come first: while one is up it owns every key it
-    // understands, regardless of the phase underneath. The startup-warning
-    // modal is checked first of all since it can only ever be up at the
-    // very start of a session, before anything else has had a chance to
-    // open (user-menu "Malformed file warns and falls back without
-    // overwriting").
-    if state.startup_warning.is_some() {
-        return map_startup_warning_key(key);
-    }
-    if state.drive_select.is_some() {
-        return map_drive_select_key(key);
-    }
-    if state.menu.is_some() {
-        return map_menu_key(key);
-    }
-    // The M5 dialogs are likewise modal overlays beside the phase.
-    if state.fuzzy_jump.is_some() {
-        return map_fuzzy_jump_key(key);
-    }
-    if let Some(dialog) = &state.find_file {
-        return map_find_file_key(key, dialog);
-    }
-    if state.user_menu.is_some() {
-        return map_user_menu_key(key);
-    }
-    if state.theme_picker.is_some() {
-        return map_theme_picker_key(key);
-    }
-    if let Some(dialog) = &state.help {
-        return map_help_key(key, dialog);
-    }
-    // The Enter-on-file action menu is likewise a modal overlay beside the
-    // phase (it opens without changing `state.phase` away from `Panels`),
-    // so it must be checked before the phase match below claims panel/
-    // command-line keys (file-action-menu "Enter on a file opens the action
-    // menu").
-    if let Some(dialog) = &state.file_action_menu {
-        return map_file_action_menu_key(key, dialog);
-    }
-
-    match &state.phase {
-        UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
-        UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
-        UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
+    match input_layer(state) {
+        // The quit-confirmation dialog is the topmost layer of all: it can
+        // open above panels, the viewer, an open menu, or any other modal
+        // dialog/overlay (application-shell "Quit request keys and
+        // confirmation"; design D5). The event loop routes here for it even
+        // while `state.phase` is `Viewer`/`Editor` — see `app.rs` — except
+        // in the editor, whose own Ctrl+C=Copy binding means this flag can
+        // never become true there.
+        InputLayer::QuitConfirm => map_quit_confirm_key(key),
+        // Below the 60x16 floor the placeholder hides whatever screen is
+        // active — panels, an open overlay, a dialog, the viewer or the
+        // editor — and input must never reach a screen the user cannot see.
+        // Only the quit dialog above and the startup warning (an overlay the
+        // precedence function keeps above this layer), both drawn over the
+        // placeholder, keep their keys (application-shell "Resize handling
+        // with 60x16 hard floor and placeholder"; resize-preserves-session-
+        // state design D3).
+        InputLayer::Undersized => map_undersized_key(key, state),
+        InputLayer::FileOp => match &state.phase {
+            UiPhase::FileOpSetup(setup) => map_file_op_setup_key(key, setup),
+            UiPhase::FileOpRunning { dialog, .. } => map_file_op_running_key(key, dialog),
+            UiPhase::FileOpSummary(_) => Some(Command::FileOpConfirm),
+            _ => None,
+        },
         // The viewer owns its own key routing (`map_viewer_key`), which
         // needs I/O (a backward/forward line-start scan) that this pure
         // mapper cannot perform — the event loop calls it directly instead
         // of `map_key` while the viewer is open (viewer: Frame-less
-        // full-screen chrome — "Viewer owns focus while open").
-        UiPhase::Viewer(_) => None,
-        // The editor likewise owns its own key routing (`map_editor_key`).
-        // It needs no I/O, but its page-size parameter is the editor body's
-        // row count (term_size.1 - 2, full width, no panel layout) rather
-        // than `map_key`'s panel-layout-derived `page_size`, so the event
-        // loop calls it directly the same way it does for the viewer
+        // full-screen chrome — "Viewer owns focus while open"). The editor
+        // likewise owns its own key routing (`map_editor_key`). It needs no
+        // I/O, but its page-size parameter is the editor body's row count
+        // (term_size.1 - 2, full width, no panel layout) rather than
+        // `map_key`'s panel-layout-derived `page_size`, so the event loop
+        // calls it directly the same way it does for the viewer
         // (builtin-editor "Full-screen editor chrome").
-        UiPhase::Editor(_) => None,
-        _ => {
+        InputLayer::Viewer | InputLayer::Editor => None,
+        // While a modal overlay is up it owns every key it understands,
+        // regardless of the phase underneath; a key its mapper does not bind
+        // is ignored and never reaches the panels or the command line
+        // (application-shell "Unbound keys never reach the panels or the
+        // command line").
+        InputLayer::Overlay => state.overlay().and_then(|overlay| map_overlay_key(key, overlay)),
+        InputLayer::Splash | InputLayer::Panels => {
             if state.quick_search.is_some() {
                 return map_quick_search_key(key, page_size);
             }
             map_panel_key(key, state, page_size, keys)
         }
+    }
+}
+
+/// The open overlay's own key mapping.
+fn map_overlay_key(key: KeyEvent, overlay: &Overlay) -> Option<Command> {
+    match overlay {
+        Overlay::Menu(_) => map_menu_key(key),
+        Overlay::DriveSelect(_) => map_drive_select_key(key),
+        Overlay::FuzzyJump(_) => map_fuzzy_jump_key(key),
+        Overlay::FindFile(dialog) => map_find_file_key(key, dialog),
+        Overlay::UserMenu(_) => map_user_menu_key(key),
+        Overlay::HistoryDialog(_) => map_history_dialog_key(key),
+        Overlay::ThemePicker(_) => map_theme_picker_key(key),
+        Overlay::FileActionMenu(dialog) => map_file_action_menu_key(key, dialog),
+        Overlay::Help(dialog) => map_help_key(key, dialog),
+        Overlay::StartupWarning(_) => map_startup_warning_key(key),
+    }
+}
+
+/// What a key means while the "terminal too small" placeholder is shown:
+/// F10 and Esc ask to quit (the quit-confirmation dialog is drawn over the
+/// placeholder), everything else is ignored. The one exception is a hidden
+/// built-in editor: there F10 and Esc are ignored too, because a confirmed
+/// quit would discard unsaved edits without the editor's own save-on-exit
+/// prompt — the same way the global quit dialog cannot be opened from inside
+/// the editor at full size (design D3).
+fn map_undersized_key(key: KeyEvent, state: &State) -> Option<Command> {
+    if matches!(state.phase, UiPhase::Editor(_)) {
+        return None;
+    }
+    match key.code {
+        KeyCode::F(10) | KeyCode::Esc => Some(Command::RequestQuit),
+        _ => None,
     }
 }
 
@@ -163,6 +179,86 @@ pub fn map_viewer_key(key: KeyEvent, viewer: &ViewerState, rows_visible: usize) 
 
 fn is_plain(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) && !key.modifiers.contains(KeyModifiers::ALT)
+}
+
+/// Route a terminal bracketed-paste (`Event::Paste`, reported only off
+/// Windows — crossterm's Windows reader delivers a paste as ordinary key
+/// events) to the text that owns the keyboard, as one batch of commands the
+/// event loop applies before a single draw (idle-aware-event-loop design
+/// D6; text-field-editing "Terminal paste arrives as one paste"):
+///
+/// - wherever Ctrl+V would paste — a single-line text field owns the
+///   keyboard (a dialog field, or the command line over the panels) — one
+///   `TextEdit(Paste(..))` with line breaks flattened, exactly what Ctrl+V's
+///   clipboard read produces. The target is *derived from the Ctrl+V
+///   mapping* (probed with the compiled-in keymap, since the paste chords
+///   are not rebindable), so there is no second routing table to drift;
+/// - in the built-in editor's text, the commands the characters would
+///   produce if typed — `EditorChar` per character, `EditorNewline` per
+///   line break;
+/// - in the editor's search/replace prompts and the viewer's search prompt,
+///   the per-character prompt commands with line breaks flattened to
+///   spaces, so a pasted line break never confirms the prompt;
+/// - anywhere else (menus, confirmation and conflict dialogs, help, the
+///   quit dialog): nothing — a pasted `y` must not answer a confirmation.
+pub fn map_paste(text: &str, state: &State) -> Vec<Command> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // The same layer order as `map_key` (`input_layer`): the quit-
+    // confirmation dialog outranks even the viewer/editor's own routing — a
+    // paste never answers it — and nothing reaches a screen the placeholder
+    // hides.
+    if matches!(input_layer(state), InputLayer::QuitConfirm | InputLayer::Undersized) {
+        return Vec::new();
+    }
+    match &state.phase {
+        UiPhase::Viewer(viewer) => {
+            if viewer.search_input.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::ViewerSearchChar).collect();
+            }
+            Vec::new()
+        }
+        UiPhase::Editor(editor) => {
+            if editor.quit_confirm {
+                return Vec::new();
+            }
+            if editor.replace_prompt.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::EditorReplaceChar).collect();
+            }
+            if editor.search_prompt.is_some() {
+                return flatten_line_breaks(text).chars().map(Command::EditorSearchChar).collect();
+            }
+            let mut commands = Vec::new();
+            let mut chars = text.chars().peekable();
+            while let Some(c) = chars.next() {
+                match c {
+                    '\r' => {
+                        // CRLF is one line break, not two.
+                        if chars.peek() == Some(&'\n') {
+                            chars.next();
+                        }
+                        commands.push(Command::EditorNewline);
+                    }
+                    '\n' => commands.push(Command::EditorNewline),
+                    _ => commands.push(Command::EditorChar(c)),
+                }
+            }
+            commands
+        }
+        _ => {
+            // Where would Ctrl+V go right now? `RequestPaste` means a
+            // single-line text field owns the keyboard — this paste is that
+            // field's text. The paste keys are compiled in (not config-
+            // rebindable), so the default keymap probes the same answer.
+            let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+            if matches!(map_key(ctrl_v, state, 0, &Keys::default()), Some(Command::RequestPaste)) {
+                vec![Command::TextEdit(TextEditOp::Paste(flatten_line_breaks(text)))]
+            } else {
+                Vec::new()
+            }
+        }
+    }
 }
 
 /// Map a key while the F4 built-in editor is open. Unlike the viewer, the
@@ -282,12 +378,10 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         // The activation key is a toggle: pressed again while a filter is
         // already active on this panel, it exits and clears the filter
         // instead of restarting one (quick-filter "Clearing the quick
-        // filter": "the activation key toggles the filter").
-        return Some(if state.active_panel().quick_filter.is_some() {
-            Command::QuickFilterEnd
-        } else {
-            Command::QuickFilterStart
-        });
+        // filter": "the activation key toggles the filter"). The keymap
+        // passes the active side; the Left/Right menus pass their own
+        // (pulldown-menu-completion design D1).
+        return Some(if state.active_panel().quick_filter.is_some() { Command::QuickFilterEnd } else { Command::QuickFilterStart(active) });
     }
     if matches_binding(&key, &keys.fuzzy_jump) {
         return Some(Command::FuzzyJumpOpen);
@@ -300,6 +394,16 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     }
     if matches_binding(&key, &keys.split_reset) {
         return Some(Command::SplitReset);
+    }
+
+    // The clear-line chord only claims the key while the buffer is
+    // non-empty; on an empty line it falls through to nothing, so a
+    // mistaken press never does anything surprising (command-line "Clear
+    // the command line with a dedicated key": "Ctrl+Y on an empty line
+    // does nothing"; design D2). `CommandLineClear` also resets the
+    // history cursor, ending any recall in progress (design D3).
+    if typing && matches_binding(&key, &keys.clear_line) {
+        return Some(Command::CommandLineClear);
     }
 
     // Clipboard export (clipboard-export "Clipboard key bindings"). Checked
@@ -328,13 +432,24 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     // Ctrl+T/Ctrl+W/Alt+1..9 panel tabs (panel-tabs "New tab", "Close tab",
-    // "Switch tab"). Checked ahead of the general match below only because
+    // "Switch tab"), plus Ctrl+U swap panels (panel-navigation "Swap panels
+    // (Ctrl+U)"). Checked ahead of the general match below only because
     // Alt+<digit> would otherwise fall through to nothing (digits aren't
-    // claimed by any other alt-combination here).
+    // claimed by any other alt-combination here). The tab commands pass the
+    // active side; the Left/Right menus pass their own (design D1 of
+    // pulldown-menu-completion).
     if ctrl && !alt {
         match key.code {
-            KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab),
-            KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab),
+            KeyCode::Char('t') | KeyCode::Char('T') => return Some(Command::OpenTab(active)),
+            KeyCode::Char('w') | KeyCode::Char('W') => return Some(Command::CloseTab(active)),
+            KeyCode::Char('u') | KeyCode::Char('U') => return Some(Command::SwapPanels),
+            // Ctrl+V pastes the system clipboard's text into the command
+            // line (text-field-editing "Paste into a text field": "Over the
+            // panels, Ctrl+V SHALL paste into the command line"; design D4 —
+            // Shift+Ins stays the selection toggle here, so it is *not* a
+            // paste key over the panels, and Ctrl+Shift+Ins stays the
+            // clipboard-paths action, claimed above).
+            KeyCode::Char('v') | KeyCode::Char('V') => return Some(Command::RequestPaste),
             _ => {}
         }
     }
@@ -360,6 +475,10 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::F(1) if alt => Some(Command::OpenDriveSelect(PanelSide::Left)),
         KeyCode::F(2) if alt => Some(Command::OpenDriveSelect(PanelSide::Right)),
         KeyCode::F(7) if alt => Some(Command::FindFileOpen),
+        // Alt+F8 opens the command-history dialog; guarded so it takes
+        // precedence over the unguarded F(8) delete arm below (command-line
+        // "Command history dialog (Alt+F8)").
+        KeyCode::F(8) if alt => Some(Command::HistoryDialogOpen),
 
         KeyCode::F(1) => Some(Command::HelpOpen),
         KeyCode::F(2) => Some(Command::UserMenuOpen),
@@ -383,20 +502,37 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Char('o') | KeyCode::Char('O') if ctrl => Some(Command::ShowScrollback),
 
         // Up/Down walk command history while something is typed, and move
-        // the panel cursor when the buffer is empty. Backspacing the buffer
-        // to empty is the documented way to hand them back to the panel.
+        // the panel cursor when the buffer is empty. Backspacing the
+        // buffer to empty, or the clear-line chord above, is the
+        // documented way to hand them back to the panel.
         KeyCode::Up if typing => Some(Command::CommandLineHistoryPrev),
         KeyCode::Down if typing => Some(Command::CommandLineHistoryNext),
         KeyCode::Up => Some(Command::MoveCursor(CursorMove::Up(1))),
         KeyCode::Down => Some(Command::MoveCursor(CursorMove::Down(1))),
+        // Left/Right move the command-line caret while the line is
+        // non-empty — mirroring the Up/Down history rule (command-line
+        // "Command-line prompt and printable-key routing": "while the
+        // buffer is empty, Left and Right SHALL have no command-line
+        // meaning"); on an empty line they stay unbound, exactly as before.
+        // Home/End/PgUp/PgDn/Delete/Ctrl+Left/Ctrl+Right keep their panel
+        // meanings even mid-composition (design D3), so this helper is
+        // *not* `map_text_edit_key`: the command line's editing set is
+        // deliberately narrower than a dialog field's.
+        KeyCode::Left if typing && is_plain(&key) => Some(Command::TextEdit(TextEditOp::Left)),
+        KeyCode::Right if typing && is_plain(&key) => Some(Command::TextEdit(TextEditOp::Right)),
+        // Ctrl+Backspace deletes the word before the caret while typing
+        // (design D3). Some terminals deliver it as Ctrl+H instead — both
+        // are mapped (design Risks).
+        KeyCode::Backspace if typing && ctrl => Some(Command::TextEdit(TextEditOp::DeleteWordBack)),
+        KeyCode::Char('h') | KeyCode::Char('H') if typing && ctrl && !alt => Some(Command::TextEdit(TextEditOp::DeleteWordBack)),
         // Esc is unconditional at panel level: it asks to quit regardless of
         // command-line content, replacing the old clear-the-buffer meaning
-        // (backspacing to empty is now what hands Up/Down back to the panel
-        // — see the Backspace arms just below) (application-shell "Quit
-        // request keys and confirmation"; command-line "Command history
-        // navigation").
+        // (backspacing to empty, or the clear-line chord, is now what hands
+        // Up/Down back to the panel — see the Backspace arms just below)
+        // (application-shell "Quit request keys and confirmation";
+        // command-line "Command history navigation").
         KeyCode::Esc => Some(Command::RequestQuit),
-        KeyCode::Backspace if typing => Some(Command::CommandLineBackspace),
+        KeyCode::Backspace if typing => Some(Command::TextEdit(TextEditOp::Backspace)),
         KeyCode::Backspace => Some(Command::ParentDir),
 
         KeyCode::PageUp if ctrl => Some(Command::ParentDir),
@@ -425,7 +561,7 @@ fn map_panel_key(key: KeyEvent, state: &State, page_size: usize, keys: &Keys) ->
         KeyCode::Char('-') if is_plain(&key) && !typing => Some(Command::GroupDeselectAll),
         KeyCode::Char('*') if is_plain(&key) && !typing => Some(Command::InvertSelection),
 
-        KeyCode::Char(c) if is_plain(&key) => Some(Command::CommandLineChar(c)),
+        KeyCode::Char(c) if is_plain(&key) => Some(Command::TextEdit(TextEditOp::Insert(c))),
         _ => None,
     }
 }
@@ -465,21 +601,21 @@ fn map_menu_key(key: KeyEvent) -> Option<Command> {
 }
 
 /// Ctrl+J fuzzy-jump dialog (fuzzy-jump "Fuzzy jump dialog invocation").
+/// The pattern is a shared text field per text-field-editing; Up/Down stay
+/// with the result list.
 fn map_fuzzy_jump_key(key: KeyEvent) -> Option<Command> {
     match key.code {
         KeyCode::Esc => Some(Command::FuzzyJumpCancel),
         KeyCode::Enter => Some(Command::FuzzyJumpConfirm),
-        KeyCode::Backspace => Some(Command::FuzzyJumpBackspace),
         KeyCode::Up => Some(Command::FuzzyJumpMove(-1)),
         KeyCode::Down => Some(Command::FuzzyJumpMove(1)),
-        KeyCode::Char(c) if is_plain(&key) => Some(Command::FuzzyJumpChar(c)),
-        _ => None,
+        _ => map_text_edit_key(key),
     }
 }
 
 /// Alt+F7 find-file dialog. Its own precedence, highest first: the pattern
-/// input stage (no search submitted yet) claims printables/Backspace/Enter;
-/// once a search is in flight (or done), Up/Down/Enter move over and
+/// input stage (no search submitted yet) claims the text-field keys and
+/// Enter; once a search is in flight (or done), Up/Down/Enter move over and
 /// confirm a result instead (find-file "Find-file invocation", "Navigate to
 /// a chosen result").
 fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
@@ -487,9 +623,7 @@ fn map_find_file_key(key: KeyEvent, dialog: &FindFileState) -> Option<Command> {
         return match key.code {
             KeyCode::Esc => Some(Command::FindFileCancel),
             KeyCode::Enter => Some(Command::FindFileSubmit),
-            KeyCode::Backspace => Some(Command::FindFileBackspace),
-            KeyCode::Char(c) if is_plain(&key) => Some(Command::FindFileChar(c)),
-            _ => None,
+            _ => map_text_edit_key(key),
         };
     }
     match key.code {
@@ -508,6 +642,22 @@ fn map_user_menu_key(key: KeyEvent) -> Option<Command> {
         KeyCode::Enter => Some(Command::UserMenuConfirm),
         KeyCode::Up => Some(Command::UserMenuMove(-1)),
         KeyCode::Down => Some(Command::UserMenuMove(1)),
+        _ => None,
+    }
+}
+
+/// Alt+F8 command-history dialog (command-line "Command history dialog
+/// (Alt+F8)"): a list overlay, not a text field — Home/End/PgUp/PgDn map to
+/// huge deltas exactly as drive-select's own Home/End do, and printables do
+/// nothing (the dialog never types).
+fn map_history_dialog_key(key: KeyEvent) -> Option<Command> {
+    match key.code {
+        KeyCode::Esc => Some(Command::HistoryDialogCancel),
+        KeyCode::Enter => Some(Command::HistoryDialogConfirm),
+        KeyCode::Up => Some(Command::HistoryDialogMove(-1)),
+        KeyCode::Down => Some(Command::HistoryDialogMove(1)),
+        KeyCode::Home | KeyCode::PageUp => Some(Command::HistoryDialogMove(isize::MIN / 2)),
+        KeyCode::End | KeyCode::PageDown => Some(Command::HistoryDialogMove(isize::MAX / 2)),
         _ => None,
     }
 }
@@ -661,29 +811,76 @@ pub fn matches_binding(key: &KeyEvent, binding: &KeyBinding) -> bool {
         && (!binding.shift || key.modifiers.contains(KeyModifiers::SHIFT))
 }
 
+/// The shared single-line text-field key set (text-field-editing "Caret
+/// model and editing keys"; design D2/D4): caret moves, word keys,
+/// Backspace/Delete, paste, and printables, used by every dialog text field
+/// — the destination/name input, the in-place Rename, the conflict dialog's
+/// rename input, the find-file pattern, and the fuzzy-jump pattern. (The
+/// command line deliberately does *not* use this helper: over the panels
+/// several of these keys keep their panel meanings — see `map_panel_key`
+/// and design D3.)
+///
+/// Returns `Option<Command>` rather than `Option<TextEditOp>` so the paste
+/// keys can emit `Command::RequestPaste` (design D4: the actual clipboard
+/// text is read TUI-side and comes back as `TextEdit(Paste(..))`).
+///
+/// Two terminals report Ctrl+Backspace differently: as `Backspace` with the
+/// Ctrl modifier, or as Ctrl+H — both are mapped to `DeleteWordBack`
+/// (design Risks). Plain printables are the only characters this helper
+/// inserts; the destination/Rename/conflict fields historically typed the
+/// base character of *any* `Char` event (their arm never filtered
+/// modifiers), so those arms keep an unguarded `Char` fallback of their own
+/// below — leaving Ctrl+V as the one Ctrl-combination whose behavior
+/// changes there, exactly as design D4 calls out.
+fn map_text_edit_key(key: KeyEvent) -> Option<Command> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let edit = |op| Some(Command::TextEdit(op));
+    match key.code {
+        KeyCode::Left if ctrl => edit(TextEditOp::WordLeft),
+        KeyCode::Right if ctrl => edit(TextEditOp::WordRight),
+        KeyCode::Backspace if ctrl => edit(TextEditOp::DeleteWordBack),
+        KeyCode::Char('h') | KeyCode::Char('H') if ctrl => edit(TextEditOp::DeleteWordBack),
+        KeyCode::Delete if ctrl => edit(TextEditOp::DeleteWordForward),
+        KeyCode::Left => edit(TextEditOp::Left),
+        KeyCode::Right => edit(TextEditOp::Right),
+        KeyCode::Home => edit(TextEditOp::Home),
+        KeyCode::End => edit(TextEditOp::End),
+        KeyCode::Backspace => edit(TextEditOp::Backspace),
+        KeyCode::Delete => edit(TextEditOp::Delete),
+        KeyCode::Insert if key.modifiers.contains(KeyModifiers::SHIFT) => Some(Command::RequestPaste),
+        KeyCode::Char('v') | KeyCode::Char('V') if ctrl => Some(Command::RequestPaste),
+        KeyCode::Char(c) if is_plain(&key) => edit(TextEditOp::Insert(c)),
+        _ => None,
+    }
+}
+
 fn map_file_op_setup_key(key: KeyEvent, setup: &FileOpSetup) -> Option<Command> {
     // Ctrl+C no longer requests quit from any file-op setup dialog
-    // (application-shell "Quit request keys and confirmation"). Unlike the
-    // Progress/Help cancel arms, `DestinationInput`/`RenameInput`'s
-    // `Char(c) => FileOpInputChar(c)` below needs no extra guard: it has
-    // never filtered by modifier (every other Ctrl-letter already types its
-    // base character there today), so Ctrl+C typing `c` is consistent with
-    // that existing behavior rather than a new special case.
+    // (application-shell "Quit request keys and confirmation"). The
+    // destination/Rename fields' text keys now run through
+    // `map_text_edit_key`, whose unguarded `Char(c)` arm keeps the
+    // pre-existing "Ctrl+C types a literal c" behavior of these fields
+    // intact (see that helper's doc comment).
     match setup {
         FileOpSetup::DeleteConfirm { .. } => match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(Command::FileOpCancel),
             _ => None,
         },
-        // `RenameInput` reuses the same `FileOpInput*`/`FileOpConfirm`/
+        // `RenameInput` reuses the same `TextEdit`/`FileOpConfirm`/
         // `FileOpCancel` commands `DestinationInput` uses (fs_ops::dialog
-        // "Reuses the same ... commands `DestinationInput` uses").
+        // "Reuses the same ... commands `DestinationInput` uses"). The
+        // `or_else` fallback preserves these fields' historical unguarded
+        // `Char` arm — "Ctrl+letter types its base character" (so Ctrl+C
+        // still types `c`) — for every character the helper didn't claim
+        // (word keys, Ctrl+V, Ctrl+H, and Shift+Ins win first).
         FileOpSetup::DestinationInput { .. } | FileOpSetup::RenameInput { .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
-            KeyCode::Backspace => Some(Command::FileOpInputBackspace),
-            KeyCode::Char(c) => Some(Command::FileOpInputChar(c)),
-            _ => None,
+            _ => map_text_edit_key(key).or(match key.code {
+                KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
+                _ => None,
+            }),
         },
     }
 }
@@ -704,9 +901,13 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
         RunningDialog::Conflict { rename_input: Some(_), .. } => match key.code {
             KeyCode::Enter => Some(Command::FileOpConfirm),
             KeyCode::Esc => Some(Command::FileOpCancel),
-            KeyCode::Backspace => Some(Command::FileOpInputBackspace),
-            KeyCode::Char(c) => Some(Command::FileOpInputChar(c)),
-            _ => None,
+            // Same historical unguarded-`Char` fallback as the destination/
+            // rename fields (Ctrl+letter types its base character) behind
+            // the shared helper's claims.
+            _ => map_text_edit_key(key).or(match key.code {
+                KeyCode::Char(c) => Some(Command::TextEdit(TextEditOp::Insert(c))),
+                _ => None,
+            }),
         },
         RunningDialog::Conflict { rename_input: None, .. } => match key.code {
             KeyCode::Char('o') | KeyCode::Char('O') => Some(Command::FileOpConflictChoice(ConflictChoice::Overwrite)),
@@ -714,6 +915,13 @@ fn map_file_op_running_key(key: KeyEvent, dialog: &RunningDialog) -> Option<Comm
             KeyCode::Char('s') | KeyCode::Char('S') => Some(Command::FileOpConflictChoice(ConflictChoice::Skip)),
             KeyCode::Char('a') | KeyCode::Char('A') => Some(Command::FileOpConflictChoice(ConflictChoice::SkipAll)),
             KeyCode::Char('r') | KeyCode::Char('R') => Some(Command::FileOpBeginRename),
+            // Cancel the job from the prompt — Esc or a plain `c`/`C`,
+            // mirroring the Progress dialog's own cancel above
+            // (operation-dialogs "Overwrite-conflict dialog": "Esc cancels
+            // the job from the conflict dialog"; process-lifecycle-hardening
+            // design D7). The plain guard keeps Ctrl+C out, as for Progress.
+            KeyCode::Esc => Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)),
+            KeyCode::Char('c') | KeyCode::Char('C') if is_plain(&key) => Some(Command::FileOpConflictChoice(ConflictChoice::Cancel)),
             _ => None,
         },
         RunningDialog::Error { .. } => match key.code {

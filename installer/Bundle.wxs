@@ -14,8 +14,9 @@
     PerUserMsiPath       - path to the built PackagePerUser.msi
     PerMachineMsiPath    - path to the built PackagePerMachine.msi
 
-  Requires the WixToolset.BootstrapperApplications.wixext extension
-  (installer/build.ps1 passes -ext for this).
+  Requires the WixToolset.BootstrapperApplications.wixext and
+  WixToolset.Util.wixext extensions (installer/build.ps1 passes -ext for
+  both; Util provides the util:ProductSearch searches below).
 
   Scope control for silent/automated installs (design D4, winget mapping):
     FileCommandSetup.exe                           -> per-user, no elevation
@@ -29,7 +30,8 @@
   provided by the engine; no custom wiring is needed for those.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
-     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
   <Bundle
     Name="FileCommand"
     Manufacturer="BigHatGroup"
@@ -45,10 +47,56 @@
     -->
     <Variable Name="InstallScope" Type="string" Value="perUser" bal:Overridable="yes" Persisted="yes" />
 
+    <!--
+      Other-scope detection (openspec change installer-scope-coexistence,
+      design D1/D2). The two MSIs deliberately have different UpgradeCodes,
+      so installing at the other scope coexists with the first install
+      instead of upgrading it. Windows builds a process's PATH as the
+      machine PATH followed by the user PATH, so when both scopes are
+      installed the per-machine copy always wins when the user types
+      `filecommand` — a per-user install or upgrade made after a per-machine
+      one is silently shadowed. These searches look up each scope's product
+      by its stable UpgradeCode (version-independent: each build changes the
+      ProductCode, never the UpgradeCode). Burn runs searches during Detect,
+      before planning, in its own non-elevated process, so the per-user
+      search sees only the per-user product of the account running setup.
+      A state of 5 (INSTALLSTATE_DEFAULT) means installed; 2
+      (INSTALLSTATE_ABSENT) means not installed. The result feeds the
+      warning label on the install page (theme/RtfTheme.xml); it never
+      blocks or prompts — quiet/passive runs only get these lines in the
+      Burn log.
+    -->
+    <util:ProductSearch Id="SearchPerMachineProduct" UpgradeCode="4E088CA3-DA52-42AB-8620-DF5E41B57C7A"
+                        Result="state" Variable="FileCommandPerMachineState" />
+    <util:ProductSearch Id="SearchPerUserProduct" UpgradeCode="E4FA877A-C5DE-4BB5-A56E-530939D32718"
+                        Result="state" Variable="FileCommandPerUserState" />
+    <!--
+      1 when the OTHER scope's product is installed: a per-user run cares
+      about the per-machine package, a per-machine run cares about the
+      per-user package. Unset (absent) searches report state 2, so the
+      variable stays 0 on clean machines and same-scope upgrades.
+    -->
+    <Variable Name="FileCommandOtherScopePresent" Type="numeric" Value="0" />
+    <SetVariable Id="SetOtherScopePresent"
+                 After="SearchPerUserProduct"
+                 Variable="FileCommandOtherScopePresent"
+                 Value="1"
+                 Type="numeric"
+                 Condition="(InstallScope &lt;&gt; &quot;perMachine&quot; AND FileCommandPerMachineState = 5) OR (InstallScope = &quot;perMachine&quot; AND FileCommandPerUserState = 5)" />
+
     <BootstrapperApplication>
+      <!--
+        Custom theme (theme/RtfTheme.xml + .wxl): a copy of the built-in
+        rtfLicense theme from WixToolset.BootstrapperApplications.wixext
+        5.0.2, extended with the scope-coexistence warning label on the
+        Install page (design D2). Theme="rtfLicense" stays so the BA style
+        is unchanged apart from that label.
+      -->
       <bal:WixStandardBootstrapperApplication
         LicenseFile="License.rtf"
         Theme="rtfLicense"
+        ThemeFile="theme\RtfTheme.xml"
+        LocalizationFile="theme\RtfTheme.wxl"
         SuppressOptionsUI="yes"
         ShowVersion="yes" />
     </BootstrapperApplication>

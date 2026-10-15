@@ -17,15 +17,7 @@ use crate::style::role_style;
 
 /// Render the Info body into `area`, which is the panel's interior (inside
 /// its double-line border, below the header row).
-pub fn render_info(
-    buf: &mut Buffer,
-    area: Rect,
-    theme: &Theme,
-    depth: ColorDepth,
-    values: &InfoValues,
-    cwd: &Path,
-    identity_lines: &[String; 4],
-) {
+pub fn render_info(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, values: &InfoValues, cwd: &Path, identity_lines: &[String; 4]) {
     if area.width < 6 || area.height == 0 {
         return;
     }
@@ -207,10 +199,7 @@ mod tests {
         let area = Rect { x: 0, y: 0, width: 46, height: 22 };
         let mut buf = Buffer::empty(area);
         render_info(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, values, Path::new(cwd), &identity());
-        (0..area.height)
-            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
+        (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
     }
 
     #[test]
@@ -347,10 +336,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let values = InfoValues { volume_label: Some("A very long volume label indeed".to_string()), ..InfoValues::default() };
         render_info(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, &values, Path::new(r"C:\"), &identity());
-        let text: String = (0..area.height)
-            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
+        let text: String = (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Volume label"), "the label is not eaten by the truncated value:\n{text}");
         assert!(text.contains('\u{2026}'), "the overlong value is truncated with an ellipsis:\n{text}");
         assert!(!text.contains("A very long volume label indeed"), "the full untruncated value must not appear:\n{text}");
@@ -385,6 +371,9 @@ mod tests {
                 return;
             }
         }
-        panic!("Volume label row not found:\n{}", (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n"));
+        panic!(
+            "Volume label row not found:\n{}",
+            (0..area.height).map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n")
+        );
     }
 }

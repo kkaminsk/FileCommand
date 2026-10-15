@@ -132,10 +132,7 @@ mod tests {
         let text = render(&dialog).join("\n");
         assert!(text.contains("C:"));
         let theme = Theme::classic();
-        assert_ne!(
-            role_style(&theme, Role::MenuHighlight, ColorDepth::Ansi16),
-            role_style(&theme, Role::MenuBody, ColorDepth::Ansi16)
-        );
+        assert_ne!(role_style(&theme, Role::MenuHighlight, ColorDepth::Ansi16), role_style(&theme, Role::MenuBody, ColorDepth::Ansi16));
     }
 
     #[test]

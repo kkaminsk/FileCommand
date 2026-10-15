@@ -54,12 +54,7 @@ pub fn clamp_overlay_dim(preferred: u16, minimum: u16, terminal: u16) -> u16 {
 pub fn overlay_rect(preferred: (u16, u16), minimum: (u16, u16), terminal: (u16, u16)) -> OverlayRect {
     let width = clamp_overlay_dim(preferred.0, minimum.0, terminal.0);
     let height = clamp_overlay_dim(preferred.1, minimum.1, terminal.1);
-    OverlayRect {
-        x: terminal.0.saturating_sub(width) / 2,
-        y: terminal.1.saturating_sub(height) / 2,
-        width,
-        height,
-    }
+    OverlayRect { x: terminal.0.saturating_sub(width) / 2, y: terminal.1.saturating_sub(height) / 2, width, height }
 }
 
 /// The open F2 user menu: just a cursor over `State::user_menu_entries`,
@@ -72,6 +67,13 @@ pub fn overlay_rect(preferred: (u16, u16), minimum: (u16, u16), terminal: (u16, 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct UserMenuState {
     pub cursor: usize,
+    /// `State::clock_ms` when the menu opened, stamped by the reducer (left
+    /// `0` by [`UserMenuState::new`]); drives the top-down unfold
+    /// (ui-animations "Pop-up menus unfold and highlights settle").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does, so opening the menu unfolds without also flashing row 0.
+    pub selected_at_ms: Option<u64>,
 }
 
 impl UserMenuState {
@@ -81,6 +83,45 @@ impl UserMenuState {
 
     /// Move the highlight by `delta`, clamped within `[0, len)`. A no-op on
     /// an empty menu (user-menu "F2 with no entries opens an empty menu").
+    pub fn move_cursor(&mut self, delta: isize, len: usize) {
+        if len == 0 {
+            self.cursor = 0;
+            return;
+        }
+        let next = self.cursor as isize + delta;
+        self.cursor = next.clamp(0, len as isize - 1) as usize;
+    }
+}
+
+// ---------------------------------------------------------------------
+// Alt+F8 command-history dialog (pulldown-menu-completion; design D2)
+// ---------------------------------------------------------------------
+
+/// The open Alt+F8 command-history dialog: a cursor over `State::history`
+/// rendered newest-first — `cursor == 0` is the *newest* entry
+/// (command-line "Command history dialog (Alt+F8)"). The same "cursor over
+/// a list" shape as [`UserMenuState`], stamped by the reducer for the same
+/// unfold/highlight-settle animations (ui-animations "Pop-up menus unfold
+/// and highlights settle").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HistoryDialogState {
+    pub cursor: usize,
+    /// `State::clock_ms` when the dialog opened, stamped by the reducer (left
+    /// `0` by [`HistoryDialogState::new`]).
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does, so opening the dialog unfolds without also flashing row 0.
+    pub selected_at_ms: Option<u64>,
+}
+
+impl HistoryDialogState {
+    pub fn new() -> HistoryDialogState {
+        HistoryDialogState::default()
+    }
+
+    /// Move the highlight by `delta`, clamped within `[0, len)` — the same
+    /// clamp-not-wrap convention as [`UserMenuState::move_cursor`]. A no-op
+    /// on an empty history (its single `(no history)` row never highlights).
     pub fn move_cursor(&mut self, delta: isize, len: usize) {
         if len == 0 {
             self.cursor = 0;
@@ -128,14 +169,17 @@ impl ThemePickerState {
 // Enter-on-file action menu (file-action-menu)
 // ---------------------------------------------------------------------
 
-/// One entry in the file-action menu, in menu order. `Run` is included only
-/// when the target is executable, and always sorts first (file-action-menu
-/// "Menu contents, ordering, and navigation"). `SendToClipboard` sits
-/// immediately after `Edit` (or first, for directory targets, which omit
+/// One entry in the file-action menu. `Open` launches the target through
+/// the platform's file association and always sorts first — except for
+/// executables, where `Run` (included only then) stays first and `Open`
+/// follows it (open-with-associated-app design D2; file-action-menu "Menu
+/// contents, ordering, and navigation"). `SendToClipboard` sits immediately
+/// after `Edit` (or right after `Open`, for directory targets, which omit
 /// `View`/`Edit`/`Run`) and never mutates the filesystem (file-action-menu
 /// "No mutation without an intervening dialog").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileActionMenuEntry {
+    Open,
     Run,
     View,
     Edit,
@@ -152,6 +196,7 @@ impl FileActionMenuEntry {
     /// activate that entry directly").
     pub fn label(self) -> &'static str {
         match self {
+            FileActionMenuEntry::Open => "Open",
             FileActionMenuEntry::Run => "Run",
             FileActionMenuEntry::View => "View",
             FileActionMenuEntry::Edit => "Edit",
@@ -186,13 +231,21 @@ pub struct FileActionMenuState {
     /// requirement ("Enter-key invocation SHALL remain single-target and
     /// file-only").
     pub selection_scoped: bool,
+    /// `State::clock_ms` when the menu opened, stamped by the reducer (left
+    /// `0` by the constructors); drives the top-down unfold (ui-animations
+    /// "Pop-up menus unfold and highlights settle").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved; `None` until it
+    /// does.
+    pub selected_at_ms: Option<u64>,
 }
 
 impl FileActionMenuState {
     /// The keyboard Enter path: file-only, never selection-scoped
     /// (file-action-menu "Enter stays single-target"). Opens with the
-    /// first entry highlighted — `Run` when `executable`, else `View`
-    /// (file-action-menu "Menu contents, ordering, and navigation").
+    /// first entry highlighted — `Run` when `executable`, else `Open`
+    /// (file-action-menu "Menu contents, ordering, and navigation";
+    /// open-with-associated-app design D2).
     pub fn new(target_name: OsString, executable: bool) -> FileActionMenuState {
         Self::open(target_name, false, executable, false)
     }
@@ -200,27 +253,24 @@ impl FileActionMenuState {
     /// The general constructor `new` delegates to, and mouse right-click
     /// uses directly (mouse-input "Right-click opens the action menu").
     /// `is_dir` omits View, Edit, and Run from the menu — they have no
-    /// meaning for a directory (file-action-menu "Directory targets and
-    /// selection-scoped invocation": "Directory menu contents").
+    /// meaning for a directory — leaving Open first to show the directory
+    /// in the platform file browser (file-action-menu "Directory targets
+    /// and selection-scoped invocation": "Directory menu contents").
     /// `selection_scoped` is recorded for `activate_file_action` to read
     /// later; it does not change which entries are listed.
     pub fn open(target_name: OsString, is_dir: bool, executable: bool, selection_scoped: bool) -> FileActionMenuState {
-        let mut entries = Vec::with_capacity(7);
+        let mut entries = Vec::with_capacity(9);
+        if !is_dir && executable {
+            entries.push(FileActionMenuEntry::Run);
+        }
+        entries.push(FileActionMenuEntry::Open);
         if !is_dir {
-            if executable {
-                entries.push(FileActionMenuEntry::Run);
-            }
             entries.push(FileActionMenuEntry::View);
             entries.push(FileActionMenuEntry::Edit);
         }
         entries.push(FileActionMenuEntry::SendToClipboard);
-        entries.extend([
-            FileActionMenuEntry::Copy,
-            FileActionMenuEntry::Rename,
-            FileActionMenuEntry::Move,
-            FileActionMenuEntry::Delete,
-        ]);
-        FileActionMenuState { target_name, entries, cursor: 0, selection_scoped }
+        entries.extend([FileActionMenuEntry::Copy, FileActionMenuEntry::Rename, FileActionMenuEntry::Move, FileActionMenuEntry::Delete]);
+        FileActionMenuState { target_name, entries, cursor: 0, selection_scoped, opened_at_ms: 0, selected_at_ms: None }
     }
 
     /// Move the highlight by `delta`, clamped within the entry list — same
@@ -407,7 +457,7 @@ const KEYBOARD_REFERENCE: &str = "\
 F-key bar modifier variants:
   Ctrl+F3..F7  Sort by name/ext/time/size/unsorted
   Alt+F1/F2    Drive select (left/right panel)
-  Alt+F7       Find file
+  Alt+F7/F8    Find file / command history
 
 Plain F-keys: F1 Help  F2 User menu  F3 View  F4 Edit
 F5 Copy  F6 Move/rename  F7 Mkdir  F8 Delete
@@ -423,6 +473,7 @@ Other bindings:
   Ctrl+P       Quick filter
   Ctrl+J       Fuzzy directory jump
   Ctrl+T/W     New/close tab
+  Ctrl+U       Swap panels
   Alt+1..9     Switch to tab N
   Alt+letter   Type-ahead jump to entry
   Ctrl+Left/Right  Adjust the panel split
@@ -459,12 +510,34 @@ const FILE_OPERATIONS: &str = "\
 F5 copies, F6 moves/renames, F7 creates a directory, and F8 deletes
 the selected entries (or the entry under the cursor when nothing is
 selected). Ins toggles selection on one entry; +, -, and * select,
-deselect, and invert a wildcard group.";
+deselect, and invert a wildcard group.
+
+Enter on a file opens the action menu. Its Open entry — first and
+highlighted for a non-executable, so Enter, Enter opens a document —
+launches the target in the application associated with it, without
+leaving FileCommand; on a directory (right-click menu) Open shows it
+in the system file browser. Executables list Run first instead, which
+suspends FileCommand so a console program's output stays visible. A
+failed Open (no association for the extension) is reported on the
+panel's status line.
+
+The destination, name, and Rename fields are full editing lines: the
+caret moves with Left/Right/Home/End (by words with Ctrl held),
+Backspace/Delete remove single characters (whole words with Ctrl held),
+and Shift+Ins or Ctrl+V pastes the clipboard's text at the caret.";
 
 const MENUS: &str = "\
 F9 opens the menu bar. Left/Right/Files/Commands/Options each drop
 down a pull-down; Left and Right act on their own panel regardless
-of which one is focused. Esc closes a pull-down, then the bar.";
+of which one is focused. Esc closes a pull-down, then the bar.
+
+Every listed item works. Left/Right offer display modes, sort
+modes, Filter, Re-read, Drive select, and New/Close tab; Files
+mirrors the F-key file operations plus clipboard export; Commands
+holds Find file, History (the Alt+F8 command-history dialog),
+Swap panels (Ctrl+U), Panels on/off, Fuzzy jump, and Menu file
+edit, which opens usermenu.toml in the F4 editor and reloads the
+F2 menu on return; Options opens the theme picker.";
 
 const VIEWER: &str = "\
 F3 opens the read-only viewer. F4 toggles text/hex mode, F2 toggles
@@ -480,9 +553,15 @@ if the buffer is modified. Undo is a single level.";
 
 const COMMAND_LINE: &str = "\
 Typing over a panel with nothing else active enters text on the
-command line. Enter runs it in the active panel's directory; `cd`
+command line at the caret. Left/Right move the caret while the line
+has text (on an empty line they do nothing); Ctrl+Backspace deletes
+the word before it; Ctrl+V pastes the clipboard's text. Home/End,
+PgUp/PgDn, Delete, and Shift+Ins keep their panel meanings.
+Enter runs the line in the active panel's directory; `cd`
 navigates the panel instead of spawning a shell. Up/Down recall
-history while something is typed; Esc clears the line.";
+history while something is typed. Ctrl+Y clears the whole line,
+ending any history recall (rebindable via key.clear_line); Esc asks
+to quit.";
 
 const MODERN_EXTRAS: &str = "\
 Ctrl+P narrows the active panel to substring matches as you type;
@@ -500,11 +579,16 @@ also offers copying just their names. All three act on the same
 selection scope as F5 Copy.";
 
 const CONFIGURATION: &str = "\
-config.toml (next to the executable) sets the theme, shell, F4
+config.toml in the profile directory sets the theme, shell, F4
 external-editor command, and the persisted panel_split percentage,
-and can remap the quick-filter, fuzzy-jump, panel-split, and
-clipboard (key.clipboard_files, key.clipboard_paths) keys.
-usermenu.toml defines the F2 user menu's entries. --nosplash skips
+and can remap the quick-filter, fuzzy-jump, panel-split, clipboard
+(key.clipboard_files, key.clipboard_paths), and clear-line
+(key.clear_line) keys.
+usermenu.toml defines the F2 user menu's entries. Both live with
+history.json in one profile directory: %APPDATA%\\FileCommand on
+Windows, ~/.config/filecommand elsewhere, or beside the executable
+when a 'portable' file sits next to it; --config-dir <path>
+overrides that for a session. --nosplash skips
 the startup splash. --theme <name> (or --theme=<name>) starts the
 session in a built-in theme instead of the configured one, for this
 launch only: it never writes config.toml, so applying a theme from
@@ -524,6 +608,23 @@ mod tests {
         m.cursor = 1;
         m.move_cursor(1, 0);
         assert_eq!(m.cursor, 0, "an empty menu holds the cursor at zero");
+    }
+
+    #[test]
+    fn history_dialog_move_cursor_clamps_and_holds_on_an_empty_history() {
+        let mut d = HistoryDialogState::new();
+        d.move_cursor(-3, 3);
+        assert_eq!(d.cursor, 0);
+        d.move_cursor(10, 3);
+        assert_eq!(d.cursor, 2, "clamped at the last row, not wrapped");
+        // Home/End/PgUp/PgDn arrive as huge deltas (input maps them the same
+        // way drive-select does) and land exactly on the ends.
+        d.move_cursor(isize::MIN / 2, 3);
+        assert_eq!(d.cursor, 0);
+        d.move_cursor(isize::MAX / 2, 3);
+        assert_eq!(d.cursor, 2);
+        d.move_cursor(1, 0);
+        assert_eq!(d.cursor, 0, "an empty history holds the cursor at zero");
     }
 
     #[test]
@@ -552,19 +653,14 @@ mod tests {
     }
 
     #[test]
-    fn file_action_menu_lists_run_first_only_when_executable() {
+    fn file_action_menu_lists_open_first_unless_the_target_is_executable() {
+        // open-with-associated-app design D2 / file-action-menu "Non-
+        // executable menu contents": Open first and highlighted.
         let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
-        assert_eq!(m.entries[0], FileActionMenuEntry::View, "non-executable: View highlighted first");
-        assert!(!m.entries.contains(&FileActionMenuEntry::Run));
-        assert_eq!(m.selected(), FileActionMenuEntry::View);
-
-        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
-        assert_eq!(m.entries[0], FileActionMenuEntry::Run, "executable: Run highlighted first");
-        assert_eq!(m.selected(), FileActionMenuEntry::Run);
         assert_eq!(
             m.entries,
             vec![
-                FileActionMenuEntry::Run,
+                FileActionMenuEntry::Open,
                 FileActionMenuEntry::View,
                 FileActionMenuEntry::Edit,
                 FileActionMenuEntry::SendToClipboard,
@@ -574,14 +670,19 @@ mod tests {
                 FileActionMenuEntry::Delete,
             ]
         );
-    }
+        assert!(!m.entries.contains(&FileActionMenuEntry::Run));
+        assert_eq!(m.selected(), FileActionMenuEntry::Open, "non-executable: Open highlighted first");
 
-    #[test]
-    fn file_action_menu_directory_target_lists_send_to_clipboard_first() {
-        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        // "Executable gets Run first": Run stays first and highlighted,
+        // Open second.
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
         assert_eq!(
             m.entries,
             vec![
+                FileActionMenuEntry::Run,
+                FileActionMenuEntry::Open,
+                FileActionMenuEntry::View,
+                FileActionMenuEntry::Edit,
                 FileActionMenuEntry::SendToClipboard,
                 FileActionMenuEntry::Copy,
                 FileActionMenuEntry::Rename,
@@ -589,6 +690,26 @@ mod tests {
                 FileActionMenuEntry::Delete,
             ]
         );
+        assert_eq!(m.selected(), FileActionMenuEntry::Run, "executable: Run highlighted first");
+    }
+
+    #[test]
+    fn file_action_menu_directory_target_lists_open_first() {
+        // file-action-menu "Directory menu contents": Open, Send to
+        // clipboard, Copy, Rename, Move, Delete — Open highlighted.
+        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        assert_eq!(
+            m.entries,
+            vec![
+                FileActionMenuEntry::Open,
+                FileActionMenuEntry::SendToClipboard,
+                FileActionMenuEntry::Copy,
+                FileActionMenuEntry::Rename,
+                FileActionMenuEntry::Move,
+                FileActionMenuEntry::Delete,
+            ]
+        );
+        assert_eq!(m.selected(), FileActionMenuEntry::Open, "directory: Open highlighted first");
     }
 
     #[test]
@@ -615,6 +736,21 @@ mod tests {
 
         let m = FileActionMenuState::new(OsString::from("notes.txt"), false);
         assert_eq!(m.hotkey_action('r'), Some(FileActionMenuEntry::Rename), "no Run entry: R falls through to Rename");
+    }
+
+    /// file-action-menu "O activates Open": `O` is unique to Open in every
+    /// menu layout (open-with-associated-app design D2).
+    #[test]
+    fn file_action_menu_hotkey_o_resolves_to_open_for_every_target_kind() {
+        let m = FileActionMenuState::new(OsString::from("report.pdf"), false);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
+        assert_eq!(m.hotkey_action('O'), Some(FileActionMenuEntry::Open));
+
+        let m = FileActionMenuState::new(OsString::from("setup.exe"), true);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
+
+        let m = FileActionMenuState::open(OsString::from("src"), true, false, false);
+        assert_eq!(m.hotkey_action('o'), Some(FileActionMenuEntry::Open));
     }
 
     #[test]

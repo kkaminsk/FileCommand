@@ -5,7 +5,7 @@ TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose af
 ## Requirements
 ### Requirement: Find-file invocation
 
-The system SHALL open a find-file dialog when the user presses Alt+F7 or selects Commands → Find file, presenting an input field for the name pattern to search for. The dialog SHALL render in the primary dialog style (black text on cyan, black double-line frame) with a bracket-and-dots input field per §4.4, using only §4.11 ANSI-16 roles and CP437-heritage single-cell glyphs.
+The system SHALL open a find-file dialog when the user presses Alt+F7 or selects Commands → Find file, presenting an input field for the name pattern to search for. The field SHALL be a shared text field per `text-field-editing`. The dialog SHALL render in the primary dialog style (black text on cyan, black double-line frame) with a bracket-and-dots input field per §4.4, using only §4.11 ANSI-16 roles and CP437-heritage single-cell glyphs.
 
 #### Scenario: Alt+F7 opens the dialog
 
@@ -16,6 +16,11 @@ The system SHALL open a find-file dialog when the user presses Alt+F7 or selects
 
 - **WHEN** the user selects Commands → Find file from the F9 pull-down menu
 - **THEN** the same find-file dialog opens, identically to the Alt+F7 path
+
+#### Scenario: Pattern is editable mid-string
+
+- **WHEN** the pattern field reads `reprt` and the user presses Left, Left, then types `o`
+- **THEN** the field reads `report`
 
 #### Scenario: Dialog uses the primary style and permitted glyphs
 
@@ -77,4 +82,23 @@ The system SHALL close the find-file dialog without changing the active panel's 
 
 - **WHEN** the find-file dialog is open and the user presses Esc
 - **THEN** the dialog closes, the active panel remains at its prior directory and cursor position, and any running search is abandoned
+
+### Requirement: Dismissed or superseded searches stop
+
+When a find-file search is no longer wanted — the dialog is dismissed with Esc, a result is confirmed while the walk is still running, or a new search replaces it — the system SHALL signal the subtree walk to stop. The walk SHALL check that signal before reading each directory and between the entries it examines, SHALL stop promptly once it is set, and SHALL send no further results. Results of a stopped or superseded walk SHALL never appear in any find-file dialog.
+
+#### Scenario: Esc stops the walk
+
+- **WHEN** a search started at `C:\` with the pattern `a` is still walking the subtree and the user presses Esc
+- **THEN** the dialog closes and the walk stops before reading another directory, producing no further results
+
+#### Scenario: Confirming a result while the walk is running stops it
+
+- **WHEN** the user highlights a result and presses Enter while the walk is still running
+- **THEN** the panel navigates to the result's directory and the walk stops
+
+#### Scenario: A new search after Esc runs alone
+
+- **WHEN** the user presses Esc during a running search, reopens the dialog with Alt+F7, and submits a different pattern
+- **THEN** only the new search's walk is running and only its matches appear in the result list
 

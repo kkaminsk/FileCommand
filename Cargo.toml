@@ -5,6 +5,11 @@ members = ["crates/filecommand-core", "crates/filecommand-tui"]
 [workspace.package]
 version = "0.1.4"
 edition = "2021"
+# Minimum supported Rust version. Verified empirically: the lowest toolchain
+# on which `cargo check --workspace --all-targets --locked` passes, and
+# re-checked by the `msrv` CI job on every pull request (ci-and-build-tooling
+# design D3).
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["The FileCommand Authors"]
 repository = "https://github.com/kkaminsk/FileCommand"
@@ -15,5 +20,60 @@ ratatui = "0.29"
 crossterm = "0.28"
 insta = "1"
 proptest = "1"
-memmap2 = "0.9"
-git2 = "0.19"
+# Local repository state only (`discover`, `head`, `statuses`): no SSH or
+# HTTPS transport, so libssh2 and, on Unix, OpenSSL drop out of the build
+# (ci-and-build-tooling design D5).
+git2 = { version = "0.19", default-features = false }
+# Windows-only binding crate shared by both crates. The feature list is the
+# union of what the workspace calls (ci-and-build-tooling design D6):
+# - Win32_Foundation: HANDLE, BOOL, SYSTEMTIME, CloseHandle, GetLastError,
+#   INVALID_HANDLE_VALUE and the ERROR_* codes
+# - Win32_Storage_FileSystem: CreateFileW, GetFileInformationByHandle,
+#   FindFirstStreamW/FindNextStreamW/FindClose, GetLogicalDrives,
+#   GetVolumeInformationW, GetDiskFreeSpaceExW, CopyFileExW, ReplaceFileW
+#   and their constants
+# - Win32_Security: required by `windows-sys` to compile CreateFileW
+#   (its SECURITY_ATTRIBUTES parameter)
+# - Win32_System_Diagnostics_Debug: SetThreadErrorMode, SEM_FAILCRITICALERRORS
+# - Win32_System_SystemInformation: GlobalMemoryStatusEx, MEMORYSTATUSEX,
+#   GetLocalTime
+# - Win32_System_SystemServices: FILE_NAMED_STREAMS
+# - Win32_System_WindowsProgramming: COPY_FILE_* and PROGRESS_* for
+#   CopyFileExW
+# - Win32_System_Console: the console control handler
+#   (process-lifecycle-hardening)
+# - Win32_System_Com: CoInitializeEx/CoUninitialize around ShellExecuteW
+#   (offload-blocking-io)
+# - Win32_UI_Shell, Win32_UI_WindowsAndMessaging: ShellExecuteW
+#   (open-with-associated-app)
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Console",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[workspace.lints.clippy]
+# Every `unsafe` block carries a `// SAFETY:` comment stating the invariant
+# that makes it sound; with `-D warnings` in CI an undocumented one fails the
+# pull request (ci-and-build-tooling design D6).
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+# `panic` deliberately stays at its default, "unwind" (ci-and-build-tooling
+# design D4). Three things depend on unwinding: the terminal-restoring RAII
+# guard and chained panic hook in `filecommand-tui::terminal` must run on a
+# main-thread panic; worker threads isolate their panics with `catch_unwind`
+# so one bad listing or job ends that thread, not the process; and the
+# `panic_restoration` integration test checks that order. `panic = "abort"`
+# would kill the process with the terminal left in raw mode.

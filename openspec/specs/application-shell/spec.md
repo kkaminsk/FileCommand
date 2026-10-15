@@ -91,11 +91,19 @@ The system SHALL acquire the alternate screen, raw mode, and (when enabled) mous
 
 ### Requirement: Panic hook restores the terminal before reporting
 
-The system SHALL install a panic hook that disables mouse capture, leaves raw mode, and leaves the alternate screen BEFORE the panic report is printed, and that chains to the previously installed hook so the backtrace still surfaces, so that a panic while in raw mode never leaves the terminal unusable.
+The system SHALL install a panic hook that disables mouse capture, leaves raw mode, and leaves the alternate screen BEFORE the panic report is printed, and that chains to the previously installed hook so the backtrace still surfaces, so that a panic while in raw mode never leaves the terminal unusable. The restoration and the chained report SHALL apply only to a panic on the UI thread, the thread that owns the terminal and runs the event loop.
+
+A panic on a worker thread SHALL NOT restore the terminal and SHALL NOT write its report onto the terminal the UI still owns. Instead, the panic SHALL be contained to that worker and surfaced through the worker's normal result:
+
+- a panicked directory listing SHALL end as a failed listing: the panel leaves its `Reading…` state and shows an error;
+- a panicked file-operation job SHALL end as a cancelled job: the progress or prompt dialog closes, the affected panels re-read, and the end-of-job summary names the internal error;
+- any other worker SHALL deliver its "no result" answer, so that no indicator stays pending.
+
+The application SHALL keep running after a worker panic.
 
 #### Scenario: Panic in raw mode restores the terminal first
 
-- **WHEN** a panic occurs while the terminal is in raw mode on the alternate screen with mouse capture enabled
+- **WHEN** a panic occurs on the UI thread while the terminal is in raw mode on the alternate screen with mouse capture enabled
 - **THEN** mouse capture is disabled, raw mode is disabled, and the alternate screen is left before any panic report is written
 
 #### Scenario: Original hook still runs
@@ -103,9 +111,48 @@ The system SHALL install a panic hook that disables mouse capture, leaves raw mo
 - **WHEN** the panic hook completes its terminal restoration
 - **THEN** it delegates to the previously installed hook so the panic message and backtrace are still reported
 
+#### Scenario: A worker panic leaves the terminal alone
+
+- **WHEN** a worker thread panics while the TUI is running in raw mode on the alternate screen
+- **THEN** raw mode, the alternate screen, and mouse capture stay as they were, no panic text is written over the TUI, and the UI keeps responding to input
+
+#### Scenario: A panicked listing ends as a failed listing
+
+- **WHEN** the worker reading a panel's directory panics partway through
+- **THEN** the panel stops showing `Reading… N`, shows an error for that directory, and can be re-read with Ctrl+R
+
+#### Scenario: A panicked job ends and closes its dialog
+
+- **WHEN** a file-operation job's worker panics while its progress dialog is shown
+- **THEN** the progress dialog closes, the affected panels re-read, and an end-of-job summary names the internal error
+- **AND** a new file operation can be started afterwards
+
 ### Requirement: Resize handling with 60x16 hard floor and placeholder
 
 The system SHALL reflow the UI on terminal resize events, laying out the interface at any size at or above the 60x16 hard floor, and MUST draw a `screen.placeholder` "terminal too small" message instead whenever the terminal is below that floor, using a single size check that governs both normal and splash states. The placeholder message SHALL name the floor: "resize to at least 60x16". Between the floor and the 80x24 nominal size the interface renders in the degraded forms defined by the `responsive-layout` capability; at or above 80x24 it renders at full fidelity.
+
+The placeholder SHALL be drawn over the active screen without discarding it. While the terminal is below the floor, the following SHALL persist unchanged and SHALL reappear when the terminal is enlarged to at or above the floor:
+
+- the panels and their tabs, cursor, selection, quick filter, and command-line text;
+- the built-in editor: its buffer including unsaved edits, caret position, insert/overwrite mode, and modified state;
+- the F3 viewer: its file, position, and text/hex and wrap modes;
+- a file-operation setup dialog with its typed input;
+- a running file-operation job, with its progress, overwrite-conflict, or error-recovery dialog;
+- the end-of-job skipped-files summary;
+- any open pull-down menu, dialog, or overlay.
+
+The startup splash is the only exception: it SHALL be dismissed when the terminal shrinks below the floor and SHALL NOT return when the terminal is enlarged.
+
+Worker results SHALL continue to be applied while the terminal is below the floor. These include directory-listing events, file-operation progress, conflict, error, and completion events, and replies to requests made before the shrink. A job that completes while the placeholder is shown therefore still re-reads the affected panels, and a conflict or error raised while it is shown waits for the user's answer.
+
+While the terminal is below the floor, input SHALL NOT reach the screen hidden under the placeholder:
+
+- Mouse input SHALL be ignored, except that while the quit-confirmation dialog is open over the placeholder its buttons SHALL stay clickable.
+- F10 and Esc SHALL open the quit-confirmation dialog, which is drawn over the placeholder. The exception is when the built-in editor is the hidden screen: there F10 and Esc SHALL be ignored, so unsaved edits are never discarded without the editor's save-on-exit prompt.
+- While the quit-confirmation dialog or the startup-warning dialog is open over the placeholder, that dialog's own keys SHALL work as usual.
+- Every other key SHALL be ignored.
+
+While the terminal is below the floor, the screen under the placeholder does not own input, so these rules take precedence over that screen's own key handling, including Esc's cancel/dismiss meaning in a hidden menu or dialog under "Quit request keys and confirmation".
 
 #### Scenario: Reflow at or above the floor
 
@@ -131,6 +178,66 @@ The system SHALL reflow the UI on terminal resize events, laying out the interfa
 
 - **WHEN** the terminal is enlarged from below the floor back to at or above 60x16
 - **THEN** the normal layout is drawn again in place of the placeholder
+
+#### Scenario: Unsaved editor buffer survives a shrink
+
+- **WHEN** the built-in editor has unsaved edits with the caret on line 12 in overwrite mode, and the terminal shrinks to 50x12 and is then enlarged to 80x24
+- **THEN** the editor is shown again with the same buffer contents, the caret on line 12, overwrite mode, and the modified indicator
+- **AND** nothing was written to disk and no prompt was raised while the placeholder was shown
+
+#### Scenario: Viewer position and mode survive a shrink
+
+- **WHEN** the F3 viewer shows a file in hex mode scrolled to offset 0x4000, and the terminal shrinks below the floor and is then enlarged
+- **THEN** the viewer is shown again on the same file, in hex mode, at offset 0x4000
+
+#### Scenario: Viewer closes normally after a shrink
+
+- **WHEN** the terminal shrinks below the floor and is enlarged while the viewer is open, and the user then closes the viewer
+- **THEN** the panels return and the viewer no longer holds the file open
+
+#### Scenario: Running job keeps reporting progress while undersized
+
+- **WHEN** a copy job is running with its progress dialog shown and the terminal shrinks below the floor
+- **THEN** the placeholder is shown, the job keeps running, and its progress events keep updating the hidden progress dialog
+- **AND** when the terminal is enlarged before the job ends, the progress dialog reappears showing the job's latest progress
+
+#### Scenario: Conflict raised while undersized waits for an answer
+
+- **WHEN** a running copy job reaches an overwrite conflict while the terminal is below the floor
+- **THEN** the job waits for an answer and the conflict is not resolved by default
+- **AND** when the terminal is enlarged the overwrite-conflict dialog is shown for that file, and answering it resumes the job
+
+#### Scenario: Job finishing while undersized still refreshes the panels
+
+- **WHEN** a copy job completes while the terminal is below the floor
+- **THEN** the panels showing the source and destination directories re-read while the placeholder is still shown
+- **AND** when the terminal is enlarged the panels show the copied files, or the end-of-job summary when items were skipped
+
+#### Scenario: Open dialog and typed text survive a shrink
+
+- **WHEN** the F5 destination dialog is open with `D:\backup` typed and the terminal shrinks below the floor and is then enlarged
+- **THEN** the destination dialog is shown again containing `D:\backup` with the caret where it was
+
+#### Scenario: Typing over the hidden editor does nothing
+
+- **WHEN** the built-in editor is the hidden screen while the terminal is below the floor and the user types letters, presses Enter, F2, F10, or Esc
+- **THEN** the buffer, caret, and file on disk are unchanged, no save runs, and no quit-confirmation or save-on-exit dialog opens
+
+#### Scenario: F10 over the placeholder asks to quit
+
+- **WHEN** the panels are the hidden screen while the terminal is below the floor and the user presses F10
+- **THEN** the quit-confirmation dialog opens over the placeholder
+- **AND** cancelling it leaves the placeholder shown and the hidden panels unchanged
+
+#### Scenario: Mouse input is ignored while undersized
+
+- **WHEN** the terminal is below the floor, no quit-confirmation dialog is open, and the user clicks or turns the mouse wheel anywhere in it
+- **THEN** no command reaches the hidden screen and nothing about it changes
+
+#### Scenario: Quit dialog buttons stay clickable over the placeholder
+
+- **WHEN** the quit-confirmation dialog is open over the placeholder and the user clicks its No button
+- **THEN** the dialog closes, the placeholder stays shown, and the hidden screen is unchanged
 
 ### Requirement: Quit request keys and confirmation
 
@@ -214,4 +321,387 @@ The system SHALL recognise `-h`, `-?`, and `--help` as the sole command-line arg
 
 - **WHEN** the application is invoked without `-h`, `-?`, or `--help`
 - **THEN** no usage text is printed and the TUI starts as normal
+
+### Requirement: Configuration profile directory
+
+The system SHALL resolve one profile directory at startup and SHALL read and write `config.toml`, `history.json`, and `usermenu.toml` only there, never relative to the process working directory. Resolution order SHALL be: the `--config-dir <path>` launch flag; else, when a file named `portable` exists beside the executable, the executable's directory; else the platform default — `%APPDATA%\FileCommand` on Windows and `$XDG_CONFIG_HOME/filecommand` (falling back to `~/.config/filecommand`) elsewhere. The directory SHALL be created on first run. If it cannot be created or written, the session SHALL run on in-memory defaults, SHALL skip persistence, and SHALL raise the dismissable startup-warning dialog naming the path and the error. When the resolved profile holds no `config.toml` and the working directory contains any of the three files, the startup-warning dialog SHALL state where FileCommand now reads its files and that the old files may be moved; the system SHALL NOT copy, move, or delete them. The `--help` usage text SHALL list `--config-dir` and SHALL print the resolved default profile directory.
+
+#### Scenario: Platform default is used when nothing overrides it
+- **WHEN** FileCommand starts on Windows from `C:\Projects\app` with no `--config-dir` flag and no `portable` marker beside the executable
+- **THEN** it reads and writes `config.toml`, `history.json`, and `usermenu.toml` under `%APPDATA%\FileCommand`, and no file is created in `C:\Projects\app`
+
+#### Scenario: Explicit --config-dir override
+- **WHEN** FileCommand is launched with `--config-dir D:\fc-test`
+- **THEN** every configuration file is read from and written to `D:\fc-test`, and the portable marker and platform default are ignored
+
+#### Scenario: Portable mode via marker file
+- **WHEN** a file named `portable` exists in the executable's directory and no `--config-dir` flag is given
+- **THEN** the executable's directory is the profile directory
+
+#### Scenario: History and frecency are shared across launch directories
+- **WHEN** the user visits directories in a session launched from `C:\a`, exits, and relaunches from `C:\b`
+- **THEN** the Ctrl+J fuzzy-jump list and command history include the entries recorded in the first session
+
+#### Scenario: Unwritable profile falls back without losing the session
+- **WHEN** the profile directory cannot be created
+- **THEN** the application starts with default settings, the startup-warning dialog names the path and error, and theme/split/history changes made during the session are not written to disk
+
+#### Scenario: Legacy files in the working directory produce a notice, not a migration
+- **WHEN** the profile directory has no `config.toml` and the working directory contains `config.toml` and `history.json`
+- **THEN** the startup-warning dialog names those files, the working directory, and the profile directory, and both files are left exactly as they were
+
+#### Scenario: Usage names the profile directory
+- **WHEN** `filecommand --help` is run
+- **THEN** the usage text lists `--config-dir <path>` and ends with the resolved default profile directory path
+
+### Requirement: Optional diagnostic log
+
+The system SHALL support an opt-in diagnostic log file, chosen at launch by the `--log <path>` flag (also accepted as `--log=<path>`) or by the `FILECOMMAND_LOG` environment variable. When both are given, the flag SHALL win.
+
+When a log path is in effect, the system SHALL append one line per event to that file. Each line SHALL begin with a UTC timestamp, followed by a short category and a message naming the operation and the affected path where there is one. The file SHALL never be truncated. At least the following SHALL be logged, most of which the application otherwise handles without telling the user:
+
+- failures to write `history.json` or `config.toml`;
+- results that could not be delivered between a worker thread and the event loop;
+- answers that could not be delivered to a running file operation;
+- metadata that could not be restored on a copied file;
+- every startup warning, including any that a later warning replaced in the startup-warning dialog.
+
+When neither the flag nor the variable is set, the system SHALL NOT create or write any log file.
+
+If the log file cannot be opened for appending, or the flag is given without a path, the session SHALL start without logging and SHALL raise the dismissable startup-warning dialog naming the path and the reason. A failure to write a log line SHALL never interrupt the session.
+
+The `--help` usage block SHALL list `--log <path>` and SHALL mention `FILECOMMAND_LOG`. The log SHALL be implemented without adding a dependency, and `filecommand-core` SHALL NOT write to it directly.
+
+#### Scenario: No log unless asked for
+
+- **WHEN** FileCommand runs without `--log` and with `FILECOMMAND_LOG` unset, and a `history.json` write fails during the session
+- **THEN** no log file is created anywhere, and the session continues as before
+
+#### Scenario: A failed history write is logged with a timestamp
+
+- **WHEN** FileCommand is launched with `--log C:\temp\fc.log` and a `history.json` write fails because the profile directory became read-only
+- **THEN** `C:\temp\fc.log` gains a line beginning with a UTC timestamp that names the history write and the path of `history.json`, together with the operating-system error
+- **AND** no dialog or status-line message is shown for it
+
+#### Scenario: The environment variable enables logging
+
+- **WHEN** `FILECOMMAND_LOG` is set to `D:\logs\fc.log` and FileCommand is launched without `--log`
+- **THEN** diagnostic lines are appended to `D:\logs\fc.log`
+
+#### Scenario: The flag wins over the environment variable
+
+- **WHEN** `FILECOMMAND_LOG` is `D:\logs\env.log` and FileCommand is launched with `--log=D:\logs\flag.log`
+- **THEN** lines are appended to `D:\logs\flag.log` and `D:\logs\env.log` is not created or written
+
+#### Scenario: Existing log content is kept
+
+- **WHEN** the log file already holds lines from an earlier session
+- **THEN** the new session's lines are appended after them
+
+#### Scenario: Unwritable log path warns and continues
+
+- **WHEN** FileCommand is launched with `--log` naming a file in a directory that does not exist
+- **THEN** the TUI starts normally, the startup-warning dialog names that path and the reason it could not be opened, and nothing is logged for the session
+
+#### Scenario: Superseded startup warnings are still recorded
+
+- **WHEN** logging is enabled and two startup warnings occur, such as an unknown `--theme` and a malformed `usermenu.toml`, so the dialog shows only the last one
+- **THEN** the log holds a line for each of the two warnings
+
+#### Scenario: Usage lists the log options
+
+- **WHEN** the user runs `filecommand --help`
+- **THEN** the usage block lists `--log <path>` and mentions the `FILECOMMAND_LOG` environment variable
+
+### Requirement: Idle event loop does not redraw
+
+The system SHALL redraw the screen only when something visible may have changed: when input or a worker result has been applied, or when a time-driven change becomes due — a frame of a running animation, the expiry of clipboard feedback, the end of the splash hold, or a minute boundary of the header clock. While none of these occurs the system SHALL NOT redraw, and SHALL NOT wake more often than about every 33 ms, and then only while worker threads that can still deliver results are running. Time-driven behavior SHALL keep its timing: animations SHALL still advance every frame from the reducer clock until they finish, clipboard feedback SHALL still expire on time without input, and the splash SHALL still end after its hold. Before input is applied after an idle period, the system SHALL bring the reducer clock up to date, so that a surface opened after idling animates from the moment it opened and two clicks separated by idle time are not treated as a double-click. A pending redraw SHALL NOT be lost when the input that follows it produces no command.
+
+#### Scenario: Idle screen is not redrawn
+
+- **WHEN** the panels are shown with no input arriving, no worker thread running, no animation in progress, no clipboard feedback shown, and no minute boundary passing for 30 seconds
+- **THEN** no frame is drawn during those 30 seconds
+
+#### Scenario: Header clock still advances while idle
+
+- **WHEN** the application is idle and the wall clock passes a minute boundary
+- **THEN** the screen is redrawn once at that boundary and the header clock shows the new minute
+
+#### Scenario: Animations still run after idling
+
+- **WHEN** the application has been idle for a minute with animations enabled and the user presses F9
+- **THEN** the menu bar sweeps and the `Left` pull-down unfolds over their normal durations with intermediate frames, rather than appearing complete on the first frame
+
+#### Scenario: Clipboard feedback expires without input
+
+- **WHEN** clipboard feedback is shown and the user presses no key
+- **THEN** the feedback disappears and the mini-status reverts when its expiry time is reached
+
+#### Scenario: Worker results still appear promptly
+
+- **WHEN** a directory listing is being read while the user presses no key
+- **THEN** each batch of entries is shown within about 33 ms of arriving, and once the listing completes and no worker remains the screen stops redrawing
+
+#### Scenario: Clicks separated by idle time are not a double-click
+
+- **WHEN** the user clicks an entry, the application sits idle for 10 seconds, and the user clicks the same entry again
+- **THEN** the second click is handled as a single click, not as a double-click
+
+#### Scenario: Redraw survives an unmapped key
+
+- **WHEN** a worker result is applied and, in the same loop iteration, the user presses a key that maps to no command
+- **THEN** the screen is still redrawn to show the worker result
+
+### Requirement: Bursts of key input render once
+
+When several input events are already queued, the system SHALL apply them in order — mapping each key against the state produced by the previous one — and SHALL draw once after the burst instead of once per key. A burst SHALL end after 64 events, after about 8 ms of processing, when no further input is queued, or when a mouse event is reached; the system SHALL then draw before handling further input, so the screen never falls far behind. Applying a burst SHALL produce the same final state as applying the same keys one at a time.
+
+#### Scenario: Holding PgDn renders one frame per burst
+
+- **WHEN** five PgDn key events are queued at once in a 100,000-entry directory
+- **THEN** all five page movements are applied and the screen is drawn once, showing the final position
+
+#### Scenario: Routing follows the state each key produces
+
+- **WHEN** the queued keys are F7 followed by the characters `new` and Enter while the panels are focused
+- **THEN** F7 opens the Make-directory dialog, `new` is typed into its field, and Enter confirms it, exactly as if the keys had been pressed slowly
+
+#### Scenario: A paste delivered as key events renders once per burst
+
+- **WHEN** the terminal delivers a 60-character pasted path as 60 key events while the command line has focus
+- **THEN** all 60 characters are inserted in order and the screen is drawn at most once for every 64 of them
+
+### Requirement: Ctrl+C during a suspended child run stops only the child
+
+While FileCommand is suspended and waiting for a child process it started, a Ctrl+C or Ctrl+Break typed at the console SHALL reach the child as usual and SHALL NOT terminate FileCommand. This covers a command run from the file-action menu's Run entry, a command from the F2 user menu, and the external editor launched by F4.
+
+After the child exits, FileCommand SHALL show its usual press-any-key prompt and then resume the TUI with its tabs, panels, command history, and session state intact. The child SHALL NOT inherit an instruction to ignore Ctrl+C from FileCommand, so a console program that stops on Ctrl+C still stops.
+
+Outside these suspended child runs, Ctrl+C handling SHALL be unchanged, as SHALL any console close, logoff, or shutdown event, which still ends FileCommand.
+
+#### Scenario: Ctrl+C stops a user-menu command and FileCommand survives
+
+- **WHEN** the user runs a user-menu entry `ping -t 127.0.0.1` and presses Ctrl+C while it runs
+- **THEN** `ping` stops and FileCommand shows its press-any-key prompt
+- **AND** after a key press the TUI resumes with the same tabs, directories, and cursor positions as before the command ran
+
+#### Scenario: Ctrl+C during a Run-entry command
+
+- **WHEN** the user activates Run on `server.exe`, a console program that stops on Ctrl+C, and presses Ctrl+C
+- **THEN** `server.exe` stops, and FileCommand is still running and resumes after the prompt
+
+#### Scenario: Ctrl+C inside the external editor does not end FileCommand
+
+- **WHEN** the configured external editor is running in the suspended terminal and the user presses Ctrl+C
+- **THEN** FileCommand does not exit, whether or not the editor itself treats Ctrl+C as a key or exits on it, and the panel re-read and resume happen as usual once the editor exits
+
+#### Scenario: The child is not made to ignore Ctrl+C
+
+- **WHEN** a child started through any of these paths installs no handler of its own and the user presses Ctrl+C
+- **THEN** the child terminates as it would when run directly from a shell
+
+### Requirement: Quit waits for job cancellation cleanup
+
+When quit is confirmed while a file-operation job is running, the system SHALL do the following before the process exits:
+
+- request the job's cancellation;
+- treat any overwrite-conflict or error-recovery prompt the job is waiting on as an abort, without requiring an answer;
+- wait for the job to finish its cancellation cleanup, including removing a partially written destination file, for up to about 2 seconds.
+
+If the job has not finished within that bound, the application SHALL exit anyway. The wait SHALL apply to any job still running when quit is confirmed, whichever screen or dialog is showing at the time. When no job is running, quit SHALL exit without delay.
+
+#### Scenario: Quit during a large copy leaves no partial file
+
+- **WHEN** a copy of a 2 GB file is in progress and the user requests quit and confirms
+- **THEN** the application exits only after the partially written destination file has been removed, and the destination holds no truncated copy of that file
+
+#### Scenario: Quit while a conflict prompt is waiting
+
+- **WHEN** a copy job is waiting on the overwrite-conflict dialog and the user requests quit and confirms
+- **THEN** the job stops without overwriting the conflicting target and without processing any further items, and the application exits after the job has ended
+
+#### Scenario: The wait is bounded
+
+- **WHEN** quit is confirmed while the job is blocked in a write to a share that has stopped responding
+- **THEN** the application exits after about 2 seconds rather than waiting for the write to return
+
+#### Scenario: No job means no wait
+
+- **WHEN** no file operation is running and the user confirms quit
+- **THEN** the application exits immediately
+
+### Requirement: The reducer performs no filesystem I/O
+
+`core::update` SHALL NOT perform filesystem I/O of any kind, directly or through any helper it calls. That includes metadata or existence queries, directory reads, and file opens. When handling a command depends on the current state of the filesystem, `core::update` SHALL:
+
+- answer from the state it already holds where that state suffices, such as an entry already listed in a panel;
+- otherwise return an effect requesting the check, tagged with a fresh request id;
+- complete the command only when the reply command carrying that id is applied.
+
+A reply whose id is no longer the outstanding request SHALL be discarded without changing state. This makes the "Pure core update function" rule checkable by a unit test that runs with no filesystem at all.
+
+#### Scenario: A command-line target outside the listing produces a probe request, not a disk read
+
+- **WHEN** a unit test applies `cd sub` to `core::update` with the active panel at `C:\NORTON` and `sub` not among its listed entries
+- **THEN** the returned effects contain a path-probe request for `C:\NORTON\sub` tagged with a request id, and the panel's `cwd` is still `C:\NORTON`
+- **AND** `core::update` made no filesystem call, so the result is the same whether or not `C:\NORTON\sub` exists on the machine running the test
+
+#### Scenario: The probe reply completes the command
+
+- **WHEN** the path-probe reply for that request id arrives reporting a directory
+- **THEN** applying it through `core::update` navigates the panel to `C:\NORTON\sub` exactly as a synchronous check would have
+
+#### Scenario: A superseded probe reply is discarded
+
+- **WHEN** a second `cd` is entered before the first probe's reply arrives, and the first reply then arrives
+- **THEN** the first reply changes nothing: no navigation, no error message, and no dialog
+
+### Requirement: Slow storage never blocks the event loop
+
+These operations SHALL run on worker threads, never on the event-loop thread, so that a slow, removable, or unreachable volume cannot freeze input or redraw:
+
+- the command-line target check;
+- opening a file in the F3 viewer;
+- opening a file in the built-in editor;
+- saving from the built-in editor;
+- launching a file's associated application;
+- writing the applied theme and the panel split to `config.toml`.
+
+While an editor or viewer open is outstanding, the status line of the panel it was requested from SHALL show `Opening <name>…`, and the panels SHALL keep accepting input. A newer F3 or F4 request SHALL supersede an outstanding open. An open reply that arrives after the user has left the panels, or after a menu, dialog, or overlay has opened, SHALL be discarded, and a viewer reply's file handle SHALL be released.
+
+While a save is outstanding, the editor SHALL show a `Saving…` notice on the row directly above its F-key bar, leaving the header and F-key bar unchanged, and SHALL NOT accept edits, caret moves, or further save or quit commands until the save completes or fails. The screen SHALL keep redrawing meanwhile.
+
+Configuration writes SHALL be performed one at a time, in the order they were requested, by a single background writer, so that two rewrites of `config.toml` never interleave. A newer value for a setting SHALL replace an older value for the same setting that has not been written yet, so the value on disk after the writes complete is always the last one requested. Moving a write to the background writer SHALL NOT change how it is written: it SHALL remain the atomic write that theme-selection "Applied theme persists to configuration" and panel-split "Split persistence to configuration" require, made durable as configuration-files "Persisted configuration writes are durable" specifies where that requirement exists, and a failed write SHALL NOT interrupt the session. When the application exits, by quit or by any other exit path, the system SHALL first complete every configuration write still outstanding, waiting at most about 2 seconds. History persistence (`history.json`) is outside this rule.
+
+On Windows, the worker that launches the associated application SHALL initialize COM in a single-threaded apartment (`COINIT_APARTMENTTHREADED`) before calling the shell launch API and SHALL uninitialize it afterwards. A launch failure SHALL be reported on the status line of the panel the Open action was invoked on.
+
+#### Scenario: F4 on a slow share keeps the panels live
+
+- **WHEN** the user presses F4 on `notes.txt` in a panel showing `\\nas\share` and reading the file takes several seconds
+- **THEN** the panels keep redrawing and moving the cursor in response to keys while the panel's status line shows `Opening notes.txt…`
+- **AND** the built-in editor opens on `notes.txt` once the read completes
+
+#### Scenario: F3 on a file whose server stopped responding does not freeze the UI
+
+- **WHEN** the user presses F3 on a file on a share whose server has stopped responding
+- **THEN** the UI keeps redrawing and accepting input while the open is outstanding
+- **AND** when the open finally fails, the panel's status line shows the failure and the viewer does not open
+
+#### Scenario: Saving to a slow share shows progress and accepts no edits
+
+- **WHEN** the user presses F2 in the built-in editor on a file whose write takes several seconds
+- **THEN** the editor shows `Saving…` above its F-key bar, the screen keeps redrawing, and typed characters are not inserted into the buffer
+- **AND** when the write completes, `Saving…` disappears, the modified indicator clears, and typing edits the buffer again
+
+#### Scenario: A newer F3 supersedes an outstanding open
+
+- **WHEN** the user presses F3 on `slow.log`, moves to `fast.txt`, and presses F3 again before `slow.log` has opened
+- **THEN** the viewer opens `fast.txt`, and the late answer for `slow.log` is discarded without replacing it
+
+#### Scenario: A late open does not pull the user out of a menu
+
+- **WHEN** an F4 open is outstanding and the user opens the F9 menu before it completes
+- **THEN** the menu stays open, the editor does not open when the read completes, and the late result is discarded
+
+#### Scenario: Launching a slow handler leaves the panels interactive
+
+- **WHEN** the user activates Open on a document whose associated application takes several seconds to start
+- **THEN** the panels keep redrawing and responding to keys during the launch
+- **AND** if the launch fails, the failure is shown on the status line of the panel the Open action was invoked on, even if the user has switched panels since
+
+#### Scenario: COM is initialized on the launch worker
+
+- **WHEN** Open launches a file on Windows
+- **THEN** the shell launch API is called on a worker thread that initialized COM in a single-threaded apartment beforehand, and that thread uninitializes COM after the call returns
+
+#### Scenario: Applying a theme on a slow profile directory keeps the UI live
+
+- **WHEN** the profile directory is on a network share that takes several seconds to answer and the user applies a theme from the theme picker
+- **THEN** the new theme is shown and the UI keeps redrawing and accepting keys while `config.toml` is being rewritten in the background
+
+#### Scenario: Rapid split adjustments persist the final value
+
+- **WHEN** the split is at 50/50 on a 100-column terminal and the user presses Ctrl+Right eight times in quick succession, ending at a 66% split
+- **THEN** the input is never held up by the writes, and once the writer has caught up `config.toml` contains `panel_split = 66`
+
+#### Scenario: A theme and a split change made together are both saved
+
+- **WHEN** the user applies a theme and, before that write finishes, adjusts the split
+- **THEN** after both writes complete `config.toml` contains both the new `theme` and the new `panel_split`
+
+#### Scenario: A setting changed just before quit is saved
+
+- **WHEN** the user adjusts the split and immediately quits and confirms, on a responsive disk
+- **THEN** the process exits only after `config.toml` holds the new `panel_split` value
+
+#### Scenario: An unresponsive profile directory cannot hold quit open
+
+- **WHEN** a configuration write is blocked on a profile directory that has stopped answering and the user confirms quit
+- **THEN** the application exits after about 2 seconds, and `config.toml` is left with either its complete previous content or its complete new content
+
+### Requirement: Modal overlays are mutually exclusive by construction
+
+The system SHALL hold the state of the modal overlays in a single overlay slot in `filecommand-core`'s `State`, so that at most one of them is open at any time. The modal overlays are the F9 menu, the drive-select dialog, fuzzy jump, find file, the F2 user menu, the command-history dialog, the theme picker, the file-action menu, the Help window (with its nested About dialog), and the startup warning. Each overlay's handler SHALL receive that overlay's state directly from the slot, so no handler depends on a separately checked gate and none can run while its overlay is closed.
+
+The quit-confirmation dialog is not part of the slot. It SHALL remain a separate layer above every other context, as "Quit request keys and confirmation" requires. The file-operation dialogs, the viewer, and the editor SHALL remain phases.
+
+Which layer owns input SHALL be defined once, by a single precedence order in `filecommand-core`, and the reducer's command routing, the TUI's key routing, its mouse routing, and its rendering and hit-map construction SHALL all follow it. The order, highest first:
+1. the quit confirmation;
+2. a file-operation dialog;
+3. the viewer;
+4. the editor;
+5. the open overlay;
+6. the panels or the startup splash.
+
+A layer SHALL handle only the commands it claims; any other command, including worker replies, SHALL pass to the layers below it as it does today. While the terminal is below the 60x16 floor, input routing SHALL additionally follow "Resize handling with 60x16 hard floor and placeholder".
+
+This structure SHALL NOT change which overlay is shown, which keys or clicks it accepts, or how it renders, in any state the application can reach.
+
+#### Scenario: A menu item opens its dialog in place of the menu
+
+- **WHEN** the F9 menu is open and the user activates Commands → Find file
+- **THEN** the menu closes and the find-file dialog opens
+- **AND** only the find-file dialog is shown, and it receives the next key
+
+#### Scenario: The user menu's Themes entry replaces the user menu
+
+- **WHEN** the F2 user menu is open with its built-in Themes entry highlighted and the user presses Enter
+- **THEN** the user menu closes and the theme picker opens in its place, with the active theme highlighted
+
+#### Scenario: Another overlay's shortcut is ignored while an overlay is open
+
+- **WHEN** the fuzzy-jump dialog is open and the user presses F9 or Alt+F1
+- **THEN** neither the menu nor the drive-select dialog opens
+- **AND** the fuzzy-jump dialog stays open with its pattern and highlight unchanged
+
+#### Scenario: Unbound keys never reach the panels or the command line
+
+- **WHEN** the F2 user menu is open and the user types a printable character that the user menu does not bind
+- **THEN** the key is ignored, so the command line and the panel cursor are unchanged
+
+#### Scenario: Late results of a dismissed search touch no other overlay
+
+- **WHEN** the user dismisses the find-file dialog with Esc while its search is still running, then opens the Help window
+- **AND** further matches from the dismissed search arrive
+- **THEN** the results are discarded, the Help window is unchanged, and no find-file dialog reappears
+
+#### Scenario: An overlay command with its overlay closed does nothing
+
+- **WHEN** a command that only an overlay binds (for example confirming fuzzy jump) reaches the reducer while that overlay is not open
+- **THEN** the state is unchanged, no effect is returned, and nothing panics
+
+#### Scenario: The quit dialog stacks above an open overlay
+
+- **WHEN** the quit-confirmation dialog is open above an open F9 pull-down and the user cancels it
+- **THEN** the pull-down is still open exactly as before, and it receives the next key
+
+#### Scenario: Worker replies pass beneath the quit dialog
+
+- **WHEN** a copy job is running, the quit-confirmation dialog is open above its progress dialog, and the job reports progress
+- **THEN** the progress dialog underneath shows the new progress and the quit-confirmation dialog stays open
+
+#### Scenario: One precedence order everywhere
+
+- **WHEN** the routing of a key, the routing of a mouse event, and the drawing and hit map of a frame are each computed for the same state
+- **THEN** all of them treat the same layer as the one that owns input, the layer defined by the single precedence order
 

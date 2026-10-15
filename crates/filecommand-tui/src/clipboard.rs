@@ -1,5 +1,6 @@
-//! The OS clipboard write behind `Effect::SetClipboard`
-//! (clipboard-export). `core::update` only ever produces a
+//! The OS clipboard access behind `Effect::SetClipboard`
+//! (clipboard-export) and `Effect::ReadClipboardText` (text-field-editing
+//! "Paste into a text field"). `core::update` only ever produces a
 //! `ClipboardPayload` — which of the three payload kinds, and the resolved,
 //! `..`-excluded absolute paths to act on; it never touches the OS. This
 //! module is where that touches real Win32 (`clipboard-win`) or, off
@@ -37,6 +38,13 @@ pub trait Clipboard {
     /// Write `text` as plain Unicode text (the Paths/Names payloads, and
     /// Files' non-Windows fallback).
     fn set_text(&self, text: &str) -> Result<(), String>;
+
+    /// Read the clipboard's current text, if it holds any — the read half
+    /// of text-field-editing "Paste into a text field" (design D4), run for
+    /// `Effect::ReadClipboardText`. `None` means "no text available" (an
+    /// empty clipboard, a non-text payload, or a clipboard that could not
+    /// be opened): pasting is then a no-op, never an error.
+    fn get_text(&self) -> Option<String>;
 }
 
 /// Normalise one clipboard item's path (clipboard-export "Windows
@@ -70,11 +78,7 @@ pub fn paths_text(items: &[PathBuf]) -> String {
 /// The Names payload's text: one file name per line, no trailing separator
 /// after the last (clipboard-export "Clipboard payloads and scope").
 pub fn names_text(items: &[PathBuf]) -> String {
-    items
-        .iter()
-        .map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("\n")
+    items.iter().map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()).collect::<Vec<_>>().join("\n")
 }
 
 #[cfg(windows)]
@@ -155,6 +159,14 @@ mod windows_impl {
             let _clip = open_with_retry()?;
             formats::Unicode.write_clipboard(&text).map_err(|e| e.to_string())
         }
+
+        fn get_text(&self) -> Option<String> {
+            // `get_clipboard_string` opens the clipboard, reads the Unicode
+            // text if any, and closes it (design D4); any failure — busy,
+            // no text, no window station in CI — is "no text available",
+            // making the paste a no-op rather than an error.
+            clipboard_win::get_clipboard_string().ok()
+        }
     }
 }
 
@@ -192,6 +204,13 @@ mod text_impl {
             let mut clip = ArboardHandle::new().map_err(|e| e.to_string())?;
             clip.set_text(text.to_string()).map_err(|e| e.to_string())
         }
+
+        fn get_text(&self) -> Option<String> {
+            // Best-effort like the rest of the non-Windows fallback: any
+            // failure (no clipboard provider, no text) is "no text
+            // available" (design D4).
+            ArboardHandle::new().ok()?.get_text().ok()
+        }
     }
 }
 
@@ -207,6 +226,9 @@ pub use text_impl::TextClipboard as PlatformClipboard;
 pub struct RecordingClipboard {
     pub files_calls: RefCell<Vec<Vec<PathBuf>>>,
     pub text_calls: RefCell<Vec<String>>,
+    /// What `get_text` returns — the fake clipboard's current text content
+    /// for paste tests (text-field-editing "Paste into a text field").
+    pub text_to_read: RefCell<Option<String>>,
     /// When `Some`, both methods return this `Err` instead of recording a
     /// call — exercises the busy/failure path (clipboard-export "Clipboard
     /// busy retry": "Persistent lock reports failure").
@@ -233,6 +255,10 @@ impl Clipboard for RecordingClipboard {
         }
         self.text_calls.borrow_mut().push(text.to_string());
         Ok(())
+    }
+
+    fn get_text(&self) -> Option<String> {
+        self.text_to_read.borrow().clone()
     }
 }
 
@@ -300,5 +326,13 @@ mod tests {
         let clip = RecordingClipboard { fail_with: Some("Clipboard busy — try again".to_string()), ..Default::default() };
         assert_eq!(clip.set_text("x"), Err("Clipboard busy — try again".to_string()));
         assert!(clip.text_calls.borrow().is_empty());
+    }
+
+    #[test]
+    fn recording_clipboard_reads_back_its_staged_text() {
+        let clip = RecordingClipboard::default();
+        assert_eq!(clip.get_text(), None, "nothing staged: the paste is a no-op");
+        *clip.text_to_read.borrow_mut() = Some("E:\\archive".to_string());
+        assert_eq!(clip.get_text().as_deref(), Some("E:\\archive"));
     }
 }
