@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/filecommand-core", "crates/filecommand-tui"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 # Minimum supported Rust version. Verified empirically: the lowest toolchain
 # on which `cargo check --workspace --all-targets --locked` passes, and
