@@ -292,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "filecommand-core"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "git2",
  "proptest",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "filecommand-tui"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "arboard",
  "clipboard-win",
