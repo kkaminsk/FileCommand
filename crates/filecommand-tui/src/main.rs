@@ -11,6 +11,12 @@ fn main() {
 }
 
 fn print_usage() {
+    // Named here so a user can find their files without reading docs
+    // (config-profile-directory "Usage names the profile directory";
+    // design D4). Nothing is created — resolution only.
+    let default_profile = filecommand_tui::app::platform_default_profile_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "the current directory (no platform config directory could be resolved)".to_string());
     println!(
         "FileCommand {version}
 A keyboard-driven, dual-panel file manager for the terminal.
@@ -23,8 +29,13 @@ OPTIONS:
     --theme <name>      Override the active theme (built-in or custom)
     --nomouse           Disable mouse capture
     --nosplash          Skip the startup splash screen
+    --noanimations      Disable decorative UI animations
+    --config-dir <path>  Use <path> for config.toml, history.json, usermenu.toml
+    --log <path>        Append diagnostic messages to <path> (or set FILECOMMAND_LOG)
 
-Press F1 inside the application for the full keyboard reference.",
+Press F1 inside the application for the full keyboard reference.
+
+Default profile directory: {default_profile}",
         version = env!("CARGO_PKG_VERSION")
     );
 }

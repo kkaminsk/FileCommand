@@ -46,25 +46,42 @@ impl Clock for TestClock {
 pub trait WallClock {
     /// Local wall-clock time as `(hour 0-23, minute 0-59)`.
     fn now_local(&self) -> (u8, u8);
+    /// Wall-clock time as Unix-epoch milliseconds. Unlike [`Clock::now_ms`]
+    /// this is comparable across process restarts, which is what the Ctrl+J
+    /// frecency index records visits in (fuzzy-jump "Frecency ranking";
+    /// history-persistence-hardening design D1). Animations and every other
+    /// in-session timing keep using the monotonic [`Clock`].
+    fn epoch_ms(&self) -> u64;
 }
 
-/// A `WallClock` pinned to a fixed `(hour, minute)`. Never advances on its
-/// own.
+/// A `WallClock` pinned to a fixed `(hour, minute)` and a fixed epoch
+/// reading. Never advances on its own.
 #[derive(Debug, Clone, Copy)]
 pub struct TestWallClock {
     hour: u8,
     minute: u8,
+    epoch_ms: u64,
 }
 
 impl TestWallClock {
     pub fn new(hour: u8, minute: u8) -> Self {
-        Self { hour: hour % 24, minute: minute % 60 }
+        Self { hour: hour % 24, minute: minute % 60, epoch_ms: 0 }
+    }
+
+    /// The same pinned time-of-day with [`WallClock::epoch_ms`] pinned to
+    /// `epoch_ms`.
+    pub fn with_epoch(self, epoch_ms: u64) -> Self {
+        Self { epoch_ms, ..self }
     }
 }
 
 impl WallClock for TestWallClock {
     fn now_local(&self) -> (u8, u8) {
         (self.hour, self.minute)
+    }
+
+    fn epoch_ms(&self) -> u64 {
+        self.epoch_ms
     }
 }
 
@@ -102,6 +119,10 @@ mod tests {
         let clock = TestWallClock::new(15, 42);
         assert_eq!(clock.now_local(), (15, 42));
         assert_eq!(clock.now_local(), (15, 42));
+        assert_eq!(clock.epoch_ms(), 0, "the epoch defaults to 0 until pinned");
+        let pinned = clock.with_epoch(1_787_441_063_250);
+        assert_eq!(pinned.epoch_ms(), 1_787_441_063_250);
+        assert_eq!(pinned.now_local(), (15, 42), "pinning the epoch leaves the time of day alone");
     }
 
     #[test]

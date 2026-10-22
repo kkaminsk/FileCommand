@@ -124,6 +124,26 @@ mod tests {
         assert_eq!(super::super::backward::previous_line_start(&src, next, 64 * 1024), 4);
     }
 
+    /// viewer-mapping-safety (design D3): a file that shrinks while it is
+    /// open reads short past its new end; the forward scan treats that
+    /// short window as end of file and terminates, returning an offset
+    /// within the snapshot length.
+    #[test]
+    fn truncation_while_open_terminates_the_forward_scan() {
+        let dir = std::env::temp_dir().join(format!("filecommand-viewer-forward-test-{}-truncated", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("file.bin");
+        std::fs::write(&path, vec![b'x'; 10_000]).unwrap();
+        let src = ByteSource::open(&path).unwrap();
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(1000).unwrap();
+        // No newline in the 1000 bytes that still exist: the short window
+        // is treated as end of file, landing on the snapshot length.
+        assert_eq!(next_line_start(&src, 0, 64 * 1024), 10_000);
+        // Starting past the new end reads empty and also lands on the
+        // snapshot length — no panic, no read past the real end.
+        assert_eq!(next_line_start(&src, 5000, 64 * 1024), 10_000);
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;

@@ -129,8 +129,7 @@ mod tests {
 
     #[test]
     fn resolved_values_replace_the_placeholder_in_place() {
-        let mut values = InfoValues::default();
-        values.drive_total = Some(1_234_567);
+        let values = InfoValues { drive_total: Some(1_234_567), ..InfoValues::default() };
         let boxes = info_boxes(&values, Some('C'));
         let drive_box = &boxes[1];
         assert_eq!(drive_box.fields[2].value, "1,234,567 bytes");

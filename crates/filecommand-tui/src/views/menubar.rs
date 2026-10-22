@@ -4,6 +4,7 @@
 //! panels' top borders and the clock while it is open. Pull-downs are
 //! single-line CP437-framed boxes hanging directly below their title.
 
+use filecommand_core::anim;
 use filecommand_core::dialogs::clamp_overlay_dim;
 use filecommand_core::listing::{display_width, pad_to_width, truncate_with_ellipsis};
 use filecommand_core::menu::{entries, MenuEntry, MenuId, MenuState, ALL_MENUS};
@@ -11,6 +12,7 @@ use filecommand_core::theme::{ColorDepth, Role, Theme};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
+use super::DialogLayout;
 use crate::style::role_style;
 
 /// Columns before the first title and between titles, matching the NC bar
@@ -40,37 +42,129 @@ pub fn title_positions() -> Vec<(MenuId, u16)> {
     out
 }
 
-pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState) {
+/// The F9 bar's geometry for a frame (reducer-overlay-structure design D8;
+/// mouse-input "Click targets match the rendered geometry"): the bar row,
+/// each title's cells, and — while a pull-down is open — the pull-down box
+/// with its item rows. One computation feeds both the renderer and the hit
+/// map.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MenuLayout {
+    /// The full-width bar row across the top of the area.
+    pub bar: Rect,
+    /// Each drawn menu title's cells and which menu it opens, in bar order;
+    /// a title that would start past the right edge is not listed.
+    pub titles: Vec<(Rect, MenuId)>,
+    /// The open pull-down: its box (`rect`), its item rows keyed by position
+    /// in `menu::entries(active)` — separators simply have no row — and its
+    /// text, one entry per position with an empty string for a separator.
+    /// `None` while the pull-down is closed, or when there is no room for
+    /// even an empty framed box under the bar.
+    pub pulldown: Option<DialogLayout>,
+}
+
+/// The bar's and open pull-down's geometry at `area`. An empty layout for a
+/// zero-sized area.
+pub fn layout(area: Rect, menu: &MenuState) -> MenuLayout {
     if area.height == 0 || area.width == 0 {
-        return;
+        return MenuLayout::default();
     }
-    let bar_style = role_style(theme, Role::MenuBar, depth);
-    let highlight_style = role_style(theme, Role::MenuHighlight, depth);
-    let hotkey_style = role_style(theme, Role::MenuHotkey, depth);
-
-    let y = area.y;
-    buf.set_string(area.x, y, " ".repeat(area.width as usize), bar_style);
-
+    let bar = Rect { x: area.x, y: area.y, width: area.width, height: 1 };
+    let mut titles = Vec::with_capacity(ALL_MENUS.len());
     for (id, x) in title_positions() {
-        let title = id.title();
         let x = area.x + x;
         if x >= area.x + area.width {
             break;
         }
-        let active = id == menu.active;
+        let w = (id.title().chars().count() as u16).min(area.x + area.width - x);
+        titles.push((Rect { x, y: area.y, width: w, height: 1 }, id));
+    }
+    MenuLayout { bar, titles, pulldown: menu.pulldown_open.then(|| pulldown_layout(area, menu.active)).flatten() }
+}
+
+/// The open pull-down's box and rows. Width and height each clamp
+/// independently via the unified overlay rule's per-dimension helper
+/// (responsive-layout "Unified overlay geometry"); rows available is the
+/// terminal height minus the bar's own row. The box hangs under its title,
+/// shifted one column left so the title sits over the box's interior rather
+/// than its frame — and shifted further left just enough to stay on screen,
+/// rather than centering (responsive-layout "Unified overlay geometry":
+/// "Pull-down box shifts left instead of centering"). `None` when there is
+/// no room for even an empty framed box.
+fn pulldown_layout(area: Rect, id: MenuId) -> Option<DialogLayout> {
+    let content_rows = entries(id).len() as u16;
+    let avail_h = area.height.saturating_sub(1);
+    let box_w = clamp_overlay_dim(pulldown_inner_width(id) as u16 + 2, MIN_INNER_W + 2, area.width);
+    let box_h = clamp_overlay_dim(content_rows + 2, MIN_BOX_H, avail_h);
+    // Frame top + frame bottom take two of the rows we have; if there
+    // isn't room for even an empty framed box, draw nothing rather than a
+    // single overlapping border row.
+    if box_h < 2 {
+        return None;
+    }
+    let inner_w = box_w.saturating_sub(2) as usize;
+    let visible = box_h.saturating_sub(2) as usize;
+
+    let title_x = title_positions().iter().find(|(m, _)| *m == id).map(|(_, x)| *x).unwrap_or(LEAD);
+    let mut x = area.x + title_x.saturating_sub(1);
+    let right_edge = area.x + area.width;
+    if x + box_w > right_edge {
+        x = right_edge.saturating_sub(box_w);
+    }
+    let y = area.y + 1;
+
+    let rows = entries(id)
+        .iter()
+        .take(visible)
+        .enumerate()
+        .filter(|(_, entry)| matches!(entry, MenuEntry::Item(_)))
+        .map(|(i, _)| (Rect { x: x + 1, y: y + 1 + i as u16, width: inner_w as u16, height: 1 }, i))
+        .collect();
+    let lines = item_rows(id, inner_w).into_iter().take(visible).map(Option::unwrap_or_default).collect();
+    Some(DialogLayout { rect: Rect { x, y, width: box_w, height: 2 + visible as u16 }, buttons: Vec::new(), rows, lines })
+}
+
+/// Draws the F9 bar and its open pull-down. `now` is the reducer clock when
+/// animations are on (`State::anim_now`) and `None` for the final frame: the
+/// bar sweeps in left-to-right and the pull-down unfolds top-down, both
+/// interpolated from the stamps on `menu` (pulldown-menus "Menu bar entrance
+/// sweep"; ui-animations "Pop-up menus unfold and highlights settle").
+pub fn render_menu_bar(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>) {
+    draw_menu_bar(buf, theme, depth, menu, now, &layout(area, menu));
+}
+
+/// Draw the bar and pull-down from an already computed [`layout`].
+pub fn draw_menu_bar(buf: &mut Buffer, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>, l: &MenuLayout) {
+    if l.bar.height == 0 || l.bar.width == 0 {
+        return;
+    }
+    super::sweep(buf, now, menu.opened_at_ms, |b| render_bar_row(b, theme, depth, menu, l));
+    if let Some(pulldown) = &l.pulldown {
+        super::unfold(buf, now, menu.pulldown_opened_at_ms, |b| render_pulldown(b, theme, depth, menu, now, pulldown));
+    }
+}
+
+/// The bar row itself: the full-width bar with every title, the active one
+/// highlighted.
+fn render_bar_row(buf: &mut Buffer, theme: &Theme, depth: ColorDepth, menu: &MenuState, l: &MenuLayout) {
+    let bar_style = role_style(theme, Role::MenuBar, depth);
+    let highlight_style = role_style(theme, Role::MenuHighlight, depth);
+    let hotkey_style = role_style(theme, Role::MenuHotkey, depth);
+
+    let y = l.bar.y;
+    buf.set_string(l.bar.x, y, " ".repeat(l.bar.width as usize), bar_style);
+
+    for (rect, id) in &l.titles {
+        let title = id.title();
+        let active = *id == menu.active;
         let style = if active { highlight_style } else { bar_style };
-        buf.set_string(x, y, clip(title, (area.x + area.width - x) as usize), style);
+        buf.set_string(rect.x, y, clip(title, rect.width as usize), style);
         // The hotkey letter stays bright-yellow on the cyan bar, but an
         // active title is a solid white-on-black block: recoloring one
         // letter inside it would break the highlight.
         if !active {
             let letter = &title[..id.hotkey().len_utf8()];
-            buf.set_string(x, y, letter, hotkey_style);
+            buf.set_string(rect.x, y, letter, hotkey_style);
         }
-    }
-
-    if menu.pulldown_open {
-        render_pulldown(buf, area, theme, depth, menu);
     }
 }
 
@@ -116,61 +210,49 @@ fn pulldown_inner_width(id: MenuId) -> usize {
         .unwrap_or(4)
 }
 
-fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDepth, menu: &MenuState) {
+/// The role one pull-down row takes (pulldown-menus "Pull-down visuals with
+/// separators and disabled items"): the highlight only when both selected
+/// and enabled — a disabled row is unselectable, so it never highlights —
+/// the hotkey accent while a just-moved highlight settles, and the greyed
+/// disabled role otherwise. A free function so the disabled rule stays
+/// pinned by a local-fixture test now that no shipped item is disabled
+/// (pulldown-menu-completion design D5).
+fn item_role(selected: bool, enabled: bool, settling: bool) -> Role {
+    if !enabled {
+        Role::MenuDisabled
+    } else if selected && settling {
+        Role::MenuHotkey
+    } else if selected {
+        Role::MenuHighlight
+    } else {
+        Role::MenuBody
+    }
+}
+
+/// Paint the open pull-down from its layout: the frame, a `├──┤` rule for
+/// each separator, and each item row on the cells its layout row names.
+fn render_pulldown(buf: &mut Buffer, theme: &Theme, depth: ColorDepth, menu: &MenuState, now: Option<u64>, l: &DialogLayout) {
     let body_style = role_style(theme, Role::MenuBody, depth);
-    let highlight_style = role_style(theme, Role::MenuHighlight, depth);
-    let disabled_style = role_style(theme, Role::MenuDisabled, depth);
+    // A newly highlighted row renders in the hotkey accent for
+    // `HIGHLIGHT_SETTLE_MS`, then settles to the normal highlight
+    // (ui-animations "Highlight settles after moving").
+    let settling = matches!((now, menu.selected_at_ms), (Some(now), Some(at)) if now.saturating_sub(at) < anim::HIGHLIGHT_SETTLE_MS);
 
     let id = menu.active;
-    let content_rows = entries(id).len() as u16;
-    // Width and height each clamp independently via the unified overlay
-    // rule's per-dimension helper (responsive-layout "Unified overlay
-    // geometry"); rows available is the terminal height minus the bar's
-    // own row.
-    let avail_h = area.height.saturating_sub(1);
-    let box_w = clamp_overlay_dim(pulldown_inner_width(id) as u16 + 2, MIN_INNER_W + 2, area.width);
-    let box_h = clamp_overlay_dim(content_rows + 2, MIN_BOX_H, avail_h);
-    let inner_w = box_w.saturating_sub(2) as usize;
-    // Frame top + frame bottom take two of the rows we have; if there
-    // isn't room for even an empty framed box, draw nothing rather than a
-    // single overlapping border row.
-    if box_h < 2 {
-        return;
-    }
-    let visible = box_h.saturating_sub(2) as usize;
-
-    let title_x = title_positions().iter().find(|(m, _)| *m == id).map(|(_, x)| *x).unwrap_or(LEAD);
-    // Hang the box under its title, shifted one column left so the title
-    // sits over the box's interior rather than its frame — and shifted
-    // further left just enough to stay on screen, rather than centering
-    // (responsive-layout "Unified overlay geometry": "Pull-down box shifts
-    // left instead of centering").
-    let mut x = area.x + title_x.saturating_sub(1);
-    let right_edge = area.x + area.width;
-    if x + box_w > right_edge {
-        x = right_edge.saturating_sub(box_w);
-    }
-    let y = area.y + 1;
-
-    let rows = item_rows(id, inner_w);
+    let inner_w = l.rect.width.saturating_sub(2) as usize;
+    let (x, y) = (l.rect.x, l.rect.y);
+    let visible = l.lines.len();
 
     buf.set_string(x, y, format!("\u{250C}{}\u{2510}", "\u{2500}".repeat(inner_w)), body_style);
-    for (i, row) in rows.iter().take(visible).enumerate() {
+    for (i, (entry, text)) in entries(id).iter().zip(&l.lines).enumerate() {
         let ry = y + 1 + i as u16;
-        match row {
-            None => {
+        match entry {
+            MenuEntry::Separator => {
                 buf.set_string(x, ry, format!("\u{251C}{}\u{2524}", "\u{2500}".repeat(inner_w)), body_style);
             }
-            Some(text) => {
+            MenuEntry::Item(item) => {
                 buf.set_string(x, ry, "\u{2502}", body_style);
-                let enabled = matches!(entries(id).get(i), Some(MenuEntry::Item(item)) if item.is_enabled());
-                let style = if i == menu.selected && enabled {
-                    highlight_style
-                } else if enabled {
-                    body_style
-                } else {
-                    disabled_style
-                };
+                let style = role_style(theme, item_role(i == menu.selected, item.is_enabled(), settling), depth);
                 buf.set_string(x + 1, ry, text, style);
                 buf.set_string(x + 1 + inner_w as u16, ry, "\u{2502}", body_style);
             }
@@ -179,64 +261,19 @@ fn render_pulldown(buf: &mut Buffer, area: Rect, theme: &Theme, depth: ColorDept
     buf.set_string(x, y + 1 + visible as u16, format!("\u{2514}{}\u{2518}", "\u{2500}".repeat(inner_w)), body_style);
 }
 
-/// The clickable menu-title rects `render_menu_bar` currently draws across
-/// the top row of `area` (mouse-input "Key bar, menu bar, pull-down items,
-/// and dialog buttons are clickable"). Mirrors `title_positions`' exact
-/// placement, same as the renderer itself does.
+/// The clickable menu-title rects `render_menu_bar` draws across the top row
+/// of `area` (mouse-input "Key bar, menu bar, pull-down items, and dialog
+/// buttons are clickable") — [`layout`]'s titles.
 pub fn hit_titles(area: Rect) -> Vec<(Rect, MenuId)> {
-    if area.height == 0 || area.width == 0 {
-        return vec![];
-    }
-    let mut out = Vec::with_capacity(ALL_MENUS.len());
-    for (id, x) in title_positions() {
-        let x = area.x + x;
-        if x >= area.x + area.width {
-            break;
-        }
-        let w = (id.title().chars().count() as u16).min(area.x + area.width - x);
-        out.push((Rect { x, y: area.y, width: w, height: 1 }, id));
-    }
-    out
+    layout(area, &MenuState::opened()).titles
 }
 
-/// The open pull-down's clickable item rects at `area` (the same full-
-/// screen `area` `render_menu_bar`/`render_pulldown` are given), indexed by
-/// position in `menu::entries(menu.active)` so the index matches exactly
-/// what `MenuState::selected` would land on — separators simply have no
-/// entry here. Mirrors `render_pulldown`'s box-geometry math (`box_w`,
-/// `box_h`, `x`, `y`, `visible`) so an item rect can never land somewhere
-/// the box isn't actually drawn. Empty when the pull-down is closed.
+/// The open pull-down's clickable item rects at `area`, indexed by position
+/// in `menu::entries(menu.active)` so the index matches exactly what
+/// `MenuState::selected` would land on — separators simply have no entry
+/// here. [`layout`]'s pull-down rows; empty when the pull-down is closed.
 pub fn hit_items(area: Rect, menu: &MenuState) -> Vec<(Rect, usize)> {
-    if !menu.pulldown_open {
-        return vec![];
-    }
-    let id = menu.active;
-    let content_rows = entries(id).len() as u16;
-    let avail_h = area.height.saturating_sub(1);
-    let box_w = clamp_overlay_dim(pulldown_inner_width(id) as u16 + 2, MIN_INNER_W + 2, area.width);
-    let box_h = clamp_overlay_dim(content_rows + 2, MIN_BOX_H, avail_h);
-    if box_h < 2 {
-        return vec![];
-    }
-    let inner_w = box_w.saturating_sub(2);
-    let visible = box_h.saturating_sub(2) as usize;
-
-    let title_x = title_positions().iter().find(|(m, _)| *m == id).map(|(_, x)| *x).unwrap_or(LEAD);
-    let mut x = area.x + title_x.saturating_sub(1);
-    let right_edge = area.x + area.width;
-    if x + box_w > right_edge {
-        x = right_edge.saturating_sub(box_w);
-    }
-    let y = area.y + 1;
-
-    let mut out = Vec::new();
-    for (i, entry) in entries(id).iter().take(visible).enumerate() {
-        if matches!(entry, MenuEntry::Item(_)) {
-            let ry = y + 1 + i as u16;
-            out.push((Rect { x: x + 1, y: ry, width: inner_w, height: 1 }, i));
-        }
-    }
-    out
+    layout(area, menu).pulldown.map(|p| p.rows).unwrap_or_default()
 }
 
 fn clip(s: &str, max_w: usize) -> String {
@@ -260,7 +297,7 @@ mod tests {
     fn render(menu: &MenuState, width: u16, height: u16) -> Vec<String> {
         let area = Rect { x: 0, y: 0, width, height };
         let mut buf = Buffer::empty(area);
-        render_menu_bar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, menu);
+        render_menu_bar(&mut buf, area, &Theme::classic(), ColorDepth::Ansi16, menu, None);
         (0..height).map(|y| (0..width).map(|x| buf[(x, y)].symbol()).collect()).collect()
     }
 
@@ -309,21 +346,32 @@ mod tests {
     #[test]
     fn separator_rows_are_drawn_with_the_horizontal_rule_glyph() {
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 24);
-        // FILES_MENU puts a separator after "Attributes" (row index 7).
-        assert!(
-            rows.iter().any(|r| r.contains('\u{251C}') && r.contains('\u{2524}')),
-            "expected a `├──┤` separator row in:\n{}",
-            rows.join("\n")
-        );
+        // FILES_MENU puts a separator after "Delete" (and two more below).
+        assert!(rows.iter().any(|r| r.contains('\u{251C}') && r.contains('\u{2524}')), "expected a `├──┤` separator row in:\n{}", rows.join("\n"));
     }
 
     #[test]
     fn every_item_and_shortcut_is_listed() {
         let rows = render(&MenuState::for_menu(MenuId::Files), 80, 24).join("\n");
-        for label in ["View", "Edit", "Copy", "Rename/Move", "Make directory", "Delete", "Attributes", "Quit"] {
+        for label in ["View", "Edit", "Copy", "Rename/Move", "Make directory", "Delete", "Select group", "Quit"] {
             assert!(rows.contains(label), "`{label}` missing from the Files pull-down");
         }
         assert!(rows.contains("F5"), "shortcut hints are rendered");
+    }
+
+    /// pulldown-menus "Pull-down visuals with separators and disabled items":
+    /// the disabled rule stays available for future items, but no shipped
+    /// item uses it — pin it against the style-rule function with a local
+    /// fixture rather than a shipped row (pulldown-menu-completion design
+    /// D5).
+    #[test]
+    fn a_disabled_row_uses_the_disabled_role_and_never_the_highlight() {
+        assert_eq!(item_role(false, false, false), Role::MenuDisabled, "disabled rows render greyed");
+        assert_eq!(item_role(true, false, false), Role::MenuDisabled, "a disabled row is unselectable, so it never highlights");
+        assert_eq!(item_role(true, false, true), Role::MenuDisabled);
+        assert_eq!(item_role(false, true, false), Role::MenuBody);
+        assert_eq!(item_role(true, true, false), Role::MenuHighlight);
+        assert_eq!(item_role(true, true, true), Role::MenuHotkey, "a just-moved highlight flashes the hotkey accent");
     }
 
     #[test]
@@ -382,7 +430,7 @@ mod tests {
     #[test]
     fn pulldown_width_fits_the_widest_item() {
         let inner = pulldown_inner_width(MenuId::Commands);
-        let widest = display_width("Compare directories") + ITEM_PAD * 2;
-        assert!(inner >= widest, "inner width {inner} cannot fit `Compare directories` ({widest})");
+        let widest = display_width("Menu file edit") + ITEM_PAD * 2;
+        assert!(inner >= widest, "inner width {inner} cannot fit `Menu file edit` ({widest})");
     }
 }

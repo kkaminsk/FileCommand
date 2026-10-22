@@ -5,10 +5,12 @@
 //! ([`update::update`]) plus the panel, listing, theme, config, clock, and
 //! identity data types that model drives.
 
+pub mod anim;
 pub mod clock;
 pub mod config;
 pub mod dialogs;
 pub mod drives;
+pub mod durable;
 pub mod editor;
 pub mod external_editor;
 pub mod find_file;
@@ -17,14 +19,18 @@ pub mod fuzzy;
 pub mod git_info;
 pub mod identity;
 pub mod info;
+pub mod line_edit;
 pub mod listing;
 pub mod menu;
 pub mod panel;
 pub mod panel_split;
 pub mod quicksearch;
 pub mod shell;
+mod stamps;
 pub mod theme;
 pub mod update;
 pub mod viewer;
 
-pub use update::{update, ButtonId, ClickMods, Command, DragState, DropTarget, Effect, PanelSide, State, UiPhase};
+pub use update::{
+    input_layer, update, ButtonId, ClickMods, Command, DragState, DropTarget, Effect, InputLayer, Overlay, PanelSide, ProbeKind, State, UiPhase,
+};

@@ -56,7 +56,7 @@ fn windows_clipboard_round_trips_a_real_file_list() {
     let long_path_item = PathBuf::from(format!(r"\\?\{}", real_file.display()));
     let unc_item = PathBuf::from(r"\\?\UNC\srv\share\dir\file.txt");
 
-    let raw_items = vec![real_file.clone(), long_path_item, unc_item];
+    let raw_items = [real_file.clone(), long_path_item, unc_item];
     let normalized: Vec<PathBuf> = raw_items.iter().map(|p| clipboard::normalize_path(p)).collect();
 
     assert_eq!(normalized[0], real_file, "a plain absolute path is left unchanged");
@@ -64,7 +64,7 @@ fn windows_clipboard_round_trips_a_real_file_list() {
     assert_eq!(normalized[2], PathBuf::from(r"\\srv\share\dir\file.txt"), "`\\\\?\\UNC\\server\\share` must be rewritten to `\\\\server\\share`");
     assert!(!normalized.iter().any(|p| p.display().to_string().contains(r"\\?\")), "no normalized item may still carry the verbatim-path prefix");
 
-    let clip = PlatformClipboard::default();
+    let clip = PlatformClipboard;
     let fell_back_to_paths = clip.set_files(&normalized).expect("set_files should succeed against a free clipboard");
     assert!(!fell_back_to_paths, "on Windows, Files must write real file objects, not fall back to text");
 

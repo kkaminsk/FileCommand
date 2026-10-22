@@ -2,10 +2,14 @@
 name = "filecommand-tui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "FileCommand terminal UI binary: event loop, rendering, terminal ownership"
 default-run = "filecommand"
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "filecommand"
@@ -21,11 +25,24 @@ unicode-width = { workspace = true }
 # Windows clipboard: CF_HDROP file objects + "Preferred DropEffect" for the
 # clipboard-export Files action (design D3).
 clipboard-win = "5.4"
+# Shared workspace binding (ci-and-build-tooling design D6). Used here for:
+# ShellExecuteW with the `open` verb (open-with-associated-app design D1);
+# the console control handler that keeps Ctrl+C during a suspended child run
+# from ending FileCommand (process-lifecycle-hardening design D1); the
+# CoInitializeEx/CoUninitialize bracket around ShellExecuteW on its worker
+# thread (offload-blocking-io design D7); and GetLocalTime for the clock.
+windows-sys = { workspace = true }
 
 [target.'cfg(not(windows))'.dependencies]
 # Non-Windows fallback: text-only clipboard (Paths/Names; Files falls back
 # to Paths text) (design D5).
 arboard = "3.6"
+
+[target.'cfg(unix)'.dependencies]
+# SIGINT/SIGQUIT ignored in the parent while a suspended child runs
+# (process-lifecycle-hardening design D2). Already in the lock graph via
+# crossterm, mio, and signal-hook, so no new crate is built.
+libc = "0.2"
 
 [dev-dependencies]
 insta = { workspace = true }

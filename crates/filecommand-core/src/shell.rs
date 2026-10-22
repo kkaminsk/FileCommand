@@ -124,10 +124,7 @@ pub fn split_spec(spec: &str) -> Vec<String> {
 /// The conventional "run this command string" flag(s) for a shell program,
 /// used when `shell =` names a program without giving its own arguments.
 fn conventional_args(program: &str) -> Vec<String> {
-    let stem = Path::new(program)
-        .file_stem()
-        .map(|s| s.to_string_lossy().to_lowercase())
-        .unwrap_or_else(|| program.to_lowercase());
+    let stem = Path::new(program).file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_else(|| program.to_lowercase());
     match stem.as_str() {
         "cmd" => vec!["/C".to_string()],
         // `-NoLogo` keeps the banner out of the suspended terminal; the
@@ -155,7 +152,7 @@ pub fn resolve_shell(configured: Option<&str>) -> ShellSpec {
 
 /// Build the full invocation for `user_text`, run from `cwd` (the active
 /// panel's directory). Both the program path and `cwd` are routed through
-/// [`spawn_safe_path`] so a shell configured with a long quoted program path,
+/// `spawn_safe_path` so a shell configured with a long quoted program path,
 /// or a panel directory near/over `MAX_PATH`, still spawns correctly.
 pub fn build_command(configured: Option<&str>, user_text: &str, cwd: &Path) -> Invocation {
     let spec = resolve_shell(configured);
@@ -174,15 +171,11 @@ pub fn is_executable_name(name: &str, pathext: &str) -> bool {
     if lower.ends_with(".lnk") {
         return true;
     }
-    pathext
-        .split(';')
-        .map(str::trim)
-        .filter(|ext| !ext.is_empty())
-        .any(|ext| {
-            let ext = ext.to_lowercase();
-            let ext = if ext.starts_with('.') { ext } else { format!(".{ext}") };
-            lower.ends_with(&ext)
-        })
+    pathext.split(';').map(str::trim).filter(|ext| !ext.is_empty()).any(|ext| {
+        let ext = ext.to_lowercase();
+        let ext = if ext.starts_with('.') { ext } else { format!(".{ext}") };
+        lower.ends_with(&ext)
+    })
 }
 
 /// Whether the entry under the cursor is an executable target, using the

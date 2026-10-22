@@ -1,9 +1,11 @@
 //! Verifies that a panic occurring while the terminal guard is "active"
 //! triggers terminal restoration *before* the previously installed panic
 //! hook runs, and that the previous hook is still invoked (chaining) —
-//! plus (mouse-basics task 1.3) that `TerminalGuard::suspend`/`resume`
-//! order mouse capture correctly around the alternate screen: capture
-//! disabled before `LeaveAlternateScreen` on suspend, re-enabled on resume.
+//! plus (mouse-basics task 1.3; idle-aware-event-loop task 3.1) that
+//! `TerminalGuard::suspend`/`resume` order mouse capture and bracketed
+//! paste correctly around the alternate screen: both disabled before
+//! `LeaveAlternateScreen` on suspend, re-enabled after the re-entry on
+//! resume.
 //!
 //! Real raw-mode/alternate-screen/mouse-capture syscalls aren't observable
 //! portably inside a captured test harness (no guaranteed real console), so
@@ -73,6 +75,10 @@ fn panic_restores_terminal_before_previous_hook_runs() {
 /// otherwise a child shell run from the command line (or an external
 /// editor, or Ctrl+O's scrollback view) would inherit mouse tracking, and
 /// on Windows capture leaves conhost's QuickEdit disabled the whole time.
+/// Bracketed paste is likewise released before the leave, right after raw
+/// mode goes off, so the child gets a terminal without it
+/// (idle-aware-event-loop design D6; text-field-editing "Child programs get
+/// a terminal without bracketed paste").
 #[test]
 fn suspend_disables_mouse_capture_before_leaving_the_alternate_screen() {
     // A `Mutex` (rather than a bare `&mut Vec`) so all three step closures
@@ -87,6 +93,10 @@ fn suspend_disables_mouse_capture_before_leaving_the_alternate_screen() {
             Ok(())
         },
         || {
+            order.lock().unwrap().push("bracketed_paste_off");
+            Ok(())
+        },
+        || {
             order.lock().unwrap().push("mouse_capture_off");
             Ok(())
         },
@@ -96,13 +106,14 @@ fn suspend_disables_mouse_capture_before_leaving_the_alternate_screen() {
         },
     )
     .expect("suspend_with must succeed when every step succeeds");
-    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_off", "mouse_capture_off", "leave_alternate_screen"]);
+    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_off", "bracketed_paste_off", "mouse_capture_off", "leave_alternate_screen"]);
 }
 
 /// When mouse capture was never configured on, `suspend` must not touch it
 /// at all — `[mouse] enabled = false` / `--nomouse` means "behave exactly
 /// as before this capability existed" (mouse-input "Mouse capture
-/// configuration").
+/// configuration"). Bracketed paste is still released: it follows the
+/// terminal, not the mouse flag.
 #[test]
 fn suspend_skips_the_mouse_capture_step_when_mouse_is_disabled() {
     // A `Mutex` (rather than a bare `&mut Vec`) so all three step closures
@@ -117,6 +128,10 @@ fn suspend_skips_the_mouse_capture_step_when_mouse_is_disabled() {
             Ok(())
         },
         || {
+            order.lock().unwrap().push("bracketed_paste_off");
+            Ok(())
+        },
+        || {
             order.lock().unwrap().push("mouse_capture_off");
             Ok(())
         },
@@ -126,12 +141,17 @@ fn suspend_skips_the_mouse_capture_step_when_mouse_is_disabled() {
         },
     )
     .expect("suspend_with must succeed when every step succeeds");
-    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_off", "leave_alternate_screen"], "mouse capture was never enabled, so nothing disables it");
+    assert_eq!(
+        *order.lock().unwrap(),
+        vec!["raw_mode_off", "bracketed_paste_off", "leave_alternate_screen"],
+        "mouse capture was never enabled, so nothing disables it"
+    );
 }
 
 /// `resume` re-enables mouse capture once the alternate screen has been
 /// re-entered — the mirror image of `suspend` releasing it beforehand, so
-/// capture is active only while the TUI actually owns the screen.
+/// capture is active only while the TUI actually owns the screen. Bracketed
+/// paste comes back beside it (idle-aware-event-loop design D6).
 #[test]
 fn resume_re_enables_mouse_capture_after_entering_the_alternate_screen() {
     // A `Mutex` (rather than a bare `&mut Vec`) so all three step closures
@@ -150,16 +170,20 @@ fn resume_re_enables_mouse_capture_after_entering_the_alternate_screen() {
             Ok(())
         },
         || {
+            order.lock().unwrap().push("bracketed_paste_on");
+            Ok(())
+        },
+        || {
             order.lock().unwrap().push("mouse_capture_on");
             Ok(())
         },
     )
     .expect("resume_with must succeed when every step succeeds");
-    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_on", "enter_alternate_screen", "mouse_capture_on"]);
+    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_on", "enter_alternate_screen", "bracketed_paste_on", "mouse_capture_on"]);
 }
 
 /// The disabled-mouse counterpart of the resume test above: no capture step
-/// runs at all.
+/// runs at all; bracketed paste still re-enables.
 #[test]
 fn resume_skips_the_mouse_capture_step_when_mouse_is_disabled() {
     // A `Mutex` (rather than a bare `&mut Vec`) so all three step closures
@@ -178,10 +202,14 @@ fn resume_skips_the_mouse_capture_step_when_mouse_is_disabled() {
             Ok(())
         },
         || {
+            order.lock().unwrap().push("bracketed_paste_on");
+            Ok(())
+        },
+        || {
             order.lock().unwrap().push("mouse_capture_on");
             Ok(())
         },
     )
     .expect("resume_with must succeed when every step succeeds");
-    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_on", "enter_alternate_screen"]);
+    assert_eq!(*order.lock().unwrap(), vec!["raw_mode_on", "enter_alternate_screen", "bracketed_paste_on"]);
 }

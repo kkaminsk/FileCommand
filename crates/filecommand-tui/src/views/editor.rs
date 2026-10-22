@@ -63,6 +63,32 @@ pub fn render_editor(buf: &mut Buffer, area: Rect, editor: &EditorState, theme: 
         buf.set_string(area.x, y, pad_to_width(&clipped, w), style);
     }
 
+    // The last body row, directly above the F-key bar, carries a one-row
+    // notice while there is something to say about the save: `Saving…`
+    // while a save is in flight on the worker thread (application-shell
+    // "Saving to a slow share shows progress and accepts no edits";
+    // offload-blocking-io design D6), otherwise the most recent failure,
+    // until the next edit or successful save (builtin-editor "A failed save
+    // leaves the original intact"; editor-encoding-safety design D6). The
+    // two share the row: a retry in flight covers the earlier failure
+    // message, and its reply then clears or replaces it. The header and the
+    // F-key bar are untouched, the same way the save-on-exit confirm
+    // overlays the body.
+    let notice = if editor.save_pending {
+        Some(("Saving…".to_string(), role_style(theme, Role::ViewerHeader, depth)))
+    } else {
+        editor.save_error.as_ref().map(|message| (format!("Save failed: {message}"), role_style(theme, Role::DialogError, depth)))
+    };
+    let save_error_row = match (notice, body_h) {
+        (Some((text, style)), h) if h > 0 => {
+            let y = body_y + h - 1;
+            let text = clip_from(&text, 0, w);
+            buf.set_string(area.x, y, pad_to_width(&text, w), style);
+            Some(y)
+        }
+        _ => None,
+    };
+
     let keybar_area = Rect { x: area.x, y: area.y + area.height - 1, width: area.width, height: 1 };
     render_editor_keybar(buf, keybar_area, theme, depth);
 
@@ -73,6 +99,10 @@ pub fn render_editor(buf: &mut Buffer, area: Rect, editor: &EditorState, theme: 
 
     let cursor_row = editor.caret.line.checked_sub(editor.top_line)?;
     if cursor_row as u16 >= body_h {
+        return None;
+    }
+    if save_error_row == Some(body_y + cursor_row as u16) {
+        // The caret's row is hidden behind the save-failure overlay.
         return None;
     }
     let cursor_col = editor.caret.col.checked_sub(editor.left_col)?;
@@ -147,13 +177,16 @@ mod tests {
     use std::path::PathBuf;
 
     fn editor_from(path: &str, text: &str) -> EditorState {
-        EditorState::from_bytes(PathBuf::from(path), text.as_bytes())
+        EditorState::from_bytes(PathBuf::from(path), text.as_bytes()).expect("test fixture is valid UTF-8")
     }
 
     fn render(editor: &EditorState, area: Rect) -> (String, Option<(u16, u16)>) {
         let mut buf = Buffer::empty(area);
         let cursor = render_editor(&mut buf, area, editor, &Theme::classic(), ColorDepth::Ansi16);
-        let text = (0..area.height).map(|y| (0..area.width).map(|x| buf[(area.x + x, area.y + y)].symbol()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        let text = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(area.x + x, area.y + y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
         (text, cursor)
     }
 
@@ -264,6 +297,71 @@ mod tests {
         let (text, cursor) = render(&e, area);
         assert_eq!(cursor, None);
         assert!(text.contains("Save changes to notes.txt?"), "{text}");
+    }
+
+    #[test]
+    fn a_save_failure_overlays_the_last_body_row_and_leaves_the_chrome_alone() {
+        let mut e = editor_from("C:\\notes.txt", "abc\n");
+        e.type_char('!');
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let (clean, _) = render(&e, area);
+        e.save_error = Some("Cannot save notes.txt: notes.txt is read-only — not saved".to_string());
+        let (text, cursor) = render(&e, area);
+        let clean_rows: Vec<&str> = clean.lines().collect();
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[0], clean_rows[0], "the header is unchanged");
+        assert_eq!(rows[23], clean_rows[23], "the F-key bar is unchanged");
+        assert!(rows[22].starts_with("Save failed: Cannot save notes.txt: notes.txt is read-only — not saved"), "`{}`", rows[22]);
+        assert_eq!(rows[1], clean_rows[1], "the text body above the overlay is unchanged");
+        assert_eq!(cursor, Some((1, 1)), "the caret is still shown when it is not on the overlay row");
+
+        let mut buf = Buffer::empty(area);
+        render_editor(&mut buf, area, &e, &Theme::classic(), ColorDepth::Ansi16);
+        let error_style = role_style(&Theme::classic(), Role::DialogError, ColorDepth::Ansi16);
+        assert_eq!(Some(buf[(0, 22)].bg), error_style.bg, "the overlay uses the dialog.error role");
+    }
+
+    /// application-shell "Saving to a slow share shows progress and accepts
+    /// no edits" (offload-blocking-io design D6): while a save is in flight
+    /// the last body row reads `Saving…`, covering an earlier failure
+    /// message, and the header and F-key bar are exactly as without it.
+    #[test]
+    fn a_pending_save_shows_saving_on_the_last_body_row_and_leaves_the_chrome_alone() {
+        let mut e = editor_from("C:\\notes.txt", "abc\n");
+        e.type_char('!');
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let (clean, _) = render(&e, area);
+        e.save_error = Some("Cannot save notes.txt: disk full".to_string());
+        e.save_pending = true;
+        let (text, cursor) = render(&e, area);
+        let clean_rows: Vec<&str> = clean.lines().collect();
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[0], clean_rows[0], "the header is unchanged");
+        assert_eq!(rows[23], clean_rows[23], "the F-key bar is unchanged");
+        assert!(rows[22].starts_with("Saving…"), "`{}`", rows[22]);
+        assert!(!text.contains("Save failed"), "the in-flight retry covers the earlier failure message");
+        assert_eq!(rows[1], clean_rows[1], "the text body above the notice is unchanged");
+        assert_eq!(cursor, Some((1, 1)), "the caret is still shown when it is not on the notice row");
+
+        // The reply lifts the notice: a failure shows its message again, a
+        // success shows nothing.
+        e.save_pending = false;
+        let (text, _) = render(&e, area);
+        assert!(text.lines().nth(22).unwrap().starts_with("Save failed: Cannot save notes.txt: disk full"));
+        e.save_error = None;
+        let (text, _) = render(&e, area);
+        assert_eq!(text, clean);
+    }
+
+    #[test]
+    fn a_long_save_failure_message_is_truncated_to_the_width() {
+        let mut e = editor_from("f.txt", "abc\n");
+        e.save_error = Some("x".repeat(200));
+        let area = Rect { x: 0, y: 0, width: 40, height: 6 };
+        let (text, _) = render(&e, area);
+        let overlay = text.lines().nth(4).unwrap();
+        assert_eq!(display_width(overlay), 40);
+        assert!(overlay.starts_with("Save failed: xxx"), "`{overlay}`");
     }
 
     #[test]

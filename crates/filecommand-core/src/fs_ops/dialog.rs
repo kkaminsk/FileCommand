@@ -4,6 +4,7 @@
 use super::conflict::ConflictInfo;
 use super::error::{ErrorInfo, SkippedItem};
 use super::job::{JobKind, ProgressInfo, SourceItem};
+use crate::line_edit::LineEdit;
 use std::ffi::OsString;
 use std::path::PathBuf;
 
@@ -15,12 +16,24 @@ pub enum FileOpSetup {
     /// Text-input dialog. For Copy/Move, `input` is the destination path
     /// (pre-filled with the opposite panel's cwd, or — for a drop-initiated
     /// dialog — the exact drop path); for Mkdir, `input` is the new
-    /// directory's name. `buttons` is `None` for the plain keyboard-
+    /// directory's name. The field is a shared text field per
+    /// text-field-editing (a pre-filled `input` opens with the caret at its
+    /// end). `buttons` is `None` for the plain keyboard-
     /// initiated F5/F6/Mkdir dialog (no button row, Enter/Esc only, unchanged
     /// from before `mouse-panel-drag`) and `Some` for a drop-initiated dialog,
     /// which adds a `[ Copy ] [ Move ] [ Cancel ]` row (operation-dialogs
-    /// "Drop-initiated destination dialog").
-    DestinationInput { kind: JobKind, sources: Vec<SourceItem>, source_dir: PathBuf, input: String, buttons: Option<DropButtons> },
+    /// "Drop-initiated destination dialog"). `hidden_by_filter` is the same
+    /// disclosure count as `DeleteConfirm`'s, rendered on the blank row
+    /// below the field (selection "Operations disclose selected entries
+    /// hidden by the quick filter"); 0 for Mkdir.
+    DestinationInput {
+        kind: JobKind,
+        sources: Vec<SourceItem>,
+        source_dir: PathBuf,
+        input: LineEdit,
+        buttons: Option<DropButtons>,
+        hidden_by_filter: usize,
+    },
     DeleteConfirm {
         sources: Vec<SourceItem>,
         source_dir: PathBuf,
@@ -30,13 +43,20 @@ pub enum FileOpSetup {
         /// The first confirmation has already been given; a second Enter/Y
         /// now runs the job.
         confirmed_once: bool,
+        /// How many of `sources` are selected entries of the source panel
+        /// that its active quick filter hides (0 when there is no filter or
+        /// nothing hidden) — computed once when the dialog opens and shown
+        /// as its own row between the question and the buttons (selection
+        /// "Operations disclose selected entries hidden by the quick
+        /// filter"; filter-selection-safety design D2/D3).
+        hidden_by_filter: usize,
     },
     /// The file-action menu's in-place Rename: a text-input dialog
     /// pre-filled with `original_name`, renaming within `source_dir`
     /// (file-action-menu "In-place Rename"). Reuses the same
-    /// `Command::FileOpInputChar`/`FileOpInputBackspace`/`FileOpConfirm`/
-    /// `FileOpCancel` commands `DestinationInput` uses.
-    RenameInput { source_dir: PathBuf, original_name: OsString, is_dir: bool, input: String },
+    /// `Command::TextEdit`/`FileOpConfirm`/`FileOpCancel` commands
+    /// `DestinationInput` uses.
+    RenameInput { source_dir: PathBuf, original_name: OsString, is_dir: bool, input: LineEdit },
 }
 
 /// The drop-initiated destination dialog's button row (operation-dialogs
@@ -52,12 +72,42 @@ pub struct DropButtons {
     pub focused: JobKind,
 }
 
+/// The hidden-selection disclosure line the delete confirmation and the
+/// copy/move destination dialog both show when some of the operation's
+/// sources are selected entries the source panel's quick filter hides
+/// (selection "Operations disclose selected entries hidden by the quick
+/// filter"; filter-selection-safety design D3). `None` when there is
+/// nothing to disclose — the dialogs are then unchanged.
+pub fn hidden_by_filter_disclosure(hidden_by_filter: usize, source_count: usize) -> Option<String> {
+    if hidden_by_filter == 0 {
+        None
+    } else if source_count == 1 {
+        Some("Selected item is hidden by filter".to_string())
+    } else {
+        Some(format!("{hidden_by_filter} of {source_count} selected hidden by filter"))
+    }
+}
+
 /// Dialogs shown while a `Job` is in flight on the worker thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunningDialog {
-    Progress { kind: JobKind, progress: ProgressInfo },
-    Conflict { kind: JobKind, info: ConflictInfo, progress: ProgressInfo, rename_input: Option<String> },
-    Error { kind: JobKind, info: ErrorInfo, progress: ProgressInfo },
+    Progress {
+        kind: JobKind,
+        progress: ProgressInfo,
+    },
+    /// `rename_input` is a shared text field per text-field-editing (`Some`
+    /// once the user picked Rename, starting empty).
+    Conflict {
+        kind: JobKind,
+        info: ConflictInfo,
+        progress: ProgressInfo,
+        rename_input: Option<LineEdit>,
+    },
+    Error {
+        kind: JobKind,
+        info: ErrorInfo,
+        progress: ProgressInfo,
+    },
 }
 
 impl RunningDialog {

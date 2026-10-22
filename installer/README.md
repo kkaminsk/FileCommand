@@ -19,6 +19,10 @@ winget manifest template and Chocolatey package used to distribute it.
 - `License.rtf` — license text shown by the bootstrapper UI (FileCommand
   is dual-licensed MIT / Apache-2.0; see `LICENSE-MIT` / `LICENSE-APACHE`
   at the repo root).
+- `theme/` — the bundle's custom WixStdBA theme: a copy of the built-in
+  `rtfLicense` theme (`RtfTheme.xml` / `RtfTheme.wxl`) extended with a
+  scope-coexistence warning on the install page (see
+  [Scope semantics](#scope-semantics) below).
 - `build.ps1` — builds the release binary and both WiX artifacts.
 - `winget/` — the winget package manifest template.
 
@@ -36,12 +40,23 @@ Burn scope switch, and versioning).
   ```powershell
   dotnet tool install --global wix
   wix extension add WixToolset.BootstrapperApplications.wixext/5.0.2
+  wix extension add WixToolset.Util.wixext/5.0.2
   ```
 
-  Pin the extension to `5.0.2` explicitly — `wix extension add` without a
+  Pin the extensions to `5.0.2` explicitly — `wix extension add` without a
   version resolves the latest release (currently 7.0.0), which is not
   compatible with the WiX v5 CLI and fails the bundle build with
-  `WIX0144: The extension ... could not be found`.
+  `WIX0144: The extension ... could not be found`. The bundle build uses
+  both extensions: BootstrapperApplications for the WixStdBA UI, and Util
+  for the `util:ProductSearch` searches that detect the other install
+  scope (see [Scope semantics](#scope-semantics)).
+
+  The custom theme under `theme/` is copied from the built-in `rtfLicense`
+  theme embedded in `WixToolset.BootstrapperApplications.wixext` **5.0.2**.
+  If either extension pin is bumped, re-derive `theme/RtfTheme.xml` and
+  `theme/RtfTheme.wxl` from the new extension version and re-apply the
+  warning-label addition (each file's header comment describes the
+  change), then re-test the bundle UI.
 
 `build.ps1` checks for `dotnet`, `wix`, and `cargo` on `PATH` up front and
 fails fast with an install hint if any are missing.
@@ -84,6 +99,14 @@ Per-user is the default for both the interactive bootstrapper UI and
 silent installs — the first-run experience never prompts for credentials
 unless per-machine is explicitly requested.
 
+The installer itself ships no configuration files: at runtime FileCommand
+keeps its per-user settings (`config.toml`, `history.json`,
+`usermenu.toml`) under `%APPDATA%\FileCommand` by default, regardless of
+install scope. See
+[Uninstalling and removing settings](#uninstalling-and-removing-settings)
+for the full profile-directory resolution order and how to remove those
+files.
+
 ### Selecting scope
 
 - **Interactive**: `FileCommandSetup.exe` — installs per-user by default;
@@ -110,6 +133,25 @@ MSIs with different UpgradeCodes, so installing at the other scope will
 **coexist** with (not replace) the first install. To change scope:
 uninstall the existing install, then install fresh at the new scope.
 
+When both scopes are installed, both install directories are on `PATH`
+— and because Windows builds a process's `PATH` as the **machine** `PATH`
+followed by the **user** `PATH`, typing `filecommand` always starts the
+per-machine copy (`%ProgramFiles%\BigHatGroup\FileCommand`), whichever
+scope was installed last. A per-user install or upgrade made after a
+per-machine one is therefore shadowed: the user upgrades, and the old
+per-machine version keeps starting.
+
+The bundle detects this at install time: before planning, it checks by
+`UpgradeCode` whether the *other* scope's MSI is already installed, and
+on an interactive run the install page warns which copy will run. The
+warning never blocks — Install proceeds as usual. Quiet and passive runs
+(`/quiet`, `/passive`, winget, Chocolatey) are never prompted; the
+detection result is simply recorded in the Burn log (run with
+`/log <path>` to see it). Mixing package managers is the most common way
+to end up with both scopes: Chocolatey installs per-machine by default
+(see `chocolatey/`), while winget's default maps to a per-user install
+(see `winget/`).
+
 ### PATH refresh in open shells
 
 Windows Installer updates the registry PATH value and broadcasts
@@ -119,6 +161,66 @@ applications (Explorer, new shell instances) pick up automatically.
 `PATH`** — this is standard Windows behavior, not a bug in this
 installer. Open a new terminal window to get `filecommand` on `PATH`
 after installing.
+
+## Uninstalling and removing settings
+
+Uninstalling FileCommand — from **Apps & features**, or with
+`FileCommandSetup.exe /uninstall` (add `/quiet` for a silent uninstall) —
+removes the program files, the Start Menu shortcut, and the `PATH` entry
+the install added, but **keeps your settings**, so a later reinstall
+picks them up. The installer never deletes user data; to remove
+FileCommand completely, delete the settings directory by hand as
+described below.
+
+### Where settings live
+
+FileCommand resolves its profile directory once at startup, in this
+order:
+
+1. `--config-dir <path>` — whatever directory was passed on the command
+   line;
+2. a file named `portable` beside `filecommand.exe` — portable mode:
+   the settings live in the executable's own directory (the install
+   directory);
+3. otherwise `%APPDATA%\FileCommand` (the default on Windows).
+
+The default profile directory holds `config.toml`, `history.json`, and
+`usermenu.toml`. Because `%APPDATA%` is per-account, a **per-machine**
+install leaves one copy under `%APPDATA%\FileCommand` for **each Windows
+account that ran FileCommand** — uninstalling from one account cannot
+(and does not) touch the others.
+
+### Removing the default settings
+
+Run as each affected user:
+
+```powershell
+# PowerShell
+Remove-Item -Recurse -Force "$env:APPDATA\FileCommand"
+```
+
+```cmd
+:: cmd.exe
+rmdir /s /q "%APPDATA%\FileCommand"
+```
+
+### Portable mode
+
+If a `portable` file sits beside `filecommand.exe`, the settings files
+live in the install directory instead of `%APPDATA%`. Uninstall removes
+only what the installer put there, so it leaves the settings files, the
+`portable` marker, and therefore the folder itself. Delete the folder by
+hand:
+
+- per-user: `%LOCALAPPDATA%\Programs\BigHatGroup\FileCommand`
+- per-machine: `%ProgramFiles%\BigHatGroup\FileCommand` (requires
+  elevation)
+
+### `--config-dir`
+
+If FileCommand was launched with `--config-dir <path>`, the settings live
+wherever that pointed. The installer never touches that location; delete
+it by hand if you want it gone.
 
 ## Production signing
 

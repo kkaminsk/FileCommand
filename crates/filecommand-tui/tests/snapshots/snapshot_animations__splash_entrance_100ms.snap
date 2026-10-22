@@ -1,0 +1,19 @@
+---
+source: crates/filecommand-tui/tests/snapshot_animations.rs
+expression: "render_text(&at(&state, 100))"
+---
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                                                                                
+                ╔══════════════════════════════════════════════╗                
+                                                               ║                
+                                                               ║                
+                                                               ║                
+                                                               ║                
+                                                               ║                
+                                                               ║                
+                                                               ║

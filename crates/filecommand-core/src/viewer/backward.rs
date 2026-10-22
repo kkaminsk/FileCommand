@@ -113,6 +113,26 @@ mod tests {
         assert_eq!(900_000 - anchor, cap as u64);
     }
 
+    /// viewer-mapping-safety (design D3): a file that shrinks while it is
+    /// open reads short past its new end; the backward scan works on the
+    /// bytes that still exist, terminates, and returns an in-range anchor.
+    #[test]
+    fn truncation_while_open_terminates_the_backward_scan() {
+        let dir = std::env::temp_dir().join(format!("filecommand-viewer-backward-test-{}-truncated", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("file.bin");
+        let mut content = vec![b'x'; 10_000];
+        content[5000] = b'\n';
+        std::fs::write(&path, &content).unwrap();
+        let src = ByteSource::open(&path).unwrap();
+        // Truncate away the only newline: the scan from 8000 reads the
+        // 1000 bytes that still exist, finds no newline, and hard-splits
+        // at the cap boundary (clamped to 0) instead of panicking.
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(1000).unwrap();
+        assert_eq!(previous_line_start(&src, 8000, DEFAULT_MAX_LINE_LEN), 0);
+        assert_eq!(previous_line_start(&src, 10_000, DEFAULT_MAX_LINE_LEN), 0);
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;

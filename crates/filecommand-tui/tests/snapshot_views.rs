@@ -21,7 +21,7 @@ use filecommand_core::menu::{MenuId, MenuState};
 use filecommand_core::panel::{ClipboardFeedback, DisplayMode, ListingProgress, PanelState, SortDirection, TreeState};
 use filecommand_core::theme::{ColorDepth, Theme};
 use filecommand_core::viewer::{ByteSource, ViewMode, ViewerState};
-use filecommand_core::{DragState, DropTarget, PanelSide, State, UiPhase};
+use filecommand_core::{DragState, DropTarget, Overlay, PanelSide, State, UiPhase};
 
 use filecommand_tui::views;
 
@@ -49,9 +49,9 @@ fn fixed_date() -> DateTime {
 fn fixed_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: Some(fixed_date()) },
-        Entry { name: "Cargo.toml".into(), kind: EntryKind::File, size: 612, modified: Some(fixed_date()) },
-        Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+        Entry::new("docs", EntryKind::Directory, 0, Some(fixed_date()), false, false),
+        Entry::new("Cargo.toml", EntryKind::File, 612, Some(fixed_date()), false, false),
+        Entry::new("readme.txt", EntryKind::File, 12_345, Some(fixed_date()), false, false),
     ]
 }
 
@@ -72,12 +72,7 @@ fn streaming_panel(cwd: &str, count: usize) -> PanelState {
 }
 
 fn base_state(phase: UiPhase, theme: Theme) -> State {
-    State {
-        left: complete_panel(r"C:\Users\demo\left", 1),
-        right: complete_panel(r"C:\Users\demo\right", 0),
-        phase,
-        ..State::empty(theme)
-    }
+    State { left: complete_panel(r"C:\Users\demo\left", 1), right: complete_panel(r"C:\Users\demo\right", 0), phase, ..State::empty(theme) }
 }
 
 /// Render `state` at `width`x`height` through a real ratatui `TestBackend`
@@ -185,8 +180,9 @@ fn drop_dialog_state(focused: JobKind) -> State {
         kind: focused,
         sources: vec![SourceItem { original_name: "readme.txt".into(), path: PathBuf::from(r"C:\Users\demo\left\readme.txt"), is_dir: false }],
         source_dir: PathBuf::from(r"C:\Users\demo\left"),
-        input: r"C:\Users\demo\right".to_string(),
+        input: filecommand_core::line_edit::LineEdit::from(r"C:\Users\demo\right"),
         buttons: Some(DropButtons { focused }),
+        hidden_by_filter: 0,
     });
     state
 }
@@ -207,6 +203,233 @@ fn snapshot_drop_dialog_with_move_focused() {
     insta::assert_snapshot!("drop_dialog_move_focused", text);
 }
 
+// -----------------------------------------------------------------
+// filter-selection-safety: the hidden-selection disclosure on the delete
+// confirmation and destination dialogs (selection "Operations disclose
+// selected entries hidden by the quick filter"; tasks.md 2.4/2.5/4.6)
+// -----------------------------------------------------------------
+
+fn hidden_disclosure_sources(n: usize) -> Vec<SourceItem> {
+    (0..n)
+        .map(|i| SourceItem {
+            original_name: format!("f{i}.txt").into(),
+            path: PathBuf::from(format!(r"C:\Users\demo\left\f{i}.txt")),
+            is_dir: false,
+        })
+        .collect()
+}
+
+fn delete_confirm_state(sources: usize, hidden_by_filter: usize) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DeleteConfirm {
+        sources: hidden_disclosure_sources(sources),
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        needs_second_confirm: false,
+        confirmed_once: false,
+        hidden_by_filter,
+    });
+    state
+}
+
+#[test]
+fn snapshot_delete_confirm_discloses_hidden_selection() {
+    let text = render_to_text(80, 24, &delete_confirm_state(5, 2), ColorDepth::Ansi16);
+    assert!(text.contains("Delete 5 files? This cannot be undone."), "the question is untouched:\n{text}");
+    assert!(text.contains("2 of 5 selected hidden by filter"), "the disclosure row is shown:\n{text}");
+    insta::assert_snapshot!("delete_confirm_hidden_by_filter", text);
+}
+
+#[test]
+fn snapshot_delete_confirm_discloses_a_single_hidden_selection() {
+    let text = render_to_text(80, 24, &delete_confirm_state(1, 1), ColorDepth::Ansi16);
+    assert!(text.contains("Delete f0.txt? This cannot be undone."), "the single item is still named:\n{text}");
+    assert!(text.contains("Selected item is hidden by filter"), "singular wording:\n{text}");
+    insta::assert_snapshot!("delete_confirm_hidden_single", text);
+}
+
+#[test]
+fn snapshot_delete_confirm_without_hidden_selection_is_unchanged() {
+    let text = render_to_text(80, 24, &delete_confirm_state(5, 0), ColorDepth::Ansi16);
+    assert!(text.contains("Delete 5 files? This cannot be undone."));
+    assert!(!text.contains("hidden by filter"), "no disclosure without hidden selections:\n{text}");
+    insta::assert_snapshot!("delete_confirm_no_hidden", text);
+}
+
+fn destination_input_state(sources: usize, hidden_by_filter: usize) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+        kind: JobKind::Copy,
+        sources: hidden_disclosure_sources(sources),
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        input: filecommand_core::line_edit::LineEdit::from(r"C:\Users\demo\right"),
+        buttons: None,
+        hidden_by_filter,
+    });
+    state
+}
+
+#[test]
+fn snapshot_destination_input_discloses_hidden_selection() {
+    let text = render_to_text(80, 24, &destination_input_state(5, 2), ColorDepth::Ansi16);
+    assert!(text.contains("2 of 5 selected hidden by filter"), "the disclosure is shown:\n{text}");
+    assert!(!text.contains("[ Copy ]"), "no button row appears — the box is unchanged:\n{text}");
+    insta::assert_snapshot!("destination_input_hidden_by_filter", text);
+}
+
+#[test]
+fn snapshot_destination_input_discloses_a_single_hidden_selection() {
+    let text = render_to_text(80, 24, &destination_input_state(1, 1), ColorDepth::Ansi16);
+    assert!(text.contains("Selected item is hidden by filter"), "singular wording:\n{text}");
+    insta::assert_snapshot!("destination_input_hidden_single", text);
+}
+
+#[test]
+fn snapshot_destination_input_without_hidden_selection_is_unchanged() {
+    let text = render_to_text(80, 24, &destination_input_state(5, 0), ColorDepth::Ansi16);
+    assert!(!text.contains("hidden by filter"), "no disclosure without hidden selections:\n{text}");
+    insta::assert_snapshot!("destination_input_no_hidden", text);
+}
+
+// -----------------------------------------------------------------
+// error-diagnostics: the job dialogs name full paths, and the end-of-job
+// summary groups skipped items and warnings (tasks 4.3, 5.5).
+// -----------------------------------------------------------------
+
+/// filesystem-error-handling "Error messages name the affected path"
+/// scenario "The error-recovery dialog shows the full path": the failing
+/// item's path on one row, the OS message on the next.
+#[test]
+fn snapshot_error_dialog_shows_the_full_path_above_the_message() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpRunning {
+        source_dir: PathBuf::from(r"D:\data\reports"),
+        dest_dir: PathBuf::from(r"C:\Users\demo\right"),
+        dialog: filecommand_core::fs_ops::dialog::RunningDialog::Error {
+            kind: JobKind::Copy,
+            info: filecommand_core::fs_ops::ErrorInfo {
+                path: PathBuf::from(r"D:\data\reports\q3.xlsx"),
+                message: "Access is denied. (os error 5)".to_string(),
+            },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(3, 30_000),
+        },
+    };
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains(r"D:\data\reports\q3.xlsx"), "the path row is shown:\n{text}");
+    assert!(text.contains("Access is denied. (os error 5)"), "the message row follows it:\n{text}");
+    insta::assert_snapshot!("error_dialog_full_path_above_message", text);
+}
+
+// -----------------------------------------------------------------
+// process-lifecycle-hardening: the overwrite-conflict dialog's Cancel row
+// (operation-dialogs "Overwrite-conflict dialog"; design D7; task 4.6)
+// -----------------------------------------------------------------
+
+fn conflict_dialog_state(rename_input: Option<filecommand_core::line_edit::LineEdit>) -> State {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpRunning {
+        source_dir: PathBuf::from(r"D:\data\reports"),
+        dest_dir: PathBuf::from(r"C:\Users\demo\right"),
+        dialog: filecommand_core::fs_ops::dialog::RunningDialog::Conflict {
+            kind: JobKind::Copy,
+            info: filecommand_core::fs_ops::ConflictInfo {
+                source_name: "report.txt".into(),
+                source_size: 2_048,
+                source_modified: Some(fixed_date()),
+                target_path: PathBuf::from(r"C:\Users\demo\right\report.txt"),
+                target_size: 900,
+                target_modified: Some(DateTime { year: 2026, month: 1, day: 1, hour: 12, minute: 30 }),
+            },
+            progress: filecommand_core::fs_ops::ProgressInfo::starting(10, 20_480),
+            rename_input,
+        },
+    };
+    state
+}
+
+/// Scenario "The Cancel control and hotkey match Esc": the `(C)ancel`
+/// control is drawn on its own row directly below the existing choice row,
+/// which is unchanged (including its pre-existing truncation at the
+/// dialog's inner width).
+#[test]
+fn snapshot_conflict_dialog_with_cancel_row() {
+    let state = conflict_dialog_state(None);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let choice_line = text.lines().position(|l| l.contains("(O)verwrite  (S)kip  (R)ename")).expect("the choice row is drawn");
+    let cancel_line = text.lines().position(|l| l.contains("(C)ancel")).expect("the Cancel row is drawn");
+    assert_eq!(cancel_line, choice_line + 1, "Cancel sits directly below the choices:\n{text}");
+    insta::assert_snapshot!("conflict_dialog_with_cancel_row", text);
+}
+
+/// Scenario "Esc in the Rename field returns to the choices": while the
+/// name field is open, Esc closes the field rather than cancelling the job,
+/// so the Cancel row is not offered — the field takes the choice row and
+/// the row below it is blank.
+#[test]
+fn snapshot_conflict_dialog_rename_field_hides_the_cancel_row() {
+    let mut edit = filecommand_core::line_edit::LineEdit::default();
+    for c in "report2.txt".chars() {
+        edit.apply(&filecommand_core::line_edit::TextEditOp::Insert(c));
+    }
+    let state = conflict_dialog_state(Some(edit));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("New name:"), "the rename field is shown:\n{text}");
+    assert!(!text.contains("(C)ancel"), "no Cancel control while renaming:\n{text}");
+    insta::assert_snapshot!("conflict_dialog_rename_field_open", text);
+}
+
+/// Regression pin for the pre-existing skipped-only rendering (task 4.3):
+/// each summary row is `{full path}: {reason}`.
+#[test]
+fn snapshot_skipped_summary_skipped_items() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSummary(vec![
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\old.log"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\archive.zip"), "target already exists".to_string()),
+    ]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Skipped 2 item(s)"), "the title counts the skipped items:\n{text}");
+    assert!(text.contains(r"D:\data\old.log: target already exists"), "each row is path: reason:\n{text}");
+    insta::assert_snapshot!("skipped_summary_skipped_items", text);
+}
+
+/// operation-dialogs "Metadata-restore failures are reported in the
+/// end-of-job summary": a warnings-only summary is titled by its warning
+/// count.
+#[test]
+fn snapshot_skipped_summary_warnings_only() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    // The reason is kept short so the whole row fits the 80-column screen
+    // un-truncated — the point here is the grouping, not the OS text.
+    state.phase = UiPhase::FileOpSummary(vec![filecommand_core::fs_ops::SkippedItem::warning(
+        PathBuf::from(r"C:\dst\report.docx"),
+        "modification time not restored: denied".to_string(),
+    )]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("1 warning(s)"), "the title is the warning count:\n{text}");
+    assert!(text.contains("Warnings"), "the warnings group is headed:\n{text}");
+    assert!(text.contains(r"C:\dst\report.docx: modification time not restored: denied"), "{text}");
+    insta::assert_snapshot!("skipped_summary_warnings_only", text);
+}
+
+/// "Warnings and skipped items appear together": one summary, skipped items
+/// first, the warnings group second, both counts in the title.
+#[test]
+fn snapshot_skipped_summary_skipped_and_warnings() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSummary(vec![
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\a.txt"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::skipped(PathBuf::from(r"D:\data\b.txt"), "target already exists".to_string()),
+        filecommand_core::fs_ops::SkippedItem::warning(PathBuf::from(r"D:\data\c.txt"), "read-only attribute not restored: denied".to_string()),
+    ]);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Skipped 2 item(s), 1 warning(s)"), "the title gives both counts:\n{text}");
+    let skipped_pos = text.find(r"D:\data\a.txt: target already exists").expect("skipped row present");
+    let header_pos = text.find("Warnings").expect("the warnings group header is present");
+    let warning_pos = text.find(r"D:\data\c.txt: read-only attribute not restored: denied").expect("warning row present");
+    assert!(skipped_pos < header_pos && header_pos < warning_pos, "skipped rows come before the Warnings group:\n{text}");
+    insta::assert_snapshot!("skipped_summary_skipped_and_warnings", text);
+}
+
 #[test]
 fn snapshot_splash_nc_classic() {
     let state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());
@@ -221,11 +444,45 @@ fn snapshot_splash_nc_mono() {
     insta::assert_snapshot!("splash_nc_mono", text);
 }
 
+/// The "terminal too small" placeholder is `State::undersized` beside the
+/// phase, not a phase of its own, so it is drawn over whatever screen is
+/// active without discarding it (application-shell "Resize handling with
+/// 60x16 hard floor and placeholder"; resize-preserves-session-state design
+/// D1/D5).
+fn undersized_state(phase: UiPhase) -> State {
+    State { undersized: true, term_size: (40, 10), ..base_state(phase, Theme::classic()) }
+}
+
 #[test]
 fn snapshot_terminal_too_small_placeholder() {
-    let state = base_state(UiPhase::Placeholder, Theme::classic());
+    let state = undersized_state(UiPhase::Panels);
     let text = render_to_text(40, 10, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("placeholder_too_small", text);
+}
+
+#[test]
+fn snapshot_placeholder_hides_the_editor_identically() {
+    // The hidden screen never shows through: the placeholder over a modified
+    // editor buffer is byte-identical to the one over the panels.
+    let mut editor = EditorState::from_bytes(PathBuf::from("notes.txt"), b"one\ntwo\nthree\n").expect("valid UTF-8 fixture");
+    editor.type_char('x');
+    assert!(editor.is_modified());
+    let over_editor = render_to_text(40, 10, &undersized_state(UiPhase::Editor(editor)), ColorDepth::Ansi16);
+    let over_panels = render_to_text(40, 10, &undersized_state(UiPhase::Panels), ColorDepth::Ansi16);
+    assert_eq!(over_editor, over_panels, "the placeholder must not leak the hidden editor");
+    insta::assert_snapshot!("placeholder_over_editor", over_editor);
+}
+
+#[test]
+fn snapshot_quit_confirm_dialog_over_the_placeholder() {
+    // application-shell "F10 over the placeholder asks to quit": the quit
+    // dialog is drawn over the placeholder, exactly as it is over any phase.
+    let mut state = undersized_state(UiPhase::Panels);
+    state.term_size = (50, 12);
+    state.quit_confirm = true;
+    let text = render_to_text(50, 12, &state, ColorDepth::Ansi16);
+    assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the placeholder");
+    insta::assert_snapshot!("quit_confirm_dialog_over_placeholder", text);
 }
 
 #[test]
@@ -276,7 +533,7 @@ fn quit_confirm_dialog_renders_above_an_open_pull_down_menu() {
     // task 4.5: the dialog can be raised while an F9 pull-down menu is open
     // — same topmost-overlay contract as above the viewer.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     state.quit_confirm = true;
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Quit FileCommand?"), "the dialog must be drawn over the open pull-down");
@@ -305,7 +562,7 @@ fn command_line_row(text: &str) -> &str {
 #[test]
 fn snapshot_command_line_with_prompt_and_typed_text() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.command_line = "dir *.txt".to_string();
+    state.command_line = filecommand_core::line_edit::LineEdit::from("dir *.txt");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let row = command_line_row(&text);
     assert!(row.contains(r"C:\Users\demo\left>dir *.txt"), "prompt + buffer in `{row}`");
@@ -324,10 +581,78 @@ fn command_line_prompt_follows_the_active_panel() {
 fn snapshot_command_line_recalling_history() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.history = vec!["cd docs".to_string(), "type readme.txt".to_string()];
-    state.command_line = "type readme.txt".to_string();
+    state.command_line = filecommand_core::line_edit::LineEdit::from("type readme.txt");
     state.history_cursor = Some(1);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("command_line_history_recall", command_line_row(&text));
+}
+
+/// Full-frame render that also reports the terminal cursor position
+/// `views::render` computed (and applies it to the frame, exactly as
+/// `app.rs`'s `draw` does), for the text-field caret tests.
+fn render_with_cursor(width: u16, height: u16, state: &State) -> (String, Option<(u16, u16)>) {
+    let identity_lines = pinned_identity_lines();
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    let mut cursor = None;
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            let output = views::render(frame.buffer_mut(), area, state, ColorDepth::Ansi16, &identity_lines, FIXED_CLOCK_TEXT, None);
+            cursor = output.cursor;
+            if let Some(pos) = output.cursor {
+                frame.set_cursor_position(pos);
+            }
+        })
+        .expect("draw into TestBackend");
+    (buffer_to_text(terminal.backend().buffer()), cursor)
+}
+
+#[test]
+fn snapshot_destination_field_scrolled_so_the_caret_is_visible() {
+    // text-field-editing "Long destination scrolls to the caret": a
+    // 60-character path in the 40-cell field shows the last 40 characters
+    // with the caret at the end, and the terminal cursor sits at the
+    // field's last cell.
+    let long_path = r"D:\backup\2026\reports\archive\final\q3\old\verylong\name\xy";
+    assert_eq!(long_path.chars().count(), 60, "the fixture path must be 60 chars for the 40-cell field");
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.phase = UiPhase::FileOpSetup(FileOpSetup::DestinationInput {
+        kind: JobKind::Copy,
+        sources: vec![SourceItem { original_name: "readme.txt".into(), path: PathBuf::from(r"C:\Users\demo\left\readme.txt"), is_dir: false }],
+        source_dir: PathBuf::from(r"C:\Users\demo\left"),
+        input: filecommand_core::line_edit::LineEdit::from(long_path),
+        buttons: None,
+        hidden_by_filter: 0,
+    });
+    let (text, cursor) = render_with_cursor(80, 24, &state);
+    assert!(text.contains(r"[ts\archive\final\q3\old\verylong\name\xy]"), "the window scrolled to the last 40 chars:\n{text}");
+    // Dialog centered at (17, 9): the field's text starts at column 20 and
+    // the caret (at the end of a full window) clamps onto its last cell.
+    assert_eq!(cursor, Some((20 + 39, 9 + 3)), "the terminal cursor sits at the field's last cell");
+    insta::assert_snapshot!("destination_field_scrolled_to_caret", text);
+}
+
+#[test]
+fn snapshot_command_line_with_the_caret_mid_text() {
+    // command-line "Caret editing mid-line": `cd srv`, Left x2, `c` ->
+    // `cd scrv` — the row shows the whole line and the terminal cursor sits
+    // at the caret (the drawn `_` is gone).
+    let mut line = filecommand_core::line_edit::LineEdit::from("cd srv");
+    line.left();
+    line.left();
+    line.insert('c');
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.command_line = line;
+    let (text, cursor) = render_with_cursor(80, 24, &state);
+    let row = command_line_row(&text);
+    assert!(row.contains(r"C:\Users\demo\left>cd scrv"), "`{row}`");
+    assert!(!row.contains('_'), "the drawn caret is replaced by the terminal cursor: `{row}`");
+    // Prompt `C:\Users\demo\left>` is 19 cells; the caret is after the
+    // inserted `c` at char 5; the command-line row is second from the
+    // bottom.
+    assert_eq!(cursor, Some((19 + 5, 22)), "the terminal cursor sits at the caret");
+    insta::assert_snapshot!("command_line_caret_mid_text", row);
 }
 
 #[test]
@@ -344,13 +669,13 @@ fn the_f9_bar_hides_the_clock_and_closing_it_restores_the_clock() {
     let without_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(without_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock shows with the bar closed");
 
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let with_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!with_menu.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is hidden while F9 is open");
 
-    // Esc-ing the bar closed (state.menu back to None) restores it — same
+    // Esc-ing the bar closed (state.menu() back to None) restores it — same
     // as any other frame where the bar isn't open.
-    state.menu = None;
+    state.close_overlay();
     let restored = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(restored.lines().next().unwrap().contains(FIXED_CLOCK_TEXT), "clock is restored once the bar closes");
 }
@@ -373,7 +698,7 @@ fn the_clock_hides_entirely_rather_than_colliding_with_a_long_path_title() {
 #[test]
 fn snapshot_menu_bar_with_left_pulldown_open() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.lines().next().unwrap().contains("Left"));
     insta::assert_snapshot!("menu_bar_left_pulldown", text);
@@ -382,7 +707,7 @@ fn snapshot_menu_bar_with_left_pulldown_open() {
 #[test]
 fn snapshot_menu_bar_with_files_pulldown_open() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::for_menu(MenuId::Files));
+    state.open_overlay(Overlay::Menu(MenuState::for_menu(MenuId::Files)));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("menu_bar_files_pulldown", text);
 }
@@ -392,7 +717,7 @@ fn snapshot_menu_bar_with_pulldown_closed() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut menu = MenuState::opened();
     menu.pulldown_open = false;
-    state.menu = Some(menu);
+    state.open_overlay(Overlay::Menu(menu));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("menu_bar_no_pulldown", text.lines().next().unwrap());
 }
@@ -401,7 +726,7 @@ fn snapshot_menu_bar_with_pulldown_closed() {
 fn the_menu_bar_replaces_the_panels_top_border_row() {
     let plain = render_to_text(80, 24, &base_state(UiPhase::Panels, Theme::classic()), ColorDepth::Ansi16);
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.menu = Some(MenuState::opened());
+    state.open_overlay(Overlay::Menu(MenuState::opened()));
     let with_menu = render_to_text(80, 24, &state, ColorDepth::Ansi16);
 
     assert!(plain.lines().next().unwrap().contains('\u{2554}'), "normally the top row is panel border");
@@ -415,7 +740,7 @@ fn the_menu_bar_replaces_the_panels_top_border_row() {
 #[test]
 fn snapshot_drive_select_dialog_labels_pending() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.drive_select = Some(DriveSelect::new(PanelSide::Left, vec!['A', 'C', 'D', 'Z'], Some('C')));
+    state.open_overlay(Overlay::DriveSelect(DriveSelect::new(PanelSide::Left, vec!['A', 'C', 'D', 'Z'], Some('C'))));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("drive_select_labels_pending", text);
 }
@@ -429,7 +754,7 @@ fn snapshot_drive_select_dialog_labels_resolved() {
     dialog.apply_label('Z', Some("net".to_string()));
     // A: has no media, so its fetch never resolves and its column stays
     // blank — which must not hold up the rest of the dialog.
-    state.drive_select = Some(dialog);
+    state.open_overlay(Overlay::DriveSelect(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("drive_select_labels_resolved", text);
 }
@@ -603,7 +928,8 @@ fn editor_state(editor: EditorState) -> State {
 
 #[test]
 fn snapshot_editor_chrome_unmodified() {
-    let editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n");
+    let editor =
+        EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"The quick brown fox\njumps over the lazy dog.\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     insta::assert_snapshot!("editor_chrome_unmodified", text);
@@ -616,7 +942,7 @@ fn snapshot_editor_header_position_and_modified_indicator() {
     // other file in this codebase), caret on line 12 column 8 (both
     // 1-based, matching the spec's header example), buffer modified.
     let content: String = (1..=440).map(|i| format!("line {i}\n")).collect();
-    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes());
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\big.txt"), content.as_bytes()).expect("valid UTF-8 fixture");
     editor.caret.line = 11;
     editor.caret.col = 7;
     editor.type_char('!');
@@ -632,7 +958,7 @@ fn snapshot_editor_header_position_and_modified_indicator() {
 
 #[test]
 fn snapshot_editor_overwrite_indicator() {
-    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n").expect("valid UTF-8 fixture");
     editor.toggle_mode();
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -643,7 +969,7 @@ fn snapshot_editor_overwrite_indicator() {
 
 #[test]
 fn snapshot_editor_keybar() {
-    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n");
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"abc\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let last = text.lines().last().unwrap();
@@ -653,7 +979,7 @@ fn snapshot_editor_keybar() {
 
 #[test]
 fn snapshot_editor_marked_selection() {
-    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"alpha\nbeta\ngamma\ndelta\n").expect("valid UTF-8 fixture");
     editor.start_mark();
     editor.move_down();
     let state = editor_state(editor);
@@ -663,7 +989,7 @@ fn snapshot_editor_marked_selection() {
 
 #[test]
 fn snapshot_editor_save_on_exit_confirm() {
-    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n");
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
     editor.type_char('!');
     editor.quit_confirm = true;
     let state = editor_state(editor);
@@ -672,9 +998,45 @@ fn snapshot_editor_save_on_exit_confirm() {
     insta::assert_snapshot!("editor_save_on_exit_confirm", text);
 }
 
+/// builtin-editor "A failed save leaves the original intact" / "Read-only
+/// file is not saved": the failure message is a one-row overlay on the last
+/// body row, with the header and the F-key bar unchanged
+/// (editor-encoding-safety design D6).
+#[test]
+fn snapshot_editor_save_failed() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
+    editor.type_char('!');
+    editor.save_error = Some("Cannot save notes.txt: notes.txt is read-only — not saved".to_string());
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[22].starts_with("Save failed: Cannot save notes.txt: notes.txt is read-only — not saved"), "`{}`", rows[22]);
+    assert!(rows[0].contains("Edit: C:\\notes.txt *"), "header unchanged: `{}`", rows[0]);
+    assert!(rows[23].trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "F-key bar unchanged: `{}`", rows[23]);
+    insta::assert_snapshot!("editor_save_failed", text);
+}
+
+/// application-shell "Saving to a slow share shows progress and accepts no
+/// edits" (offload-blocking-io design D6): while the save is in flight the
+/// last body row reads `Saving…`, with the header and the F-key bar exactly
+/// as builtin-editor "Full-screen editor chrome" specifies.
+#[test]
+fn snapshot_editor_saving() {
+    let mut editor = EditorState::from_bytes(PathBuf::from(r"C:\notes.txt"), b"abc\n").expect("valid UTF-8 fixture");
+    editor.type_char('!');
+    editor.save_pending = true;
+    let state = editor_state(editor);
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[22].starts_with("Saving…"), "`{}`", rows[22]);
+    assert!(rows[0].contains("Edit: C:\\notes.txt *"), "header unchanged: `{}`", rows[0]);
+    assert!(rows[23].trim_end().starts_with("1Help 2Save 3Mark 4Replac 5 6 7Search 8 9 10Quit"), "F-key bar unchanged: `{}`", rows[23]);
+    insta::assert_snapshot!("editor_saving", text);
+}
+
 #[test]
 fn editor_replaces_the_panels_full_screen() {
-    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n");
+    let editor = EditorState::from_bytes(PathBuf::from("f.txt"), b"content\n").expect("valid UTF-8 fixture");
     let state = editor_state(editor);
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!text.contains('\u{2554}'), "no panel border while the editor is open:\n{text}");
@@ -782,9 +1144,8 @@ fn snapshot_brief_mode_three_name_columns() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut panel = complete_panel(r"C:\Users\demo\left", 0);
     panel.display_mode = DisplayMode::Brief;
-    panel.entries = std::iter::once(Entry::parent_dir())
-        .chain((0..8).map(|i| Entry { name: format!("f{i}.txt").into(), kind: EntryKind::File, size: 0, modified: None }))
-        .collect();
+    panel.entries =
+        std::iter::once(Entry::parent_dir()).chain((0..8).map(|i| Entry::new(format!("f{i}.txt"), EntryKind::File, 0, None, false, false))).collect();
     state.left = panel;
     // A short panel (6 body rows, after the command line and F-key bar
     // reserve their own rows) so the 9 entries visibly wrap into a second
@@ -804,10 +1165,7 @@ fn tree_panel(prior_mode: DisplayMode, cursor: usize) -> PanelState {
     let mut tree = TreeState::new(PathBuf::from(r"C:\"), prior_mode);
     tree.insert_children(
         &PathBuf::from(r"C:\"),
-        vec![
-            Entry { name: "Alpha".into(), kind: EntryKind::Directory, size: 0, modified: None },
-            Entry { name: "Beta".into(), kind: EntryKind::Directory, size: 0, modified: None },
-        ],
+        vec![Entry::new("Alpha", EntryKind::Directory, 0, None, false, false), Entry::new("Beta", EntryKind::Directory, 0, None, false, false)],
     );
     tree.cursor = cursor;
     panel.display_mode = DisplayMode::Tree;
@@ -861,7 +1219,7 @@ fn quick_view_previews_the_opposite_cursor_file() {
     state.left = left;
 
     let mut right = PanelState::new(file_path.parent().unwrap().to_path_buf());
-    right.entries = vec![Entry { name: "preview.txt".into(), kind: EntryKind::File, size: 34, modified: None }];
+    right.entries = vec![Entry::new("preview.txt", EntryKind::File, 34, None, false, false)];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -872,7 +1230,10 @@ fn quick_view_previews_the_opposite_cursor_file() {
     assert!(text.contains("Hello from quick view"), "the previewed file's head is rendered like the viewer's text mode:\n{text}");
     assert!(text.contains("second line"), "{text}");
     let bottom_row = text.lines().nth(21).unwrap();
-    assert!(bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'), "mini-status shows the previewed file's name and size: `{bottom_row}`");
+    assert!(
+        bottom_row.contains("preview.txt") && bottom_row.contains('3') && bottom_row.contains('4'),
+        "mini-status shows the previewed file's name and size: `{bottom_row}`"
+    );
 }
 
 #[test]
@@ -883,7 +1244,7 @@ fn snapshot_quick_view_shows_sub_dir_indicator_for_a_directory_cursor() {
     state.left = left;
 
     let mut right = PanelState::new(PathBuf::from(r"C:\Users\demo\right"));
-    right.entries = vec![Entry { name: "docs".into(), kind: EntryKind::Directory, size: 0, modified: None }];
+    right.entries = vec![Entry::new("docs", EntryKind::Directory, 0, None, false, false)];
     right.progress = ListingProgress::Complete { count: 1 };
     right.cursor = 0;
     state.right = right;
@@ -932,6 +1293,85 @@ fn snapshot_git_info_absent_reserves_no_marker_column() {
 }
 
 // ---------------------------------------------------------------------
+// hidden-entry-styling: hidden/system entries render dimmed, in Full and
+// Brief alike (task 3.2)
+// ---------------------------------------------------------------------
+
+/// The task-3.2 fixture: a hidden directory (`.git`, under the cursor), a
+/// plain directory, a hidden file, a *selected* hidden file, and a plain
+/// file — one row per precedence tier of design D3.
+fn hidden_entries_fixture() -> Vec<Entry> {
+    vec![
+        Entry::parent_dir(),
+        Entry::new(".git", EntryKind::Directory, 0, Some(fixed_date()), true, false),
+        Entry::new("docs", EntryKind::Directory, 0, Some(fixed_date()), false, false),
+        Entry::new("desktop.ini", EntryKind::File, 87, Some(fixed_date()), true, false),
+        Entry::new("secret.txt", EntryKind::File, 35_840, Some(fixed_date()), true, false),
+        Entry::new("readme.txt", EntryKind::File, 612, Some(fixed_date()), false, false),
+    ]
+}
+
+fn hidden_entries_panel(cwd: &str, mode: DisplayMode) -> PanelState {
+    let mut panel = complete_panel(cwd, 1); // cursor on the hidden `.git`
+    panel.display_mode = mode;
+    panel.entries = hidden_entries_fixture();
+    panel.progress = ListingProgress::Complete { count: panel.entries.len() };
+    panel.selected.insert("secret.txt".into());
+    panel
+}
+
+#[test]
+fn snapshot_hidden_entries_dimmed_in_full_and_brief() {
+    use filecommand_core::theme::Role;
+    use filecommand_tui::style::role_style;
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left = hidden_entries_panel(r"C:\Users\demo\left", DisplayMode::Full);
+    state.right = hidden_entries_panel(r"C:\Users\demo\right", DisplayMode::Brief);
+
+    // The cursor bar only renders on the active panel, so each mode's
+    // precedence is asserted against a render with that panel active.
+    let theme = Theme::classic();
+    let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+    let hidden = style_of(Role::PanelHidden);
+    let selected = style_of(Role::PanelSelected);
+    let cursor = style_of(Role::PanelCursor);
+    let directory = style_of(Role::PanelDirectory);
+    let file = style_of(Role::PanelFile);
+    assert_ne!(hidden, file, "sanity: the hidden role differs from the file role");
+
+    // Full (left) panel, active: entry rows start at y = 2, names at x = 1.
+    let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+    let full_cell = |y: u16| buf[(1, y)].style();
+    assert_eq!(full_cell(3).fg, cursor.fg, "cursor bar wins over hidden (.git)");
+    assert_eq!(full_cell(4).fg, directory.fg, "plain directory unchanged");
+    assert_eq!(full_cell(5).fg, hidden.fg, "hidden file dimmed (desktop.ini)");
+    assert_eq!(full_cell(5).bg, hidden.bg);
+    assert_eq!(full_cell(6).fg, selected.fg, "selected beats hidden (secret.txt)");
+    assert_eq!(full_cell(7).fg, file.fg, "plain file unchanged");
+
+    // Brief (right) panel, active: six entries fit in the first of the
+    // three columns, rows y = 1..6 at x = 41 (right panel starts at x = 40
+    // in the default 50/50 split at 80 columns).
+    state.active = PanelSide::Right;
+    let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
+    let brief_cell = |y: u16| buf[(41, y)].style();
+    assert_eq!(brief_cell(1).fg, directory.fg, ".. keeps the directory style");
+    assert_eq!(brief_cell(2).fg, cursor.fg, "cursor bar wins over hidden (.git)");
+    assert_eq!(brief_cell(3).fg, directory.fg, "plain directory unchanged");
+    assert_eq!(brief_cell(4).fg, hidden.fg, "hidden file dimmed in Brief too (desktop.ini)");
+    assert_eq!(brief_cell(5).fg, selected.fg, "selected beats hidden (secret.txt)");
+    assert_eq!(brief_cell(6).fg, file.fg, "plain file unchanged");
+
+    // The snapshot itself pins the glyph grid: hidden styling changes only
+    // colors, and the hidden directory keeps its ▶SUB-DIR◀ marker.
+    state.active = PanelSide::Left;
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("desktop.ini") && text.contains(".git"), "hidden entries still list:\n{text}");
+    insta::assert_snapshot!("hidden_entries_full_and_brief", text);
+}
+
+// ---------------------------------------------------------------------
 // M5: quick-filter/type-ahead mini-status, and the fuzzy-jump, find-file,
 // user-menu, and Help/About dialogs (§8; quick-filter, type-ahead-jump,
 // fuzzy-jump, find-file, user-menu, help-and-about)
@@ -948,7 +1388,7 @@ fn mini_status_row(text: &str) -> &str {
 #[test]
 fn snapshot_quick_filter_mini_status_replaces_normal_content() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let row = mini_status_row(&text);
     assert!(row.contains("rep"), "`{row}`");
@@ -964,7 +1404,7 @@ fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
     // (quick-filter "the panel body is narrowed to entries whose displayed
     // name contains the pattern").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(left_half.contains(".."), "`..` must always stay visible: {left_half}");
@@ -976,7 +1416,7 @@ fn quick_filter_narrows_the_full_mode_body_to_matching_entries() {
 #[test]
 fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let right_half: String = text.lines().map(|l| l.chars().skip(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(right_half.contains("docs"), "the opposite panel's body must stay unfiltered: {right_half}");
@@ -987,7 +1427,7 @@ fn quick_filter_leaves_the_opposite_panels_body_unfiltered() {
 fn quick_filter_narrows_the_brief_mode_body_to_matching_entries() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     state.left.display_mode = filecommand_core::panel::DisplayMode::Brief;
-    state.left.quick_filter = Some("read".to_string());
+    state.left.set_quick_filter(Some("read".to_string()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     let left_half: String = text.lines().map(|l| l.chars().take(40).collect::<String>()).collect::<Vec<_>>().join("\n");
     assert!(left_half.contains("readme.txt"), "the matching entry must stay visible: {left_half}");
@@ -1050,6 +1490,73 @@ fn snapshot_clipboard_feedback_mini_status_error() {
     insta::assert_snapshot!("clipboard_feedback_mini_status_error", row);
 }
 
+// ---------------------------------------------------------------------
+// offload-blocking-io: the pending note on the mini-status line (design D3)
+// ---------------------------------------------------------------------
+
+/// command-line "cd to an unresponsive UNC path does not freeze the UI":
+/// `Checking <path>…` on the panel's mini-status while the probe runs.
+#[test]
+fn snapshot_pending_note_checking_mini_status() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note(r"Checking \\nas\share…".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains(r"Checking \\nas\share…"), "`{row}`");
+    insta::assert_snapshot!("pending_note_checking_mini_status", row);
+}
+
+/// application-shell "F4 on a slow share keeps the panels live":
+/// `Opening <name>…` on the panel's mini-status while the open runs.
+#[test]
+fn snapshot_pending_note_opening_mini_status() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note("Opening notes.txt…".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("Opening notes.txt…"), "`{row}`");
+    insta::assert_snapshot!("pending_note_opening_mini_status", row);
+}
+
+/// The note ranks below the status override (clipboard feedback here) and
+/// above `last_error`, and uses the normal ministatus style.
+#[test]
+fn pending_note_ranks_below_the_override_and_above_the_error() {
+    use filecommand_core::theme::Role;
+    use filecommand_tui::style::role_style;
+
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.pending_note = Some("Opening notes.txt…".to_string());
+    state.left.last_error = Some("Cannot open notes.txt: access denied".to_string());
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("Opening notes.txt…"), "the note wins over the error: `{row}`");
+    assert!(!row.contains("Cannot open"), "`{row}`");
+
+    state.left.clipboard_feedback =
+        Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let row = mini_status_row(&text);
+    assert!(row.contains("1 file copied to clipboard"), "the override wins over the note: `{row}`");
+    assert!(!row.contains("Opening"), "`{row}`");
+
+    // The note is drawn in the normal ministatus role, not the error role.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.left.set_pending_note("Opening notes.txt…".to_string());
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).expect("TestBackend terminal");
+    terminal
+        .draw(|frame| {
+            let area = frame.area();
+            views::render(frame.buffer_mut(), area, &state, ColorDepth::Ansi16, &pinned_identity_lines(), FIXED_CLOCK_TEXT, None);
+        })
+        .unwrap();
+    let buf = terminal.backend().buffer();
+    let x = (0..80u16).find(|x| buf[(*x, 21)].symbol() == "O").expect("the note is on the mini-status row");
+    let theme = Theme::classic();
+    assert_eq!(buf[(x, 21)].fg, role_style(&theme, Role::PanelMinistatus, ColorDepth::Ansi16).fg.unwrap());
+}
+
 #[test]
 fn clipboard_feedback_takes_precedence_over_the_quick_filter_mini_status() {
     // Ctrl+C is matched over the panels ahead of the quick-filter's
@@ -1057,7 +1564,7 @@ fn clipboard_feedback_takes_precedence_over_the_quick_filter_mini_status() {
     // the same frame; the feedback must win (clipboard-export "Clipboard
     // feedback").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.left.quick_filter = Some("rep".to_string());
+    state.left.set_quick_filter(Some("rep".to_string()));
     state.left.clipboard_feedback =
         Some(ClipboardFeedback { message: "1 file copied to clipboard".to_string(), is_error: false, expires_at_ms: 3_000 });
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
@@ -1082,7 +1589,7 @@ fn snapshot_fuzzy_jump_dialog() {
         filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Documents"), visit_count: 5, last_visited_ms: 1_000 },
         filecommand_core::quicksearch::FrecencyEntry { path: PathBuf::from(r"C:\Users\demo\Downloads"), visit_count: 1, last_visited_ms: 500 },
     ];
-    state.fuzzy_jump = Some(filecommand_core::quicksearch::FuzzyJumpState::new());
+    state.open_overlay(Overlay::FuzzyJump(filecommand_core::quicksearch::FuzzyJumpState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Fuzzy jump"));
     assert!(text.contains("Documents") && text.contains("Downloads"));
@@ -1093,18 +1600,18 @@ fn snapshot_fuzzy_jump_dialog() {
 fn snapshot_find_file_dialog_with_streamed_results() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
-    dialog.push('r');
-    dialog.push('e');
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('r'));
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('e'));
     dialog.submit(1);
     dialog.push_match(
         1,
         filecommand_core::listing::FindMatch {
             relative_path: PathBuf::from(r"docs\readme.txt"),
-            entry: Entry { name: "readme.txt".into(), kind: EntryKind::File, size: 12_345, modified: Some(fixed_date()) },
+            entry: Entry::new("readme.txt", EntryKind::File, 12_345, Some(fixed_date()), false, false),
         },
     );
     dialog.mark_done(1);
-    state.find_file = Some(dialog);
+    state.open_overlay(Overlay::FindFile(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Find file"));
     assert!(text.contains(r"docs\readme.txt"));
@@ -1115,10 +1622,10 @@ fn snapshot_find_file_dialog_with_streamed_results() {
 fn snapshot_find_file_dialog_no_matches() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut dialog = filecommand_core::find_file::FindFileState::new(PathBuf::from(r"C:\Users\demo\left"));
-    dialog.push('z');
+    dialog.apply(&filecommand_core::line_edit::TextEditOp::Insert('z'));
     dialog.submit(1);
     dialog.mark_done(1);
-    state.find_file = Some(dialog);
+    state.open_overlay(Overlay::FindFile(dialog));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("No matches"));
     insta::assert_snapshot!("find_file_dialog_no_matches", text);
@@ -1132,7 +1639,7 @@ fn snapshot_user_menu_dialog_with_entries() {
         filecommand_core::config::UserMenuEntry { label: "Backup".to_string(), command: r"robocopy . D:\backup /E".to_string() },
         filecommand_core::config::UserMenuEntry { label: "Checksum".to_string(), command: "certutil -hashfile x SHA256".to_string() },
     ];
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Compress") && text.contains("Backup") && text.contains("Checksum"));
     assert!(!text.contains("robocopy"), "the command string is never shown, only the label");
@@ -1144,7 +1651,7 @@ fn snapshot_user_menu_dialog_with_entries() {
 #[test]
 fn snapshot_user_menu_dialog_empty_state() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.user_menu = Some(filecommand_core::dialogs::UserMenuState::new());
+    state.open_overlay(Overlay::UserMenu(filecommand_core::dialogs::UserMenuState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("no entries"));
     assert!(text.contains("Themes"), "the built-in Themes row renders below the placeholder even with no user entries");
@@ -1152,10 +1659,69 @@ fn snapshot_user_menu_dialog_empty_state() {
     insta::assert_snapshot!("user_menu_dialog_empty", text);
 }
 
+// ---------------------------------------------------------------------
+// pulldown-menu-completion: the Alt+F8 command-history dialog and the
+// Ctrl+U swap (tasks 3.2; command-line "Command history dialog (Alt+F8)";
+// panel-navigation "Swap panels (Ctrl+U)")
+// ---------------------------------------------------------------------
+
+#[test]
+fn snapshot_history_dialog_populated() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.history = vec!["cd C:\\work".to_string(), "del old.log".to_string(), "cd D:\\".to_string()];
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("History"));
+    // Newest first: `cd D:\` renders above `del old.log`, above `cd C:\work`.
+    let newest = text.find("cd D:\\").unwrap();
+    let middle = text.find("del old.log").unwrap();
+    let oldest = text.find("cd C:\\work").unwrap();
+    assert!(newest < middle && middle < oldest, "newest entry renders first:\n{text}");
+    insta::assert_snapshot!("history_dialog_populated", text);
+}
+
+#[test]
+fn snapshot_history_dialog_empty() {
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.open_overlay(Overlay::HistoryDialog(filecommand_core::dialogs::HistoryDialogState::new()));
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(text.contains("(no history)"));
+    insta::assert_snapshot!("history_dialog_empty", text);
+}
+
+#[test]
+fn snapshot_panels_after_ctrl_u_swap() {
+    // Through the real reducer: the two panels trade places, the active side
+    // (left) and its cursor bar stay put, and the command-line prompt follows
+    // the directory now shown on the left (panel-navigation "Swap keeps
+    // focus on the same side"). The git info moves with its panel, so the
+    // branch suffix/marker column the *inactive* right panel was holding
+    // invisibly surfaces on the left border once the swap brings it under
+    // the active panel ("Git info follows the swap").
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.right.git_info = GitInfo {
+        branch: Some("main".to_string()),
+        statuses: std::collections::HashMap::from([(std::ffi::OsString::from("readme.txt"), FileStatus::Modified)]),
+    };
+    let (state, effects) = filecommand_core::update(state, filecommand_core::Command::SwapPanels);
+    assert!(effects.iter().all(|e| !matches!(e, filecommand_core::Effect::StartListing { .. })), "no directory is re-read");
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    let top = text.lines().next().unwrap();
+    let left_top: String = top.chars().take(40).collect();
+    let right_top: String = top.chars().skip(40).collect();
+    assert!(left_top.contains(r"C:\Users\demo\right (main)"), "the left border shows the right's directory and its branch: `{left_top}`");
+    assert!(right_top.contains(r"C:\Users\demo\left"), "the right panel now shows the left's directory: `{right_top}`");
+    assert!(!right_top.contains("(main)"), "no suffix on the inactive (repo-less) right border: `{right_top}`");
+    // The marker column came along too: `M` beside readme.txt on the left.
+    assert_eq!(text.lines().nth(5).unwrap().chars().nth(1), Some('M'), "the marker column moved with the panel");
+    assert!(command_line_row(&text).contains(r"C:\Users\demo\right>"), "the prompt follows the swap");
+    insta::assert_snapshot!("panels_after_swap", text);
+}
+
 #[test]
 fn snapshot_theme_picker_dialog_with_active_theme_marked() {
     let mut state = base_state(UiPhase::Panels, Theme::terminal_green());
-    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("terminal-green"));
+    state.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState::open("terminal-green")));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Themes"));
     for name in filecommand_core::theme::BUILTIN_THEME_NAMES {
@@ -1195,12 +1761,12 @@ fn snapshot_theme_picker_dialog_previews_a_non_active_highlighted_theme() {
     // render through `purple-lights`'s role table, while the marker stays
     // on the applied theme's (`nc-classic`) row (theme-selection scenario
     // "Moving the highlight previews the theme").
-    use filecommand_core::theme::{BUILTIN_THEME_NAMES, Role};
+    use filecommand_core::theme::{Role, BUILTIN_THEME_NAMES};
     use filecommand_tui::style::role_style;
 
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let highlight = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
-    state.theme_picker = Some(filecommand_core::dialogs::ThemePickerState { highlight });
+    state.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState { highlight }));
 
     let buf = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
     let text = buffer_to_text(&buf);
@@ -1237,7 +1803,7 @@ fn theme_picker_open_with_the_active_theme_highlighted_is_byte_identical_to_the_
     let before = render_to_buffer(80, 24, &state, ColorDepth::Ansi16);
 
     let mut opened = state;
-    opened.theme_picker = Some(filecommand_core::dialogs::ThemePickerState::open("nc-classic"));
+    opened.open_overlay(Overlay::ThemePicker(filecommand_core::dialogs::ThemePickerState::open("nc-classic")));
     let after = render_to_buffer(80, 24, &opened, ColorDepth::Ansi16);
 
     // Derive the dialog's exact footprint from its own box-drawing corners
@@ -1319,36 +1885,72 @@ fn snapshot_fkey_bar_under_each_new_theme() {
 
 #[test]
 fn snapshot_file_action_menu_dialog_non_executable() {
-    // file-action-menu "Menu contents, ordering, and navigation":
-    // non-executable targets list View, Edit, Copy, Rename, Move, Delete
-    // with View highlighted first, and no Run entry.
+    // file-action-menu "Menu contents, ordering, and navigation"
+    // (open-with-associated-app design D2): non-executable targets list
+    // Open, View, Edit, Send to clipboard, Copy, Rename, Move, Delete with
+    // Open highlighted first, and no Run entry.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false));
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("readme.txt"), false)));
+    let menu = state.file_action_menu().unwrap();
+    assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(!text.contains("Run"), "a non-executable target must not list Run");
-    assert!(text.contains("View") && text.contains("Edit") && text.contains("Copy"));
+    assert!(text.contains("Open") && text.contains("View") && text.contains("Edit") && text.contains("Copy"));
     assert!(text.contains("Rename") && text.contains("Move") && text.contains("Delete"));
+    let open_pos = text.find("Open").unwrap();
+    let view_pos = text.find("View").unwrap();
+    assert!(open_pos < view_pos, "Open must render before View");
     insta::assert_snapshot!("file_action_menu_dialog_non_executable", text);
 }
 
 #[test]
 fn snapshot_file_action_menu_dialog_executable() {
-    // file-action-menu "Menu contents, ordering, and navigation": an
-    // executable target lists Run first (default-highlighted).
+    // file-action-menu "Menu contents, ordering, and navigation"
+    // (open-with-associated-app design D2): an executable target lists Run
+    // first (default-highlighted), then Open, then View.
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.file_action_menu = Some(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true));
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::new(std::ffi::OsString::from("setup.exe"), true)));
+    let menu = state.file_action_menu().unwrap();
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Run, "Run stays highlighted on open");
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Run"), "an executable target must list Run");
     let run_pos = text.find("Run").unwrap();
+    let open_pos = text.find("Open").unwrap();
     let view_pos = text.find("View").unwrap();
-    assert!(run_pos < view_pos, "Run must render before View");
+    assert!(run_pos < open_pos, "Run must render before Open");
+    assert!(open_pos < view_pos, "Open must render before View");
     insta::assert_snapshot!("file_action_menu_dialog_executable", text);
+}
+
+#[test]
+fn snapshot_file_action_menu_dialog_directory() {
+    // file-action-menu "Directory targets and selection-scoped invocation":
+    // a directory target lists Open, Send to clipboard, Copy, Rename, Move,
+    // Delete — Open first and highlighted, no View/Edit/Run — and Open
+    // shows the directory in the platform file browser.
+    let mut state = base_state(UiPhase::Panels, Theme::classic());
+    state.open_overlay(Overlay::FileActionMenu(filecommand_core::dialogs::FileActionMenuState::open(
+        std::ffi::OsString::from("docs"),
+        true,
+        false,
+        false,
+    )));
+    let menu = state.file_action_menu().unwrap();
+    assert_eq!(menu.entries[0], filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is listed first");
+    assert_eq!(menu.selected(), filecommand_core::dialogs::FileActionMenuEntry::Open, "Open is highlighted on open");
+    let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
+    assert!(!text.contains("Run"), "a directory target must not list Run");
+    let open_pos = text.find("Open").unwrap();
+    let clipboard_pos = text.find("Send to clipboard").unwrap();
+    assert!(open_pos < clipboard_pos, "Open must render before Send to clipboard");
+    insta::assert_snapshot!("file_action_menu_dialog_directory", text);
 }
 
 #[test]
 fn snapshot_help_window_topic_list() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.help = Some(filecommand_core::dialogs::HelpState::new());
+    state.open_overlay(Overlay::Help(filecommand_core::dialogs::HelpState::new()));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Help"));
     assert!(text.contains("About FileCommand"));
@@ -1361,7 +1963,7 @@ fn snapshot_help_window_topic_page() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut help = filecommand_core::dialogs::HelpState::new();
     help.page = Some(1); // Keyboard reference
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("modifier variants"));
     assert!(!text.contains("About FileCommand"), "the list is replaced by the page");
@@ -1373,7 +1975,7 @@ fn snapshot_about_dialog_over_help_window() {
     let mut state = base_state(UiPhase::Panels, Theme::classic());
     let mut help = filecommand_core::dialogs::HelpState::new();
     help.about_open = true;
-    state.help = Some(help);
+    state.open_overlay(Overlay::Help(help));
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("License: MIT OR Apache-2.0"));
     assert!(text.contains("OK"));
@@ -1386,7 +1988,7 @@ fn snapshot_startup_warning_dialog_overlays_the_panels() {
     // warning dialog (not a panel mini-status) at startup (user-menu
     // "Malformed file warns and falls back without overwriting").
     let mut state = base_state(UiPhase::Panels, Theme::classic());
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Warning"));
     assert!(text.contains("usermenu.toml is malformed"));
@@ -1400,7 +2002,7 @@ fn snapshot_startup_warning_dialog_overlays_the_splash_screen_too() {
     // with the splash screen — it must still be visible on top of it rather
     // than getting lost underneath.
     let mut state = base_state(UiPhase::Splash { started_at_ms: 0 }, Theme::classic());
-    state.startup_warning = Some("usermenu.toml is malformed; F2 uses the default user menu".to_string());
+    state.set_startup_warning("usermenu.toml is malformed; F2 uses the default user menu".to_string());
     let text = render_to_text(80, 24, &state, ColorDepth::Ansi16);
     assert!(text.contains("Warning"));
     assert!(text.contains("usermenu.toml is malformed"));

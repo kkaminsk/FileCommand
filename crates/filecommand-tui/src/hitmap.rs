@@ -2,11 +2,13 @@
 //! translate a raw mouse event into what the user clicked without any
 //! coordinate or `crossterm::event::KeyModifiers` ever reaching
 //! `filecommand-core` (design D2; mouse-input "Hit-testing stays in the
-//! TUI"). Every field is built by the matching view module's own hit-test
-//! helper (`views::panel::hit_test`, `views::keybar::hit_slots`, ...),
-//! mirroring the exact geometry that module's renderer just drew — so the
-//! hit map can never describe a rect that isn't actually on screen this
-//! frame.
+//! TUI"). `views::render` fills it in the same dispatch that draws the
+//! frame: the panel, tab-strip, key-bar and command-line regions come from
+//! the `layout::compute` the panels were drawn with, and every dialog's and
+//! menu's buttons or rows from the `DialogLayout` its renderer just painted
+//! from (reducer-overlay-structure design D8; mouse-input "Click targets
+//! match the rendered geometry") — so the hit map can never describe a rect
+//! that isn't actually on screen this frame.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -158,7 +160,7 @@ mod tests {
 
         fn panel_with(cwd: &str, n_entries: usize, scroll_offset: usize) -> PanelState {
             let mut panel = PanelState::new(PathBuf::from(cwd));
-            panel.entries = (0..n_entries).map(|i| Entry { name: OsString::from(format!("f{i}.txt")), kind: EntryKind::File, size: 0, modified: None }).collect();
+            panel.entries = (0..n_entries).map(|i| Entry::new(OsString::from(format!("f{i}.txt")), EntryKind::File, 0, None, false, false)).collect();
             panel.scroll_offset = scroll_offset;
             panel
         }
@@ -166,7 +168,10 @@ mod tests {
         /// Whether `inner` lies entirely within `outer` — not just its
         /// top-left corner, the whole rect.
         fn rect_nests_inside(outer: Rect, inner: Rect) -> bool {
-            inner.x >= outer.x && inner.y >= outer.y && inner.x + inner.width <= outer.x + outer.width && inner.y + inner.height <= outer.y + outer.height
+            inner.x >= outer.x
+                && inner.y >= outer.y
+                && inner.x + inner.width <= outer.x + outer.width
+                && inner.y + inner.height <= outer.y + outer.height
         }
 
         fn rects_overlap(a: Rect, b: Rect) -> bool {

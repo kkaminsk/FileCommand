@@ -34,34 +34,14 @@ const KEYS_FULL: &[(&str, &str)] = &[
 
 /// The main panel bar's short form: `1Hlp 2Mnu 3Vew 4Edt 5Cpy 6Ren 7Mkd
 /// 8Del 9Pdn 10Qit` (50 columns).
-const KEYS_SHORT: &[(&str, &str)] = &[
-    ("1", "Hlp"),
-    ("2", "Mnu"),
-    ("3", "Vew"),
-    ("4", "Edt"),
-    ("5", "Cpy"),
-    ("6", "Ren"),
-    ("7", "Mkd"),
-    ("8", "Del"),
-    ("9", "Pdn"),
-    ("10", "Qit"),
-];
+const KEYS_SHORT: &[(&str, &str)] =
+    &[("1", "Hlp"), ("2", "Mnu"), ("3", "Vew"), ("4", "Edt"), ("5", "Cpy"), ("6", "Ren"), ("7", "Mkd"), ("8", "Del"), ("9", "Pdn"), ("10", "Qit")];
 
 /// The main panel bar's numbers-only form: `1 2 3 4 5 6 7 8 9 10` (20
 /// columns) — defensive headroom below the 60-column floor, where the
 /// short form already fits.
-const KEYS_NUMBERS_ONLY: &[(&str, &str)] = &[
-    ("1", ""),
-    ("2", ""),
-    ("3", ""),
-    ("4", ""),
-    ("5", ""),
-    ("6", ""),
-    ("7", ""),
-    ("8", ""),
-    ("9", ""),
-    ("10", ""),
-];
+const KEYS_NUMBERS_ONLY: &[(&str, &str)] =
+    &[("1", ""), ("2", ""), ("3", ""), ("4", ""), ("5", ""), ("6", ""), ("7", ""), ("8", ""), ("9", ""), ("10", "")];
 
 /// The display-column width a bar built from `pairs` would occupy: every
 /// slot's number plus label, plus one separating space between slots (none

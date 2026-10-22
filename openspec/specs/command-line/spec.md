@@ -5,7 +5,7 @@ TBD - created by archiving change m3-command-line-and-menus. Update Purpose afte
 ## Requirements
 ### Requirement: Command-line prompt and printable-key routing
 
-The system SHALL render a command line below the panels showing a shell prompt with the active panel's current path (e.g. `C:\NORTON>`), and while a panel is focused and no quick-search or dialog is active, printable keys SHALL be appended to the command-line buffer rather than the panel, matching classic NC behavior.
+The system SHALL render a command line below the panels showing a shell prompt with the active panel's current path (e.g. `C:\NORTON>`), and while a panel is focused and no quick-search or dialog is active, printable keys SHALL be inserted into the command-line buffer at its caret rather than sent to the panel, matching classic NC behavior. The buffer SHALL be backed by the shared line-edit model (`text-field-editing`). While the buffer is non-empty, Left and Right SHALL move the caret and Ctrl+Backspace SHALL delete the word before it; while the buffer is empty, Left and Right SHALL have no command-line meaning. Home, End, PgUp, PgDn, Delete, and Ctrl+Left/Ctrl+Right SHALL keep their panel meanings regardless of buffer content.
 
 The prompt SHALL follow the active panel: switching panels or navigating the active panel to a new directory SHALL update the displayed prompt path to that panel's current path.
 
@@ -22,6 +22,18 @@ Because printable keys route to the command line while a panel is focused, the c
 #### Scenario: Printable key routes to command line
 - **WHEN** a panel is focused, no quick-search or dialog is active, and the user types `d`, `i`, `r`
 - **THEN** the command-line buffer becomes `dir` and the panel cursor does not move
+
+#### Scenario: Caret editing mid-line
+- **WHEN** the buffer holds `cd srv` and the user presses Left, Left, then types `c`
+- **THEN** the buffer reads `cd scrv` with the caret after the `c` and the panel cursor does not move
+
+#### Scenario: Left on an empty line does nothing to the panel
+- **WHEN** the buffer is empty and the user presses Left
+- **THEN** neither the buffer nor the panel cursor changes
+
+#### Scenario: Home still moves the panel cursor while composing
+- **WHEN** the buffer holds `cd docs` and the user presses Home
+- **THEN** the panel cursor jumps to the first entry and the buffer and its caret are unchanged
 
 #### Scenario: Quick-search mode captures printables instead
 - **WHEN** type-ahead quick-search mode is active and the user types a printable key
@@ -46,7 +58,7 @@ Enter on an executable target (PATHEXT match or `.lnk`) SHALL NOT spawn the targ
 
 ### Requirement: Command history navigation
 
-The system SHALL maintain a command history and, while the command-line buffer is non-empty, Up and Down SHALL navigate previous and next history entries into the buffer. While the buffer is empty, Up and Down SHALL instead move the panel cursor. Backspacing the buffer to empty SHALL be the mechanism that hands Up/Down back to the panel; Esc SHALL NOT clear the buffer — over the panels it requests application quit (application-shell "Quit request keys and confirmation"). Command history SHALL persist to `history.json`, written atomically.
+The system SHALL maintain a command history and, while the command-line buffer is non-empty, Up and Down SHALL navigate previous and next history entries into the buffer. While the buffer is empty, Up and Down SHALL instead move the panel cursor. Backspacing the buffer to empty, or pressing the clear-line chord (default Ctrl+Y — see "Clear the command line with a dedicated key"), SHALL be the mechanisms that hand Up/Down back to the panel; Esc SHALL NOT clear the buffer — over the panels it requests application quit (application-shell "Quit request keys and confirmation"). Command history SHALL persist to `history.json`, written atomically.
 
 #### Scenario: Up recalls previous command while composing
 
@@ -70,15 +82,19 @@ The system SHALL maintain a command history and, while the command-line buffer i
 
 ### Requirement: Paste filename and path to command line
 
-The system SHALL paste the cursor entry's filename onto the command line when Ctrl+Enter is pressed, and the cursor entry's full path when Ctrl+] is pressed, inserting at the command-line buffer. Ctrl+] (ASCII 0x1D) SHALL be available on all platforms; Ctrl+Enter SHALL be available on Windows and best-effort elsewhere (available only where the kitty keyboard protocol delivers it). Both bindings SHALL be overridable in `config.toml`.
+The system SHALL paste the cursor entry's filename onto the command line when Ctrl+Enter is pressed, and the cursor entry's full path when Ctrl+] is pressed, appending to the end of the command-line buffer (after a separating space when the buffer is non-empty and does not already end in one) and leaving the caret at the end. Ctrl+] (ASCII 0x1D) SHALL be available on all platforms; Ctrl+Enter SHALL be available on Windows and best-effort elsewhere (available only where the kitty keyboard protocol delivers it). Both bindings SHALL be overridable in `config.toml`.
 
 #### Scenario: Ctrl+Enter pastes filename
 - **WHEN** the cursor is on entry `README.md` in `C:\NORTON` and the user presses Ctrl+Enter
-- **THEN** `README.md` is inserted into the command-line buffer
+- **THEN** `README.md` is inserted at the end of the command-line buffer and the caret is at the end
 
 #### Scenario: Ctrl+] pastes full path
 - **WHEN** the cursor is on entry `README.md` in `C:\NORTON` and the user presses Ctrl+]
-- **THEN** `C:\NORTON\README.md` is inserted into the command-line buffer
+- **THEN** `C:\NORTON\README.md` is inserted at the end of the command-line buffer and the caret is at the end
+
+#### Scenario: Paste after caret editing lands at the end
+- **WHEN** the buffer holds `del ` with the caret after `d`, and the user presses Ctrl+Enter on `old.log`
+- **THEN** the buffer reads `del old.log` and the caret is at the end
 
 ### Requirement: Panels on/off reveals terminal scrollback
 
@@ -122,7 +138,19 @@ When the user presses Enter with a non-empty command-line buffer, the system SHA
 
 ### Requirement: cd navigates the active panel or rejects a nonexistent target
 
-`cd <path>` SHALL resolve `<path>` against the active panel's current directory (supporting `.`, `..`, bare drive letters, UNC paths, and relative paths, exactly as today). Before navigating, the system SHALL verify the resolved target exists and is a directory. If it does, the active panel SHALL navigate to it exactly as today. If it does not — the target doesn't exist, or exists but is not a directory — the system SHALL reject the command: the active panel's `cwd` SHALL be left completely unchanged, no listing read SHALL be attempted, and the panel's error state SHALL be set to indicate the target could not be found.
+`cd <path>` SHALL resolve `<path>` against the active panel's current directory (supporting `.`, `..`, bare drive letters, UNC paths, and relative paths), producing the normalized absolute path that "cd, del and rmdir targets resolve to a normalized absolute path" defines. Before navigating, the system SHALL verify the resolved target exists and is a directory. If it does, the active panel SHALL navigate to it exactly as today. If it does not — the target doesn't exist, or exists but is not a directory — the system SHALL reject the command: the active panel's `cwd` SHALL be left completely unchanged, no listing read SHALL be attempted, and the panel's error state SHALL be set to indicate the target could not be found.
+
+The check is made in one of two ways:
+
+- When the resolved target is an entry already listed in the active panel, that listing SHALL answer the check immediately.
+- Otherwise the check SHALL run asynchronously on that resolved path, off the event-loop thread, through the `\\?\` long-path abstraction, so that targets longer than 260 characters and UNC targets are checked correctly. While it is outstanding, input and redraw SHALL continue and the panel's status line SHALL show `Checking <path>…`.
+
+An asynchronous answer SHALL be applied only if both of these hold:
+
+- it is still the most recent command-line check;
+- the panel the command was entered for still shows the directory it showed when the command was entered.
+
+Otherwise it SHALL be discarded with no navigation and no error message.
 
 #### Scenario: cd navigates to a valid relative subdirectory
 - **WHEN** the active panel is at `C:\NORTON` containing subdirectory `sub`, and the command buffer is `cd sub`
@@ -136,9 +164,39 @@ When the user presses Enter with a non-empty command-line buffer, the system SHA
 - **WHEN** the active panel is at `C:\NORTON`, `readme.txt` is a file in it, and the command buffer is `cd readme.txt`
 - **THEN** the active panel's current directory remains `C:\NORTON` and the panel shows an error indicating the target is not a directory
 
+#### Scenario: A listed subdirectory needs no filesystem check
+- **WHEN** the active panel at `C:\NORTON` lists the subdirectory `sub` and the command buffer is `cd sub`
+- **THEN** navigation to `C:\NORTON\sub` begins in response to the Enter itself, without waiting for any filesystem check
+
+#### Scenario: cd to an unresponsive UNC path does not freeze the UI
+- **WHEN** the active panel is at `C:\NORTON` and the command buffer is `cd \\offline-server\share`, whose server does not respond
+- **THEN** while the check is outstanding the UI keeps redrawing and accepting keys, the panel's status line shows `Checking \\offline-server\share…`, and the panel's current directory remains `C:\NORTON`
+- **AND** when the check finally fails, the panel shows an error indicating the target was not found and no listing read was started
+
+#### Scenario: cd to a path longer than 260 characters
+- **WHEN** the command buffer is `cd` followed by an existing directory whose absolute path exceeds 260 characters and which is not listed in the active panel
+- **THEN** the check finds the directory and the active panel navigates to it, rather than reporting it as not found
+
+#### Scenario: A late answer after navigating elsewhere is discarded
+- **WHEN** `cd \\slow-server\share` is outstanding and the user presses Enter on the listed directory `docs` before its check completes
+- **THEN** the panel shows `docs`, and the late answer for `\\slow-server\share` neither navigates the panel nor sets an error
+
 ### Requirement: del and rmdir route into the existing delete-confirmation flow
 
-`del <target>` and `rmdir <target>` SHALL resolve `<target>` against the active panel's current directory. `.` and `..` are never valid targets — neither names an entry deletable through these verbs — and SHALL be rejected outright: the panel's error state SHALL be set and no dialog SHALL open. `del` SHALL only accept a target that is a file; `rmdir` SHALL only accept a target that is a directory. A target that doesn't exist, or whose type doesn't match the verb, SHALL be rejected: the panel's error state SHALL be set accordingly and no dialog SHALL open. A valid, type-matched target SHALL open the same delete-confirmation dialog used by F8 and the file-action menu's Delete entry, scoped to that single entry — including the existing non-empty-directory second confirmation for `rmdir` — and SHALL NOT delete anything until that dialog is accepted.
+`del <target>` and `rmdir <target>` SHALL resolve `<target>` against the active panel's current directory, producing the normalized absolute path that "cd, del and rmdir targets resolve to a normalized absolute path" defines. `.` and `..` are never valid targets — neither names an entry deletable through these verbs — and SHALL be rejected outright: the panel's error state SHALL be set and no dialog SHALL open. `del` SHALL only accept a target that is a file; `rmdir` SHALL only accept a target that is a directory. A target that doesn't exist, or whose type doesn't match the verb, SHALL be rejected: the panel's error state SHALL be set accordingly and no dialog SHALL open. A valid, type-matched target SHALL open the same delete-confirmation dialog used by F8 and the file-action menu's Delete entry, scoped to that single entry — including the existing non-empty-directory second confirmation for `rmdir` — and SHALL NOT delete anything until that dialog is accepted.
+
+The existence and type check is made in one of two ways:
+
+- When the resolved target is an entry already listed in the active panel, that listing SHALL answer the check immediately.
+- Otherwise the check SHALL run asynchronously on that resolved path, off the event-loop thread, through the `\\?\` long-path abstraction. While it is outstanding, input and redraw SHALL continue and the panel's status line SHALL show `Checking <path>…`.
+
+An asynchronous answer SHALL be applied, opening the dialog or setting the error, only if all of these hold:
+
+- it is still the most recent command-line check;
+- the panel the command was entered for still shows the directory it showed when the command was entered;
+- the panels still own input, with no menu, dialog, or overlay open and no file operation in progress.
+
+Otherwise it SHALL be discarded and no dialog SHALL open.
 
 #### Scenario: del on a file opens the delete-confirmation dialog
 - **WHEN** the active panel is at `C:\NORTON`, `notes.txt` is a file in it, and the command buffer is `del notes.txt`
@@ -163,4 +221,76 @@ When the user presses Enter with a non-empty command-line buffer, the system SHA
 #### Scenario: del/rmdir reject the current and parent directories
 - **WHEN** the command buffer is `rmdir ..` (or `del ..`, `rmdir .`, `del .`)
 - **THEN** the command is rejected, no dialog opens, and the panel shows an error indicating the target is invalid — the dialog must never offer to delete the panel's current or parent directory
+
+#### Scenario: del on an unlisted target on a slow share does not freeze the UI
+- **WHEN** the command buffer is `del \\nas\share\old.log`, which is not listed in the active panel, and the server answers slowly
+- **THEN** the UI keeps redrawing and accepting keys while the panel's status line shows `Checking \\nas\share\old.log…`
+- **AND** once the check reports a file, the delete-confirmation dialog opens naming `old.log`, and nothing is deleted until it is accepted
+
+#### Scenario: A late answer does not open the dialog over a menu
+- **WHEN** `rmdir \\nas\share\tmp` is outstanding and the user opens the F9 menu before its check completes
+- **THEN** the menu stays open and the delete-confirmation dialog does not open when the check completes
+
+#### Scenario: del on a path longer than 260 characters
+- **WHEN** the command buffer is `del` followed by an existing file whose absolute path exceeds 260 characters and which is not listed in the active panel
+- **THEN** the delete-confirmation dialog opens naming that file, rather than the target being reported as not found
+
+### Requirement: Clear the command line with a dedicated key
+
+The system SHALL clear the entire command-line buffer when the user presses the clear-line chord (default Ctrl+Y) while the panels own input and the buffer is non-empty; clearing SHALL also end any history recall in progress so that Up/Down return to moving the panel cursor. On an empty buffer the chord SHALL have no effect. The chord SHALL be overridable via `key.clear_line` in `config.toml` using the existing keybinding-override mechanism. Esc SHALL continue to request quit (application-shell "Quit request keys and confirmation"); the chord SHALL be bound only while the panels own input, and the existing key handling of menus, dialogs, the viewer, and the editor SHALL be unchanged.
+
+#### Scenario: Ctrl+Y clears a composed line
+- **WHEN** the buffer holds `cd Program Files` and the user presses Ctrl+Y
+- **THEN** the buffer is empty, the panel cursor has not moved, and no dialog opens
+
+#### Scenario: Ctrl+Y on an empty line does nothing
+- **WHEN** the buffer is empty and the user presses Ctrl+Y
+- **THEN** nothing changes: no quit dialog, no cursor movement
+
+#### Scenario: Clearing ends history recall
+- **WHEN** the user has recalled a history entry with Up and then presses Ctrl+Y, then Up again
+- **THEN** the buffer is empty after Ctrl+Y and the second Up moves the panel cursor instead of recalling history
+
+#### Scenario: Rebinding the clear key
+- **WHEN** `config.toml` sets `key.clear_line = "ctrl+k"` and the buffer holds text
+- **THEN** Ctrl+K clears the buffer and Ctrl+Y no longer does
+
+### Requirement: Command history dialog (Alt+F8)
+
+The system SHALL open a modal command-history dialog on Alt+F8 or Commands → History, listing the persisted command history newest first in the primary dialog style. Up/Down/Home/End/PgUp/PgDn SHALL move the highlight; Enter SHALL replace the command-line buffer with the highlighted entry (caret at the end, no history recall in progress) and close the dialog without running anything; Esc SHALL close it unchanged. An empty history SHALL show a single `(no history)` row on which Enter does nothing. The dialog SHALL NOT respond to the mouse (it joins the unsupported-overlay set).
+
+#### Scenario: Pick an entry
+- **WHEN** the history holds `cd C:\work` then `cd D:\` and the user presses Alt+F8, Down, Enter
+- **THEN** the dialog closes and the buffer reads `cd C:\work` with the caret at the end; nothing has run
+
+#### Scenario: Esc leaves the buffer alone
+- **WHEN** the buffer holds `cd x` and the user opens the dialog and presses Esc
+- **THEN** the dialog closes and the buffer still reads `cd x`
+
+#### Scenario: Empty history
+- **WHEN** the history is empty and the user presses Alt+F8, then Enter
+- **THEN** the dialog shows `(no history)` and Enter leaves the buffer unchanged with the dialog open until Esc
+
+### Requirement: cd, del and rmdir targets resolve to a normalized absolute path
+
+The path a `cd`, `del` or `rmdir` target resolves to SHALL be an absolute path with no `.` or `..` components, whenever the active panel's directory is absolute. The supported forms keep their meaning: `.`, `..`, a bare drive letter, a UNC path, an absolute path, and a path relative to the active panel's directory. Two forms are defined precisely:
+
+- A path containing `..` components, such as `..\x`, SHALL resolve to the directory it names after those components are removed, and SHALL NOT be kept as typed.
+- A drive-relative path (`D:x`) SHALL resolve against the active panel's directory when that directory is on drive `D:`, and against `D:\` otherwise. It SHALL NOT depend on any process-wide current directory.
+
+These are the same rules the destination input dialog uses (operation-dialogs "Relative destinations resolve against the source panel directory"). The existence check, the navigation, and the delete-confirmation flow SHALL all use the resolved path.
+
+#### Scenario: cd with a parent-relative path lands on the normalized directory
+- **WHEN** the active panel is at `C:\work\proj`, `C:\work\x` exists, and the command buffer is `cd ..\x`
+- **THEN** the active panel navigates to `C:\work\x` and lists it successfully
+- **AND** the panel's current directory contains no `..` component
+
+#### Scenario: cd with a drive-relative path resolves against the panel or the drive root
+- **WHEN** the active panel is at `D:\work`, `D:\work\old` exists, and the command buffer is `cd D:old`
+- **THEN** the active panel navigates to `D:\work\old`
+- **AND** when the active panel is instead at `C:\work` and `D:\old` exists, the same command navigates to `D:\old`
+
+#### Scenario: del with a parent-relative path names the resolved file
+- **WHEN** the active panel is at `C:\work\proj`, `C:\work\old.txt` is a file, and the command buffer is `del ..\old.txt`
+- **THEN** the delete-confirmation dialog opens for `C:\work\old.txt`, and nothing is deleted until it is accepted
 

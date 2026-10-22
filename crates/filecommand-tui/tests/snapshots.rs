@@ -38,18 +38,22 @@ fn fixed_identity() -> [String; 4] {
 fn sample_entries() -> Vec<Entry> {
     vec![
         Entry::parent_dir(),
-        Entry {
-            name: OsString::from("Documents"),
-            kind: EntryKind::Directory,
-            size: 0,
-            modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }),
-        },
-        Entry {
-            name: OsString::from("notes.txt"),
-            kind: EntryKind::File,
-            size: 2048,
-            modified: Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }),
-        },
+        Entry::new(
+            OsString::from("Documents"),
+            EntryKind::Directory,
+            0,
+            Some(DateTime { year: 2026, month: 8, day: 7, hour: 14, minute: 36 }),
+            false,
+            false,
+        ),
+        Entry::new(
+            OsString::from("notes.txt"),
+            EntryKind::File,
+            2048,
+            Some(DateTime { year: 2026, month: 8, day: 7, hour: 9, minute: 5 }),
+            false,
+            false,
+        ),
     ]
 }
 
@@ -86,11 +90,11 @@ fn full_panel_active_and_inactive_nc_classic() {
 /// snapshots protect against — a plain `assert_eq!` against a literal
 /// golden string, which (unlike an `insta` snapshot) cannot be
 /// silently re-accepted with `cargo insta review`/`--accept` without a
-/// deliberate source edit. Pins the exact 80x24 nominal-size rendering
-/// the column-ladder (D3) and Brief-formula (D4) anchors both promise is
-/// byte-identical to the pre-responsive-layout output (panel-navigation
-/// "Full display mode layout"; additional-panel-modes "Brief display
-/// mode"; responsive-layout task 6.3).
+/// deliberate source edit. Pins the exact 80x24 nominal-size rendering of
+/// the Full-mode layout: the `│` separator directly followed by the Size
+/// column, every Size/Date/Time value complete (`▶UP--DIR◀`, `MM-DD-YY`,
+/// `HH:MM`), and the row filling the interior exactly (panel-navigation
+/// "Full display mode layout"; full-mode-column-widths design D1).
 #[test]
 fn full_panel_at_80x24_matches_the_pinned_golden_string() {
     let state = sample_state(Theme::classic());
@@ -99,13 +103,13 @@ fn full_panel_at_80x24_matches_the_pinned_golden_string() {
     let header_row = text.lines().nth(1).unwrap();
     assert_eq!(
         header_row,
-        "\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}\u{2551}Name\u{2193}        \u{2502} Size    Date    Time   \u{2551}",
-        "the Full-mode column header at the 80x24 nominal size changed (panel-navigation \"Full display mode layout\", D3 anchor)"
+        "\u{2551}Name\u{2193}        \u{2502}Size      Date     Time \u{2551}\u{2551}Name\u{2193}        \u{2502}Size      Date     Time \u{2551}",
+        "the Full-mode column header at the 80x24 nominal size changed (panel-navigation \"Full display mode layout\")"
     );
     let first_entry_row = text.lines().nth(2).unwrap();
     assert_eq!(
         first_entry_row,
-        "\u{2551}..           \u{2502} \u{25B6}UP--DI                \u{2551}\u{2551}                                      \u{2551}",
+        "\u{2551}..           \u{2502}\u{25B6}UP--DIR\u{25C4}               \u{2551}\u{2551}                                      \u{2551}",
         "the Full-mode entry row at the 80x24 nominal size changed"
     );
     let last_line = text.lines().last().unwrap().trim_end();
@@ -133,7 +137,10 @@ fn splash_nc_mono() {
 
 #[test]
 fn terminal_too_small_placeholder() {
-    let state = State { phase: UiPhase::Placeholder, term_size: (40, 10), ..State::empty(Theme::classic()) };
+    // "Terminal too small" is `State::undersized` beside the phase, not a
+    // phase (resize-preserves-session-state design D1); the accepted
+    // snapshot is unchanged by construction (design D5).
+    let state = State { undersized: true, term_size: (40, 10), ..State::empty(Theme::classic()) };
     insta::assert_snapshot!("terminal_too_small_placeholder", render(&state, (40, 10)));
 }
 
@@ -149,7 +156,7 @@ fn splash_renders_at_60x16() {
 fn placeholder_below_the_floor() {
     // application-shell "Placeholder below the floor": one column below
     // the new 60x16 floor still shows the placeholder, naming 60x16.
-    let state = State { phase: UiPhase::Placeholder, term_size: (59, 16), ..State::empty(Theme::classic()) };
+    let state = State { undersized: true, term_size: (59, 16), ..State::empty(Theme::classic()) };
     let text = render(&state, (59, 16));
     assert!(text.contains("60x16"), "expected the placeholder to name the 60x16 floor:\n{text}");
     insta::assert_snapshot!("placeholder_below_the_60x16_floor", text);

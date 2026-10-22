@@ -26,6 +26,14 @@ pub enum ConflictChoice {
     Skip,
     SkipAll,
     Rename(OsString),
+    /// Abort the whole job from the conflict prompt (operation-dialogs
+    /// "Overwrite-conflict dialog": Esc, `C`, or the Cancel control). The
+    /// conflicting target is left untouched and is *not* recorded as a
+    /// skipped item; the job ends as cancelled through the same path as
+    /// the progress dialog's Cancel. Also what a job waiting on a conflict
+    /// answer resolves to when cancellation is requested or the answer can
+    /// no longer arrive (process-lifecycle-hardening design D5/D7).
+    Cancel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +130,15 @@ mod tests {
         assert_eq!(policy.resolve(info()), ConflictResolution::Ask(info()));
     }
 
+    #[test]
+    fn cancel_choice_does_not_latch() {
+        // process-lifecycle-hardening design D7: Cancel ends the job, so
+        // there is nothing for the policy to remember.
+        let mut policy = ConflictPolicy::new();
+        policy.apply(&ConflictChoice::Cancel);
+        assert_eq!(policy.resolve(info()), ConflictResolution::Ask(info()));
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -135,12 +152,7 @@ mod tests {
         }
 
         fn arb_choice() -> impl Strategy<Value = Choice> {
-            prop_oneof![
-                Just(Choice::Overwrite),
-                Just(Choice::OverwriteAll),
-                Just(Choice::Skip),
-                Just(Choice::SkipAll),
-            ]
+            prop_oneof![Just(Choice::Overwrite), Just(Choice::OverwriteAll), Just(Choice::Skip), Just(Choice::SkipAll),]
         }
 
         proptest! {

@@ -1,0 +1,7 @@
+# Commits that only reformat code; `git blame` skips them when configured
+# with `git config blame.ignoreRevsFile .git-blame-ignore-revs` (GitHub's
+# blame view reads this file automatically).
+
+# ci-and-build-tooling: one-time `cargo fmt --all` with the committed
+# rustfmt.toml (max_width = 150, use_small_heuristics = "Max").
+58a7792b2404d3ca04d6e66478fe25183ee8d2e1

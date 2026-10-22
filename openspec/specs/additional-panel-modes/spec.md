@@ -5,7 +5,7 @@ TBD - created by archiving change m5-editor-and-modern-extras. Update Purpose af
 ## Requirements
 ### Requirement: Brief display mode
 
-The panel SHALL provide a Brief display mode that lists entry names only, arranged in `max(1, floor(interior_width / 12))` columns across the panel width — where `interior_width` is the panel's width inside its border — with the division remainder given to the last column and no Size/Date/Time columns. At the 80×24 nominal size with the default split this yields exactly three columns. Column alignment MUST use display width (`unicode-width`) so that CJK, emoji, and wide-glyph names stay aligned, and entries MUST retain the standard directory/file/selection/cursor styling and the `▶UP--DIR◀` marker for `..`.
+The panel SHALL provide a Brief display mode that lists entry names only, arranged in `max(1, floor(interior_width / 12))` columns across the panel width — where `interior_width` is the panel's width inside its border — with the division remainder given to the last column and no Size/Date/Time columns. At the 80×24 nominal size with the default split this yields exactly three columns. Column alignment MUST use display width (`unicode-width`) so that CJK, emoji, and wide-glyph names stay aligned, and entries MUST retain the standard directory/file/hidden/selection/cursor styling and the `▶UP--DIR◀` marker for `..`, with the same style precedence as Full mode (`panel-navigation` "Entry row rendering").
 
 #### Scenario: Brief mode renders three columns at the nominal size
 
@@ -31,6 +31,11 @@ The panel SHALL provide a Brief display mode that lists entry names only, arrang
 
 - **WHEN** the panel is in Brief mode and contains directories, files, a selected entry, and the `..` parent entry
 - **THEN** directories render in the directory style, files in the file style, selected entries in the selected style, the cursor as a full-width inverse bar, and `..` renders as `▶UP--DIR◀`
+
+#### Scenario: Brief mode dims hidden entries
+
+- **WHEN** a panel in Brief mode lists a hidden file and a hidden directory
+- **THEN** both names render with the `panel.hidden` role, with the same precedence against cursor and selection as in Full mode
 
 ### Requirement: Tree display mode structure and rendering
 

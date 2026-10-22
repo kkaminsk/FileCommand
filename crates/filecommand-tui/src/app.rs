@@ -2,28 +2,35 @@
 //! `Command`s, applies `core::update`, executes the returned effects, and
 //! redraws. This is the only place effects are actually performed.
 
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
-use crossterm::event::{self, Event, KeyEventKind, MouseEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind, MouseEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 
 use filecommand_core::clock::{format_clock, Clock, WallClock};
-use filecommand_core::editor::{EditorMove, EditorState, LoadResult as EditorLoadResult};
+use filecommand_core::editor::EditorMove;
 use filecommand_core::external_editor::EditorInvocation;
+use filecommand_core::fs_ops::CancelFlag;
+use filecommand_core::line_edit::flatten_line_breaks;
 use filecommand_core::listing::DateTime;
 use filecommand_core::shell::{Invocation, ShellConfig};
 use filecommand_core::theme::{ColorDepth, Theme, BUILTIN_THEME_NAMES};
 use filecommand_core::update::ClipboardPayloadKind;
 use filecommand_core::viewer::hex::HEX_BYTES_PER_ROW;
 use filecommand_core::viewer::{backward, forward, ByteSource, ViewMode, ViewerState};
-use filecommand_core::{config, drives, identity, update, Command, Effect, PanelSide, State, UiPhase};
+use filecommand_core::{anim, config, drives, identity, input_layer, update, Command, Effect, InputLayer, PanelSide, State, UiPhase};
 
 use crate::clipboard::{self, Clipboard, PlatformClipboard};
 use crate::clock::{RealClock, RealWallClock};
+use crate::config_writer::{ConfigWrite, ConfigWriter};
+use crate::console;
+use crate::diag;
+use crate::history_writer::HistoryWriter;
 use crate::hitmap::HitMap;
 use crate::input::{self, MouseTracker, ViewerInput};
 use crate::terminal::TerminalGuard;
@@ -31,6 +38,20 @@ use crate::views;
 use crate::worker;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(33);
+/// A burst of already-queued input applies at most this many events before
+/// a draw, so the screen never falls far behind the keyboard
+/// (idle-aware-event-loop "Bursts of key input render once"; design D5).
+const BURST_MAX_EVENTS: usize = 64;
+/// The burst's other bound: about this much processing time, then a draw.
+const BURST_MAX_DURATION: Duration = Duration::from_millis(8);
+/// How long a confirmed quit waits for a running job to finish its
+/// cancellation cleanup — removing a partially written destination file —
+/// before exiting anyway (application-shell "Quit waits for job cancellation
+/// cleanup"; process-lifecycle-hardening design D3). Bounded so a write
+/// blocked on an unresponsive share cannot hang quit.
+const QUIT_JOB_WAIT: Duration = Duration::from_secs(2);
+/// How often [`shutdown_job`] re-checks whether the job thread has ended.
+const QUIT_JOB_POLL: Duration = Duration::from_millis(10);
 const CONFIG_FILE: &str = "config.toml";
 const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 
@@ -39,15 +60,45 @@ const RESUME_PROMPT: &str = "Press any key to return to FileCommand . . .";
 struct Runtime {
     tx: Sender<Command>,
     active_job: Option<worker::JobHandle>,
-    history_path: PathBuf,
-    /// Where `Effect::PersistTheme` writes the `theme =` key back
-    /// (theme-selection "Applied theme persists to configuration").
-    config_path: PathBuf,
+    /// The cancel flags of the cancellable background requests still running
+    /// — directory listings, find-file walks, viewer searches — keyed by the
+    /// request id the reducer minted for them, so `Effect::CancelRequest`
+    /// can stop one (listing-request-guard design D3). Owned here, like
+    /// `active_job`, because flags are TUI plumbing, not pure state.
+    cancels: CancelRegistry,
+    /// The background `history.json` writer `Effect::PersistHistory` hands
+    /// its snapshot to; it owns the history path, and is the disabled no-op
+    /// when persistence is off for the session. Owned here so every exit
+    /// path from `run` flushes it on drop (fuzzy-jump "Quitting flushes
+    /// unwritten history"; history-persistence-hardening design D4).
+    history_writer: HistoryWriter,
+    /// The background `config.toml` writer `Effect::PersistTheme` and
+    /// `Effect::PersistPanelSplit` hand their values to; it owns the config
+    /// path, writes one setting at a time with the newest value, and is the
+    /// disabled no-op when persistence is off for the session. Owned here so
+    /// every exit path from `run` flushes it on drop, bounded
+    /// (application-shell "Slow storage never blocks the event loop";
+    /// offload-blocking-io design D9).
+    config_writer: ConfigWriter,
+    /// Where the F2 user menu lives; `Command::EditUserMenuFile` opens it via
+    /// `State::user_menu_path`, and when the editor that had it open returns
+    /// (built-in close or external exit) the file is reloaded and fed back as
+    /// `Command::UserMenuReloaded` (user-menu "Edit the user menu file from
+    /// the Commands menu"; design D4).
+    usermenu_path: PathBuf,
     /// The F3 viewer's open byte window, kept here rather than in
     /// `core::State` because `ByteSource` is an I/O handle, not application
-    /// state (design D1). Set on `Effect::OpenViewer`, cleared on
-    /// `Command::ViewerClose` — the only path out of `UiPhase::Viewer`.
+    /// state (design D1). Adopted from `viewer_handoff` when a current
+    /// `Command::ViewerOpened` is applied, cleared on `Command::ViewerClose`
+    /// — the only path out of `UiPhase::Viewer`.
     viewer_source: Option<(PathBuf, ByteSource)>,
+    /// The channel a viewer-open worker hands its `ByteSource` back on,
+    /// immediately before its `ViewerOpened` reply (offload-blocking-io
+    /// design D4). Drained by `apply` after every `ViewerOpened`: the entry
+    /// whose request the reducer accepted becomes `viewer_source`, and every
+    /// other entry — a superseded or discarded open — is dropped, closing
+    /// its handle.
+    viewer_handoff: (Sender<worker::ViewerHandoff>, Receiver<worker::ViewerHandoff>),
     /// The OS clipboard behind `Effect::SetClipboard` — `Box<dyn Clipboard>`
     /// rather than a concrete type so tests can swap in
     /// `clipboard::RecordingClipboard` (clipboard-export; design D3).
@@ -58,6 +109,116 @@ struct Runtime {
     /// crossterm may otherwise believe a button is still held after a
     /// suspended shell/editor/scrollback run (design D1 risk).
     mouse_tracker: MouseTracker,
+    /// Per-panel git-query slots (left, right) bounding the app to one
+    /// in-flight git status query per panel: a navigation while one is
+    /// running queues only the newest request, and a queued request inside a
+    /// repository that just timed out is never started (git-info "Rapid
+    /// navigation does not pile up queries"; git-info-timeout-memory design
+    /// D3).
+    git_slots: [worker::GitQuerySlot; 2],
+    /// How many worker threads that can still post to `tx` are alive
+    /// (idle-aware-event-loop design D3): the loop polls at the usual ~33 ms
+    /// cadence only while this is nonzero, and sleeps until the next
+    /// time-driven deadline otherwise.
+    workers: worker::WorkerGauge,
+    /// The one worker message a budgeted [`drain_events`] took from the
+    /// channel but did not apply because its budget had run out — applied
+    /// first by the next drain, since `mpsc::Receiver` cannot peek
+    /// (streaming-listing-performance design D7).
+    held: Option<Command>,
+}
+
+/// The cancel flags of the background requests the reducer can supersede
+/// (listing-request-guard design D3): one `fs_ops::job::CancelFlag` — the
+/// same flag that backs job cancellation — per running `StartListing`,
+/// `FindInSubtree`, or `RunViewerSearch`, keyed by request id. The reducer
+/// decides supersession (it mints and compares the ids) and emits
+/// `Effect::CancelRequest(id)`; this registry owns the flags and flips the
+/// right one. Ids are globally unique (`State::next_request_id`), so one map
+/// serves all three request kinds.
+#[derive(Default)]
+struct CancelRegistry {
+    flags: HashMap<u64, CancelFlag>,
+}
+
+impl CancelRegistry {
+    /// A fresh, unset flag for the request `id`, remembered until it is
+    /// cancelled or retired. The clone handed back travels to the worker.
+    fn register(&mut self, id: u64) -> CancelFlag {
+        let flag = CancelFlag::new();
+        self.flags.insert(id, flag.clone());
+        flag
+    }
+
+    /// `Effect::CancelRequest(id)`: set the flag and forget the entry. An
+    /// unknown id — a request that already finished, or one that was never
+    /// cancellable — is a silent no-op, so the reducer never needs to know
+    /// whether a worker is still alive.
+    fn cancel(&mut self, id: u64) {
+        if let Some(flag) = self.flags.remove(&id) {
+            flag.cancel();
+        }
+    }
+
+    /// Forget the entry without setting its flag: the request's final reply
+    /// has passed through, so there is nothing left to stop.
+    fn retire(&mut self, id: u64) {
+        self.flags.remove(&id);
+    }
+}
+
+impl Runtime {
+    /// `apply`'s post-`update` step for a `Command::ViewerOpened { request }`
+    /// (offload-blocking-io design D4): drain the hand-off channel, keeping
+    /// the entry for `request` as `viewer_source` only if the reducer
+    /// accepted the reply — the phase *became* `Viewer` on this file — and
+    /// dropping every entry for an older request, which closes its handle.
+    /// The worker sends the source before the command, so the matching
+    /// entry is always already queued here; an older one belongs to an open
+    /// the user superseded, whose own `ViewerOpened` the reducer discarded
+    /// or will discard. An entry for a *newer* request (ids are monotonic)
+    /// whose command is still queued behind this one is put back, so two
+    /// opens completing back to back both find their source.
+    fn adopt_viewer_handoff(&mut self, request: u64, was_viewer: bool, after: &State) {
+        let opened_path = match &after.phase {
+            UiPhase::Viewer(viewer) if !was_viewer => Some(viewer.path.clone()),
+            _ => None,
+        };
+        let mut newer = Vec::new();
+        while let Ok((entry_request, path, source)) = self.viewer_handoff.1.try_recv() {
+            if entry_request == request {
+                if opened_path.as_deref() == Some(path.as_path()) {
+                    self.viewer_source = Some((path, source));
+                }
+                // A discarded reply's source is dropped here, releasing the file.
+            } else if entry_request > request {
+                newer.push((entry_request, path, source));
+            }
+            // An older entry is dropped here, releasing the file.
+        }
+        for entry in newer {
+            let _ = self.viewer_handoff.0.send(entry);
+        }
+    }
+
+    /// `Command::ViewerClose`'s release of the viewer's byte source, so the
+    /// file handle is closed with the viewer (viewer: Instant open —
+    /// "Closing the viewer releases the file").
+    fn release_viewer_source(&mut self) {
+        self.viewer_source = None;
+    }
+
+    /// `apply`'s post-`update` check (resize-preserves-session-state design
+    /// D7): the source goes when the viewer phase has just ended by any
+    /// route, or when a `ViewerOpened` was applied but the phase did not
+    /// become `Viewer` (the reply was discarded). It is keyed to that
+    /// *transition*, never to "the phase is not `Viewer`": a command applied
+    /// while the viewer is open must not drop its source.
+    fn release_viewer_source_if_viewer_ended(&mut self, was_viewer: bool, viewer_opened: bool, after: &State) {
+        if (was_viewer || viewer_opened) && !matches!(after.phase, UiPhase::Viewer(_)) {
+            self.release_viewer_source();
+        }
+    }
 }
 
 /// Launch-time command-line switches, parsed once by [`parse_launch_args`]
@@ -72,6 +233,11 @@ pub struct LaunchOptions {
     /// `[mouse] enabled` key, mirroring `--nosplash` (mouse-input "Mouse
     /// capture configuration").
     pub no_mouse: bool,
+    /// `--noanimations`: run with every decorative animation off regardless
+    /// of `config.toml`'s `animations` key, mirroring `--nosplash`
+    /// (ui-animations "Animations are disabled by config or launch flag" —
+    /// the flag wins when the two disagree).
+    pub no_animations: bool,
     /// `--theme <name>` or `--theme=<name>`: `None` when the switch was not
     /// passed at all; `Some(String::new())` when it was passed with no
     /// following value (e.g. as the final argument); `Some(name)` otherwise,
@@ -79,6 +245,22 @@ pub struct LaunchOptions {
     /// resolution happens in `resolve_startup_theme`, not here
     /// (theme-selection "Launch-time theme override via --theme").
     pub theme: Option<String>,
+    /// `--config-dir <path>` or `--config-dir=<path>`: `None` when the
+    /// switch was not passed at all; `Some(String::new())` when it was
+    /// passed with no following value (a startup warning downstream, never
+    /// a crash); `Some(path)` otherwise, where `path` wins outright over
+    /// portable mode and the platform default — resolution happens in
+    /// `resolve_profile_dir`, not here (config-profile-directory
+    /// "Configuration profile directory": "Explicit --config-dir
+    /// override"). Same absent/empty/value convention as `theme` above.
+    pub config_dir: Option<String>,
+    /// `--log <path>` or `--log=<path>`: enable the diagnostic log at
+    /// `path` for this session, winning over the `FILECOMMAND_LOG`
+    /// environment variable. Same absent/empty/value convention as `theme`
+    /// and `config_dir` above; resolution happens in `run` via
+    /// `resolve_log_path` (error-diagnostics; application-shell "Optional
+    /// diagnostic log").
+    pub log: Option<String>,
 }
 
 /// Parse launch switches from an argument iterator (excluding the program
@@ -97,6 +279,8 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
             opts.no_splash = true;
         } else if arg == "--nomouse" {
             opts.no_mouse = true;
+        } else if arg == "--noanimations" {
+            opts.no_animations = true;
         } else if arg == "--theme" {
             // A missing value (switch is the final argument) is recorded as
             // an empty string rather than `None`, so `resolve_startup_theme`
@@ -105,20 +289,204 @@ pub fn parse_launch_args<I: IntoIterator<Item = String>>(args: I) -> LaunchOptio
             opts.theme = Some(iter.next().unwrap_or_default());
         } else if let Some(value) = arg.strip_prefix("--theme=") {
             opts.theme = Some(value.to_string());
+        } else if arg == "--config-dir" {
+            // Same missing-value convention as --theme above: recorded as
+            // an empty string so startup warns and falls through to normal
+            // profile resolution rather than crashing (task 1.1).
+            opts.config_dir = Some(iter.next().unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--config-dir=") {
+            opts.config_dir = Some(value.to_string());
+        } else if arg == "--log" {
+            // Same missing-value convention again (error-diagnostics design
+            // D2): an empty string so startup warns "--log needs a path"
+            // instead of silently disabling the log.
+            opts.log = Some(iter.next().unwrap_or_default());
+        } else if let Some(value) = arg.strip_prefix("--log=") {
+            opts.log = Some(value.to_string());
         }
     }
     opts
 }
 
+/// The platform default profile directory: `%APPDATA%\FileCommand` on
+/// Windows, `$XDG_CONFIG_HOME/filecommand` (else `~/.config/filecommand`)
+/// elsewhere; `None` when no config-home environment variable is set
+/// (config-profile-directory "Configuration profile directory"; design D1).
+/// `pub` so `main.rs`'s usage text can name it (design D4) — nothing is
+/// created here.
+pub fn platform_default_profile_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        std::env::var_os("APPDATA").map(|appdata| PathBuf::from(appdata).join("FileCommand"))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("filecommand"))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("filecommand")))
+    }
+}
+
+/// Why the last-resort cwd fallback fired, named in its startup warning —
+/// the environment variable(s) that would normally resolve the platform
+/// default (design D1: "never silent").
+#[cfg(windows)]
+const CONFIG_HOME_UNSET_HINT: &str = "APPDATA is not set";
+#[cfg(not(windows))]
+const CONFIG_HOME_UNSET_HINT: &str = "neither XDG_CONFIG_HOME nor HOME is set";
+
+/// Resolve the one profile directory every configuration file lives in
+/// (config-profile-directory "Configuration profile directory"). Order
+/// (design D1): an explicit `--config-dir` flag wins outright — a relative
+/// value is resolved against the working directory at startup; else, when
+/// a file named `portable` exists beside the executable, the executable's
+/// own directory (portable mode); else the platform default. When no
+/// config-home variable resolves either, the working directory is the
+/// last-resort fallback and the returned warning says so — resolution is
+/// never silent.
+fn resolve_profile_dir(flag: Option<PathBuf>, exe_dir: Option<&Path>) -> (PathBuf, Option<String>) {
+    if let Some(path) = flag {
+        let path = if path.is_absolute() { path } else { std::env::current_dir().map(|cwd| cwd.join(&path)).unwrap_or(path) };
+        return (path, None);
+    }
+    if let Some(dir) = exe_dir {
+        if dir.join("portable").exists() {
+            return (dir.to_path_buf(), None);
+        }
+    }
+    if let Some(default) = platform_default_profile_dir() {
+        return (default, None);
+    }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let warning = format!("{CONFIG_HOME_UNSET_HINT}; using the current directory {} for configuration files", cwd.display());
+    (cwd, Some(warning))
+}
+
+/// Interpret the raw `--config-dir` flag value the way
+/// `resolve_startup_theme` interprets `--theme`: `None` (switch absent) is
+/// no override; `Some(path)` wins outright; `Some("")` — the switch passed
+/// with no value — produces a startup warning, not a crash, and falls
+/// through to normal resolution (application-shell "Configuration profile
+/// directory": "Explicit --config-dir override"; task 1.1).
+fn config_dir_override(raw: Option<&str>) -> (Option<PathBuf>, Option<String>) {
+    match raw {
+        Some("") => (None, Some("--config-dir requires a value".to_string())),
+        Some(path) => (Some(PathBuf::from(path)), None),
+        None => (None, None),
+    }
+}
+
+/// Resolve the diagnostic-log path chosen at launch (error-diagnostics
+/// design D2; application-shell "Optional diagnostic log"): the `--log`
+/// flag wins over `FILECOMMAND_LOG` outright, an empty flag value is a
+/// warning rather than a path, and an empty or unset variable counts as
+/// unset. `Err` is the startup-warning text; `Ok(None)` leaves logging off
+/// and creates nothing ("No log unless asked for").
+fn resolve_log_path(flag: Option<&str>, env: Option<&str>) -> Result<Option<String>, String> {
+    match flag {
+        Some("") => Err("--log needs a path".to_string()),
+        Some(path) => Ok(Some(path.to_string())),
+        None => match env {
+            Some(value) if !value.is_empty() => Ok(Some(value.to_string())),
+            _ => Ok(None),
+        },
+    }
+}
+
+/// Open the log [`resolve_log_path`] chose. Runs before profile resolution
+/// so every startup warning that follows can be recorded (design D2/D3). An
+/// unopenable path downgrades to a startup warning naming the path and the
+/// reason — the session continues without logging ("Unwritable log path
+/// warns and continues").
+fn init_diagnostic_log(path: Option<String>) -> Option<String> {
+    let path = path?;
+    match diag::init(Path::new(&path)) {
+        Ok(()) => None,
+        Err(err) => Some(format!("Diagnostic log disabled: cannot open {path} ({err})")),
+    }
+}
+
+/// Create the profile directory on first run. Failure is soft — the
+/// session runs on in-memory defaults with persistence skipped — and the
+/// returned warning names the path and the error (design D2; scenario
+/// "Unwritable profile falls back without losing the session").
+fn ensure_profile_dir(profile: &Path) -> Option<String> {
+    std::fs::create_dir_all(profile)
+        .err()
+        .map(|err| format!("Could not create {}: {err} — settings will not be saved this session", profile.display()))
+}
+
+/// The legacy-files startup notice (design D3; scenario "Legacy files in
+/// the working directory produce a notice, not a migration"): when the
+/// profile directory has no `config.toml` and the launch directory still
+/// holds pre-profile `config.toml`/`history.json`/`usermenu.toml` files,
+/// say where FileCommand now reads from and that the old files can be
+/// moved — nothing is copied or deleted. `None` when no notice applies.
+fn legacy_notice(cwd: &Path, profile: &Path) -> Option<String> {
+    let names = config::legacy_files_present(cwd, profile);
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Found {} in {}; FileCommand now reads {}. Move them there to keep your settings.",
+        names.join(", "),
+        cwd.display(),
+        profile.display()
+    ))
+}
+
 pub fn run(launch: LaunchOptions) -> io::Result<()> {
+    // Installed from this thread, which thereby becomes the UI thread the
+    // hook restores the terminal for; worker panics leave it alone
+    // (process-lifecycle-hardening design D4).
     crate::terminal::install_panic_hook();
+    // The console control handler that keeps a Ctrl+C typed during a
+    // suspended child run from ending FileCommand (application-shell
+    // "Ctrl+C during a suspended child run stops only the child"; design
+    // D1). Registered once; a failure only leaves the old behavior in place,
+    // so it is logged rather than fatal.
+    #[cfg(windows)]
+    if let Err(e) = console::install_ctrl_handler() {
+        diag::log("startup", format_args!("console control handler not installed: {e}"));
+    }
+    // The diagnostic log is resolved and opened before anything below can
+    // warn, so every startup warning — including ones a later warning
+    // replaces in the single-slot dialog — is recorded (error-diagnostics
+    // design D2/D3; application-shell "Optional diagnostic log"). The flag
+    // wins over FILECOMMAND_LOG; a missing value or an unopenable file
+    // degrades to a startup warning rather than aborting the session.
+    let log_warning = match resolve_log_path(launch.log.as_deref(), std::env::var("FILECOMMAND_LOG").ok().as_deref()) {
+        Ok(path) => init_diagnostic_log(path),
+        Err(warning) => Some(warning),
+    };
+    // The profile directory is resolved before anything loads: every
+    // configuration file (config.toml, history.json, usermenu.toml) lives
+    // there now, never relative to the launch directory
+    // (config-profile-directory "Configuration profile directory").
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
+    let (flag, flag_warning) = config_dir_override(launch.config_dir.as_deref());
+    let (profile_dir, resolve_warning) = resolve_profile_dir(flag, exe_dir.as_deref());
+    let create_warning = ensure_profile_dir(&profile_dir);
+    let persist_enabled = create_warning.is_none();
+    let config_path = profile_dir.join(CONFIG_FILE);
+    let history_path = profile_dir.join(config::HISTORY_FILE);
+    let usermenu_path = profile_dir.join(config::USERMENU_FILE);
+    // Probed before the loads below (none of which create a config.toml):
+    // legacy files left over from the per-launch-directory layout (design
+    // D3).
+    let legacy_warning = legacy_notice(&cwd, &profile_dir);
     // Loaded before the guard so the guard can enable mouse capture (or not)
     // on its very first frame rather than flipping it on a moment later
     // (application-shell "Terminal acquired on startup"; mouse-input "Mouse
     // capture configuration") — `config::load` is pure file I/O with no
     // terminal dependency, so this reorder ahead of `TerminalGuard::new` is
     // safe.
-    let config = config::load(Path::new(CONFIG_FILE));
+    let config::ParsedConfig { config, warnings: parsed_warnings } = config::load(&config_path);
+    // config.toml warnings first, usermenu.toml warnings appended below, in
+    // file-then-line order (configuration-files "Several warnings are
+    // summarized"; design D4).
+    let mut config_warnings: Vec<String> = parsed_warnings.iter().map(ToString::to_string).collect();
     let mouse_enabled = config.mouse_enabled && !launch.no_mouse;
     let mut guard = TerminalGuard::new(mouse_enabled)?;
 
@@ -130,118 +498,209 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
 
     let size = guard.terminal.size()?;
     let term_size = (size.width, size.height);
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let year = DateTime::from_system_time(SystemTime::now()).year;
     let identity_lines = identity::identity_lines(year);
 
-    let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), cwd.clone(), cwd, show_splash);
+    let (mut state, effects) = State::initial(theme, term_size, clock.now_ms(), wall_clock.epoch_ms(), cwd.clone(), cwd, show_splash);
     apply_config(&mut state, &config);
-    // Session-only: this only ever sets `state.startup_warning` in memory,
+    apply_launch_options(&mut state, &launch);
+    // A `--log` switch with no value, an unopenable log file, a
+    // `--config-dir` switch with no value, and the last-resort cwd fallback
+    // are session-only, in-memory warnings — same convention as the theme
+    // override warning just below. Each goes through `set_startup_warning`
+    // so it lands in the diagnostic log even when a later warning replaces
+    // it in the dialog (error-diagnostics design D3).
+    if let Some(warning) = log_warning {
+        set_startup_warning(&mut state, warning);
+    }
+    if let Some(warning) = flag_warning {
+        set_startup_warning(&mut state, warning);
+    }
+    if let Some(warning) = resolve_warning {
+        set_startup_warning(&mut state, warning);
+    }
+    // Session-only: this only ever sets the startup warning in memory,
     // never touches `config.toml` (theme-selection "Override is
     // session-only"; design D4). `apply_user_menu` below may overwrite this
     // with its own warning if both fire at once — matching the pre-existing
-    // single-`startup_warning`-field behavior, not a new decision here.
+    // last-writer-wins behavior, with the superseded warning
+    // kept in the diagnostic log.
     if let Some(warning) = theme_warning {
-        state.startup_warning = Some(warning);
+        set_startup_warning(&mut state, warning);
     }
-    let history_file = config::load_history_file(Path::new(config::HISTORY_FILE));
-    state.history = history_file.commands;
-    state.dir_history = history_file.directories;
-    let user_menu = config::load_user_menu(Path::new(config::USERMENU_FILE));
+    // A file from an earlier build (no format marker) carries session-
+    // relative visit times; they are re-stamped to the startup epoch, future
+    // times are clamped, and the index is pruned to its cap (fuzzy-jump
+    // "Legacy history file is migrated at load"; design D2).
+    let mut loaded = config::load_history_document(&history_path);
+    config::migrate_loaded_history(&mut loaded.file, loaded.legacy, state.epoch_ms);
+    state.history = loaded.file.commands;
+    state.dir_history = loaded.file.directories;
+    let user_menu = config::load_user_menu(&usermenu_path);
+    config_warnings.extend(user_menu.warnings.iter().map(ToString::to_string));
     apply_user_menu(&mut state, user_menu);
+    // Commands → Menu file edit reads the path back out of `State`
+    // (pulldown-menu-completion design D4).
+    state.user_menu_path = usermenu_path.clone();
+    // The legacy notice and the unwritable-profile warning write last, so
+    // the persistence-breaking one (design D2) stays visible when several
+    // warnings fire at once; still the same single-field, last-writer-wins
+    // behavior (config-profile-directory design D3), with every superseded
+    // warning kept in the diagnostic log.
+    if let Some(warning) = legacy_warning {
+        set_startup_warning(&mut state, warning);
+    }
+    if let Some(warning) = create_warning {
+        set_startup_warning(&mut state, warning);
+    }
+    // Lowest precedence of all: the configuration-content summary is shown
+    // only when no other startup warning fired (design D4).
+    apply_configuration_warnings(&mut state, &config_warnings);
+    stamp_startup_warning(&mut state);
 
     let (tx, rx) = mpsc::channel::<Command>();
+    // Both background writers exist only when the profile directory is
+    // writable this session; otherwise every persist effect is a no-op
+    // (config-profile-directory "Unwritable profile falls back without
+    // losing the session"; design D2).
+    let (history_writer, config_writer) = if persist_enabled {
+        (HistoryWriter::spawn(history_path, crate::history_writer::DEBOUNCE, crate::history_writer::MAX_WAIT), ConfigWriter::spawn(config_path))
+    } else {
+        (HistoryWriter::disabled(), ConfigWriter::disabled())
+    };
     let mut rt = Runtime {
         tx,
         active_job: None,
-        history_path: PathBuf::from(config::HISTORY_FILE),
-        config_path: PathBuf::from(CONFIG_FILE),
+        cancels: CancelRegistry::default(),
+        history_writer,
+        config_writer,
+        usermenu_path,
         viewer_source: None,
-        clipboard: Box::new(PlatformClipboard::default()),
+        viewer_handoff: mpsc::channel(),
+        clipboard: Box::new(PlatformClipboard),
         mouse_tracker: MouseTracker::new(),
+        git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+        workers: worker::WorkerGauge::new(),
+        held: None,
     };
 
     if run_effects(effects, &mut guard, &mut rt)? {
-        return Ok(());
+        return shutdown(&mut rt);
     }
     let (mut state, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
     let mut hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
 
     // A non-mouse event read while draining a burst of mouse events (design
-    // D7) is stashed here rather than lost — crossterm has no way to push an
-    // event back onto its queue, so the next loop iteration consumes this
-    // instead of polling again.
+    // D7), or a mouse event that ended a key burst (idle-aware-event-loop
+    // design D5), is stashed here rather than lost — crossterm has no way to
+    // push an event back onto its queue, so the next loop iteration consumes
+    // this instead of polling again.
     let mut pending_event: Option<Event> = None;
 
+    // Idle-aware-event-loop design D1: `needs_draw` persists across
+    // iterations and is cleared only by an actual draw, so a worker result
+    // drained in an iteration whose key then maps to no command still
+    // repaints (application-shell "Redraw survives an unmapped key") — the
+    // old per-iteration `dirty` flag lost that redraw.
+    let mut needs_draw = false;
+    // The wall-clock reading the last drawn frame's header clock showed; a
+    // changed reading at a poll timeout means a minute boundary passed and
+    // the header must be repainted (application-shell "Header clock still
+    // advances while idle").
+    let mut drawn_clock = wall_clock.now_local();
+    let mut events = CrosstermEvents;
+
     loop {
-        let (s, mut dirty) = drain_events(state, &rx, &mut guard, &mut rt)?;
+        // Budgeted (streaming-listing-performance design D7): at most ~8 ms
+        // or 64 messages before input is read and the frame drawn, so a
+        // worker flood — a 100k-entry directory streaming in — never starves
+        // the keyboard (panel-navigation "Input stays responsive while a
+        // 100,000-entry directory streams in"). What remains is a `backlog`
+        // the poll below must not sleep on.
+        let (s, drained) = drain_events(state, &rx, &mut guard, &mut rt)?;
         state = s;
+        needs_draw |= drained.applied;
+        let mut backlog = drained.backlog;
+
+        // Design D3's race: a worker can post its last message and drop its
+        // gauge token between the drain above and this gauge read. The send
+        // happens-before the token's release-decrement, so with a zero
+        // reading one more drain is guaranteed to see that message — without
+        // it the loop could sleep a whole deadline with it unapplied.
+        let workers_alive = rt.workers.live() > 0;
+        if !workers_alive {
+            let (s, drained) = drain_events(state, &rx, &mut guard, &mut rt)?;
+            state = s;
+            needs_draw |= drained.applied;
+            backlog = drained.backlog;
+        }
+
+        // While a draw is already pending there is no sleeping: poll with a
+        // zero timeout so input that is already queued applies before the
+        // frame (one draw for the whole batch), then fall through to it.
+        let timeout = if needs_draw {
+            Duration::ZERO
+        } else {
+            let now = clock.now_ms();
+            next_timeout(
+                now,
+                anim::next_wake_ms(&state),
+                Duration::from_millis(crate::clock::ms_until_next_minute(crate::clock::now_unix_ms())),
+                workers_alive,
+                backlog,
+            )
+        };
 
         let next_event = match pending_event.take() {
             Some(e) => Some(e),
-            None if event::poll(POLL_INTERVAL)? => Some(event::read()?),
+            None if events.poll(timeout)? => Some(events.read()?),
             None => None,
         };
 
         match next_event {
             Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-                // The quit-confirmation dialog outranks the viewer/editor's
-                // own direct-dispatch key routing: once it is up, every key
-                // goes through `map_key` (which checks `quit_confirm`
-                // first), regardless of `state.phase` — the same way it
-                // outranks every other overlay inside `map_key` itself
-                // (application-shell "Quit request keys and
-                // confirmation"; design D5).
-                let cmd = if state.quit_confirm {
-                    let page_size = active_panel_page_size(&state);
-                    input::map_key(key, &state, page_size, &keys)
-                } else {
-                    match &state.phase {
-                        UiPhase::Viewer(viewer) => {
-                            let rows_visible = views::viewer::body_rows(state.term_size.1);
-                            let source = rt.viewer_source.as_ref().map(|(_, s)| s);
-                            input::map_viewer_key(key, viewer, rows_visible)
-                                .and_then(|action| resolve_viewer_navigation(viewer, source, action, rows_visible))
-                        }
-                        UiPhase::Editor(editor) => {
-                            let rows_visible = views::editor::body_rows(state.term_size.1);
-                            input::map_editor_key(key, editor, rows_visible)
-                        }
-                        _ => {
-                            let page_size = active_panel_page_size(&state);
-                            input::map_key(key, &state, page_size, &keys)
-                        }
-                    }
-                };
-                match cmd {
-                    Some(cmd) => {
-                        let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
-                        if quit {
-                            return Ok(());
-                        }
-                        state = s;
-                        dirty = true;
-                    }
-                    None => continue,
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
+                if quit {
+                    return shutdown(&mut rt);
+                }
+                state = s;
+                // Design D5: with the first key handled, keep applying
+                // already-queued input — each key mapped against the state
+                // the previous one produced — then draw once.
+                let mut handler = LoopHandler { guard: &mut guard, rt: &mut rt, keys: &keys };
+                let (s, quit, burst_applied) = drain_key_burst(key, state, &mut events, &mut pending_event, &mut handler)?;
+                state = s;
+                needs_draw |= burst_applied;
+                if quit {
+                    return shutdown(&mut rt);
                 }
             }
             Some(Event::Resize(w, h)) => {
-                let (s, quit) = apply(state, Command::Resize(w, h), &mut guard, &mut rt)?;
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
+                }
+                let (s, quit) = apply(s, Command::Resize(w, h), &mut guard, &mut rt)?;
+                if quit {
+                    return shutdown(&mut rt);
                 }
                 state = s;
-                dirty = true;
+                needs_draw = true;
             }
             Some(Event::Mouse(first)) => {
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
+                if quit {
+                    return shutdown(&mut rt);
+                }
+                state = s;
                 // Drain every mouse event already queued this frame after
                 // the first, so a burst of wheel/drag events causes at most
                 // one redraw (mouse-input "Mouse events are coalesced";
                 // design D7). A non-mouse event read mid-drain is stashed in
                 // `pending_event` rather than lost.
                 let mut batch = vec![first];
-                while event::poll(Duration::ZERO)? {
-                    match event::read()? {
+                while events.poll(Duration::ZERO)? {
+                    match events.read()? {
                         Event::Mouse(m) => batch.push(m),
                         other => {
                             pending_event = Some(other);
@@ -251,31 +710,105 @@ pub fn run(launch: LaunchOptions) -> io::Result<()> {
                 }
                 let (s, quit, batch_dirty) = apply_mouse_batch(state, batch, &hitmap, &mut guard, &mut rt)?;
                 if quit {
-                    return Ok(());
+                    return shutdown(&mut rt);
                 }
                 state = s;
-                dirty = dirty || batch_dirty;
+                needs_draw |= batch_dirty;
             }
+            // A bracketed paste (never produced on Windows — design D6) is
+            // one batch of commands into the field Ctrl+V would paste into,
+            // drawn once.
+            Some(Event::Paste(text)) => {
+                let (s, quit) = tick_before_input(state, &clock, &wall_clock, &mut guard, &mut rt)?;
+                if quit {
+                    return shutdown(&mut rt);
+                }
+                state = s;
+                for cmd in input::map_paste(&text, &state) {
+                    let (s, quit) = apply(state, cmd, &mut guard, &mut rt)?;
+                    state = s;
+                    needs_draw = true;
+                    if quit {
+                        return shutdown(&mut rt);
+                    }
+                }
+            }
+            // Key releases, focus events: nothing to apply.
             Some(_) => {}
             None => {
-                let (s, quit) = apply(state, Command::Tick(clock.now_ms()), &mut guard, &mut rt)?;
-                if quit {
-                    return Ok(());
+                // A poll timeout applies nothing and draws nothing unless a
+                // deadline actually came due (design D1/D2) — the
+                // worker-cadence wakeups this arm also gets are what used to
+                // cost a full frame every 33 ms forever (audit P-05).
+                let now = clock.now_ms();
+                let core_due = anim::next_wake_ms(&state).is_some_and(|wake| now >= wake);
+                let minute_due = wall_clock.now_local() != drawn_clock;
+                if core_due || minute_due {
+                    let (s, quit) = apply(state, Command::Tick { now_ms: now, epoch_ms: wall_clock.epoch_ms() }, &mut guard, &mut rt)?;
+                    if quit {
+                        return shutdown(&mut rt);
+                    }
+                    state = s;
+                    needs_draw = true;
                 }
-                state = s;
-                dirty = true;
             }
         }
 
-        if dirty {
+        if needs_draw {
             // Effects that feed a command straight back (drive enumeration)
             // must land before the frame, so the dialog paints complete on
-            // its very first appearance rather than a frame later.
+            // its very first appearance rather than a frame later. Under the
+            // same budget: a backlog left here is picked up by the next
+            // iteration's drain, after this frame has been shown.
             let (s, _) = drain_events(state, &rx, &mut guard, &mut rt)?;
             state = s;
             hitmap = draw(&mut guard, &state, &identity_lines, &wall_clock, rt.viewer_source.as_ref().map(|(_, s)| s))?;
+            needs_draw = false;
+            drawn_clock = wall_clock.now_local();
         }
     }
+}
+
+/// The one exit path for every quit return in [`run`] (application-shell
+/// "Quit waits for job cancellation cleanup"; process-lifecycle-hardening
+/// design D3). Acts on `rt.active_job` directly — whatever phase core is
+/// in, so a quit confirmed from a screen that no longer shows
+/// `FileOpRunning` still waits for the job — and returns `Ok(())` so the
+/// call sites read `return shutdown(&mut rt)`. With no job there is nothing
+/// to wait for and quit exits at once.
+fn shutdown(rt: &mut Runtime) -> io::Result<()> {
+    if let Some(job) = rt.active_job.take() {
+        if !shutdown_job(job, QUIT_JOB_WAIT) {
+            // The same partial-file risk as before this change, now confined
+            // to a job whose write has not returned in two seconds
+            // (error-diagnostics coordination: the timeout is logged).
+            diag::log("job", format_args!("quit: job thread still running after {} ms; exiting without its cleanup", QUIT_JOB_WAIT.as_millis()));
+        }
+    }
+    Ok(())
+}
+
+/// Request `job`'s cancellation and wait up to `wait` for its thread to
+/// end, polling `is_finished()` every [`QUIT_JOB_POLL`]. Returns `true`
+/// when the thread ended (and was joined), `false` when it was abandoned at
+/// the bound. No dialog answer is sent: the sink's reply loop turns the
+/// cancel flag into an abort for whichever prompt is pending (design D5),
+/// so a conflict and an error reply can never be mismatched. The screen is
+/// not redrawn meanwhile — at most `wait` passes with the last frame still
+/// showing.
+fn shutdown_job(job: worker::JobHandle, wait: Duration) -> bool {
+    job.cancel.cancel();
+    let deadline = Instant::now() + wait;
+    while !job.thread.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(QUIT_JOB_POLL);
+    }
+    // Finished: the join cannot block, and a contained panic has already
+    // been turned into the job's `JobDone` reply by `spawn_job`.
+    let _ = job.thread.join();
+    true
 }
 
 /// A wheel/scroll command not yet applied, accumulated across consecutive
@@ -383,8 +916,12 @@ fn apply_mouse_batch(
         if matches!(m.kind, MouseEventKind::Moved) {
             continue;
         }
+        // While the placeholder hides the screen, the viewer/editor wheel
+        // arms are skipped and every event goes through `input::map_mouse`,
+        // whose `context` ignores all of it except the quit dialog's buttons
+        // (resize-preserves-session-state design D3).
         match &state.phase {
-            UiPhase::Viewer(_) => match m.kind {
+            UiPhase::Viewer(_) if !state.undersized => match m.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                     let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                     pending = match pending {
@@ -397,7 +934,7 @@ fn apply_mouse_batch(
                 }
                 _ => flush!(),
             },
-            UiPhase::Editor(_) => match m.kind {
+            UiPhase::Editor(_) if !state.undersized => match m.kind {
                 MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                     let notch = if m.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
                     pending = match pending {
@@ -437,9 +974,201 @@ fn apply_mouse_batch(
     Ok((state, false, dirty))
 }
 
+/// The loop's terminal-event source, factored behind a trait so the burst
+/// drain can be driven by a scripted queue in tests (idle-aware-event-loop
+/// task 2.7). Production reads crossterm.
+trait EventSource {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool>;
+    fn read(&mut self) -> io::Result<Event>;
+}
+
+struct CrosstermEvents;
+
+impl EventSource for CrosstermEvents {
+    fn poll(&mut self, timeout: Duration) -> io::Result<bool> {
+        event::poll(timeout)
+    }
+    fn read(&mut self) -> io::Result<Event> {
+        event::read()
+    }
+}
+
+/// The poll timeout for one loop iteration (idle-aware-event-loop design
+/// D2/D3), factored pure for tests. Zero while a drained worker backlog is
+/// still pending (`backlog`, from the budgeted [`drain_events`];
+/// streaming-listing-performance design D7); at most `POLL_INTERVAL` while
+/// worker threads that can still post results are alive, so results keep
+/// today's latency; otherwise the earliest of the reducer's next wake
+/// (`core_wake`, on the same monotonic-millisecond axis as `now`) and the
+/// header clock's next minute flip (`minute_wake`).
+fn next_timeout(now: u64, core_wake: Option<u64>, minute_wake: Duration, workers_alive: bool, backlog: bool) -> Duration {
+    if backlog {
+        return Duration::ZERO;
+    }
+    let mut timeout = minute_wake;
+    if let Some(wake) = core_wake {
+        timeout = timeout.min(Duration::from_millis(wake.saturating_sub(now)));
+    }
+    if workers_alive {
+        timeout = timeout.min(POLL_INTERVAL);
+    }
+    timeout
+}
+
+/// Design D4: bring the reducer clock up to date before the first event of
+/// an input batch is applied, when the last delivered tick is older than
+/// `POLL_INTERVAL` — so a surface opened after an idle stretch is stamped
+/// with the real time and animates from its opening frame, and two clicks
+/// separated by idle time are not mistaken for a double-click
+/// (application-shell "Clicks separated by idle time are not a
+/// double-click"). A no-op while the clock is already fresh; applies no
+/// transition early (a key during the splash hold still dismisses the
+/// splash, exactly as before).
+fn tick_before_input(
+    state: State,
+    clock: &RealClock,
+    wall_clock: &RealWallClock,
+    guard: &mut TerminalGuard,
+    rt: &mut Runtime,
+) -> io::Result<(State, bool)> {
+    let now = clock.now_ms();
+    if now.saturating_sub(state.clock_ms) > POLL_INTERVAL.as_millis() as u64 {
+        // Both clocks travel in the tick, so a visit recorded right after an
+        // idle stretch is stamped with fresh wall-clock time too
+        // (history-persistence-hardening design D1).
+        apply(state, Command::Tick { now_ms: now, epoch_ms: wall_clock.epoch_ms() }, guard, rt)
+    } else {
+        Ok((state, false))
+    }
+}
+
+/// What the key-burst drain needs from the loop around it: the per-key
+/// mapping (factored out of the loop body, design D5) and the command
+/// application path. Production wires [`map_pressed_key`] + [`apply`] through
+/// [`LoopHandler`]; tests drive the same drain with a recording handler and
+/// no terminal.
+trait BurstHandler {
+    fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command>;
+    fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)>;
+}
+
+struct LoopHandler<'a> {
+    guard: &'a mut TerminalGuard,
+    rt: &'a mut Runtime,
+    keys: &'a config::Keys,
+}
+
+impl BurstHandler for LoopHandler<'_> {
+    fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command> {
+        map_pressed_key(key, state, self.keys, self.rt.viewer_source.as_ref().map(|(_, s)| s))
+    }
+    fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)> {
+        apply(state, cmd, self.guard, self.rt)
+    }
+}
+
+/// The loop's per-key mapping (idle-aware-event-loop design D5), factored
+/// out of the loop body so the first key of an iteration and every drained
+/// burst key go through the same routing. The layer that owns input comes
+/// from the single precedence order (`filecommand_core::input_layer`;
+/// reducer-overlay-structure design D2): the viewer and editor layers map
+/// through their own functions — the viewer's needs the open `ByteSource`,
+/// the editor's its own page size — and every other layer goes through
+/// `input::map_key`, which routes by the same function. That is what makes
+/// the quit-confirmation dialog outrank the viewer/editor's direct dispatch
+/// (application-shell "Quit request keys and confirmation"; design D5), and
+/// the "terminal too small" placeholder gate every key of a hidden viewer or
+/// editor (resize-preserves-session-state design D3).
+fn map_pressed_key(key: KeyEvent, state: &State, keys: &config::Keys, viewer_source: Option<&ByteSource>) -> Option<Command> {
+    match (input_layer(state), &state.phase) {
+        (InputLayer::Viewer, UiPhase::Viewer(viewer)) => {
+            let rows_visible = views::viewer::body_rows(state.term_size.1);
+            input::map_viewer_key(key, viewer, rows_visible).and_then(|action| resolve_viewer_navigation(viewer, viewer_source, action, rows_visible))
+        }
+        (InputLayer::Editor, UiPhase::Editor(editor)) => {
+            let rows_visible = views::editor::body_rows(state.term_size.1);
+            input::map_editor_key(key, editor, rows_visible)
+        }
+        _ => {
+            let page_size = active_panel_page_size(state);
+            input::map_key(key, state, page_size, keys)
+        }
+    }
+}
+
+/// One iteration's application of an input burst (idle-aware-event-loop
+/// "Bursts of key input render once"; design D5): apply `first` (a pressed
+/// key), then keep reading with a zero poll while the burst budget
+/// ([`BURST_MAX_EVENTS`] events or [`BURST_MAX_DURATION`]) lasts — each
+/// pressed key mapped against the state the previous one produced, so
+/// state-dependent routing (Enter opening a dialog, the next characters
+/// landing in its field) is exactly as if the keys had arrived one loop
+/// iteration at a time. Key releases and focus events are skipped; a resize
+/// is applied like any command; a paste goes through `input::map_paste` as
+/// one batch; a mouse event ends the burst and is stashed in
+/// `pending_event` for the next iteration's mouse-batch path. Returns
+/// `(state, quit, applied)`, `applied` feeding the loop's `needs_draw`.
+fn drain_key_burst(
+    first: KeyEvent,
+    mut state: State,
+    events: &mut dyn EventSource,
+    pending_event: &mut Option<Event>,
+    handler: &mut dyn BurstHandler,
+) -> io::Result<(State, bool, bool)> {
+    let started = Instant::now();
+    let mut applied = false;
+    let mut handled = 0usize;
+    let mut next = Event::Key(first);
+    loop {
+        match next {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                if let Some(cmd) = handler.map_key(key, &state) {
+                    let (s, quit) = handler.apply(state, cmd)?;
+                    state = s;
+                    applied = true;
+                    if quit {
+                        return Ok((state, true, applied));
+                    }
+                }
+            }
+            Event::Resize(w, h) => {
+                let (s, quit) = handler.apply(state, Command::Resize(w, h))?;
+                state = s;
+                applied = true;
+                if quit {
+                    return Ok((state, true, applied));
+                }
+            }
+            Event::Paste(text) => {
+                for cmd in input::map_paste(&text, &state) {
+                    let (s, quit) = handler.apply(state, cmd)?;
+                    state = s;
+                    applied = true;
+                    if quit {
+                        return Ok((state, true, applied));
+                    }
+                }
+            }
+            Event::Mouse(mouse) => {
+                *pending_event = Some(Event::Mouse(mouse));
+                return Ok((state, false, applied));
+            }
+            _ => {}
+        }
+        handled += 1;
+        if handled >= BURST_MAX_EVENTS || started.elapsed() >= BURST_MAX_DURATION {
+            return Ok((state, false, applied));
+        }
+        if !events.poll(Duration::ZERO)? {
+            return Ok((state, false, applied));
+        }
+        next = events.read()?;
+    }
+}
+
 /// Resolve the startup theme from `config.theme` and an optional `--theme`
 /// launch override, returning the theme to start with plus an optional
-/// warning message for `state.startup_warning`.
+/// warning message for the startup-warning dialog.
 ///
 /// `override_name`: `None` when `--theme` was not passed (no warning is
 /// ever produced in that case); `Some("")` when `--theme` was passed with no
@@ -487,6 +1216,39 @@ fn apply_config(state: &mut State, config: &config::Config) {
     state.shell = ShellConfig::from_env(config.shell.clone());
     state.editor = config.editor.clone();
     state.split_percent = config.panel_split;
+    state.animations = config.animations;
+}
+
+/// Apply launch switches that override a config-driven `State` value:
+/// `--noanimations` forces animations off even when `animations = true`
+/// (ui-animations "Flag overrides config"). Run after [`apply_config`], which
+/// copies the config's value, so the flag always has the last word.
+fn apply_launch_options(state: &mut State, launch: &LaunchOptions) {
+    if launch.no_animations {
+        state.animations = false;
+    }
+}
+
+/// The one writer of the startup warning at startup (error-diagnostics
+/// design D3): the dialog stays last-writer-wins — `State::set_startup_
+/// warning` replaces an existing warning's message rather than asserting an
+/// empty overlay slot (reducer-overlay-structure design D5) — but every
+/// warning, including ones a later assignment replaces, is recorded in the
+/// diagnostic log (application-shell "Optional diagnostic log": "Superseded
+/// startup warnings are still recorded"). With the log disabled this is
+/// exactly the core setter.
+fn set_startup_warning(state: &mut State, warning: String) {
+    diag::log("startup", &warning);
+    state.set_startup_warning(warning);
+}
+
+/// Stamp the startup-warning dialog's open time so it irises in like every
+/// other modal. It is raised here, in `run`, rather than by a reducer
+/// command, so the reducer's own stamping post-condition never sees it open.
+fn stamp_startup_warning(state: &mut State) {
+    if state.startup_warning().is_some() {
+        state.dialog_opened_at_ms = state.clock_ms;
+    }
 }
 
 /// Snapshot the F2 user menu into `State` at startup, factored out of `run`
@@ -494,13 +1256,44 @@ fn apply_config(state: &mut State, config: &config::Config) {
 /// terminal. On a malformed `usermenu.toml`, `config::load_user_menu` has
 /// already fallen back to default entries in memory without touching the
 /// file; this raises the spec-required dismissable startup-warning dialog
-/// (`state.startup_warning`) rather than a panel mini-status, since the
+/// (`state.startup_warning()`) rather than a panel mini-status, since the
 /// warning concerns the whole session, not either panel specifically
 /// (user-menu "Malformed file warns and falls back without overwriting").
 fn apply_user_menu(state: &mut State, user_menu: config::UserMenuLoadResult) {
     state.user_menu_entries = user_menu.entries;
     if user_menu.malformed {
-        state.startup_warning = Some(format!("{} is malformed; F2 uses the default user menu", config::USERMENU_FILE));
+        let file = config::USERMENU_FILE;
+        let warning = match user_menu.problem {
+            // A not-UTF-8 file gets its own message naming the way out,
+            // because the built-in editor will not open it
+            // (configuration-files "Non-UTF-8 usermenu.toml is kept, not
+            // overwritten"; design D3).
+            Some(config::UserMenuProblem::NotUtf8) => {
+                format!("{file} is not UTF-8 text; using the default menu — re-save it as UTF-8 or delete it to recreate the defaults")
+            }
+            Some(config::UserMenuProblem::Unreadable(error)) => format!("{file} could not be read ({error}); using the default menu"),
+            Some(config::UserMenuProblem::InvalidToml) | None => format!("{file} is malformed; F2 uses the default user menu"),
+        };
+        set_startup_warning(state, warning);
+    }
+}
+
+/// Show the `config.toml`/`usermenu.toml` content warnings as one summary
+/// line in the startup-warning dialog, but only when no other startup
+/// warning is already up: the summary has the lowest precedence, so every
+/// warning an existing requirement mandates (profile directory, `--theme`,
+/// malformed user menu, legacy notice, unwritable profile) still shows
+/// (configuration-files "Profile warning keeps precedence", "Theme override
+/// warning keeps precedence"; design D4). Every individual warning goes to
+/// the diagnostic log regardless, since the dialog shows only the first.
+fn apply_configuration_warnings(state: &mut State, warnings: &[String]) {
+    for warning in warnings {
+        diag::log("config", warning);
+    }
+    if state.startup_warning().is_none() {
+        if let Some(summary) = config::summarize_warnings(warnings) {
+            set_startup_warning(state, summary);
+        }
     }
 }
 
@@ -606,27 +1399,122 @@ fn apply(state: State, cmd: Command, guard: &mut TerminalGuard, rt: &mut Runtime
     // cached byte source needs to be dropped — checked before `update`
     // consumes `cmd`.
     if matches!(cmd, Command::ViewerClose) {
-        rt.viewer_source = None;
+        rt.release_viewer_source();
     }
+    // A cancellable request's final reply retires its cancel flag — there is
+    // nothing left to stop (listing-request-guard design D3). Same pre-
+    // `update` interception point as the viewer source above.
+    match &cmd {
+        Command::ListingComplete { request, .. }
+        | Command::ListingFailed { request, .. }
+        | Command::FindFileSearchDone { request }
+        | Command::ViewerSearchResult { request, .. } => rt.cancels.retire(*request),
+        _ => {}
+    }
+    // The source must also go whenever the viewer phase *ends* by any other
+    // route, and when a `ViewerOpened` is discarded, so the file is held
+    // exactly as long as the viewer exists — see
+    // `Runtime::release_viewer_source_if_viewer_ended` (resize-preserves-
+    // session-state design D7; viewer "Closing the viewer releases the file").
+    let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
+    let viewer_opened = match cmd {
+        Command::ViewerOpened { request, .. } => Some(request),
+        _ => None,
+    };
+    // Commands → Menu file edit, built-in-editor leg: remember whether the
+    // editor currently has the user-menu file open, so the transition out of
+    // `UiPhase::Editor` (any of the quit paths, save-on-exit included)
+    // triggers the reload below (user-menu "Edit the user menu file from the
+    // Commands menu"; design D4).
+    let editing_user_menu = matches!(&state.phase, UiPhase::Editor(editor) if editor.path == rt.usermenu_path);
     let (state, effects) = update(state, cmd);
     let quit = run_effects(effects, guard, rt)?;
+    // The viewer-open worker's source is waiting on the hand-off channel
+    // ahead of its `ViewerOpened`; it becomes the viewer's source only when
+    // the reducer accepted the reply (offload-blocking-io design D4).
+    if let Some(request) = viewer_opened {
+        rt.adopt_viewer_handoff(request, was_viewer, &state);
+    }
+    rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened.is_some(), &state);
+    if editing_user_menu && !matches!(state.phase, UiPhase::Editor(_)) {
+        reload_user_menu(rt);
+    }
     Ok((state, quit))
 }
 
-/// Drain every queued worker event, including any command an effect fed
-/// straight back. The `bool` is `true` if anything was applied, so the
-/// caller knows to redraw.
-fn drain_events(mut state: State, rx: &Receiver<Command>, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, bool)> {
-    let mut applied = false;
-    while let Ok(cmd) = rx.try_recv() {
-        applied = true;
-        let (s, quit) = apply(state, cmd, guard, rt)?;
+/// Re-read `usermenu.toml` and feed the parse result back as
+/// `Command::UserMenuReloaded` (design D4) — drained before the next frame,
+/// exactly like the `RereadPanel` an external editor's return sends.
+fn reload_user_menu(rt: &Runtime) {
+    worker::deliver(&rt.tx, "user menu reload", Command::UserMenuReloaded(config::load_user_menu(&rt.usermenu_path)));
+}
+
+/// How many queued worker messages one [`drain_events`] call applies before
+/// the loop reads input and redraws (streaming-listing-performance design
+/// D7; panel-navigation "Input stays responsive while a 100,000-entry
+/// directory streams in").
+const DRAIN_BUDGET_MESSAGES: usize = 64;
+
+/// How long one [`drain_events`] call may spend applying messages — about a
+/// frame — before it stops and lets input and the frame through (design D7).
+const DRAIN_BUDGET: Duration = Duration::from_millis(8);
+
+/// What one budgeted drain did (streaming-listing-performance design D7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct DrainOutcome {
+    /// Something was applied, so the caller redraws.
+    applied: bool,
+    /// The budget ran out with messages still queued — the one taken by the
+    /// budget check is held for the next drain — so the loop polls input
+    /// with a zero timeout and draws before draining further.
+    backlog: bool,
+}
+
+/// Drain queued worker events, including any command an effect fed straight
+/// back, under the drain budget: at most [`DRAIN_BUDGET_MESSAGES`] messages
+/// or [`DRAIN_BUDGET`] of wall time, whichever comes first (design D7). A
+/// message taken from the channel when the budget turns out to be spent is
+/// parked in [`Runtime::held`] and applied first next time, so nothing is
+/// lost or reordered.
+fn drain_events(state: State, rx: &Receiver<Command>, guard: &mut TerminalGuard, rt: &mut Runtime) -> io::Result<(State, DrainOutcome)> {
+    let mut held = rt.held.take();
+    let result = drain_budgeted(state, rx, &mut held, &Instant::now, |state, cmd| apply(state, cmd, guard, rt));
+    rt.held = held;
+    result
+}
+
+/// The budgeted drain behind [`drain_events`], factored over the state type,
+/// the one-slot `held` buffer, the clock and the application step so tests
+/// can drive it with a scripted channel and no terminal (design D7). Stops
+/// when the channel is empty (no backlog), after `apply` reports quit, or
+/// when a message is taken with the budget already spent — that message is
+/// placed in `held` and `backlog` is reported. The `held` message is always
+/// the first one applied.
+fn drain_budgeted<S>(
+    mut state: S,
+    rx: &Receiver<Command>,
+    held: &mut Option<Command>,
+    now: &dyn Fn() -> Instant,
+    mut apply: impl FnMut(S, Command) -> io::Result<(S, bool)>,
+) -> io::Result<(S, DrainOutcome)> {
+    let start = now();
+    let mut outcome = DrainOutcome::default();
+    let mut applied_count = 0usize;
+    while let Some(cmd) = held.take().or_else(|| rx.try_recv().ok()) {
+        if applied_count >= DRAIN_BUDGET_MESSAGES || now().saturating_duration_since(start) >= DRAIN_BUDGET {
+            *held = Some(cmd);
+            outcome.backlog = true;
+            break;
+        }
+        applied_count += 1;
+        outcome.applied = true;
+        let (s, quit) = apply(state, cmd)?;
         state = s;
         if quit {
             break;
         }
     }
-    Ok((state, applied))
+    Ok((state, outcome))
 }
 
 /// Execute effects returned by `update`. Returns `true` if the caller should
@@ -635,9 +1523,13 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
     let mut quit = false;
     for effect in effects {
         match effect {
-            Effect::StartListing { panel, path } => worker::spawn_listing(panel, path, rt.tx.clone()),
+            Effect::StartListing { panel, path, request } => {
+                let cancel = rt.cancels.register(request);
+                worker::spawn_listing(panel, path, request, cancel, rt.tx.clone(), rt.workers.token());
+            }
+            Effect::CancelRequest(request) => rt.cancels.cancel(request),
             Effect::Quit => quit = true,
-            Effect::RunJob(job) => rt.active_job = Some(worker::spawn_job(job, rt.tx.clone())),
+            Effect::RunJob(job) => rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token())),
             Effect::CancelJob => {
                 if let Some(handle) = &rt.active_job {
                     handle.cancel.cancel();
@@ -645,12 +1537,19 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
             }
             Effect::SendConflictReply(choice) => {
                 if let Some(handle) = &rt.active_job {
-                    let _ = handle.reply_tx.send(worker::JobReply::Conflict(choice));
+                    // A failed send means the job thread has already ended;
+                    // the answer is lost, so it is logged rather than
+                    // dropped silently (error-diagnostics design D3).
+                    if handle.reply_tx.send(worker::JobReply::Conflict(choice)).is_err() {
+                        diag::log("job", "conflict answer not delivered: job ended");
+                    }
                 }
             }
             Effect::SendErrorReply(choice) => {
                 if let Some(handle) = &rt.active_job {
-                    let _ = handle.reply_tx.send(worker::JobReply::Error(choice));
+                    if handle.reply_tx.send(worker::JobReply::Error(choice)).is_err() {
+                        diag::log("job", "error answer not delivered: job ended");
+                    }
                 }
             }
             Effect::RunShellCommand(invocation, side) => {
@@ -664,54 +1563,84 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                 // Fed straight back, same as drive enumeration: the panel
                 // that owned the command must show whatever the command did
                 // to its directory the moment the TUI repaints.
-                let _ = rt.tx.send(Command::RereadPanel(side));
+                worker::deliver(&rt.tx, "panel re-read", Command::RereadPanel(side));
+            }
+            Effect::OpenWithAssociation { side, path, cwd } => {
+                // Fire-and-forget (open-with-associated-app design D1/D3):
+                // no suspend, no wait, no mouse-tracker reset, no panel
+                // re-read. The launch runs on a worker thread with COM
+                // initialized (offload-blocking-io design D7), so a slow
+                // handler never freezes the panels; only a launch failure
+                // reports back, as the command that lands the message on
+                // the invoking panel's status line.
+                worker::spawn_open_with_association(side, path, cwd, rt.tx.clone(), rt.workers.token());
+            }
+            Effect::ProbePath { request, path } => {
+                // The command-line target check the reducer no longer makes
+                // itself (application-shell "The reducer performs no
+                // filesystem I/O"; offload-blocking-io design D1/D2).
+                worker::spawn_path_probe(request, path, rt.tx.clone(), rt.workers.token());
             }
             Effect::ShowScrollback => {
                 show_scrollback(guard)?;
                 rt.mouse_tracker.reset();
             }
             Effect::PersistHistory(file) => {
-                // A history write failing (read-only directory, full disk)
-                // must never take the session down with it.
-                let _ = config::save_history_file_atomic(&rt.history_path, &file);
+                // Handed to the background writer, which coalesces bursts,
+                // merges with the on-disk file, and writes durably off this
+                // thread (fuzzy-jump "Navigation does not wait for the
+                // history write"; history-persistence-hardening design D4).
+                // The writer is the disabled no-op when the profile
+                // directory is unwritable this session
+                // (config-profile-directory; design D2), and a failed write
+                // is logged there rather than taking the session down.
+                rt.history_writer.submit(file);
             }
             Effect::PersistTheme(name) => {
-                // Same tolerance as history: a failed config write must
-                // never take the session down (the theme is already active
-                // in memory either way).
-                let _ = config::save_theme_atomic(&rt.config_path, &name);
+                // Handed to the background configuration writer, which
+                // applies writes one at a time with the newest value per
+                // setting and flushes, bounded, at exit (application-shell
+                // "Slow storage never blocks the event loop"; offload-
+                // blocking-io design D9). Same tolerance as history: a
+                // failed write is logged there and never takes the session
+                // down (the theme is already active in memory either way);
+                // the writer is the disabled no-op when persistence is off
+                // for the session (design D2).
+                rt.config_writer.submit(ConfigWrite::Theme(name));
             }
             Effect::PersistPanelSplit(percent) => {
-                // Same tolerance as the theme write above (panel-split
-                // "Split persistence to configuration").
-                let _ = config::save_panel_split_atomic(&rt.config_path, percent);
+                // Same path as the theme write above (panel-split "Split
+                // persistence to configuration"; design D2).
+                rt.config_writer.submit(ConfigWrite::PanelSplit(percent));
             }
             Effect::EnumerateDrives(target) => {
                 // Cheap enough for the input path: a bitmask read, no media
                 // or network probing. Fed straight back so the dialog's
                 // first painted frame already lists every letter.
-                let _ = rt.tx.send(Command::DriveListReady { target, drives: drives::enumerate_drives() });
+                worker::deliver(&rt.tx, "drive list", Command::DriveListReady { target, drives: drives::enumerate_drives() });
             }
-            Effect::FetchDriveLabel { target, letter, generation } => worker::spawn_drive_label(target, letter, generation, rt.tx.clone()),
-            Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone()),
-            Effect::QueryGitInfo { panel, path, request } => worker::spawn_git_info_query(panel, path, request, rt.tx.clone()),
-            Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone()),
-            Effect::OpenViewer { path } => match ByteSource::open(&path) {
-                Ok(source) => {
-                    // O(1): opening/mapping touches only the handle and its
-                    // length, never the content (viewer: Instant open), so
-                    // this runs synchronously rather than on a worker
-                    // thread, exactly like `EnumerateDrives`.
-                    let file_len = source.len();
-                    rt.viewer_source = Some((path.clone(), source));
-                    let _ = rt.tx.send(Command::ViewerOpened { path, file_len });
-                }
-                Err(e) => {
-                    let _ = rt.tx.send(Command::ViewerOpenFailed { message: e.to_string() });
-                }
-            },
+            Effect::FetchDriveLabel { target, letter, generation } => {
+                worker::spawn_drive_label(target, letter, generation, rt.tx.clone(), rt.workers.token())
+            }
+            Effect::QueryInfo { panel, path, request } => worker::spawn_info_query(panel, path, request, rt.tx.clone(), rt.workers.token()),
+            Effect::QueryGitInfo { panel, path, request } => {
+                let slot = match panel {
+                    PanelSide::Left => &rt.git_slots[0],
+                    PanelSide::Right => &rt.git_slots[1],
+                };
+                slot.request(panel, path, request, rt.tx.clone(), rt.workers.token());
+            }
+            Effect::ExpandTreeNode { panel, path } => worker::spawn_tree_expand(panel, path, rt.tx.clone(), rt.workers.token()),
+            Effect::OpenViewer { request, path } => {
+                // Off the event loop: a dropped SMB session blocks the open
+                // for the redirector timeout (offload-blocking-io design
+                // D4/D5). The source comes back on the hand-off channel
+                // ahead of the `ViewerOpened` reply.
+                worker::spawn_viewer_open(request, path, rt.viewer_handoff.0.clone(), rt.tx.clone(), rt.workers.token());
+            }
             Effect::RunViewerSearch { path, start_offset, pattern, request } => {
-                worker::spawn_viewer_search(path, start_offset, pattern, request, rt.tx.clone());
+                let cancel = rt.cancels.register(request);
+                worker::spawn_viewer_search(path, start_offset, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
             }
             Effect::RunExternalEditor(invocation, side) => {
                 let result = run_external_editor(guard, &invocation)?;
@@ -722,41 +1651,36 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                         // panel that owned the cursor entry, mirroring
                         // `RunShellCommand` (external-editor: Synchronous wait
                         // and panel re-read — "Panel refreshed after edit").
-                        let _ = rt.tx.send(Command::RereadPanel(side));
+                        worker::deliver(&rt.tx, "panel re-read", Command::RereadPanel(side));
+                        // Commands → Menu file edit returns through here too:
+                        // reload the user menu when the file the editor had
+                        // open was `usermenu.toml` (design D4). A panel F4
+                        // edit's `file_arg` is a bare file name, never the
+                        // absolute menu path, so this never false-fires.
+                        if Path::new(&invocation.file_arg) == rt.usermenu_path.as_path() {
+                            reload_user_menu(rt);
+                        }
                     }
                     Err(message) => {
-                        let _ = rt.tx.send(Command::ExternalEditorSpawnFailed { message });
+                        worker::deliver(&rt.tx, "external editor failure", Command::ExternalEditorSpawnFailed { message });
                     }
                 }
             }
-            Effect::OpenEditor { path } => match EditorState::open(&path) {
-                // Synchronous, like `Effect::OpenViewer`: the whole read is
-                // bounded by the 10 MB cap, so this is cheap enough for the
-                // input path rather than warranting a worker thread (design
-                // D1).
-                Ok(EditorLoadResult::Loaded(editor)) => {
-                    let _ = rt.tx.send(Command::EditorOpened(Box::new(editor)));
-                }
-                Ok(EditorLoadResult::TooLarge { size }) => {
-                    let _ = rt.tx.send(Command::EditorTooLarge { path, size });
-                }
-                Err(e) => {
-                    let _ = rt.tx.send(Command::EditorOpenFailed { message: e.to_string() });
-                }
-            },
+            Effect::OpenEditor { request, path } => {
+                // Off the event loop: the whole-file read is bounded by the
+                // 10 MB cap but not in latency on a slow share (offload-
+                // blocking-io design D4).
+                worker::spawn_editor_open(request, path, rt.tx.clone(), rt.workers.token());
+            }
             Effect::FindInSubtree { root, pattern, request } => {
-                worker::spawn_find_subtree(root, pattern, request, rt.tx.clone());
+                let cancel = rt.cancels.register(request);
+                worker::spawn_find_subtree(root, pattern, request, cancel, rt.tx.clone(), rt.workers.token());
             }
             Effect::SaveEditor { editor, then_quit } => {
-                let mut editor = *editor;
-                match editor.save() {
-                    Ok(()) => {
-                        let _ = rt.tx.send(Command::EditorSaved { editor: Box::new(editor), then_quit });
-                    }
-                    Err(e) => {
-                        let _ = rt.tx.send(Command::EditorSaveFailed { message: e.to_string() });
-                    }
-                }
+                // Off the event loop; the reducer keeps the editor gated on
+                // `save_pending` until the reply (offload-blocking-io design
+                // D6).
+                worker::spawn_editor_save(editor, then_quit, rt.tx.clone(), rt.workers.token());
             }
             Effect::SetClipboard(payload) => {
                 // Path normalisation (clipboard-export "Windows file-object
@@ -775,7 +1699,25 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
                     ClipboardPayloadKind::Names => (rt.clipboard.set_text(&clipboard::names_text(&items)), false),
                 };
                 let normalized_payload = update::ClipboardPayload { kind: payload.kind, items };
-                let _ = rt.tx.send(Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
+                worker::deliver(&rt.tx, "clipboard result", Command::ClipboardResult { payload: normalized_payload, fell_back_to_paths, result });
+            }
+            Effect::ReadClipboardText => {
+                // The read half of paste (text-field-editing "Paste into a
+                // text field"; design D4): clipboard text comes back as
+                // `TextEdit(Paste(..))` for whichever field owns the
+                // keyboard when it arrives. Line breaks flatten to a single
+                // space here (`LineEdit::insert_str` does the same again,
+                // so the core behavior never depends on this path — and the
+                // terminal bracketed-paste route flattens through the same
+                // helper; idle-aware-event-loop design D6), and a clipboard
+                // with no text feeds nothing back — the key is then a no-op
+                // ("Empty clipboard is a no-op").
+                if let Some(text) = rt.clipboard.get_text() {
+                    let text = flatten_line_breaks(&text);
+                    if !text.is_empty() {
+                        worker::deliver(&rt.tx, "paste", Command::TextEdit(filecommand_core::line_edit::TextEditOp::Paste(text)));
+                    }
+                }
             }
         }
     }
@@ -787,21 +1729,113 @@ fn run_effects(effects: Vec<Effect>, guard: &mut TerminalGuard, rt: &mut Runtime
 /// Restore runs on every path — a spawn failure, a non-zero exit, or a
 /// child that scribbled over the screen — because `resume` is idempotent
 /// and the panic hook covers the rest.
+///
+/// The whole stretch, from before the suspend until after the resume has
+/// re-entered raw mode, runs inside a [`console::ChildRunGuard`], so a
+/// Ctrl+C or Ctrl+Break typed meanwhile reaches only the child
+/// (application-shell "Ctrl+C during a suspended child run stops only the
+/// child"; process-lifecycle-hardening design D1/D2).
 fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::Result<()> {
+    let mut child_run = console::ChildRunGuard::new();
     guard.suspend()?;
-    let status = std::process::Command::new(&invocation.program)
-        .args(&invocation.args)
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
+    let status = console::spawn_and_wait(
+        std::process::Command::new(&invocation.program)
+            .args(&invocation.args)
+            .current_dir(&invocation.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+        &mut child_run,
+    );
     if let Err(e) = &status {
         // The message lands in the scrollback the user is about to see.
         let _ = writeln!(io::stdout(), "\r\nCould not run `{}`: {e}", invocation.program);
     }
     wait_for_key()?;
-    guard.resume()
+    guard.resume()?;
+    drop(child_run);
+    Ok(())
+}
+
+/// Open `path` with the application the platform associates it with
+/// (open-with-associated-app; design D1): `ShellExecuteW` with the `open`
+/// verb on Windows, a detached `xdg-open`/`open` elsewhere. Never suspends
+/// the TUI and never waits on the launched program; `Err(message)` is the
+/// user-facing failure text for the invoking panel's status line. Called
+/// from `worker::spawn_open_with_association`, on a worker thread with COM
+/// initialized (offload-blocking-io design D7).
+#[cfg(windows)]
+pub(crate) fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+        s.encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    // ShellExecuteW predates long-path support, so the `\\?\` verbatim
+    // prefix must come off first — the same normalization the clipboard-
+    // export payload applies (its "Long-path prefix is stripped" scenario;
+    // file-action-menu "Open with the associated application": "Long path is
+    // passed without the verbatim prefix").
+    let path = clipboard::normalize_path(path);
+    let cwd = clipboard::normalize_path(cwd);
+    let verb = wide(std::ffi::OsStr::new("open"));
+    let file = wide(path.as_os_str());
+    let directory = wide(cwd.as_os_str());
+
+    // SAFETY: every pointer is to a null-terminated UTF-16 buffer that
+    // outlives the call; a null hwnd simply means no owner window.
+    let result = unsafe { ShellExecuteW(std::ptr::null_mut(), verb.as_ptr(), file.as_ptr(), std::ptr::null(), directory.as_ptr(), SW_SHOWNORMAL) };
+    // Per MSDN a return value greater than 32 is success; anything else is
+    // an error code (a SE_ERR_* / ERROR_* value).
+    let code = result as usize;
+    if code > 32 {
+        return Ok(());
+    }
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+    Err(open_with_association_error(&name, code as u32))
+}
+
+/// The user-facing message for a failed `ShellExecuteW` return code,
+/// factored out pure so it is testable without touching the shell (design
+/// D1): `SE_ERR_NOASSOC` names the missing association,
+/// `ERROR_FILE_NOT_FOUND` the missing target, and anything else reports the
+/// raw code (file-action-menu "Open with the associated application").
+#[cfg(windows)]
+fn open_with_association_error(name: &str, code: u32) -> String {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::UI::Shell::SE_ERR_NOASSOC;
+
+    match code {
+        SE_ERR_NOASSOC => format!("No application is associated with {name}"),
+        ERROR_FILE_NOT_FOUND => format!("{name} not found"),
+        _ => format!("Could not open {name} (error {code})"),
+    }
+}
+
+/// The non-Windows half of the Open action (design D1): `xdg-open`
+/// (Linux/BSD) or `open` (macOS), spawned detached — all stdio to null, no
+/// wait — so the TUI stays live and the launched program's output can never
+/// interleave with it. A spawn error maps to the same failure message shape
+/// the Windows path produces.
+#[cfg(not(windows))]
+pub(crate) fn open_with_association(path: &Path, cwd: &Path) -> Result<(), String> {
+    let program = if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    std::process::Command::new(program)
+        .arg(path)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| {
+            let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
+            format!("Could not open {name} ({e})")
+        })
 }
 
 /// Suspend the TUI, run the F4 external editor on the real terminal, and
@@ -815,13 +1849,18 @@ fn run_shell_command(guard: &mut TerminalGuard, invocation: &Invocation) -> io::
 /// — so a misbehaving editor can never leave the terminal corrupted
 /// (external-editor: Terminal restored when the editor crashes).
 fn run_external_editor(guard: &mut TerminalGuard, invocation: &EditorInvocation) -> io::Result<Result<(), String>> {
+    // Same child-run guard as `run_shell_command`: Ctrl+C inside the editor
+    // never ends FileCommand (application-shell "Ctrl+C inside the external
+    // editor does not end FileCommand"; design D1/D2).
+    let mut child_run = console::ChildRunGuard::new();
     guard.suspend()?;
-    let result = spawn_editor_and_wait(invocation);
+    let result = spawn_editor_and_wait(invocation, &mut child_run);
     if let Err(message) = &result {
         let _ = writeln!(io::stdout(), "\r\n{message}");
     }
     wait_for_key()?;
     guard.resume()?;
+    drop(child_run);
     Ok(result)
 }
 
@@ -831,18 +1870,20 @@ fn run_external_editor(guard: &mut TerminalGuard, invocation: &EditorInvocation)
 /// `run_shell_command`'s precedent of not treating the child's exit code as
 /// FileCommand's own error); `Err` only when the process could not be
 /// spawned at all (external-editor: Editor spawn errors do not crash the
-/// app).
-fn spawn_editor_and_wait(invocation: &EditorInvocation) -> Result<(), String> {
-    std::process::Command::new(&invocation.program)
-        .args(&invocation.leading_args)
-        .arg(&invocation.file_arg)
-        .current_dir(&invocation.cwd)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map(|_| ())
-        .map_err(|e| format!("Could not run `{}`: {e}", invocation.program))
+/// app). `child_run` is armed once the editor has started (design D2).
+fn spawn_editor_and_wait(invocation: &EditorInvocation, child_run: &mut console::ChildRunGuard) -> Result<(), String> {
+    console::spawn_and_wait(
+        std::process::Command::new(&invocation.program)
+            .args(&invocation.leading_args)
+            .arg(&invocation.file_arg)
+            .current_dir(&invocation.cwd)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit()),
+        child_run,
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Could not run `{}`: {e}", invocation.program))
 }
 
 /// Ctrl+O: hand the screen back so the host terminal's scrollback (which is
@@ -910,6 +1951,7 @@ fn draw(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use std::ffi::OsString;
 
     /// A harmless, always-present "editor" invocation per platform — exits
@@ -926,6 +1968,230 @@ mod tests {
         EditorInvocation { program, leading_args, file_arg: OsString::from(file_arg), cwd: std::env::temp_dir() }
     }
 
+    /// listing-request-guard design D3 (task 5.14): `cancel` sets the
+    /// registered flag and forgets it, an unknown id is a no-op, and
+    /// `retire` forgets without setting.
+    #[test]
+    fn cancel_registry_cancels_retires_and_ignores_unknown_ids() {
+        let mut registry = CancelRegistry::default();
+        let listing = registry.register(1);
+        let walk = registry.register(2);
+        assert!(!listing.is_cancelled() && !walk.is_cancelled(), "fresh flags are unset");
+
+        registry.cancel(1);
+        assert!(listing.is_cancelled(), "cancel sets the worker's clone of the flag");
+        assert!(!registry.flags.contains_key(&1), "and removes the entry");
+        assert!(!walk.is_cancelled(), "other requests are untouched");
+
+        registry.cancel(1);
+        registry.cancel(999);
+        assert_eq!(registry.flags.len(), 1, "an already-finished or unknown id is a silent no-op");
+
+        registry.retire(2);
+        assert!(!walk.is_cancelled(), "retire never sets the flag");
+        assert!(registry.flags.is_empty());
+    }
+
+    /// A `Runtime` with no terminal and no worker threads, for the viewer-
+    /// source tests below.
+    fn headless_runtime(dir: &std::path::Path) -> (Runtime, Receiver<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let rt = Runtime {
+            tx,
+            active_job: None,
+            cancels: CancelRegistry::default(),
+            history_writer: HistoryWriter::disabled(),
+            config_writer: ConfigWriter::disabled(),
+            usermenu_path: dir.join("usermenu.toml"),
+            viewer_source: None,
+            viewer_handoff: mpsc::channel(),
+            clipboard: Box::new(clipboard::RecordingClipboard::default()),
+            mouse_tracker: MouseTracker::new(),
+            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+            workers: worker::WorkerGauge::new(),
+            held: None,
+        };
+        (rt, rx)
+    }
+
+    /// Mirrors `apply` minus `run_effects` (which needs a `TerminalGuard`):
+    /// the pre-`update` `ViewerClose` release, the post-`update` hand-off
+    /// adoption and the transition check, in the same order.
+    fn apply_headless(state: State, cmd: Command, rt: &mut Runtime) -> State {
+        if matches!(cmd, Command::ViewerClose) {
+            rt.release_viewer_source();
+        }
+        let was_viewer = matches!(state.phase, UiPhase::Viewer(_));
+        let viewer_opened = match cmd {
+            Command::ViewerOpened { request, .. } => Some(request),
+            _ => None,
+        };
+        let (state, _effects) = update(state, cmd);
+        if let Some(request) = viewer_opened {
+            rt.adopt_viewer_handoff(request, was_viewer, &state);
+        }
+        rt.release_viewer_source_if_viewer_ended(was_viewer, viewer_opened.is_some(), &state);
+        state
+    }
+
+    /// Run the viewer-open worker for `path` under `request` the way
+    /// `run_effects` does, and return its `ViewerOpened` reply once the
+    /// source is waiting on the hand-off channel.
+    fn open_on_worker(rt: &Runtime, rx: &Receiver<Command>, request: u64, path: &Path) -> Command {
+        worker::spawn_viewer_open(request, path.to_path_buf(), rt.viewer_handoff.0.clone(), rt.tx.clone(), rt.workers.token());
+        match rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(cmd @ Command::ViewerOpened { .. }) => cmd,
+            other => panic!("expected ViewerOpened, got {other:?}"),
+        }
+    }
+
+    /// A state whose pending open is `request` on the left panel, as
+    /// `handle_request_viewer` would have recorded it.
+    fn state_awaiting_open(request: u64) -> State {
+        let mut state = State::empty(Theme::classic());
+        state.term_size = (80, 24);
+        state.request_seq = request;
+        state.pending_open =
+            Some(filecommand_core::update::PendingOpen { request, side: PanelSide::Left, kind: filecommand_core::update::PendingOpenKind::Viewer });
+        state
+    }
+
+    /// viewer: Instant open — "Closing the viewer releases the file": after
+    /// the worker's source is adopted on `ViewerOpened` and
+    /// `Command::ViewerClose` clears it, the file and its directory can both
+    /// be removed — an open handle blocks directory removal on Windows, so
+    /// this fails if the source leaks. `apply`/`run_effects` need a
+    /// `TerminalGuard`, which a headless test cannot construct, so this
+    /// drives the same `Runtime` methods those two call.
+    #[test]
+    fn closing_the_viewer_releases_the_file_and_its_directory() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        let opened = open_on_worker(&rt, &rx, 1, &path);
+        assert!(matches!(&opened, Command::ViewerOpened { request: 1, path: opened, file_len: 11 } if *opened == path), "{opened:?}");
+        let state = apply_headless(state_awaiting_open(1), opened, &mut rt);
+        assert!(matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the worker's source was adopted");
+
+        let state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// offload-blocking-io design D4 (task 5.7): `spawn_viewer_open` delivers
+    /// the source on the hand-off channel *before* its `ViewerOpened`, and
+    /// `apply` keeps only the entry whose request the reducer accepted,
+    /// dropping a non-matching one so its file is released.
+    #[test]
+    fn apply_keeps_the_matching_viewer_source_and_drops_a_superseded_one() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-handoff-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let slow = dir.join("slow.log");
+        let fast = dir.join("fast.txt");
+        std::fs::write(&slow, b"slow").unwrap();
+        std::fs::write(&fast, b"fast!").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        // The superseded open (request 1) and the current one (request 2)
+        // both complete; each source is on the channel before its command.
+        let opened_slow = open_on_worker(&rt, &rx, 1, &slow);
+        assert!(rt.viewer_handoff.1.try_recv().is_ok(), "the source arrives ahead of ViewerOpened");
+        let opened_fast = open_on_worker(&rt, &rx, 2, &fast);
+
+        // The reducer's pending open is request 2: the stale reply for 1 is
+        // discarded, and no source is adopted for it.
+        let state = apply_headless(state_awaiting_open(2), opened_slow, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels, "the stale reply did not open the viewer");
+        assert!(rt.viewer_source.is_none(), "no source is kept for a discarded reply");
+
+        let state = apply_headless(state, opened_fast, &mut rt);
+        match &state.phase {
+            UiPhase::Viewer(v) => assert_eq!(v.path, fast),
+            other => panic!("expected the viewer on fast.txt, got {other:?}"),
+        }
+        match &rt.viewer_source {
+            Some((path, source)) => {
+                assert_eq!(path, &fast, "the adopted source is the one for the accepted reply");
+                assert_eq!(source.len(), 5);
+            }
+            None => panic!("the matching source was adopted"),
+        }
+        // `slow.log`'s handle was dropped with its entry, so the file can go.
+        std::fs::remove_file(&slow).expect("the superseded open's handle was released");
+
+        let _state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&fast).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// resize-preserves-session-state design D7 (task 3.4): the byte source
+    /// follows the viewer *phase*. It survives a shrink below the floor and
+    /// the enlarge back, and is released exactly when the viewer closes.
+    #[test]
+    fn viewer_source_follows_the_viewer_phase_across_a_resize() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-resize-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        let opened = open_on_worker(&rt, &rx, 1, &path);
+        // A listing chunk already queued ahead of the reply is applied while
+        // the phase is still `Panels`: the queued hand-off must survive it.
+        let state = state_awaiting_open(1);
+        let request = state.left.listing_request.unwrap_or(0);
+        let state = apply_headless(state, Command::ListingChunk { panel: PanelSide::Left, entries: vec![], request }, &mut rt);
+        let state = apply_headless(state, opened, &mut rt);
+        assert!(matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some());
+
+        // Shrink below the floor and enlarge: the viewer phase persists, and
+        // so does its source.
+        let state = apply_headless(state, Command::Resize(50, 12), &mut rt);
+        assert!(state.undersized && matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the hidden viewer keeps its file open");
+        let state = apply_headless(state, Command::Resize(80, 24), &mut rt);
+        assert!(!state.undersized && matches!(state.phase, UiPhase::Viewer(_)));
+        assert!(rt.viewer_source.is_some(), "the source is still there when the viewer reappears");
+
+        // Closing releases it — and only then.
+        let state = apply_headless(state, Command::ViewerClose, &mut rt);
+        assert_eq!(state.phase, UiPhase::Panels);
+        assert!(rt.viewer_source.is_none());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
+    /// Design D7's second clause: a `ViewerOpened` the reducer discards
+    /// (here it arrives while the end-of-job summary owns the phase) must not
+    /// leave the worker's source behind — the hand-off entry is dropped.
+    #[test]
+    fn a_discarded_viewer_opened_releases_the_source() {
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-viewer-discard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("file.bin");
+        std::fs::write(&path, b"hello world").unwrap();
+        let (mut rt, rx) = headless_runtime(&dir);
+
+        let opened = open_on_worker(&rt, &rx, 1, &path);
+        let mut state = state_awaiting_open(1);
+        state.phase = UiPhase::FileOpSummary(vec![]);
+        let state = apply_headless(state, opened, &mut rt);
+        assert!(!matches!(state.phase, UiPhase::Viewer(_)), "the summary dialog swallowed the reply");
+        assert!(rt.viewer_source.is_none());
+        assert!(rt.viewer_handoff.1.try_recv().is_err(), "the hand-off channel was drained");
+        std::fs::remove_file(&path).expect("the discarded reply's handle was released");
+        std::fs::remove_dir(&dir).unwrap();
+    }
+
     /// Regression test for the F4 external editor being silently dead: a
     /// config-driven startup (via `config::parse`, the real parsing path,
     /// not a hand-built `Config`) must populate `state.editor`, mirroring
@@ -934,7 +2200,7 @@ mod tests {
     /// parsed correctly but never reached `State`.
     #[test]
     fn apply_config_wires_the_configured_editor_and_shell_into_state() {
-        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n");
+        let config = config::parse("editor = \"code --wait\"\nshell = \"pwsh -NoLogo -Command\"\n").config;
         let mut state = State::empty(Theme::classic());
         assert_eq!(state.editor, None, "sanity: editor starts unset before wiring");
         apply_config(&mut state, &config);
@@ -944,7 +2210,7 @@ mod tests {
 
     #[test]
     fn apply_config_wires_the_configured_panel_split_into_state() {
-        let config = config::parse("panel_split = 66\n");
+        let config = config::parse("panel_split = 66\n").config;
         let mut state = State::empty(Theme::classic());
         assert_eq!(state.split_percent, 50, "sanity: split starts at the default before wiring");
         apply_config(&mut state, &config);
@@ -953,10 +2219,69 @@ mod tests {
 
     #[test]
     fn apply_config_leaves_editor_unset_when_config_omits_it() {
-        let config = config::parse("splash = false\n");
+        let config = config::parse("splash = false\n").config;
         let mut state = State::empty(Theme::classic());
         apply_config(&mut state, &config);
         assert_eq!(state.editor, None);
+    }
+
+    /// ui-animations "Animations are disabled by config or launch flag":
+    /// `State::empty` starts with animations off (so existing tests are
+    /// unaffected); a real launch turns them on from the default config.
+    #[test]
+    fn apply_config_turns_animations_on_by_default_and_off_when_configured() {
+        let mut state = State::empty(Theme::classic());
+        assert!(!state.animations, "sanity: a state built without config does not animate");
+        apply_config(&mut state, &config::parse("").config);
+        assert!(state.animations, "default is animated");
+        apply_config(&mut state, &config::parse("animations = false\n").config);
+        assert!(!state.animations, "animations = false disables them");
+    }
+
+    /// ui-animations "Flag overrides config": `--noanimations` wins over
+    /// `animations = true`, and without the flag the config value stands.
+    #[test]
+    fn noanimations_flag_overrides_the_config_value() {
+        let on = config::parse("animations = true\n").config;
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &on);
+        apply_launch_options(&mut state, &parse_launch_args(["--noanimations".to_string()]));
+        assert!(!state.animations, "the flag wins over animations = true");
+
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &on);
+        apply_launch_options(&mut state, &parse_launch_args(Vec::<String>::new()));
+        assert!(state.animations, "no flag leaves the config value alone");
+
+        let mut state = State::empty(Theme::classic());
+        apply_config(&mut state, &config::parse("animations = false\n").config);
+        apply_launch_options(&mut state, &parse_launch_args(Vec::<String>::new()));
+        assert!(!state.animations, "the flag never turns animations on");
+    }
+
+    #[test]
+    fn parse_launch_args_reads_noanimations_alongside_other_switches() {
+        let opts = parse_launch_args(["--noanimations".to_string()]);
+        assert!(opts.no_animations);
+        assert!(!opts.no_splash && !opts.no_mouse);
+        assert!(!parse_launch_args(["--nosplash".to_string()]).no_animations, "absent switch leaves it off");
+
+        let mixed = parse_launch_args(["--theme=terminal-green".to_string(), "--noanimations".to_string(), "--nosplash".to_string()]);
+        assert!(mixed.no_animations && mixed.no_splash);
+        assert_eq!(mixed.theme.as_deref(), Some("terminal-green"));
+    }
+
+    /// The startup warning is raised outside the reducer, so `run` stamps its
+    /// open time explicitly for the iris; with no warning nothing is stamped.
+    #[test]
+    fn stamp_startup_warning_records_the_clock_only_when_a_warning_is_up() {
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 1234;
+        stamp_startup_warning(&mut state);
+        assert_eq!(state.dialog_opened_at_ms, 0, "no warning: nothing to stamp");
+        state.set_startup_warning("usermenu.toml is malformed".to_string());
+        stamp_startup_warning(&mut state);
+        assert_eq!(state.dialog_opened_at_ms, 1234);
     }
 
     /// theme-selection "Applied theme persists to configuration" scenario
@@ -966,7 +2291,7 @@ mod tests {
     /// something else.
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_for_an_unknown_name() {
-        let config = config::parse("theme = \"no-such-theme\"\n");
+        let config = config::parse("theme = \"no-such-theme\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
         assert_eq!(warning, None, "no --theme switch was passed, so no warning is raised");
@@ -977,7 +2302,7 @@ mod tests {
     /// unset -> load -> resolve path end to end.
     #[test]
     fn resolve_startup_theme_falls_back_to_nc_classic_when_theme_is_unset() {
-        let config = config::parse("splash = false\n");
+        let config = config::parse("splash = false\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::classic().name);
         assert_eq!(warning, None);
@@ -988,7 +2313,7 @@ mod tests {
     /// the fallback.
     #[test]
     fn resolve_startup_theme_loads_a_known_configured_theme() {
-        let config = config::parse("theme = \"terminal-green\"\n");
+        let config = config::parse("theme = \"terminal-green\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, None);
         assert_eq!(theme.name, Theme::terminal_green().name);
         assert_eq!(warning, None);
@@ -1066,7 +2391,8 @@ mod tests {
     /// regardless of order, just like any two independent switches.
     #[test]
     fn parse_launch_args_reads_nomouse_alongside_other_switches_regardless_of_order() {
-        let nomouse_first = parse_launch_args(["--nomouse".to_string(), "--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
+        let nomouse_first =
+            parse_launch_args(["--nomouse".to_string(), "--nosplash".to_string(), "--theme".to_string(), "terminal-green".to_string()]);
         assert!(nomouse_first.no_mouse);
         assert!(nomouse_first.no_splash);
         assert_eq!(nomouse_first.theme.as_deref(), Some("terminal-green"));
@@ -1077,11 +2403,258 @@ mod tests {
         assert_eq!(nomouse_last.theme.as_deref(), Some("terminal-green"));
     }
 
+    // -- config-profile-directory "Configuration profile directory" -------
+
+    /// Parser: `--config-dir <path>` (space-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_config_dir_with_a_space_separated_value() {
+        let opts = parse_launch_args(["--config-dir".to_string(), "D:\\fc-test".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some("D:\\fc-test"));
+        assert!(!opts.no_splash && !opts.no_mouse && !opts.no_animations);
+        assert_eq!(opts.theme, None);
+    }
+
+    /// Parser: `--config-dir=<path>` (equals-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_config_dir_with_an_equals_separated_value() {
+        let opts = parse_launch_args(["--config-dir=relative/dir".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some("relative/dir"));
+    }
+
+    /// Parser: `--config-dir` as the final argument has no value to
+    /// consume, recorded as an empty string (a startup warning downstream,
+    /// never a crash) — the same convention as `--theme` (task 1.1).
+    #[test]
+    fn parse_launch_args_records_an_empty_value_when_config_dir_has_no_following_argument() {
+        let opts = parse_launch_args(["--config-dir".to_string()]);
+        assert_eq!(opts.config_dir.as_deref(), Some(""));
+    }
+
+    /// Parser: no `--config-dir` switch at all leaves the field unset,
+    /// distinct from the missing-value case above.
+    #[test]
+    fn parse_launch_args_leaves_config_dir_unset_when_the_switch_is_absent() {
+        assert_eq!(parse_launch_args(["--nosplash".to_string()]).config_dir, None);
+    }
+
+    // -- error-diagnostics "Optional diagnostic log" ----------------------
+
+    /// Parser: `--log <path>` (space-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_log_with_a_space_separated_value() {
+        let opts = parse_launch_args(["--log".to_string(), "D:\\logs\\fc.log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some("D:\\logs\\fc.log"));
+        assert!(!opts.no_splash && !opts.no_mouse && !opts.no_animations);
+        assert_eq!(opts.theme, None);
+        assert_eq!(opts.config_dir, None);
+    }
+
+    /// Parser: `--log=<path>` (equals-separated spelling).
+    #[test]
+    fn parse_launch_args_reads_log_with_an_equals_separated_value() {
+        let opts = parse_launch_args(["--log=fc.log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some("fc.log"));
+    }
+
+    /// Parser: `--log` as the final argument has no value to consume,
+    /// recorded as an empty string (the "--log needs a path" startup warning
+    /// downstream, never a crash) — the same convention as `--theme`
+    /// (design D2).
+    #[test]
+    fn parse_launch_args_records_an_empty_value_when_log_has_no_following_argument() {
+        let opts = parse_launch_args(["--log".to_string()]);
+        assert_eq!(opts.log.as_deref(), Some(""));
+    }
+
+    /// Parser: no `--log` switch at all leaves the field unset, distinct
+    /// from the missing-value case above.
+    #[test]
+    fn parse_launch_args_leaves_log_unset_when_the_switch_is_absent() {
+        assert_eq!(parse_launch_args(["--nosplash".to_string()]).log, None);
+    }
+
+    /// Design D2 / "The flag wins over the environment variable": a present
+    /// `--log` beats `FILECOMMAND_LOG`; with no flag the variable applies,
+    /// unless it is empty or unset.
+    #[test]
+    fn resolve_log_path_prefers_the_flag_over_the_environment() {
+        assert_eq!(resolve_log_path(Some("flag.log"), Some("env.log")), Ok(Some("flag.log".to_string())));
+        assert_eq!(resolve_log_path(None, Some("env.log")), Ok(Some("env.log".to_string())), "the variable enables logging without the flag");
+        assert_eq!(resolve_log_path(None, None), Ok(None), "neither set: logging stays off");
+        assert_eq!(resolve_log_path(None, Some("")), Ok(None), "an empty variable counts as unset");
+        assert_eq!(resolve_log_path(Some("flag.log"), None), Ok(Some("flag.log".to_string())));
+    }
+
+    /// Design D2 / "the flag is given without a path": an empty `--log`
+    /// value is a startup warning naming the switch, and it still wins over
+    /// the variable (an empty flag must not silently fall back).
+    #[test]
+    fn resolve_log_path_warns_when_the_flag_has_no_path() {
+        let warning = resolve_log_path(Some(""), Some("env.log")).expect_err("an empty flag value warns");
+        assert!(warning.contains("--log"), "the warning names the switch: {warning}");
+        assert!(warning.contains("path"), "the warning says what is missing: {warning}");
+    }
+
+    /// Design D2 / "Unwritable log path warns and continues": an
+    /// unopenable log path becomes a startup warning naming the path and
+    /// the reason it could not be opened; `None` (no log requested) stays
+    /// silent. The failing call never enables the global log, so this test
+    /// is safe for the other diag tests in the binary.
+    #[test]
+    fn init_diagnostic_log_warns_naming_path_and_reason_when_open_fails() {
+        let missing_dir = std::env::temp_dir().join(format!("filecommand-tui-app-log-init-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing_dir);
+        let path = missing_dir.join("fc.log");
+        let warning = init_diagnostic_log(Some(path.display().to_string())).expect("an unopenable log path warns");
+        assert!(warning.contains("Diagnostic log disabled"), "{warning}");
+        assert!(warning.contains(&path.display().to_string()), "the warning names the path: {warning}");
+        assert_eq!(init_diagnostic_log(None), None, "no log requested, no warning");
+    }
+
+    /// Task 1.1: a missing value becomes a warning and normal resolution
+    /// continues; a real value passes through untouched.
+    #[test]
+    fn config_dir_override_warns_on_a_missing_value_and_passes_a_real_one_through() {
+        let (flag, warning) = config_dir_override(Some(""));
+        assert_eq!(flag, None, "normal resolution continues after the warning");
+        assert!(warning.as_deref().is_some_and(|w| w.contains("--config-dir")), "the warning names the switch: {warning:?}");
+
+        let (flag, warning) = config_dir_override(Some("D:\\fc-test"));
+        assert_eq!(flag.as_deref(), Some(Path::new("D:\\fc-test")));
+        assert_eq!(warning, None);
+
+        assert_eq!(config_dir_override(None), (None, None), "no switch is neither an override nor a warning");
+    }
+
+    /// Design D1: an explicit flag wins outright — the portable marker and
+    /// the platform default are not even consulted — and a relative value
+    /// resolves against the working directory at startup.
+    #[test]
+    fn resolve_profile_dir_flag_wins_over_everything() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-flag-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("portable"), "").unwrap(); // would win, if consulted
+
+        let absolute = PathBuf::from(if cfg!(windows) { "D:\\fc-test" } else { "/tmp/fc-test" });
+        let (dir, warning) = resolve_profile_dir(Some(absolute.clone()), Some(&exe_dir));
+        assert_eq!(dir, absolute);
+        assert_eq!(warning, None);
+
+        let cwd = std::env::current_dir().unwrap();
+        let (dir, warning) = resolve_profile_dir(Some(PathBuf::from("fc-rel")), Some(&exe_dir));
+        assert_eq!(dir, cwd.join("fc-rel"), "a relative flag value resolves against the cwd");
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1 / scenario "Portable mode via marker file": with no flag,
+    /// a `portable` marker beside the executable makes the executable's
+    /// directory the profile, beating the platform default.
+    #[test]
+    fn resolve_profile_dir_portable_marker_wins_over_the_platform_default() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-portable-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        std::fs::write(exe_dir.join("portable"), "").unwrap();
+
+        let (dir, warning) = resolve_profile_dir(None, Some(&exe_dir));
+        assert_eq!(dir, exe_dir);
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1 / scenario "Platform default is used when nothing
+    /// overrides it": no flag and no marker file means the platform
+    /// default applies (asserted per-platform just below).
+    #[test]
+    fn resolve_profile_dir_without_a_marker_uses_the_platform_default() {
+        let exe_dir = std::env::temp_dir().join(format!("filecommand-profile-nomarker-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&exe_dir);
+        std::fs::create_dir_all(&exe_dir).unwrap();
+
+        let (dir, warning) = resolve_profile_dir(None, Some(&exe_dir));
+        assert_eq!(dir, platform_default_profile_dir().expect("a config home is set on this test host"));
+        assert_eq!(warning, None);
+        let _ = std::fs::remove_dir_all(&exe_dir);
+    }
+
+    /// Design D1: the platform default is `%APPDATA%\FileCommand`.
+    #[cfg(windows)]
+    #[test]
+    fn platform_default_profile_dir_is_appdata_filecommand() {
+        let appdata = std::env::var_os("APPDATA").expect("APPDATA is set on Windows hosts");
+        assert_eq!(platform_default_profile_dir(), Some(PathBuf::from(appdata).join("FileCommand")));
+    }
+
+    /// Design D1: the platform default is `$XDG_CONFIG_HOME/filecommand`,
+    /// else `~/.config/filecommand`.
+    #[cfg(not(windows))]
+    #[test]
+    fn platform_default_profile_dir_is_xdg_or_home_filecommand() {
+        let expected = std::env::var_os("XDG_CONFIG_HOME")
+            .map(|xdg| PathBuf::from(xdg).join("filecommand"))
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("filecommand")))
+            .expect("XDG_CONFIG_HOME or HOME is set on Unix hosts");
+        assert_eq!(platform_default_profile_dir(), Some(expected));
+    }
+
+    /// Design D2 / scenario "Unwritable profile falls back without losing
+    /// the session": an uncreatable profile yields the fail-soft warning
+    /// naming the path and the error; a creatable one yields none.
+    #[test]
+    fn ensure_profile_dir_warns_naming_path_and_error_when_creation_fails() {
+        let dir = std::env::temp_dir().join(format!("filecommand-profile-ensure-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        std::fs::write(&blocker, "a file, not a directory").unwrap();
+
+        let target = blocker.join("sub");
+        let warning = ensure_profile_dir(&target).expect("creating below a plain file must fail");
+        assert!(warning.contains(&target.display().to_string()), "the warning names the path: {warning}");
+        assert!(warning.contains("settings will not be saved this session"), "the warning says persistence is off: {warning}");
+
+        assert_eq!(ensure_profile_dir(&dir.join("fresh")), None, "a creatable directory is no warning");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Design D3 / scenario "Legacy files in the working directory produce
+    /// a notice, not a migration": the notice names the found files and
+    /// both directories, says they can be moved, and leaves them exactly
+    /// as they were.
+    #[test]
+    fn legacy_notice_names_the_files_and_both_directories() {
+        let root = std::env::temp_dir().join(format!("filecommand-profile-legacy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let cwd = root.join("cwd");
+        let profile = root.join("profile");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::write(cwd.join("config.toml"), "theme = \"nc-mono\"\n").unwrap();
+        std::fs::write(cwd.join("history.json"), "{}\n").unwrap();
+
+        let notice = legacy_notice(&cwd, &profile).expect("legacy files raise the notice");
+        assert!(notice.contains("config.toml, history.json"), "names the found files: {notice}");
+        assert!(notice.contains(&cwd.display().to_string()), "names the working directory: {notice}");
+        assert!(notice.contains(&profile.display().to_string()), "names the profile directory: {notice}");
+        assert!(notice.contains("Move them there"), "says the files can be moved: {notice}");
+
+        // Nothing was copied or moved: the old files are untouched and the
+        // profile stays empty.
+        assert!(cwd.join("config.toml").exists() && cwd.join("history.json").exists());
+        assert!(!profile.join("config.toml").exists());
+
+        std::fs::write(profile.join("config.toml"), "").unwrap();
+        assert_eq!(legacy_notice(&cwd, &profile), None, "a populated profile silences the notice");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// theme-selection "Valid override wins over configuration": a valid
     /// `--theme` value beats a different `config.theme`, with no warning.
     #[test]
     fn resolve_startup_theme_override_wins_over_configuration() {
-        let config = config::parse("theme = \"nc-classic\"\n");
+        let config = config::parse("theme = \"nc-classic\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("yellow-storm"));
         assert_eq!(theme.name, Theme::yellow_storm().name);
         assert_eq!(warning, None, "a valid override produces no warning");
@@ -1092,7 +2665,7 @@ mod tests {
     /// warning naming the rejected value and listing the valid names.
     #[test]
     fn resolve_startup_theme_unknown_override_falls_back_with_a_warning() {
-        let config = config::parse("theme = \"nc-mono\"\n");
+        let config = config::parse("theme = \"nc-mono\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("no-such-theme"));
         assert_eq!(theme.name, Theme::mono().name);
         let warning = warning.expect("an unknown override raises a warning");
@@ -1107,7 +2680,7 @@ mod tests {
     /// value was missing (distinct wording from the unknown-name case).
     #[test]
     fn resolve_startup_theme_missing_value_falls_back_with_a_warning() {
-        let config = config::parse("theme = \"nc-mono\"\n");
+        let config = config::parse("theme = \"nc-mono\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some(""));
         assert_eq!(theme.name, Theme::mono().name);
         let warning = warning.expect("a missing value raises a warning");
@@ -1121,15 +2694,15 @@ mod tests {
     /// untouched (design D4).
     #[test]
     fn picker_apply_persists_normally_during_an_overridden_session() {
-        let config = config::parse("theme = \"nc-classic\"\n");
+        let config = config::parse("theme = \"nc-classic\"\n").config;
         let (theme, warning) = resolve_startup_theme(&config, Some("terminal-green"));
         assert_eq!(theme.name, Theme::terminal_green().name);
         assert_eq!(warning, None);
 
-        let (state, _) = State::initial(theme, (80, 24), 0, PathBuf::from("."), PathBuf::from("."), false);
+        let (state, _) = State::initial(theme, (80, 24), 0, 0, PathBuf::from("."), PathBuf::from("."), false);
         let (state, _) = update(state, Command::ThemePickerOpen);
         let target = BUILTIN_THEME_NAMES.iter().position(|n| *n == "purple-lights").unwrap();
-        let current = state.theme_picker.as_ref().unwrap().highlight;
+        let current = state.theme_picker().unwrap().highlight;
         let (state, _) = update(state, Command::ThemePickerMove(target as isize - current as isize));
         let (state, effects) = update(state, Command::ThemePickerConfirm);
         assert_eq!(state.theme.name, "purple-lights", "the picker's choice wins, not the launch override");
@@ -1140,7 +2713,7 @@ mod tests {
     /// `usermenu.toml` used to only set the left panel's inline
     /// `last_error` (with a comment noting there was no startup-warning
     /// dialog); the spec requires a dismissable modal instead. Verifies
-    /// `apply_user_menu` raises `state.startup_warning`, falls back to
+    /// `apply_user_menu` raises `state.startup_warning()`, falls back to
     /// default entries, and never touches either panel's `last_error`.
     #[test]
     fn apply_user_menu_raises_the_startup_warning_dialog_on_malformed_content() {
@@ -1151,13 +2724,14 @@ mod tests {
             warnings: Vec::new(),
             created_default: false,
             malformed: true,
+            problem: Some(config::UserMenuProblem::InvalidToml),
         };
         apply_user_menu(&mut state, malformed);
         assert_eq!(state.user_menu_entries, default_entries, "falls back to default entries");
         assert!(
-            state.startup_warning.as_deref().is_some_and(|m| m.contains(config::USERMENU_FILE)),
+            state.startup_warning().is_some_and(|m| m.contains(config::USERMENU_FILE)),
             "expected a startup warning naming the malformed file: {:?}",
-            state.startup_warning
+            state.startup_warning()
         );
         assert_eq!(state.left.last_error, None, "the warning is a dedicated modal, not a panel mini-status");
         assert_eq!(state.right.last_error, None);
@@ -1167,15 +2741,150 @@ mod tests {
     fn apply_user_menu_does_not_warn_on_well_formed_content() {
         let mut state = State::empty(Theme::classic());
         let entries = config::default_user_menu_entries();
-        let ok = config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false };
+        let ok =
+            config::UserMenuLoadResult { entries: entries.clone(), warnings: Vec::new(), created_default: false, malformed: false, problem: None };
         apply_user_menu(&mut state, ok);
         assert_eq!(state.user_menu_entries, entries);
-        assert_eq!(state.startup_warning, None);
+        assert_eq!(state.startup_warning(), None);
+    }
+
+    /// configuration-files "Non-UTF-8 usermenu.toml is kept, not
+    /// overwritten": the not-UTF-8 outcome gets its own message that says
+    /// how to recover, instead of the generic malformed one (design D3).
+    #[test]
+    fn apply_user_menu_names_the_not_utf8_recovery_for_a_non_utf8_file() {
+        let mut state = State::empty(Theme::classic());
+        let result = config::UserMenuLoadResult {
+            entries: config::default_user_menu_entries(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+            problem: Some(config::UserMenuProblem::NotUtf8),
+        };
+        apply_user_menu(&mut state, result);
+        let warning = state.startup_warning().expect("a not-UTF-8 user menu raises the dialog");
+        assert!(warning.starts_with("usermenu.toml is not UTF-8 text"), "{warning}");
+        assert!(warning.contains("re-save it as UTF-8"), "{warning}");
+    }
+
+    /// history-persistence-hardening design D1: the renderer ranks the
+    /// Ctrl+J list with `state.epoch_ms`, exactly as the reducer's Enter
+    /// does, so the first drawn row is the row Enter navigates to even when
+    /// the monotonic and wall clocks differ by decades.
+    #[test]
+    fn fuzzy_jump_renderer_and_reducer_rank_with_the_same_epoch_clock() {
+        use filecommand_core::quicksearch::FrecencyEntry;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let e = 1_787_000_000_000u64;
+        let day = 24 * 60 * 60 * 1000;
+        let mut state = State::empty(Theme::classic());
+        state.clock_ms = 500;
+        state.epoch_ms = e + 3 * day + 60_000;
+        state.dir_history = vec![
+            FrecencyEntry { path: PathBuf::from(r"C:\old"), visit_count: 3, last_visited_ms: e },
+            FrecencyEntry { path: PathBuf::from(r"C:\new"), visit_count: 3, last_visited_ms: e + 3 * day },
+        ];
+        let (state, _) = update(state, Command::FuzzyJumpOpen);
+
+        let area = Rect { x: 0, y: 0, width: 80, height: 24 };
+        let mut buf = Buffer::empty(area);
+        views::fuzzy_jump::render_fuzzy_jump(
+            &mut buf,
+            area,
+            &state.theme,
+            ColorDepth::Ansi16,
+            state.fuzzy_jump().unwrap(),
+            &state.dir_history,
+            state.epoch_ms,
+        );
+        let first_row = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol().to_string()).collect::<String>())
+            .find(|row| row.contains("C:\\"))
+            .expect("the list draws at least one directory row");
+        assert!(first_row.contains(r"C:\new"), "the renderer draws the more recently visited directory first: {first_row:?}");
+
+        let (state, effects) = update(state, Command::FuzzyJumpConfirm);
+        assert_eq!(state.left.cwd, PathBuf::from(r"C:\new"), "Enter lands on the row that was drawn first");
+        assert!(effects.iter().any(|e| matches!(e, Effect::StartListing { path, .. } if path == Path::new(r"C:\new"))));
+    }
+
+    // -- configuration-files: the warning summary and its precedence ------
+
+    /// The config.toml warnings come first, then usermenu.toml's, and the
+    /// dialog shows the first plus a `(+N more)` count across both files
+    /// (configuration-files "Several warnings are summarized"; design D4).
+    #[test]
+    fn configuration_warnings_summarize_across_both_files() {
+        let mut state = State::empty(Theme::classic());
+        let parsed = config::parse("colour = \"red\"\nsplash false\n");
+        let menu = config::parse_usermenu("[[entry]]\nlabel = \"A\"\ncommand = \"a\"\nicon = \"x\"\n");
+        let mut warnings: Vec<String> = parsed.warnings.iter().map(ToString::to_string).collect();
+        warnings.extend(menu.warnings.iter().map(ToString::to_string));
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        apply_configuration_warnings(&mut state, &warnings);
+        let shown = state.startup_warning().expect("the summary is shown");
+        assert!(shown.starts_with("config.toml line 1: unknown setting \"colour\""), "{shown}");
+        assert!(shown.ends_with("(+2 more)"), "{shown}");
+    }
+
+    /// configuration-files "Profile warning keeps precedence": an existing
+    /// startup warning (here the unwritable-profile one) is never replaced
+    /// by the configuration summary.
+    #[test]
+    fn configuration_warnings_never_displace_an_existing_startup_warning() {
+        let mut state = State::empty(Theme::classic());
+        let profile_warning = "Could not create the profile directory C:\\nope: access denied; settings will not be saved".to_string();
+        set_startup_warning(&mut state, profile_warning.clone());
+        let warnings = vec!["config.toml line 2: unknown setting \"colour\"; ignored".to_string()];
+        apply_configuration_warnings(&mut state, &warnings);
+        assert_eq!(state.startup_warning(), Some(profile_warning.as_str()));
+    }
+
+    /// configuration-files "Theme override warning keeps precedence": the
+    /// `--theme` warning wins over an unknown-setting summary; so does a
+    /// malformed `usermenu.toml`.
+    #[test]
+    fn theme_override_and_malformed_user_menu_warnings_outrank_the_summary() {
+        let config = config::parse("colour = \"red\"\n");
+        let summary: Vec<String> = config.warnings.iter().map(ToString::to_string).collect();
+
+        let mut state = State::empty(Theme::classic());
+        let (_, theme_warning) = resolve_startup_theme(&config.config, Some("no-such-theme"));
+        set_startup_warning(&mut state, theme_warning.expect("unknown --theme warns"));
+        apply_configuration_warnings(&mut state, &summary);
+        let shown = state.startup_warning().unwrap().to_string();
+        assert!(shown.contains("--theme no-such-theme"), "{shown}");
+
+        let mut state = State::empty(Theme::classic());
+        let malformed = config::UserMenuLoadResult {
+            entries: config::default_user_menu_entries(),
+            warnings: Vec::new(),
+            created_default: false,
+            malformed: true,
+            problem: Some(config::UserMenuProblem::InvalidToml),
+        };
+        apply_user_menu(&mut state, malformed);
+        apply_configuration_warnings(&mut state, &summary);
+        let shown = state.startup_warning().unwrap();
+        assert!(shown.contains("usermenu.toml is malformed"), "{shown}");
+    }
+
+    /// configuration-files "Clean configuration produces no warning".
+    #[test]
+    fn no_configuration_warnings_leave_the_startup_warning_alone() {
+        let mut state = State::empty(Theme::classic());
+        apply_configuration_warnings(&mut state, &[]);
+        assert_eq!(state.startup_warning(), None);
+        let parsed = config::parse("splash = false # c\ntheme = \"nc-mono\" # c\n[mouse] # c\nenabled = true\n");
+        assert!(parsed.warnings.is_empty(), "{:?}", parsed.warnings);
     }
 
     #[test]
     fn spawn_editor_and_wait_succeeds_for_a_real_program() {
-        assert_eq!(spawn_editor_and_wait(&stub_invocation("0")), Ok(()));
+        let _serial = console::FLAG_LOCK.lock().unwrap();
+        let mut child_run = console::ChildRunGuard::new();
+        assert_eq!(spawn_editor_and_wait(&stub_invocation("0"), &mut child_run), Ok(()));
     }
 
     #[test]
@@ -1186,9 +2895,198 @@ mod tests {
             file_arg: OsString::from("report.txt"),
             cwd: std::env::temp_dir(),
         };
-        let result = spawn_editor_and_wait(&inv);
+        let _serial = console::FLAG_LOCK.lock().unwrap();
+        let mut child_run = console::ChildRunGuard::new();
+        let result = spawn_editor_and_wait(&inv, &mut child_run);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("filecommand-definitely-not-a-real-editor-binary"));
+    }
+
+    // -- process-lifecycle-hardening: quit waits for job cleanup (task 2.3,
+    // 2.4; application-shell "Quit waits for job cancellation cleanup";
+    // design D3) ---------------------------------------------------------
+
+    /// A `Runtime` with no terminal behind it, enough for `shutdown` and the
+    /// effect bodies the tests here drive.
+    fn test_runtime(dir: &Path) -> (Runtime, Receiver<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let rt = Runtime {
+            tx,
+            active_job: None,
+            cancels: CancelRegistry::default(),
+            history_writer: HistoryWriter::disabled(),
+            config_writer: ConfigWriter::disabled(),
+            usermenu_path: dir.join("usermenu.toml"),
+            viewer_source: None,
+            viewer_handoff: mpsc::channel(),
+            clipboard: Box::new(clipboard::RecordingClipboard::default()),
+            mouse_tracker: MouseTracker::new(),
+            git_slots: [worker::GitQuerySlot::new(), worker::GitQuerySlot::new()],
+            workers: worker::WorkerGauge::new(),
+            held: None,
+        };
+        (rt, rx)
+    }
+
+    /// A stand-in job thread: `body` runs with the handle's cancel flag.
+    fn fake_job(body: impl FnOnce(filecommand_core::fs_ops::CancelFlag) + Send + 'static) -> worker::JobHandle {
+        let cancel = filecommand_core::fs_ops::CancelFlag::new();
+        let (reply_tx, _reply_rx) = mpsc::channel();
+        let thread_cancel = cancel.clone();
+        let thread = std::thread::spawn(move || body(thread_cancel));
+        worker::JobHandle { cancel, reply_tx, thread }
+    }
+
+    #[test]
+    fn shutdown_waits_for_a_job_that_finishes_its_cleanup_after_the_cancel() {
+        // The thread notices the flag, then takes 300 ms to clean up (the
+        // partial-file removal) before ending: quit returns only after that.
+        let job = fake_job(|cancel| {
+            while !cancel.is_cancelled() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let started = Instant::now();
+        assert!(shutdown_job(job, QUIT_JOB_WAIT), "the thread ended within the bound");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(300), "returned only after the cleanup finished, took {elapsed:?}");
+        assert!(elapsed < QUIT_JOB_WAIT, "and well before the bound, took {elapsed:?}");
+    }
+
+    #[test]
+    fn shutdown_gives_up_on_a_job_that_never_finishes_after_about_two_seconds() {
+        // Scenario "The wait is bounded": a write blocked on an unresponsive
+        // share never returns; quit exits anyway after `QUIT_JOB_WAIT`.
+        let job = fake_job(|_cancel| std::thread::sleep(Duration::from_secs(20)));
+        let started = Instant::now();
+        assert!(!shutdown_job(job, QUIT_JOB_WAIT), "abandoned at the bound");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= QUIT_JOB_WAIT, "took {elapsed:?}");
+        assert!(elapsed < QUIT_JOB_WAIT + Duration::from_secs(1), "took {elapsed:?}");
+    }
+
+    #[test]
+    fn shutdown_with_no_job_returns_immediately() {
+        // Scenario "No job means no wait".
+        let (mut rt, _rx) = test_runtime(&std::env::temp_dir());
+        let started = Instant::now();
+        shutdown(&mut rt).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(100), "took {:?}", started.elapsed());
+    }
+
+    #[test]
+    fn shutdown_joins_a_job_that_has_already_finished_without_waiting() {
+        let job = fake_job(|_cancel| {});
+        // Let the thread end first.
+        while !job.thread.is_finished() {
+            std::thread::yield_now();
+        }
+        let started = Instant::now();
+        assert!(shutdown_job(job, QUIT_JOB_WAIT));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    /// Scenario "Quit during a large copy leaves no partial file" (task
+    /// 2.4), end to end through the real `spawn_job` and `RealFs`: quit
+    /// confirmed mid-copy sets the flag, the engine's cancel path removes
+    /// the partially written destination, and `shutdown` returns only once
+    /// it has. The copy source is a sparse 256 MB file so the test is quick
+    /// to set up while the copy still takes long enough to be interrupted.
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_mid_copy_leaves_no_partial_destination_file() {
+        use filecommand_core::fs_ops::{Job, JobKind, JobOutcome, SourceItem};
+
+        let dir = std::env::temp_dir().join(format!("filecommand-tui-app-quit-copy-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let src_dir = dir.join("src");
+        let dst_dir = dir.join("dst");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        std::fs::create_dir_all(&dst_dir).unwrap();
+        let src = src_dir.join("big.bin");
+        std::fs::File::create(&src).unwrap().set_len(256 * 1024 * 1024).unwrap();
+        let dst = dst_dir.join("big.bin");
+
+        let (mut rt, rx) = test_runtime(&dir);
+        let job = Job {
+            kind: JobKind::Copy,
+            sources: vec![SourceItem { original_name: OsString::from("big.bin"), path: src.clone(), is_dir: false }],
+            source_dir: src_dir.clone(),
+            dest_dir: dst_dir.clone(),
+            new_dir_name: None,
+        };
+        rt.active_job = Some(worker::spawn_job(job, rt.tx.clone(), rt.workers.token()));
+
+        // Mid-copy: since durable-file-copy the engine writes a sibling
+        // `<name>.~fc-partial` file and renames it over the target only once
+        // the copy is complete, so the partial file is what shows the copy
+        // is in progress. If the final target appears first the copy already
+        // finished and this run cannot exercise the scenario.
+        let partial = dst_dir.join(format!("big.bin{}", filecommand_core::fs_ops::PARTIAL_SUFFIX));
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !partial.exists() {
+            assert!(!dst.exists(), "the copy finished before it could be interrupted; enlarge the source");
+            assert!(Instant::now() < deadline, "the copy never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        let started = Instant::now();
+        shutdown(&mut rt).unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!partial.exists(), "the partially written destination was removed before quit returned");
+        assert!(!dst.exists(), "an interrupted copy never lands on the final name");
+        assert!(elapsed < QUIT_JOB_WAIT, "the job ended within the bound rather than being abandoned, took {elapsed:?}");
+        let outcomes: Vec<Command> = rx.try_iter().filter(|c| matches!(c, Command::JobDone { .. })).collect();
+        assert!(
+            matches!(outcomes.as_slice(), [Command::JobDone { outcome: JobOutcome::Cancelled { .. }, .. }]),
+            "the job reported itself cancelled: {outcomes:?}"
+        );
+        assert!(std::fs::metadata(&src).is_ok(), "the source is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // -- error-diagnostics: status-line errors name the item (task 4.3) ---
+
+    /// filesystem-error-handling "Error messages name the affected path":
+    /// the viewer and editor open failures read `Cannot open <file>: <OS
+    /// message>` (scenario "Viewer open failure names the file").
+    #[test]
+    fn cannot_message_formats_the_viewer_and_editor_open_failure() {
+        let err = io::Error::new(io::ErrorKind::PermissionDenied, "Access is denied. (os error 5)");
+        let path = Path::new("dir").join("locked.db");
+        assert_eq!(worker::cannot_message("open", &path, &err), "Cannot open locked.db: Access is denied. (os error 5)");
+    }
+
+    /// Scenario "Editor save failure names the file": `Cannot save <file>:
+    /// <reason>`, where the reason may be the editor's own refusal text as
+    /// well as an OS message.
+    #[test]
+    fn cannot_message_formats_the_editor_save_failure() {
+        let err = io::Error::new(io::ErrorKind::StorageFull, "There is not enough space on the disk. (os error 112)");
+        let path = Path::new("dir").join("notes.txt");
+        assert_eq!(worker::cannot_message("save", &path, &err), "Cannot save notes.txt: There is not enough space on the disk. (os error 112)");
+        // A non-`io::Error` reason (the editor's own refusal) formats the
+        // same way around it.
+        assert_eq!(
+            worker::cannot_message("save", Path::new("notes.txt"), "notes.txt is read-only — not saved"),
+            "Cannot save notes.txt: notes.txt is read-only — not saved"
+        );
+    }
+
+    /// open-with-associated-app design D1 / file-action-menu "Open with the
+    /// associated application": the `ShellExecuteW` error-code mapping —
+    /// 31 (`SE_ERR_NOASSOC`) names the missing association, 2
+    /// (`ERROR_FILE_NOT_FOUND`) the missing target, anything else reports
+    /// the raw code. Pure-value test; the constants' values are pinned by
+    /// the Win32 API.
+    #[cfg(windows)]
+    #[test]
+    fn open_with_association_error_maps_the_known_shell_execute_codes() {
+        assert_eq!(open_with_association_error("report.xyz", 31), "No application is associated with report.xyz");
+        assert_eq!(open_with_association_error("report.xyz", 2), "report.xyz not found");
+        assert_eq!(open_with_association_error("report.xyz", 5), "Could not open report.xyz (error 5)");
     }
 
     #[test]
@@ -1232,5 +3130,341 @@ mod tests {
         f.write_all(contents).unwrap();
         f.flush().unwrap();
         ByteSource::open(&path).unwrap()
+    }
+
+    // -----------------------------------------------------------------
+    // idle-aware-event-loop: the poll-timeout choice (design D2/D3; task
+    // 2.3) and the key-burst drain (design D5; task 2.7)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn next_timeout_is_zero_with_a_drain_backlog() {
+        assert_eq!(next_timeout(1_000, Some(1_033), Duration::from_millis(60_000), true, true), Duration::ZERO);
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(60_000), false, true), Duration::ZERO);
+    }
+
+    #[test]
+    fn next_timeout_is_capped_at_the_poll_interval_while_workers_are_alive() {
+        // No deadlines at all: the worker cadence governs (design D3).
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(60_000), true, false), POLL_INTERVAL);
+        // A nearer deadline wins over the cap; a farther one does not raise it.
+        assert_eq!(next_timeout(1_000, Some(1_010), Duration::from_millis(60_000), true, false), Duration::from_millis(10));
+        assert_eq!(next_timeout(1_000, Some(5_000), Duration::from_millis(60_000), true, false), POLL_INTERVAL);
+    }
+
+    #[test]
+    fn next_timeout_is_the_earliest_deadline_with_no_workers() {
+        // The minute boundary alone bounds the sleep (application-shell
+        // "Header clock still advances while idle").
+        assert_eq!(next_timeout(1_000, None, Duration::from_millis(42_000), false, false), Duration::from_millis(42_000));
+        // A core deadline ahead of it wins.
+        assert_eq!(next_timeout(1_000, Some(1_033), Duration::from_millis(42_000), false, false), Duration::from_millis(33));
+        // A deadline already in the past is due now.
+        assert_eq!(next_timeout(1_000, Some(900), Duration::from_millis(42_000), false, false), Duration::ZERO);
+    }
+
+    // -----------------------------------------------------------------
+    // streaming-listing-performance: the budgeted drain (design D7; task 5.3)
+    // -----------------------------------------------------------------
+
+    fn tick(n: u64) -> Command {
+        Command::Tick { now_ms: n, epoch_ms: 0 }
+    }
+
+    fn tick_value(cmd: &Command) -> u64 {
+        match cmd {
+            Command::Tick { now_ms, .. } => *now_ms,
+            other => panic!("expected a Tick, got {other:?}"),
+        }
+    }
+
+    /// A clock that never advances: only the message budget governs.
+    fn frozen_clock() -> impl Fn() -> Instant {
+        let t = Instant::now();
+        move || t
+    }
+
+    #[test]
+    fn a_prefilled_channel_drains_in_budgeted_slices_in_order_without_loss() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..1_000u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let mut slices = Vec::new();
+        loop {
+            let before = applied.len();
+            let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+                applied.push(tick_value(&cmd));
+                Ok((s, false))
+            })
+            .unwrap();
+            slices.push(applied.len() - before);
+            assert!(outcome.applied);
+            if !outcome.backlog {
+                break;
+            }
+            assert!(held.is_some(), "a backlog always comes with the message the budget check took");
+        }
+        assert_eq!(applied, (0..1_000).collect::<Vec<_>>(), "order preserved, nothing lost or duplicated");
+        assert_eq!(slices.len(), 16, "15 full slices of 64 and the remainder");
+        assert!(slices[..15].iter().all(|&n| n == DRAIN_BUDGET_MESSAGES), "{slices:?}");
+        assert_eq!(slices[15], 1_000 - 15 * DRAIN_BUDGET_MESSAGES);
+        assert!(held.is_none(), "nothing is held once the channel is drained");
+    }
+
+    #[test]
+    fn the_held_message_is_applied_first_by_the_next_drain() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..70u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: true });
+        assert_eq!(applied.len(), 64);
+        assert_eq!(held.as_ref().map(tick_value), Some(64), "the 65th message was taken by the budget check and parked");
+
+        // More arrive behind it; the parked one still goes first.
+        tx.send(tick(70)).unwrap();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: false });
+        assert_eq!(applied[64..], [64, 65, 66, 67, 68, 69, 70]);
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn the_time_budget_stops_a_drain_and_holds_the_message_it_took() {
+        // The clock advances 5 ms per reading: the start reading, then one
+        // per message taken — the first message is checked at +5 ms (within
+        // 8 ms) and applied, the second at +10 ms is parked.
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..10u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let t0 = Instant::now();
+        let reads = std::cell::Cell::new(0u32);
+        let clock = move || {
+            reads.set(reads.get() + 1);
+            t0 + Duration::from_millis(5) * reads.get()
+        };
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            applied.push(tick_value(&cmd));
+            Ok((s, false))
+        })
+        .unwrap();
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: true });
+        assert_eq!(applied, vec![0]);
+        assert_eq!(held.as_ref().map(tick_value), Some(1));
+    }
+
+    #[test]
+    fn an_empty_channel_reports_nothing_applied_and_no_backlog() {
+        let (_tx, rx) = std::sync::mpsc::channel::<Command>();
+        let clock = frozen_clock();
+        let mut held = None;
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, _| Ok((s, false))).unwrap();
+        assert_eq!(outcome, DrainOutcome::default());
+        assert!(held.is_none());
+    }
+
+    #[test]
+    fn a_quit_ends_the_drain_without_a_backlog_claim() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        for i in 0..5u64 {
+            tx.send(tick(i)).unwrap();
+        }
+        let clock = frozen_clock();
+        let mut held = None;
+        let mut applied: Vec<u64> = Vec::new();
+        let ((), outcome) = drain_budgeted((), &rx, &mut held, &clock, |s, cmd| {
+            let v = tick_value(&cmd);
+            applied.push(v);
+            Ok((s, v == 2))
+        })
+        .unwrap();
+        assert_eq!(applied, vec![0, 1, 2]);
+        assert_eq!(outcome, DrainOutcome { applied: true, backlog: false });
+        assert!(held.is_none());
+    }
+
+    /// A scripted `EventSource`: `poll` reports "ready" while the queue is
+    /// non-empty, `read` pops it.
+    struct ScriptedEvents {
+        queue: std::collections::VecDeque<Event>,
+    }
+
+    impl ScriptedEvents {
+        fn of(events: impl IntoIterator<Item = Event>) -> ScriptedEvents {
+            ScriptedEvents { queue: events.into_iter().collect() }
+        }
+
+        fn remaining(&self) -> usize {
+            self.queue.len()
+        }
+    }
+
+    impl EventSource for ScriptedEvents {
+        fn poll(&mut self, _timeout: Duration) -> io::Result<bool> {
+            Ok(!self.queue.is_empty())
+        }
+        fn read(&mut self) -> io::Result<Event> {
+            Ok(self.queue.pop_front().expect("poll reported an event ready"))
+        }
+    }
+
+    /// A `BurstHandler` that records the mapped commands and applies them
+    /// through the real reducer — no terminal, and effects reduced to the
+    /// quit flag (a headless test cannot run a `TerminalGuard`).
+    struct RecordingHandler {
+        keys: config::Keys,
+        applied: Vec<Command>,
+    }
+
+    impl BurstHandler for RecordingHandler {
+        fn map_key(&mut self, key: KeyEvent, state: &State) -> Option<Command> {
+            map_pressed_key(key, state, &self.keys, None)
+        }
+        fn apply(&mut self, state: State, cmd: Command) -> io::Result<(State, bool)> {
+            self.applied.push(cmd.clone());
+            let (state, effects) = update(state, cmd);
+            Ok((state, effects.contains(&Effect::Quit)))
+        }
+    }
+
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// The pre-burst-loop behavior, as the reference the burst must match:
+    /// map each key against the state the previous one produced, apply,
+    /// repeat (application-shell "Bursts of key input render once":
+    /// "Applying a burst SHALL produce the same final state as applying the
+    /// same keys one at a time").
+    fn apply_one_at_a_time(mut state: State, codes: &[KeyCode]) -> (State, Vec<Command>) {
+        let mut applied = Vec::new();
+        for &code in codes {
+            if let Some(cmd) = map_pressed_key(KeyEvent::new(code, KeyModifiers::NONE), &state, &config::Keys::default(), None) {
+                applied.push(cmd.clone());
+                let (s, _) = update(state, cmd);
+                state = s;
+            }
+        }
+        (state, applied)
+    }
+
+    fn burst(initial: State, first: KeyCode, rest: Vec<Event>) -> (State, bool, bool, Vec<Command>, ScriptedEvents, Option<Event>) {
+        let mut events = ScriptedEvents::of(rest);
+        let mut pending_event = None;
+        let mut handler = RecordingHandler { keys: config::Keys::default(), applied: Vec::new() };
+        let (state, quit, applied) =
+            drain_key_burst(KeyEvent::new(first, KeyModifiers::NONE), initial, &mut events, &mut pending_event, &mut handler).unwrap();
+        (state, quit, applied, handler.applied, events, pending_event)
+    }
+
+    #[test]
+    fn a_held_page_down_burst_applies_every_key_and_draws_once() {
+        // application-shell "Holding PgDn renders one frame per burst": five
+        // queued PgDn presses apply five page movements, the queue empties
+        // in one drain (one loop iteration, hence one draw), and the final
+        // state matches one-at-a-time application.
+        let mut state = State::empty(Theme::classic());
+        state.term_size = (80, 24);
+        let entries: Vec<_> = (0..500)
+            .map(|i| filecommand_core::listing::Entry::new(format!("f{i:03}.txt"), filecommand_core::listing::EntryKind::File, 1, None, false, false))
+            .collect();
+        state.left.listing_request = Some(1);
+        let (s, _) = update(state, Command::ListingChunk { panel: PanelSide::Left, entries, request: 1 });
+        state = s;
+
+        let keys = [KeyCode::PageDown; 5];
+        let (burst_state, quit, applied, commands, events, pending) = burst(state.clone(), keys[0], keys[1..].iter().map(|&c| press(c)).collect());
+        assert!(!quit);
+        assert!(applied, "the burst applied commands, so the loop draws once after it");
+        assert_eq!(events.remaining(), 0, "the whole burst drained in one call");
+        assert!(pending.is_none());
+        assert_eq!(commands.len(), 5, "every queued key was applied");
+
+        let (reference_state, reference_commands) = apply_one_at_a_time(state, &keys);
+        assert_eq!(commands, reference_commands);
+        assert_eq!(burst_state, reference_state, "burst and one-at-a-time produce the same state");
+        assert!(burst_state.left.cursor > 0, "the cursor actually paged down");
+    }
+
+    #[test]
+    fn burst_routing_follows_the_state_each_key_produces() {
+        // application-shell "Routing follows the state each key produces":
+        // F7 opens the Make-directory dialog, `new` types into its field,
+        // Enter confirms it — exactly as if the keys had been pressed
+        // slowly. Mapping the burst against the *original* state would
+        // route the characters to the command line and Enter to
+        // `Command::Enter` instead of `FileOpConfirm`.
+        let state = State::empty(Theme::classic());
+        let rest = vec![press(KeyCode::Char('n')), press(KeyCode::Char('e')), press(KeyCode::Char('w')), press(KeyCode::Enter)];
+        let (burst_state, quit, applied, commands, events, pending) = burst(state.clone(), KeyCode::F(7), rest);
+        assert!(!quit && applied && pending.is_none() && events.remaining() == 0);
+        assert_eq!(
+            commands,
+            vec![
+                Command::RequestMkdir,
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('n')),
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('e')),
+                Command::TextEdit(filecommand_core::line_edit::TextEditOp::Insert('w')),
+                Command::FileOpConfirm,
+            ],
+            "each key mapped against the state the previous one produced"
+        );
+        let (reference_state, _) =
+            apply_one_at_a_time(state, &[KeyCode::F(7), KeyCode::Char('n'), KeyCode::Char('e'), KeyCode::Char('w'), KeyCode::Enter]);
+        assert_eq!(burst_state, reference_state);
+        assert!(
+            matches!(
+                burst_state.phase,
+                UiPhase::FileOpSetup(filecommand_core::fs_ops::dialog::FileOpSetup::DestinationInput { .. }) | UiPhase::FileOpRunning { .. }
+            ),
+            "the dialog opened and was confirmed: {:?}",
+            burst_state.phase
+        );
+    }
+
+    #[test]
+    fn a_burst_past_the_event_cap_stops_and_draws_before_continuing() {
+        // application-shell "A paste delivered as key events renders once
+        // per burst": 70 queued characters apply 64, then the drain returns
+        // so the loop draws before the remaining 6 are read next iteration.
+        let state = State::empty(Theme::classic());
+        let rest: Vec<Event> = (0..69).map(|_| press(KeyCode::Char('x'))).collect();
+        let (state, quit, applied, commands, events, _) = burst(state, KeyCode::Char('x'), rest);
+        assert!(!quit && applied);
+        assert_eq!(commands.len(), BURST_MAX_EVENTS, "the burst stops at the cap");
+        assert_eq!(events.remaining(), 70 - BURST_MAX_EVENTS);
+        assert_eq!(state.command_line.text().len(), BURST_MAX_EVENTS, "all 64 characters landed in the command line");
+    }
+
+    #[test]
+    fn a_mouse_event_ends_the_burst_and_is_stashed_for_the_next_iteration() {
+        // design D5: the mouse-batch path takes the stashed event next
+        // iteration.
+        let state = State::empty(Theme::classic());
+        let mouse = Event::Mouse(crossterm::event::MouseEvent { kind: MouseEventKind::ScrollDown, column: 5, row: 5, modifiers: KeyModifiers::NONE });
+        let (_state, quit, applied, commands, events, pending) = burst(state, KeyCode::PageDown, vec![mouse]);
+        assert!(!quit && applied);
+        assert_eq!(commands.len(), 1, "only the first key applied before the mouse event");
+        assert_eq!(events.remaining(), 0);
+        assert!(matches!(pending, Some(Event::Mouse(_))), "the mouse event is stashed, not lost or applied mid-burst");
     }
 }

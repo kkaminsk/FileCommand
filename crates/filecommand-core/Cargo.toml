@@ -2,15 +2,25 @@
 name = "filecommand-core"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "Platform-agnostic application logic for FileCommand (no terminal dependencies)"
 
+[lints]
+workspace = true
+
 [dependencies]
 unicode-width = { workspace = true }
-memmap2 = { workspace = true }
 git2 = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# All Win32 calls (drive enumeration, volume information, free space, memory
+# status, file identity, alternate-data-stream enumeration, `CopyFileExW`,
+# `ReplaceFileW`) go through the shared workspace binding; no prototype is
+# hand-declared (ci-and-build-tooling design D6).
+windows-sys = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

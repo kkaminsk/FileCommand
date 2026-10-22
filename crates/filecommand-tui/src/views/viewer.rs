@@ -2,10 +2,10 @@
 //! body, and its own F-key bar. A frame-less view that replaces the panels
 //! while open (viewer: Frame-less full-screen chrome), rendered as a pure
 //! function of `ViewerState` plus an already-open `ByteSource` window into
-//! the file (design D1). The byte reads it performs are bounded lookups
-//! into a memory map (or a small positioned read on the chunk-read
-//! fallback) — never a whole-file scan, matching the "instant open, no line
-//! index" contract the core `viewer` module implements.
+//! the file (design D1). The byte reads it performs are bounded positioned
+//! reads on the open handle — never a whole-file scan, matching the
+//! "instant open, no line index" contract the core `viewer` module
+//! implements.
 
 use filecommand_core::listing::{display_width, format_count, pad_to_width};
 use filecommand_core::theme::{ColorDepth, Role, Theme};
@@ -74,11 +74,7 @@ pub fn render_viewer(buf: &mut Buffer, area: Rect, viewer: &ViewerState, theme: 
 /// the file name visible last, left-truncated with `…` if even that alone
 /// does not fit (responsive-layout "Full-screen surface degradation").
 fn render_header(buf: &mut Buffer, x: u16, y: u16, w: usize, viewer: &ViewerState, style: Style) {
-    let filename = viewer
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| viewer.path.display().to_string());
+    let filename = viewer.path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| viewer.path.display().to_string());
     let pct = percent_through(viewer.top_offset, viewer.file_len);
     let pos = match viewer.mode {
         ViewMode::Text => format!("Col {}", viewer.h_scroll),

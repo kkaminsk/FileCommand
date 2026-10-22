@@ -5,6 +5,10 @@
 pub mod app;
 pub mod clipboard;
 pub mod clock;
+pub mod config_writer;
+pub mod console;
+pub mod diag;
+pub mod history_writer;
 pub mod hitmap;
 pub mod input;
 pub mod layout;

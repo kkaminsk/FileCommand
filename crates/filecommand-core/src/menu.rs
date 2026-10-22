@@ -4,7 +4,7 @@
 //! sits alongside the phase in `State` so a file-op dialog and the menu can
 //! never both claim the phase slot. Everything here is pure data plus index
 //! arithmetic — dispatching an item's action is the caller's job
-//! ([`crate::update`] turns a [`MenuAction`] back into a `Command`).
+//! ([`crate::update`](fn@crate::update) turns a [`MenuAction`] back into a `Command`).
 
 use crate::listing::SortMode;
 use crate::panel::DisplayMode;
@@ -69,8 +69,9 @@ impl MenuId {
     }
 }
 
-/// What activating an item does. Items for features that land in later
-/// milestones carry [`MenuAction::Unimplemented`] and render disabled.
+/// What activating an item does. Every shipped item is wired
+/// (pulldown-menu-completion); [`MenuAction::Unimplemented`] is retained for
+/// future proposals, whose items render disabled until they land.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
     ToggleInfoMode,
@@ -80,8 +81,19 @@ pub enum MenuAction {
     SetDisplayMode(DisplayMode),
     EnterTree,
     SortBy(SortMode),
+    /// Left/Right → Filter: start the quick filter on the menu's own panel
+    /// (which becomes the active panel so typing reaches it — design D1).
+    QuickFilter,
     Reread,
     DriveSelect,
+    /// Left/Right → New tab (Ctrl+T) on the menu's own panel.
+    NewTab,
+    /// Left/Right → Close tab (Ctrl+W) on the menu's own panel.
+    CloseTab,
+    /// Files → View (F3).
+    View,
+    /// Files → Edit (F4).
+    Edit,
     Copy,
     Move,
     Mkdir,
@@ -98,13 +110,23 @@ pub enum MenuAction {
     InvertSelection,
     PanelsOnOff,
     FindFile,
+    /// Commands → History (Alt+F8): open the command-history dialog
+    /// (command-line "Command history dialog (Alt+F8)").
+    History,
+    /// Commands → Swap panels (Ctrl+U): exchange the two panels' state
+    /// (panel-navigation "Swap panels (Ctrl+U)").
+    SwapPanels,
     FuzzyJump,
+    /// Commands → Menu file edit: open `usermenu.toml` in the F4 editor path
+    /// (user-menu "Edit the user menu file from the Commands menu").
+    EditMenuFile,
     Quit,
     /// Options → Themes: opens the theme-selection picker dialog
     /// (theme-selection "Options menu opens the theme picker").
     OpenThemes,
     /// Rendered as a real entry so the menu matches its final shape, but
-    /// greyed out and unselectable until its milestone lands.
+    /// greyed out and unselectable until its milestone lands. No shipped item
+    /// uses it (pulldown-menu-completion design D5).
     Unimplemented,
 }
 
@@ -161,17 +183,17 @@ const PANEL_MENU: &[MenuEntry] = &[
     item("Size", 0, "Ctrl-F6", MenuAction::SortBy(SortMode::Size)),
     item("Unsorted", 0, "Ctrl-F7", MenuAction::SortBy(SortMode::Unsorted)),
     MenuEntry::Separator,
-    item("Filter", 0, "", MenuAction::Unimplemented),
+    item("Filter", 0, "Ctrl-P", MenuAction::QuickFilter),
     item("Re-read", 0, "Ctrl-R", MenuAction::Reread),
     item("Drive select", 0, "Alt-F1/F2", MenuAction::DriveSelect),
     MenuEntry::Separator,
-    item("New tab", 0, "Ctrl-T", MenuAction::Unimplemented),
-    item("Close tab", 0, "Ctrl-W", MenuAction::Unimplemented),
+    item("New tab", 0, "Ctrl-T", MenuAction::NewTab),
+    item("Close tab", 0, "Ctrl-W", MenuAction::CloseTab),
 ];
 
 const FILES_MENU: &[MenuEntry] = &[
-    item("View", 0, "F3", MenuAction::Unimplemented),
-    item("Edit", 0, "F4", MenuAction::Unimplemented),
+    item("View", 0, "F3", MenuAction::View),
+    item("Edit", 0, "F4", MenuAction::Edit),
     item("Copy", 0, "F5", MenuAction::Copy),
     item("Rename/Move", 0, "F6", MenuAction::Move),
     item("Make directory", 0, "F7", MenuAction::Mkdir),
@@ -180,8 +202,6 @@ const FILES_MENU: &[MenuEntry] = &[
     item("Copy to clipboard", 0, "Ctrl-C", MenuAction::ClipboardFiles),
     item("Copy path(s)", 0, "Ctrl-Sh-Ins", MenuAction::ClipboardPaths),
     item("Copy name(s)", 0, "", MenuAction::ClipboardNames),
-    MenuEntry::Separator,
-    item("Attributes", 0, "", MenuAction::Unimplemented),
     MenuEntry::Separator,
     item("Select group", 0, "+", MenuAction::SelectGroup),
     item("Deselect group", 0, "-", MenuAction::DeselectGroup),
@@ -192,21 +212,14 @@ const FILES_MENU: &[MenuEntry] = &[
 
 const COMMANDS_MENU: &[MenuEntry] = &[
     item("Find file", 0, "Alt-F7", MenuAction::FindFile),
-    item("History", 0, "Alt-F8", MenuAction::Unimplemented),
-    item("Swap panels", 0, "Ctrl-U", MenuAction::Unimplemented),
+    item("History", 0, "Alt-F8", MenuAction::History),
+    item("Swap panels", 0, "Ctrl-U", MenuAction::SwapPanels),
     item("Panels on/off", 0, "Ctrl-O", MenuAction::PanelsOnOff),
-    item("Compare directories", 0, "", MenuAction::Unimplemented),
     item("Fuzzy jump", 0, "Ctrl-J", MenuAction::FuzzyJump),
-    item("Menu file edit", 0, "", MenuAction::Unimplemented),
+    item("Menu file edit", 0, "", MenuAction::EditMenuFile),
 ];
 
-const OPTIONS_MENU: &[MenuEntry] = &[
-    item("Configuration", 0, "", MenuAction::Unimplemented),
-    item("Themes", 0, "", MenuAction::OpenThemes),
-    item("Editor selection", 0, "", MenuAction::Unimplemented),
-    MenuEntry::Separator,
-    item("Save setup", 0, "", MenuAction::Unimplemented),
-];
+const OPTIONS_MENU: &[MenuEntry] = &[item("Themes", 0, "", MenuAction::OpenThemes)];
 
 /// The pull-down contents for a menu.
 pub fn entries(id: MenuId) -> &'static [MenuEntry] {
@@ -227,6 +240,19 @@ pub struct MenuState {
     /// Esc-from-a-pull-down leaves behind.
     pub pulldown_open: bool,
     pub selected: usize,
+    /// `State::clock_ms` when the bar opened. Stamped by the reducer (the
+    /// constructors below leave it `0`), read only by the renderer to drive
+    /// the bar's entrance sweep (ui-animations "Render-only motion model
+    /// driven by the reducer clock").
+    pub opened_at_ms: u64,
+    /// `State::clock_ms` when the current pull-down began unfolding —
+    /// re-stamped on Left/Right traversal and hotkey jumps, since the new
+    /// pull-down unfolds while already open and interactive (design D4).
+    pub pulldown_opened_at_ms: u64,
+    /// `State::clock_ms` when the highlight last moved within the current
+    /// pull-down, or `None` if it has not moved since the pull-down opened
+    /// (opening is the unfold's job, not a highlight flash).
+    pub selected_at_ms: Option<u64>,
 }
 
 impl MenuState {
@@ -237,7 +263,14 @@ impl MenuState {
 
     /// Open `id`'s pull-down with the first selectable item highlighted.
     pub fn for_menu(id: MenuId) -> MenuState {
-        MenuState { active: id, pulldown_open: true, selected: first_selectable(id).unwrap_or(0) }
+        MenuState {
+            active: id,
+            pulldown_open: true,
+            selected: first_selectable(id).unwrap_or(0),
+            opened_at_ms: 0,
+            pulldown_opened_at_ms: 0,
+            selected_at_ms: None,
+        }
     }
 
     pub fn items(&self) -> &'static [MenuEntry] {
@@ -259,22 +292,7 @@ impl MenuState {
     /// Move the selection by `delta` rows, landing only on enabled items and
     /// wrapping at the ends.
     pub fn move_selection(&mut self, delta: isize) {
-        let entries = self.items();
-        let len = entries.len();
-        if len == 0 {
-            return;
-        }
-        let step = if delta >= 0 { 1isize } else { -1isize };
-        let mut index = self.selected as isize;
-        // At most one full lap: if nothing is selectable we leave the
-        // selection where it was rather than spinning.
-        for _ in 0..len {
-            index = (index + step).rem_euclid(len as isize);
-            if is_selectable(&entries[index as usize]) {
-                self.selected = index as usize;
-                return;
-            }
-        }
+        self.selected = move_selection_in(self.items(), self.selected, delta);
     }
 
     /// Switch to an adjacent menu, keeping the pull-down open so horizontal
@@ -288,6 +306,28 @@ impl MenuState {
 
 fn is_selectable(entry: &MenuEntry) -> bool {
     matches!(entry, MenuEntry::Item(item) if item.is_enabled())
+}
+
+/// The selection-walk core of [`MenuState::move_selection`], factored out so
+/// the skip-disabled/separator rule can be tested against a local fixture
+/// rather than relying on shipped items being disabled (pulldown-menu-
+/// completion design D5: no shipped item is disabled).
+fn move_selection_in(entries: &[MenuEntry], selected: usize, delta: isize) -> usize {
+    let len = entries.len();
+    if len == 0 {
+        return selected;
+    }
+    let step = if delta >= 0 { 1isize } else { -1isize };
+    let mut index = selected as isize;
+    // At most one full lap: if nothing is selectable we leave the
+    // selection where it was rather than spinning.
+    for _ in 0..len {
+        index = (index + step).rem_euclid(len as isize);
+        if is_selectable(&entries[index as usize]) {
+            return index as usize;
+        }
+    }
+    selected
 }
 
 /// The index of the first enabled item in `id`'s pull-down.
@@ -336,17 +376,31 @@ mod tests {
     }
 
     #[test]
-    fn vertical_selection_skips_separators_and_disabled_items() {
+    fn vertical_selection_skips_separators() {
         let mut menu = MenuState::for_menu(MenuId::Files);
-        // "Attributes" is disabled and bounded by separators on both sides,
-        // so stepping past "Copy name(s)" must land on "Select group".
-        let copy_names = entries(MenuId::Files)
-            .iter()
-            .position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy name(s)"))
-            .unwrap();
+        // A separator sits between "Copy name(s)" and "Select group", so
+        // stepping down from the former must land on the latter.
+        let copy_names = entries(MenuId::Files).iter().position(|e| matches!(e, MenuEntry::Item(i) if i.label == "Copy name(s)")).unwrap();
         menu.selected = copy_names;
         menu.move_selection(1);
         assert_eq!(menu.selected_item().map(|i| i.label), Some("Select group"));
+    }
+
+    #[test]
+    fn vertical_selection_skips_disabled_items_in_a_local_fixture() {
+        // No shipped item is disabled (design D5), so the skip-disabled rule
+        // is pinned against a local fixture: a disabled item bounded by
+        // separators must never be landed on, from either direction.
+        let fixture: Vec<MenuEntry> = vec![
+            item("Alpha", 0, "", MenuAction::Copy),
+            MenuEntry::Separator,
+            item("Beta", 0, "", MenuAction::Unimplemented),
+            MenuEntry::Separator,
+            item("Gamma", 0, "", MenuAction::Quit),
+        ];
+        assert!(!MenuAction::Unimplemented.is_enabled(), "sanity: the fixture's disabled item is disabled");
+        assert_eq!(move_selection_in(&fixture, 0, 1), 4, "Down from Alpha skips the disabled Beta and both separators");
+        assert_eq!(move_selection_in(&fixture, 4, -1), 0, "Up from Gamma skips them going back");
     }
 
     #[test]
@@ -355,18 +409,12 @@ mod tests {
         menu.move_selection(-1);
         assert_eq!(menu.selected_item().map(|i| i.label), Some("Quit"), "Up from the first item wraps to the last");
         menu.move_selection(1);
-        assert_eq!(menu.selected_item().map(|i| i.label), Some("Copy"), "Down from the last wraps to the first");
+        assert_eq!(menu.selected_item().map(|i| i.label), Some("View"), "Down from the last wraps to the first");
     }
 
     #[test]
     fn selection_never_rests_on_a_disabled_item() {
         for id in ALL_MENUS {
-            // An all-disabled menu (Options today) legitimately has nothing
-            // to land on; `selected_item` returning `None` is what keeps
-            // Enter from activating anything there.
-            if first_selectable(id).is_none() {
-                continue;
-            }
             let mut menu = MenuState::for_menu(id);
             for delta in [1isize, -1] {
                 for _ in 0..entries(id).len() * 2 {
@@ -381,25 +429,28 @@ mod tests {
     }
 
     #[test]
-    fn options_menu_themes_is_enabled_the_rest_still_render_disabled() {
-        // Themes (theme-selection) is the first Options entry, and is the
-        // canonical "renders disabled" example's *former* stand-in — see
-        // `pulldown-menus` MODIFIED "Menu contents": the rest of the menu
-        // stays a placeholder (pulldown-menus "Not-yet-available feature
-        // renders disabled" now anchors on Attributes/Configuration/etc.
-        // instead).
+    fn every_shipped_item_is_enabled() {
+        // pulldown-menu-completion "Every listed item is wired": no shipped
+        // menu carries a greyed-out placeholder any more (design D5 — the
+        // disabled-rendering rule stays available for future items).
+        for id in ALL_MENUS {
+            for entry in entries(id) {
+                if let MenuEntry::Item(item) = entry {
+                    assert!(item.is_enabled(), "{:?} `{}` must not ship disabled", id, item.label);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn options_menu_lists_themes_alone() {
+        // Options collapsed to its one wired entry — no separator (design
+        // D5): Configuration, Editor selection, and Save setup were removed.
+        let entries = entries(MenuId::Options);
+        assert_eq!(entries.len(), 1, "Options lists Themes alone");
+        assert!(matches!(entries[0], MenuEntry::Item(i) if i.label == "Themes" && i.action == MenuAction::OpenThemes));
         let menu = MenuState::for_menu(MenuId::Options);
         assert_eq!(menu.selected_item().map(|i| i.label), Some("Themes"));
-        for label in ["Configuration", "Editor selection", "Save setup"] {
-            let item = entries(MenuId::Options)
-                .iter()
-                .find_map(|e| match e {
-                    MenuEntry::Item(i) if i.label == label => Some(i),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("`{label}` missing from the Options menu"));
-            assert!(!item.is_enabled(), "`{label}` should still render disabled");
-        }
     }
 
     #[test]
@@ -431,7 +482,6 @@ mod tests {
                 "Copy to clipboard",
                 "Copy path(s)",
                 "Copy name(s)",
-                "Attributes",
                 "Select group",
                 "Deselect group",
                 "Invert selection",
@@ -473,15 +523,87 @@ mod tests {
     }
 
     #[test]
-    fn not_yet_built_features_render_as_disabled_entries_not_omissions() {
-        let history = entries(MenuId::Commands)
+    fn panel_menus_list_their_specified_items_in_order() {
+        // pulldown-menus "Menu contents": the full Left/Right pull-down, in
+        // order (`Left and Right menus mirror each other`).
+        let labels: Vec<&str> = entries(MenuId::Left)
             .iter()
-            .find_map(|e| match e {
-                MenuEntry::Item(i) if i.label == "History" => Some(i),
-                _ => None,
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i.label),
+                MenuEntry::Separator => None,
             })
-            .expect("History is present even though it is unimplemented");
-        assert!(!history.is_enabled());
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                "Brief",
+                "Full",
+                "Tree",
+                "Quick view",
+                "Info",
+                "Name",
+                "Extension",
+                "Modif. time",
+                "Size",
+                "Unsorted",
+                "Filter",
+                "Re-read",
+                "Drive select",
+                "New tab",
+                "Close tab",
+            ]
+        );
+    }
+
+    #[test]
+    fn commands_menu_lists_its_specified_items_in_order() {
+        // pulldown-menus "Menu contents": Commands, in order — Compare
+        // directories is gone, History/Swap panels/Menu file edit are wired.
+        let labels: Vec<&str> = entries(MenuId::Commands)
+            .iter()
+            .filter_map(|e| match e {
+                MenuEntry::Item(i) => Some(i.label),
+                MenuEntry::Separator => None,
+            })
+            .collect();
+        assert_eq!(labels, vec!["Find file", "History", "Swap panels", "Panels on/off", "Fuzzy jump", "Menu file edit"]);
+    }
+
+    #[test]
+    fn removed_items_are_absent_from_every_menu() {
+        // pulldown-menus "Removed items are absent" (design D5: remove,
+        // don't hide).
+        for id in ALL_MENUS {
+            for entry in entries(id) {
+                if let MenuEntry::Item(item) = entry {
+                    for removed in ["Attributes", "Compare directories", "Configuration", "Editor selection", "Save setup"] {
+                        assert_ne!(item.label, removed, "{id:?} still lists removed `{removed}`");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn newly_wired_items_carry_their_keyboard_equivalents_shortcut_hints() {
+        // The wired items show the same hyphenated hint style as the rest of
+        // the menu (F3/F4/Ctrl+P/Ctrl+T/Ctrl+W/Alt+F8/Ctrl+U bindings).
+        let by_label = |id: MenuId, label: &str| -> &'static MenuItem {
+            entries(id)
+                .iter()
+                .find_map(|e| match e {
+                    MenuEntry::Item(i) if i.label == label => Some(i),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("`{label}` missing from the {id:?} menu"))
+        };
+        assert_eq!(by_label(MenuId::Files, "View").shortcut, "F3");
+        assert_eq!(by_label(MenuId::Files, "Edit").shortcut, "F4");
+        assert_eq!(by_label(MenuId::Left, "Filter").shortcut, "Ctrl-P");
+        assert_eq!(by_label(MenuId::Left, "New tab").shortcut, "Ctrl-T");
+        assert_eq!(by_label(MenuId::Left, "Close tab").shortcut, "Ctrl-W");
+        assert_eq!(by_label(MenuId::Commands, "History").shortcut, "Alt-F8");
+        assert_eq!(by_label(MenuId::Commands, "Swap panels").shortcut, "Ctrl-U");
     }
 
     #[test]
@@ -518,7 +640,7 @@ mod tests {
         menu.pulldown_open = false;
         menu.go_to(MenuId::Files);
         assert!(menu.pulldown_open);
-        assert_eq!(menu.selected_item().map(|i| i.label), Some("Copy"));
+        assert_eq!(menu.selected_item().map(|i| i.label), Some("View"));
     }
 
     #[test]

@@ -36,6 +36,14 @@ const SIZE_COL_W: usize = 9;
 const DATE_COL_W: usize = 8;
 const TIME_COL_W: usize = 5;
 
+/// The rendered text widths inside those reserved cells — exactly the
+/// content's own widths (`▶SUB-DIR◀`/`▶UP--DIR◀` are 9 cells, `MM-DD-YY`
+/// is 8, `HH:MM` is 5), so no Full-mode Size/Date/Time value ever renders
+/// truncated (full-mode-column-widths; design D1).
+const SIZE_TEXT_W: usize = 9;
+const DATE_TEXT_W: usize = 8;
+const TIME_TEXT_W: usize = 5;
+
 /// The Name column never shrinks below this many display cells in Full
 /// mode — the anchor `MIN_NAME_W` for the column ladder (design D3).
 const MIN_NAME_W: usize = 12;
@@ -58,10 +66,11 @@ impl ColumnSet {
     /// Display cells consumed by the columns after Name (including the
     /// separator pipe and inter-column spaces), or 0 when only Name renders
     /// — in which case Name spans the full interior with no pipe or slack.
-    /// `SIZE_COL_W`/`DATE_COL_W`/`TIME_COL_W` are unchanged from the fixed
-    /// 80x24 layout, so the reserved width (and therefore the rendered
-    /// output) at the nominal size is byte-identical to before this change
-    /// (design D3's anchor).
+    /// The reserved widths (25 / 20 / 12 / 0) are unchanged from the fixed
+    /// 80x24 layout, so `choose_columns`, the Name-column ladder, and every
+    /// breakpoint are untouched by full-mode-column-widths — only
+    /// `format_full_row`'s text widths grew to fill the reservation exactly
+    /// (design D1).
     fn reserved_w(self) -> usize {
         if !self.size {
             return 0;
@@ -106,23 +115,42 @@ fn choose_columns(interior_w: usize, marker_w: usize) -> ColumnSet {
 /// Assembles a Full-mode row (or header row) string from its four fields,
 /// appending only the blocks `cols` selects — the same function backs both
 /// the header row and every entry row, so "the header row shows exactly the
-/// columns currently rendered" holds by construction.
+/// columns currently rendered" holds by construction. With all four columns
+/// present the row is exactly `name_w + 25` cells — the full interior — and
+/// every Size/Date/Time value renders at its content width, untruncated,
+/// with no slack left at the row's right edge; for the reduced column sets
+/// the row comes out shorter than the reservation and the difference stays
+/// trailing padding, as before (panel-navigation "Full display mode
+/// layout"; design D1). `size` arrives already right-aligned by the caller
+/// for entry rows, so header labels keep their left alignment here (design
+/// D2).
 fn format_full_row(name_w: usize, cols: ColumnSet, name: &str, size: &str, date: &str, time: &str) -> String {
     let mut s = pad_to_width(name, name_w);
     if cols.size {
         s.push('\u{2502}');
-        s.push(' ');
-        s.push_str(&pad_to_width(size, SIZE_COL_W - 2));
+        s.push_str(&pad_to_width(size, SIZE_TEXT_W));
     }
     if cols.date {
         s.push(' ');
-        s.push_str(&pad_to_width(date, DATE_COL_W - 1));
+        s.push_str(&pad_to_width(date, DATE_TEXT_W));
     }
     if cols.time {
         s.push(' ');
-        s.push_str(&pad_to_width(time, TIME_COL_W - 1));
+        s.push_str(&pad_to_width(time, TIME_TEXT_W));
     }
     s
+}
+
+/// Left-pads `s` to exactly `width` display columns so numeric values
+/// right-align in their column (the NC convention for Size; design D2).
+/// Values already at or over `width` pass through untouched —
+/// `▶SUB-DIR◀`/`▶UP--DIR◀` fill the Size column exactly.
+fn pad_left_to_width(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        return s.to_string();
+    }
+    format!("{}{}", " ".repeat(width - w), s)
 }
 
 /// A column header label, with the sort arrow appended when this column is
@@ -260,7 +288,9 @@ fn drag_feedback_for(panel: &PanelState, side: PanelSide, drag: &DragState) -> O
             };
             DragFeedback::Valid { row: Some(RowHighlight::Row(name.clone())), dir }
         }
-        Some(DropTarget::TreeNode { side: s, path }) if *s == side => DragFeedback::Valid { row: Some(RowHighlight::TreeNode(path.clone())), dir: path.clone() },
+        Some(DropTarget::TreeNode { side: s, path }) if *s == side => {
+            DragFeedback::Valid { row: Some(RowHighlight::TreeNode(path.clone())), dir: path.clone() }
+        }
         Some(DropTarget::Tab { side: s, index }) if *s == side => {
             let dir = panel.tab_dirs().get(*index).cloned()?;
             DragFeedback::Valid { row: Some(RowHighlight::Tab(*index)), dir }
@@ -354,10 +384,12 @@ pub fn hit_test(area: Rect, panel: &PanelState) -> crate::hitmap::PanelHits {
         DisplayMode::Full => {
             let rows_start = body_y0 + 1;
             let rows_h = body_h.saturating_sub(1);
-            let visible = panel.visible_indices();
-            for row in 0..rows_h {
-                let y = rows_start + row;
-                let Some(entry) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i)) else { continue };
+            // Only the rows on screen, through the cached visible window —
+            // no per-frame allocation of every visible index (streaming-
+            // listing-performance design D5).
+            for (row, i) in panel.visible_window(panel.scroll_offset, rows_h as usize).enumerate() {
+                let y = rows_start + row as u16;
+                let Some(entry) = panel.entries.get(i) else { continue };
                 let rect = Rect { x: x0 + 1, y, width: right_x.saturating_sub(x0 + 1), height: 1 };
                 hits.rows.push((rect, entry.name.clone()));
             }
@@ -429,6 +461,8 @@ pub fn render_panel(
     let header_style = role_style(theme, Role::PanelHeader, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
+    let hidden_style = role_style(theme, Role::PanelHidden, depth);
+    let selected_style = role_style(theme, Role::PanelSelected, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
     let button_focused_style = role_style(theme, Role::ButtonFocused, depth);
     // A clipboard action's feedback (clipboard-export "Clipboard feedback")
@@ -498,7 +532,14 @@ pub fn render_panel(
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         let inner = Rect { x: x0 + 1, y: body_y0, width: area.width - 2, height: body_h };
         info_panel::render_info(buf, inner, theme, depth, &panel.info, &panel.cwd, identity_lines);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -507,7 +548,14 @@ pub fn render_panel(
     if panel.display_mode == DisplayMode::Brief {
         draw_side_borders(buf, x0, body_y0, right_x, body_h, frame_style);
         render_brief_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, &row_highlight, button_focused_style);
-        render_bottom_border(buf, area, panel, frame_style, ministatus_style, drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()));
+        render_bottom_border(
+            buf,
+            area,
+            panel,
+            frame_style,
+            ministatus_style,
+            drag_status.clone().or_else(|| clipboard_override.clone()).or_else(|| input_override.clone()),
+        );
         return;
     }
 
@@ -515,7 +563,8 @@ pub fn render_panel(
     // driving the opposite panel as the cursor moves (additional-panel-
     // modes "Tree display mode structure and rendering").
     if panel.display_mode == DisplayMode::Tree {
-        let mini_status = render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style, &row_highlight, button_focused_style);
+        let mini_status =
+            render_tree_body(buf, x0, body_y0, right_x, w, body_h, panel, theme, depth, active, frame_style, &row_highlight, button_focused_style);
         render_bottom_border(
             buf,
             area,
@@ -573,41 +622,56 @@ pub fn render_panel(
     buf.set_string(right_x, body_y0, "\u{2551}", frame_style);
 
     // Entry rows. When a quick filter is active the body is narrowed to
-    // `visible_indices()` (`..` plus name-matching entries) rather than the
-    // full `entries` list, matching `move_cursor`'s cursor-restriction and
-    // the spec's "the panel body is narrowed to entries whose displayed
-    // name contains the pattern" requirement (quick-filter "Substring
-    // narrowing as the pattern is typed").
-    let visible = panel.visible_indices();
+    // the panel's cached visible list (`..` plus name-matching entries)
+    // rather than the full `entries` list, matching `move_cursor`'s
+    // cursor-restriction and the spec's "the panel body is narrowed to
+    // entries whose displayed name contains the pattern" requirement
+    // (quick-filter "Substring narrowing as the pattern is typed"). Only
+    // the window of rows on screen is walked, so a frame costs the rows
+    // shown rather than the directory's size (streaming-listing-performance
+    // design D5).
     let rows_start = body_y0 + 1;
     let rows_h = body_h.saturating_sub(1); // header row
     let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
-    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, visible.len(), panel.scroll_offset);
+    let thumb = scrollbar_thumb(rows_h as usize, rows_h as usize, panel.visible_len(), panel.scroll_offset);
+    let mut window = panel.visible_window(panel.scroll_offset, rows_h as usize);
     for row in 0..rows_h {
         let y = rows_start + row;
         buf.set_string(x0, y, "\u{2551}", frame_style);
         draw_scrollbar_cell(buf, right_x, y, row as usize, thumb, frame_style, scrollbar_style);
-        if let Some((entry, is_selected)) = visible.get(panel.scroll_offset + row as usize).and_then(|&i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
+        if let Some((entry, is_cursor)) = window.next().and_then(|i| panel.entries.get(i).map(|e| (e, active && i == panel.cursor))) {
             // The drag's target row (mouse-panel-drag "Drag feedback")
             // outranks the ordinary selected/dir/file styling — but never a
             // *source* row, since a dragged item's own directory/descendant
             // is already rejected as a target by core (design D7), so this
             // can never coincide with one of the rows the drag is dragging.
             let is_drag_target = is_target_row(&row_highlight, &entry.name);
+            // Entry style precedence (panel-navigation "Entry row
+            // rendering"; hidden-entry-styling design D3): drag-target
+            // highlight, then the cursor bar, then Ins-selection, then the
+            // hidden dimming (which covers hidden directories too), then the
+            // ordinary directory/file styles.
             let style = if is_drag_target {
                 button_focused_style
-            } else if is_selected {
+            } else if is_cursor {
                 cursor_style
+            } else if entry.kind != EntryKind::ParentDir && panel.selected.contains(&entry.name) {
+                selected_style
+            } else if entry.hidden {
+                hidden_style
             } else if entry.is_dir_like() {
                 dir_style
             } else {
                 file_style
             };
             let name = display_name_lossy(entry);
+            // Numeric sizes right-align in the 9-cell Size column (the NC
+            // convention; design D2); the `..`/directory markers are
+            // already 9 cells wide and fill it.
             let size_col = match entry.kind {
                 EntryKind::ParentDir => "\u{25B6}UP--DIR\u{25C4}".to_string(),
                 EntryKind::Directory => "\u{25B6}SUB-DIR\u{25C4}".to_string(),
-                EntryKind::File => format_size(entry.size),
+                EntryKind::File => pad_left_to_width(&format_size(entry.size), SIZE_TEXT_W),
             };
             let (date_col, time_col) = match entry.modified {
                 Some(dt) => (format_date(dt), format_time(dt)),
@@ -618,7 +682,7 @@ pub fn render_panel(
                 let marker = git_marker(panel, entry);
                 let marker_style = if is_drag_target {
                     button_focused_style
-                } else if is_selected {
+                } else if is_cursor {
                     cursor_style
                 } else if let Some((_, role)) = marker {
                     role_style(theme, role, depth)
@@ -651,8 +715,10 @@ fn draw_side_borders(buf: &mut Buffer, x0: u16, body_y0: u16, right_x: u16, body
 
 /// Brief mode's body: entry names only, laid out across three columns in
 /// column-major order, using `unicode-width` for alignment and preserving
-/// the standard directory/file/selected/cursor styling and the `..`
-/// up-dir marker (additional-panel-modes "Brief display mode").
+/// the standard directory/file/hidden/selected/cursor styling and the `..`
+/// up-dir marker, with the same style precedence as Full mode
+/// (additional-panel-modes "Brief display mode"; hidden-entry-styling
+/// design D3).
 #[allow(clippy::too_many_arguments)]
 fn render_brief_body(
     buf: &mut Buffer,
@@ -670,6 +736,7 @@ fn render_brief_body(
 ) {
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let file_style = role_style(theme, Role::PanelFile, depth);
+    let hidden_style = role_style(theme, Role::PanelHidden, depth);
     let cursor_style = role_style(theme, Role::PanelCursor, depth);
     let selected_style = role_style(theme, Role::PanelSelected, depth);
     let scrollbar_style = role_style(theme, Role::PanelScrollbar, depth);
@@ -688,15 +755,16 @@ fn render_brief_body(
         *last += inner_w - base_w * n_cols;
     }
     let rows_h = body_h as usize;
-    // Narrow to the active quick filter's `visible_indices()` (`..` plus
+    // Narrow to the active quick filter's cached visible list (`..` plus
     // name-matching entries), exactly like Full mode above (quick-filter
-    // "Substring narrowing as the pattern is typed").
-    let visible = panel.visible_indices();
+    // "Substring narrowing as the pattern is typed"); each cell is one O(1)
+    // `visible_at` lookup, column-major (streaming-listing-performance
+    // design D5).
     // The overflow-only scrollbar reflects the cursor window's linear
     // position through the whole visible list, not one column's share of it
     // — window_capacity is every position the `n_cols`-wide window shows at
     // once (additional-panel-modes "Brief mode column scrolling").
-    let thumb = scrollbar_thumb(rows_h, n_cols * rows_h, visible.len(), panel.scroll_offset);
+    let thumb = scrollbar_thumb(rows_h, n_cols * rows_h, panel.visible_len(), panel.scroll_offset);
 
     for row in 0..rows_h {
         let y = body_y0 + row as u16;
@@ -704,14 +772,19 @@ fn render_brief_body(
         let mut x = x0 + 1;
         for (c, &cw) in col_widths.iter().enumerate() {
             let pos = panel.scroll_offset + c * rows_h + row;
-            if let Some((entry, idx)) = visible.get(pos).and_then(|&i| panel.entries.get(i).map(|e| (e, i))) {
+            if let Some((entry, idx)) = panel.visible_at(pos).and_then(|i| panel.entries.get(i).map(|e| (e, i))) {
                 let is_cursor = active && idx == panel.cursor;
+                // Same precedence as Full mode (hidden-entry-styling design
+                // D3): drag target, cursor bar, Ins-selection, hidden
+                // dimming, then directory/file.
                 let style = if is_target_row(row_highlight, &entry.name) {
                     button_focused_style
                 } else if is_cursor {
                     cursor_style
                 } else if entry.kind != EntryKind::ParentDir && panel.selected.contains(&entry.name) {
                     selected_style
+                } else if entry.hidden {
+                    hidden_style
                 } else if entry.is_dir_like() {
                     dir_style
                 } else {
@@ -779,7 +852,13 @@ fn render_tree_body(
             Some(node) if node.depth == 0 => {
                 let is_target = is_target_tree_node(row_highlight, &node.path);
                 let text = node.path.display().to_string();
-                let style = if is_target { button_focused_style } else if is_cursor { cursor_style } else { dir_style };
+                let style = if is_target {
+                    button_focused_style
+                } else if is_cursor {
+                    cursor_style
+                } else {
+                    dir_style
+                };
                 buf.set_string(x0 + 1, y, pad_to_width(&text, inner_w), style);
             }
             Some(node) => {
@@ -810,7 +889,16 @@ fn render_tree_body(
 /// directory indicator"; design D7). Returns the mini-status override — the
 /// previewed file's name and size.
 #[allow(clippy::too_many_arguments)]
-fn render_quick_view_body(buf: &mut Buffer, x0: u16, body_y0: u16, w: usize, body_h: u16, opposite: &PanelState, theme: &Theme, depth: ColorDepth) -> Option<String> {
+fn render_quick_view_body(
+    buf: &mut Buffer,
+    x0: u16,
+    body_y0: u16,
+    w: usize,
+    body_h: u16,
+    opposite: &PanelState,
+    theme: &Theme,
+    depth: ColorDepth,
+) -> Option<String> {
     let text_style = role_style(theme, Role::ViewerText, depth);
     let dir_style = role_style(theme, Role::PanelDirectory, depth);
     let inner_w = w.saturating_sub(2);
@@ -855,18 +943,23 @@ fn render_bottom_border(
     // `bracketed` below), so the content itself has 2 fewer cells to work
     // with than the interior.
     let status_budget = inner_w.saturating_sub(2);
-    // An inline error (a failed listing, a failed F3/F4 dispatch — §7 "panel
-    // shows an inline error state") takes over the mini-status line until
-    // the next successful operation clears it (`begin_new_listing`). The
-    // multi-select summary takes precedence over the per-entry status while
-    // one or more entries are selected (selection "Selection count and size
-    // summary"); both drop fields/truncate with `…` in ladder order as the
-    // panel narrows (responsive-layout "Chrome degradation").
+    // A pending note — `Checking <path>…` while a command-line target probe
+    // runs, `Opening <name>…` while an F3/F4 open runs — ranks below the
+    // override and above the error, in the normal ministatus style
+    // (offload-blocking-io design D3). An inline error (a failed listing, a
+    // failed F3/F4 dispatch — §7 "panel shows an inline error state") takes
+    // over the mini-status line until the next successful operation clears
+    // it (`begin_new_listing`). The multi-select summary takes precedence
+    // over the per-entry status while one or more entries are selected
+    // (selection "Selection count and size summary"); both drop fields/
+    // truncate with `…` in ladder order as the panel narrows
+    // (responsive-layout "Chrome degradation").
     let status_text = match status_override {
         Some(text) => text,
-        None => match &panel.last_error {
-            Some(message) => message.clone(),
-            None => match panel.progress {
+        None => match (&panel.pending_note, &panel.last_error) {
+            (Some(note), _) => note.clone(),
+            (None, Some(message)) => message.clone(),
+            (None, None) => match panel.progress {
                 ListingProgress::Streaming { count } => reading_status(count),
                 ListingProgress::Complete { .. } => match panel.selection_status() {
                     Some(summary) => truncate_with_ellipsis(&summary, status_budget),
@@ -881,12 +974,7 @@ fn render_bottom_border(
     let fill_total = inner_w.saturating_sub(display_width(&bracketed));
     let left_fill = fill_total / 2;
     let right_fill = fill_total - left_fill;
-    let bottom = format!(
-        "\u{255A}{}{}{}\u{255D}",
-        "\u{2550}".repeat(left_fill),
-        bracketed,
-        "\u{2550}".repeat(right_fill),
-    );
+    let bottom = format!("\u{255A}{}{}{}\u{255D}", "\u{2550}".repeat(left_fill), bracketed, "\u{2550}".repeat(right_fill),);
     buf.set_string(area.x, bottom_y, &bottom, frame_style);
     if !bracketed.is_empty() {
         buf.set_string(area.x + 1 + left_fill as u16, bottom_y, &bracketed, ministatus_style);
@@ -972,7 +1060,7 @@ mod tests {
 
     use super::*;
     use filecommand_core::fs_ops::SourceItem;
-    use filecommand_core::listing::Entry;
+    use filecommand_core::listing::{DateTime, Entry};
     use filecommand_core::panel::TreeState;
 
     // -----------------------------------------------------------------
@@ -1001,8 +1089,8 @@ mod tests {
         let mut left = PanelState::new(PathBuf::from(r"C:\left"));
         left.entries = vec![
             Entry::parent_dir(),
-            Entry { name: OsString::from("src"), kind: EntryKind::Directory, size: 0, modified: None },
-            Entry { name: OsString::from("a.txt"), kind: EntryKind::File, size: 10, modified: None },
+            Entry::new(OsString::from("src"), EntryKind::Directory, 0, None, false, false),
+            Entry::new(OsString::from("a.txt"), EntryKind::File, 10, None, false, false),
         ];
         left.progress = ListingProgress::Complete { count: left.entries.len() };
         let mut right = PanelState::new(PathBuf::from(r"C:\right"));
@@ -1052,7 +1140,11 @@ mod tests {
         render_panel(&mut with_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, Some(&drag));
         let mut without_drag = Buffer::empty(area);
         render_panel(&mut without_drag, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
-        assert_eq!(buffer_to_text(&with_drag, area), buffer_to_text(&without_drag, area), "source rows/frame must render unchanged while a drag targets the other panel");
+        assert_eq!(
+            buffer_to_text(&with_drag, area),
+            buffer_to_text(&without_drag, area),
+            "source rows/frame must render unchanged while a drag targets the other panel"
+        );
     }
 
     #[test]
@@ -1176,7 +1268,9 @@ mod tests {
         // Narrow just enough that Name+Size+Date+Time would leave Name
         // under 12, but Name+Size+Date still fits at >= 12.
         let full_name_w = |w: usize| w.saturating_sub(ColumnSet::FULL.reserved_w());
-        let w = (0usize..40).find(|&w| full_name_w(w) < MIN_NAME_W && w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) >= MIN_NAME_W).unwrap();
+        let w = (0usize..40)
+            .find(|&w| full_name_w(w) < MIN_NAME_W && w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) >= MIN_NAME_W)
+            .unwrap();
         let cols = choose_columns(w, 0);
         assert_eq!(cols, ColumnSet { size: true, date: true, time: false });
     }
@@ -1185,7 +1279,10 @@ mod tests {
     fn choose_columns_drops_date_next() {
         let two_col = ColumnSet { size: true, date: false, time: false };
         let w = (0usize..40)
-            .find(|&w| w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) < MIN_NAME_W && w.saturating_sub(two_col.reserved_w()) >= MIN_NAME_W)
+            .find(|&w| {
+                w.saturating_sub(ColumnSet { time: false, ..ColumnSet::FULL }.reserved_w()) < MIN_NAME_W
+                    && w.saturating_sub(two_col.reserved_w()) >= MIN_NAME_W
+            })
             .unwrap();
         let cols = choose_columns(w, 0);
         assert_eq!(cols, two_col);
@@ -1208,6 +1305,156 @@ mod tests {
         let without_marker = choose_columns(28, 0);
         let with_marker = choose_columns(28, 1);
         assert!(with_marker != ColumnSet::FULL || without_marker == ColumnSet::FULL);
+    }
+
+    // -----------------------------------------------------------------
+    // full-mode-column-widths: untruncated values, right-aligned sizes
+    // (tasks.md 2.1, 2.2).
+    // -----------------------------------------------------------------
+
+    /// A `C:\left` panel holding `entries`, rendered Full-mode and active at
+    /// 40x10 (the 80x24 default-split panel width: a 38-cell interior),
+    /// returned as plain-text rows.
+    fn render_left_panel_rows(entries: Vec<Entry>) -> String {
+        let mut left = PanelState::new(PathBuf::from(r"C:\left"));
+        left.progress = ListingProgress::Complete { count: entries.len() };
+        left.entries = entries;
+        let right = PanelState::new(PathBuf::from(r"C:\right"));
+        let theme = Theme::classic();
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, &left, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        buffer_to_text(&buf, area)
+    }
+
+    #[test]
+    fn full_mode_row_renders_size_date_and_time_untruncated_and_fills_the_interior() {
+        // panel-navigation "Values render untruncated at the nominal size":
+        // a directory modified 2026-06-27 23:30 renders `▶SUB-DIR◀`,
+        // `06-27-26`, and `23:30` complete, with no blank cells between the
+        // Time value and the right border.
+        let dt = DateTime { year: 2026, month: 6, day: 27, hour: 23, minute: 30 };
+        let text =
+            render_left_panel_rows(vec![Entry::parent_dir(), Entry::new(OsString::from("docs"), EntryKind::Directory, 0, Some(dt), false, false)]);
+        // Rows: 0 = top border, 1 = header, 2 = `..`, 3 = `docs`.
+        let header_interior: String = text.lines().nth(1).unwrap().chars().skip(1).take(38).collect();
+        assert!(header_interior.contains("\u{2502}Size"), "header labels stay left-aligned after the separator: `{header_interior}`");
+
+        let up_interior: String = text.lines().nth(2).unwrap().chars().skip(1).take(38).collect();
+        assert!(up_interior.contains("\u{25B6}UP--DIR\u{25C4}"), "`▶UP--DIR◀` renders complete: `{up_interior}`");
+
+        let row = text.lines().nth(3).unwrap();
+        assert_eq!(row.chars().count(), 40, "the row spans the panel frame: `{row}`");
+        let interior: String = row.chars().skip(1).take(38).collect();
+        assert!(interior.contains("\u{25B6}SUB-DIR\u{25C4}"), "`▶SUB-DIR◀` renders complete: `{interior}`");
+        assert!(interior.contains("06-27-26"), "the date renders in full: `{interior}`");
+        assert!(interior.ends_with("23:30"), "the time renders in full and the row fills the interior exactly: `{interior}`");
+    }
+
+    #[test]
+    fn full_mode_file_sizes_are_right_aligned_in_the_size_column() {
+        // panel-navigation "Sizes are right-aligned": `87` and `35K` share
+        // their last-digit cell column.
+        let text = render_left_panel_rows(vec![
+            Entry::parent_dir(),
+            Entry::new(OsString::from("a.txt"), EntryKind::File, 87, None, false, false),
+            Entry::new(OsString::from("b.txt"), EntryKind::File, 35 * 1024, None, false, false),
+        ]);
+        // Interior layout: 13-cell Name, `│`, then the 9-cell Size column —
+        // cells 15..24 of the 40-cell row.
+        let size_cells = |row: &str| row.chars().skip(15).take(9).collect::<String>();
+        let a_row = text.lines().nth(3).unwrap();
+        let b_row = text.lines().nth(4).unwrap();
+        assert_eq!(size_cells(a_row), "       87", "`87` right-aligns: `{a_row}`");
+        assert_eq!(size_cells(b_row), "      35K", "`35K` right-aligns: `{b_row}`");
+    }
+
+    #[test]
+    fn pad_left_to_width_right_aligns_and_leaves_full_width_values_untouched() {
+        assert_eq!(pad_left_to_width("87", SIZE_TEXT_W), "       87");
+        assert_eq!(pad_left_to_width("35K", SIZE_TEXT_W), "      35K");
+        assert_eq!(pad_left_to_width("\u{25B6}SUB-DIR\u{25C4}", SIZE_TEXT_W), "\u{25B6}SUB-DIR\u{25C4}");
+    }
+
+    // -----------------------------------------------------------------
+    // hidden-entry-styling: hidden dimming and its precedence (tasks.md
+    // 3.1).
+    // -----------------------------------------------------------------
+
+    /// The hidden-styling fixture: `..`, a hidden directory (`.git`, under
+    /// the cursor), a plain directory, a hidden file, a *selected* hidden
+    /// file, and a plain file — one row per precedence tier of design D3.
+    fn hidden_fixture_panel() -> PanelState {
+        let mut left = PanelState::new(PathBuf::from(r"C:\left"));
+        left.entries = vec![
+            Entry::parent_dir(),
+            Entry::new(OsString::from(".git"), EntryKind::Directory, 0, None, true, false),
+            Entry::new(OsString::from("docs"), EntryKind::Directory, 0, None, false, false),
+            Entry::new(OsString::from("desktop.ini"), EntryKind::File, 0, None, true, false),
+            Entry::new(OsString::from("secret.txt"), EntryKind::File, 0, None, true, false),
+            Entry::new(OsString::from("readme.txt"), EntryKind::File, 0, None, false, false),
+        ];
+        left.progress = ListingProgress::Complete { count: left.entries.len() };
+        left.cursor = 1; // on the hidden `.git` directory
+        left.selected.insert(OsString::from("secret.txt"));
+        left
+    }
+
+    /// Renders `panel` active at 40x10 and returns the raw buffer (for style
+    /// assertions) plus the plain-text grid.
+    fn render_fixture(panel: &PanelState) -> (Buffer, String) {
+        let right = PanelState::new(PathBuf::from(r"C:\right"));
+        let theme = Theme::classic();
+        let area = Rect { x: 0, y: 0, width: 40, height: 10 };
+        let mut buf = Buffer::empty(area);
+        render_panel(&mut buf, area, panel, &theme, ColorDepth::Ansi16, true, &fixed_identity(), &right, None, PanelSide::Left, None);
+        let text = buffer_to_text(&buf, area);
+        (buf, text)
+    }
+
+    #[test]
+    fn full_mode_styles_hidden_entries_with_cursor_and_selection_precedence() {
+        let theme = Theme::classic();
+        let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+        let (buf, text) = render_fixture(&hidden_fixture_panel());
+
+        // Rows: 0 = border, 1 = header, then `..`, `.git`, `docs`,
+        // `desktop.ini`, `secret.txt`, `readme.txt`.
+        let cell = |y: u16| buf[(1, y)].style();
+        assert_eq!(cell(2).fg, style_of(Role::PanelDirectory).fg, "`..` keeps the directory style");
+        assert_eq!(cell(3).fg, style_of(Role::PanelCursor).fg, "cursor bar wins over hidden (scenario \"Cursor bar wins\")");
+        assert_eq!(cell(3).bg, style_of(Role::PanelCursor).bg, "the cursor bar spans the hidden row");
+        assert_eq!(cell(4).fg, style_of(Role::PanelDirectory).fg, "a plain directory is unchanged");
+        assert_eq!(cell(5).fg, style_of(Role::PanelHidden).fg, "a hidden file renders dimmed (scenario \"Hidden entries render dimmed\")");
+        assert_eq!(cell(5).bg, style_of(Role::PanelHidden).bg);
+        assert_eq!(cell(6).fg, style_of(Role::PanelSelected).fg, "selected beats hidden (scenario \"Selected hidden entry shows selected style\")");
+        assert_eq!(cell(6).bg, style_of(Role::PanelSelected).bg);
+        assert_eq!(cell(7).fg, style_of(Role::PanelFile).fg, "a plain file is unchanged");
+
+        // The hidden directory keeps its directory marker in the Size
+        // column even though its name is dimmed.
+        let git_row = text.lines().nth(3).unwrap();
+        assert!(git_row.contains("\u{25B6}SUB-DIR\u{25C4}"), "`.git` still shows ▶SUB-DIR◀: `{git_row}`");
+    }
+
+    #[test]
+    fn brief_mode_dims_hidden_entries_with_the_same_precedence() {
+        // additional-panel-modes "Brief mode dims hidden entries".
+        let mut panel = hidden_fixture_panel();
+        panel.display_mode = DisplayMode::Brief;
+        let theme = Theme::classic();
+        let style_of = |role: Role| role_style(&theme, role, ColorDepth::Ansi16);
+        let (buf, _) = render_fixture(&panel);
+
+        // Six entries fit in the first of the three 12/12/14 columns
+        // (rows_h = 8), at rows 1..6, x = 1.
+        let cell = |y: u16| buf[(1, y)].style();
+        assert_eq!(cell(1).fg, style_of(Role::PanelDirectory).fg, "`..` keeps the directory style");
+        assert_eq!(cell(2).fg, style_of(Role::PanelCursor).fg, "cursor bar wins (.git)");
+        assert_eq!(cell(3).fg, style_of(Role::PanelDirectory).fg, "docs");
+        assert_eq!(cell(4).fg, style_of(Role::PanelHidden).fg, "desktop.ini dimmed");
+        assert_eq!(cell(5).fg, style_of(Role::PanelSelected).fg, "secret.txt: selected beats hidden");
+        assert_eq!(cell(6).fg, style_of(Role::PanelFile).fg, "readme.txt plain");
     }
 
     #[test]
