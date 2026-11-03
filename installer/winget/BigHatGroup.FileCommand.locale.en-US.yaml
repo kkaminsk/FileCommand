@@ -6,9 +6,10 @@ PackageLocale: en-US
 Publisher: BigHatGroup
 PackageName: FileCommand
 License: MIT OR Apache-2.0
-ShortDescription: >-
-  A keyboard-driven, dual-panel file manager for the terminal, recreating
-  the Norton Commander 5.5 workflow with modern extras.
+# Keep third-party brand names out of ShortDescription: winget-pkgs
+# policy 1.2 flagged the original wording on the 0.1.0 submission
+# (microsoft/winget-pkgs#429006), and this is the approved replacement.
+ShortDescription: A keyboard-driven dual-panel terminal file manager with a classic dual-pane workflow and modern extras.
 Moniker: filecommand
 Tags:
   - file-manager

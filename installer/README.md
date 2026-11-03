@@ -251,8 +251,10 @@ validate.
   `BHGPublic/private-mcp` profile.
 - A local checkout of the CodeSigning repo, for
   `Azure.CodeSigning.Dlib.dll` and the Trusted Signing metadata JSON.
-  Defaults to `C:\GitHub\CodeSigning`; override with `-CodeSigningDlib`
-  and `-CodeSigningMetadata` if it lives elsewhere.
+  Defaults to a `CodeSigning` checkout next to this repo (for example
+  `C:\Temp\tsscat\CodeSigning` beside `C:\Temp\tsscat\FileCommand`);
+  override with `-CodeSigningDlib` and `-CodeSigningMetadata` if it lives
+  elsewhere.
 - A Windows SDK signtool (10.0.26100.0+ recommended); auto-detected, or
   pass `-SignToolPath` explicitly.
 
